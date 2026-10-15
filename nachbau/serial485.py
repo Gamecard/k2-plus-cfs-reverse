@@ -40,9 +40,19 @@ BROADCAST_BTM = 0xFC     # Belt-Module
 
 MAX_RETRIES = 4          # Beleg: klippy.log "retries = 4"
 
+# Plausibilitätsgrenzen für das Längenfeld (len = status+fun+daten... inkl. crc,
+# vgl. build_frame: len = len(data)+3). Minimum 3 = Frame ohne Daten.
+# Ein kleineres Maximum als das Byte-Maximum 255 ist nicht belegt (weder
+# Wrapper-Quellen noch Mitschnitte) -> 255.
+FRAME_LEN_MIN = 3
+FRAME_LEN_MAX = 255
+
+import logging
 import threading
 import time
 from collections import deque
+
+_log = logging.getLogger(__name__)
 
 
 def crc8_cal(data):
@@ -84,6 +94,8 @@ def parse_frame(raw):
     if raw[0] != PACK_HEAD:
         raise ValueError("head-Fehler: 0x%02x" % raw[0])
     length, status, fun = raw[2], raw[3], raw[4]
+    if not FRAME_LEN_MIN <= length <= FRAME_LEN_MAX:
+        raise ValueError("Längenfeld unplausibel: %d" % length)
     expect = length + 3  # head+addr+len (3) + length-Inhalt
     if len(raw) < expect:
         raise ValueError("unvollständig: %d < %d" % (len(raw), expect))
@@ -91,6 +103,37 @@ def parse_frame(raw):
     if crc8_cal(body) != raw[expect - 1]:
         raise ValueError("CRC-Fehler")
     return fun, bytes(raw[5:expect - 1])
+
+
+def _scan_frame(buf):
+    """Prüft den Pufferanfang auf EINEN Frame (Empfangs-Zustandsautomat).
+
+    Gibt zurück:
+      ("need", None)  – Frame-Anfang plausibel, aber noch unvollständig
+                        -> weiterlesen (fragmentierte/lange Frames).
+      ("bad", err)    – falscher Head, unplausibles Längenfeld oder
+                        CRC-Fehler -> resynchronisieren.
+      ("ok", (expect, addr, status, fun, daten)) – gültiger Frame der
+                        Länge expect am Pufferanfang.
+    """
+    if not buf:
+        return "need", None
+    if buf[0] != PACK_HEAD:
+        return "bad", ValueError("head-Fehler: 0x%02x" % buf[0])
+    if len(buf) < 3:
+        return "need", None
+    length = buf[2]
+    if not FRAME_LEN_MIN <= length <= FRAME_LEN_MAX:
+        return "bad", ValueError("Längenfeld unplausibel: %d" % length)
+    expect = length + 3
+    if len(buf) < expect:
+        return "need", None
+    raw = bytes(buf[:expect])
+    try:
+        fun, data = parse_frame(raw)
+    except ValueError as e:
+        return "bad", e
+    return "ok", (expect, raw[1], raw[3], fun, data)
 
 
 def _resync(buf):
@@ -164,66 +207,95 @@ class Serial485:
             return None
         return cb(addr, status, fun, data)
 
+    def _dispatch_safe(self, addr, status, fun, data):
+        """_dispatch ohne Exception-Propagation (Handler-Fehler werden
+        geloggt, der Busverkehr läuft weiter). Aufruf NUR ohne gehaltenes
+        _lock (Handler dürfen selbst Bus-Funktionen aufrufen)."""
+        try:
+            self._dispatch(addr, status, fun, data)
+        except Exception:
+            _log.exception("Bus-Handler für addr 0x%02x fun 0x%02x fehlgeschlagen",
+                           addr, fun)
+
     def _recv_frame_locked(self, deadline, expect_fun=None, expect_addr=None):
         """EIN gültiger Frame unter gehaltenem _lock. Gibt
         (addr, status, fun, daten, rohframe) zurück. Zählt crc_errors.
-        Wirft TimeoutError bei abgelaufener Deadline."""
+        Wirft TimeoutError bei abgelaufener Deadline.
+
+        Ablauf: Puffer (Überhang + gelesene Chunks) wird VOLLSTÄNDIG
+        abgearbeitet, bevor neu gelesen wird:
+          - unvollständiger Frame-Anfang -> weiterlesen (Fragmente, >64 Byte)
+          - falscher Head/unplausibles len/CRC-Fehler -> _resync (nächster 0xF7)
+          - gültiger, aber nicht gewollter Frame (fun/addr-Mismatch, z.B.
+            Herzschlag) -> als GANZES überspringen (Daten dürfen 0xF7
+            enthalten, z.B. Belt-Flash); nicht dispatcht (wie bisher)
+        Bei Deadline mit unvollständigem Rest wird hinter dem vermeintlichen
+        Head nach einem kompletten Frame gesucht (Müll-Head, der einen echten
+        Frame "verschluckt"). Findet sich keiner, bleibt der Rest als
+        Überhang erhalten (get_response/_bg_thread können ihn vervollständigen;
+        transact leert ihn ohnehin vor jedem Senden).
+        """
         buf = bytearray(getattr(self, "_rest_buf", b"") or b"")
         self._rest_buf = b""
         last_err = None
-        # ggf. liegt bereits ein kompletter Frame im Überhang
-        if len(buf) >= 6:
-            try:
-                rfun0, _ = parse_frame(bytes(buf))
-                length0 = buf[2]
-                expect0 = length0 + 3
-                if len(buf) >= expect0:
-                    raw0 = bytes(buf[:expect0])
-                    addr0, status0 = raw0[1], raw0[3]
-                    if ((expect_fun is None or rfun0 == expect_fun)
-                            and (expect_addr is None or addr0 == expect_addr)):
-                        _, rdata0 = parse_frame(bytes(buf[:expect0]))
-                        self._rest_buf = bytes(buf[expect0:])
-                        return addr0, status0, rfun0, rdata0, raw0
-            except ValueError:
-                pass
-        while time.monotonic() < deadline:
+        final = False          # Deadline erreicht: nur noch Lookahead
+        pending = b""          # unvollständiger Rest zum Deadline-Zeitpunkt
+        found_any = False      # Lookahead hat einen gültigen Frame gefunden
+        while True:
+            while buf:
+                state, val = _scan_frame(buf)
+                if state == "need":
+                    if not final:
+                        break
+                    buf = _resync(buf)
+                    continue
+                if state == "bad":
+                    if not final:  # Lookahead-Treffer nicht als Busfehler zählen
+                        if "CRC" in str(val):
+                            self._inc("crc_errors")
+                        last_err = val
+                    buf = _resync(buf)
+                    continue
+                expect, addr, status, rfun, rdata = val
+                raw = bytes(buf[:expect])
+                if final:
+                    found_any = True
+                if expect_fun is not None and rfun != expect_fun:
+                    last_err = ValueError("fun-Mismatch: 0x%02x" % rfun)
+                    del buf[:expect]
+                    continue
+                if expect_addr is not None and addr != expect_addr:
+                    last_err = ValueError("addr-Mismatch: 0x%02x" % addr)
+                    del buf[:expect]
+                    continue
+                self._rest_buf = bytes(buf[expect:])  # Überhang (Folgeframe)
+                return addr, status, rfun, rdata, raw
+            if final:
+                break
+            if time.monotonic() >= deadline:
+                final = True
+                pending = bytes(buf)
+                continue
             chunk = self.ser.read(64)
-            if not chunk:
-                continue
-            buf += chunk
-            try:
-                rfun, rdata = parse_frame(bytes(buf))
-            except ValueError as e:
-                if "CRC" in str(e):
-                    self._inc("crc_errors")
-                last_err = e
-                buf = _resync(buf)
-                continue
-            length = buf[2]
-            expect = length + 3
-            raw = bytes(buf[:expect])
-            addr, status = raw[1], raw[3]
-            if expect_fun is not None and rfun != expect_fun:
-                last_err = ValueError("fun-Mismatch: 0x%02x" % rfun)
-                buf = _resync(buf)
-                continue
-            if expect_addr is not None and addr != expect_addr:
-                last_err = ValueError("addr-Mismatch: 0x%02x" % addr)
-                buf = _resync(buf)
-                continue
-            rest = bytes(buf[expect:])
-            self._rest_buf = rest  # Überhang (Folgeframe) merken
-            return addr, status, rfun, rdata, raw
+            if chunk:
+                buf += chunk
+        if not found_any and pending:
+            self._rest_buf = pending
         raise TimeoutError(last_err or "keine Antwort")
 
     def _transact_locked(self, addr, fun, data, timeout, retries,
                          expect_fun, status, want_full=False):
         """Kern unter gehaltenem _lock. want_full -> (addr,status,fun,daten,roh),
-        sonst nur daten. Zählt sent/retries/received/timeouts, dispatchet."""
+        sonst nur daten. Zählt sent/retries/received/timeouts.
+
+        Dispatcht NICHT selbst: der Aufrufer ruft _dispatch_safe erst nach
+        Freigabe von _lock (sonst Deadlock, wenn ein Handler Bus-Funktionen
+        aufruft – threading.Lock ist nicht reentrant)."""
         expect_fun = fun if expect_fun is None else expect_fun
         frame = build_frame(addr, fun, data, status=status)
         last_err = None
+        # TODO: am klippy.log nachzählen, ob 4 Versuche oder 1+4
+        # (aktuell: retries=4 -> 1 Erstsendung + 4 Wiederholungen = 5 Sendungen).
         for attempt in range(retries + 1):
             if attempt > 0:
                 self._inc("retries")
@@ -242,10 +314,6 @@ class Serial485:
                 last_err = e
                 continue
             self._inc("received")
-            try:
-                self._dispatch(raddr, rstatus, rfun, rdata)
-            except Exception:
-                pass
             if want_full:
                 return raddr, rstatus, rfun, rdata, rraw
             return rdata
@@ -305,8 +373,8 @@ class Serial485:
     def _start_session(self, start_bg=False, bg_timeout=0.2):
         """Explizite Session-Eröffnung (Beleg: Serialhdl_485._start_session).
 
-        Stellt sicher, dass der Port offen ist, leert den Empfangspuffer und
-        markiert die Session aktiv. Idempotent. Mit start_bg=True wird der
+        Stellt sicher, dass der Port offen ist, leert den Empfangspuffer
+        (Port + interner Überhang _rest_buf) und markiert die Session aktiv. Idempotent. Mit start_bg=True wird der
         Hintergrund-Leser (_bg_thread) als Daemon gestartet.
         """
         if not getattr(self, "_connected", False) or getattr(self, "ser", None) is None:
@@ -316,6 +384,7 @@ class Serial485:
                 self.ser.reset_input_buffer()
             except Exception:
                 pass
+        self._rest_buf = b""
         self._session_active = True
         if start_bg:
             self._start_bg(timeout=bg_timeout)
@@ -355,11 +424,10 @@ class Serial485:
                     except TimeoutError:
                         continue
                     self._inc("received")
-                try:
-                    self._dispatch(raddr, rstatus, rfun, rdata)
-                except Exception:
-                    pass
+                # außerhalb von _lock (Handler dürfen Bus-Funktionen rufen)
+                self._dispatch_safe(raddr, rstatus, rfun, rdata)
             except Exception:
+                _log.exception("_bg_thread: Fehler beim Empfang")
                 continue
 
     def raw_send(self, addr, fun, data=(), status=STATUS_OK):
@@ -375,16 +443,27 @@ class Serial485:
                           status=STATUS_OK):
         """Sendet, wartet auf Antwort mit passendem fun-Code
         (Beleg: Serialhdl_485.raw_send_wait_ack). Gibt Antwort-Daten zurück."""
-        timeout = self.default_timeout if timeout is None else timeout
-        with self._lock:
-            return self._transact_locked(addr, fun, list(data), timeout,
-                                         retries, expect_fun, status)
+        full = self._send_wait_full_nodispatch(addr, fun, data, timeout,
+                                               retries, expect_fun, status)
+        self._dispatch_safe(*full[:4])  # nach Freigabe von _lock
+        return full[3]
 
     def raw_send_wait_ack_full(self, addr, fun, data=(), timeout=None,
                                retries=MAX_RETRIES, expect_fun=None,
                                status=STATUS_OK):
         """Wie raw_send_wait_ack, gibt aber (addr, status, fun, daten, rohframe)
         zurück (für Wrapper-Vollframes, vgl. auto_addr data_handler)."""
+        full = self._send_wait_full_nodispatch(addr, fun, data, timeout,
+                                               retries, expect_fun, status)
+        self._dispatch_safe(*full[:4])  # nach Freigabe von _lock
+        return full
+
+    def _send_wait_full_nodispatch(self, addr, fun, data=(), timeout=None,
+                                   retries=MAX_RETRIES, expect_fun=None,
+                                   status=STATUS_OK):
+        """Intern: wie raw_send_wait_ack_full, aber OHNE Dispatch. Der
+        Aufrufer muss _dispatch_safe(*full[:4]) selbst (ohne Locks) aufrufen
+        (genutzt vom Wrapper, der unter _send_lock sendet)."""
         timeout = self.default_timeout if timeout is None else timeout
         with self._lock:
             return self._transact_locked(addr, fun, list(data), timeout,
@@ -408,16 +487,19 @@ class Serial485:
                 self._inc("timeouts")
                 raise
             self._inc("received")
-            try:
-                self._dispatch(raddr, rstatus, rfun, rdata)
-            except Exception:
-                pass
-            return raddr, rstatus, rfun, rdata
+        self._dispatch_safe(raddr, rstatus, rfun, rdata)  # ohne _lock
+        return raddr, rstatus, rfun, rdata
 
     def register_response(self, addr, fun, callback):
         """Registriert Antwort-Handler für (addr, fun)
         (Beleg: Serialhdl_485.register_response). None = Wildcard.
-        callback(addr, status, fun, daten). callback=None löscht."""
+        callback(addr, status, fun, daten). callback=None löscht.
+
+        Handler laufen NACH Freigabe des Bus-Locks (im Thread des Aufrufers
+        von transact/raw_send_wait_ack/get_response bzw. im _bg_thread) und
+        dürfen daher selbst Bus-Funktionen aufrufen. Exceptions im Handler
+        werden geloggt (logging), nicht propagiert. Nur die Antwort, auf die
+        gewartet wurde, wird dispatcht; übersprungene Fremd-Frames nicht."""
         with self._lock:
             if callback is None:
                 self._handlers.pop((addr, fun), None)
@@ -456,7 +538,7 @@ class Serial_485_Wrapper:
     remove_send_data/send_queue_process/register_response/
     is_exist_in_send_list/handle_callback (+ _connect/_disconnect/stats).
 
-    Wire-Format wie im Live-Betrieb (Beleg: auto_addr_wrapper-live.py
+    Wire-Format wie im Live-Betrieb (Beleg: auto_addr_wrapper.py
     send_package + belt_mdl.py send_data): data_send = [addr][len][status]
     [fun][daten...] OHNE Head und OHNE CRC (CRC ergänzt der Treiber beim
     Senden). Rückgabe von cmd_send_data_with_response ist der VOLLE
@@ -528,38 +610,52 @@ class Serial_485_Wrapper:
             raise ValueError("data_send zu kurz: %d" % len(wire))
         return wire[0], wire[1], wire[2], wire[3], wire[4:]
 
-    def _send_entry(self, entry):
-        """Sendet EINEN Queue-Eintrag, gibt Vollframe oder None (Timeout)."""
+    def _send_entry(self, entry, deferred):
+        """Sendet EINEN Queue-Eintrag, gibt Vollframe oder None (Timeout).
+
+        Dispatch (Bus-Registry + handle_callback) wird NICHT hier ausgeführt,
+        sondern als (eintrag, vollantwort) an deferred angehängt; der
+        Aufrufer führt ihn nach Freigabe von _send_lock aus (_run_deferred),
+        damit Handler selbst senden dürfen ohne Deadlock."""
         addr, _length, status, fun, payload = self._split_wire(entry["data"])
         retries = MAX_RETRIES if entry["retransmit"] else 0
         try:
-            _raddr, _rstatus, _rfun, _rdata, rraw = \
-                self.bus.raw_send_wait_ack_full(
-                    addr, fun, list(payload), timeout=entry["timeout"],
-                    retries=retries, expect_fun=fun, status=status)
+            full = self.bus._send_wait_full_nodispatch(
+                addr, fun, list(payload), timeout=entry["timeout"],
+                retries=retries, expect_fun=fun, status=status)
         except TimeoutError:
             return None
-        try:
-            self.handle_callback(entry["data"], rraw)
-        except Exception:
-            pass
-        return rraw
+        deferred.append((entry["data"], full))
+        return full[4]
+
+    def _run_deferred(self, deferred):
+        """Führt gesammelte Dispatches aus (ohne gehaltene Locks), in
+        Sende-Reihenfolge: erst Bus-Registry, dann Wrapper-Registry."""
+        for data_send, full in deferred:
+            self.bus._dispatch_safe(*full[:4])
+            try:
+                self.handle_callback(data_send, full[4])
+            except Exception:
+                _log.exception("Wrapper handle_callback fehlgeschlagen")
 
     def send_queue_process(self):
         """Arbeitet die Queue FIFO ab, ein Eintrag gleichzeitig
         (Beleg: Serial_485_Wrapper.send_queue_process). Gibt
         [(eintrags-id, antwort-vollframe-oder-None)] in Reihenfolge zurück."""
         results = []
+        deferred = []
         with self._send_lock:
             while True:
                 with self._qlock:
                     if not self._queue:
                         break
                     entry = self._queue.popleft()
-                resp = self._send_entry(entry)
+                resp = self._send_entry(entry, deferred)
                 with self._qlock:
                     self._done[entry["id"]] = resp
                 results.append((entry["id"], resp))
+        # Handler erst nach Freigabe von _send_lock (dürfen selbst senden)
+        self._run_deferred(deferred)
         return results
 
     # --- Sende-Kommandos (Belegnamen) ---
@@ -572,21 +668,29 @@ class Serial_485_Wrapper:
         eingereihte Einträge werden zuerst gesendet.
         """
         eid = self.add_send_data(data, timeout=timeout, retransmit=retransmit)
+        deferred = []
+        result = None
         with self._send_lock:
             with self._qlock:
-                if eid in self._done:  # Neben-Thread hat ihn schon erledigt
-                    return self._done.pop(eid)
-            while True:
+                done = eid in self._done  # Neben-Thread hat ihn schon erledigt
+                if done:
+                    result = self._done.pop(eid)
+            while not done:
                 with self._qlock:
                     if not self._queue:
-                        return self._done.pop(eid, None)
+                        result = self._done.pop(eid, None)
+                        break
                     entry = self._queue.popleft()
-                resp = self._send_entry(entry)
+                resp = self._send_entry(entry, deferred)
                 with self._qlock:
                     self._done[entry["id"]] = resp
                     if entry["id"] == eid:
-                        return self._done.pop(eid)
+                        result = self._done.pop(eid)
+                        break
                     # fremde Antworten liegen für deren Threads in _done
+        # Handler erst nach Freigabe von _send_lock (dürfen selbst senden)
+        self._run_deferred(deferred)
+        return result
 
     def cmd_485_send_data(self, data, timeout=1.0):
         """Fire-and-forget (Beleg: Serial_485_Wrapper.cmd_485_send_data).
@@ -607,7 +711,9 @@ class Serial_485_Wrapper:
 
     def handle_callback(self, data_send, msg):
         """Dispatchet Antwort-Vollframe msg an Registry
-        (Beleg: Serial_485_Wrapper.handle_callback)."""
+        (Beleg: Serial_485_Wrapper.handle_callback). Handler-Exceptions
+        werden geloggt und nicht propagiert (Rückgabe dann None). Wird vom
+        Wrapper ohne gehaltene Locks aufgerufen."""
         try:
             rfun, _rdata = parse_frame(bytes(msg))
         except ValueError:
@@ -620,12 +726,13 @@ class Serial_485_Wrapper:
                 try:
                     return cb(bytes(data_send), bytes(msg))
                 except Exception:
+                    _log.exception("Wrapper-Handler %r fehlgeschlagen", key)
                     return None
         if self._default_handler is not None:
             try:
                 return self._default_handler(bytes(data_send), bytes(msg))
             except Exception:
-                pass
+                _log.exception("Wrapper-Default-Handler fehlgeschlagen")
         return None
 
     # --- Lifecycle/Stats ---
@@ -665,7 +772,9 @@ _LIVE_FRAMES = [
 
 def selftest():
     fails = 0
+    total = 0  # Anzahl aller Einzelchecks (Live-Frames, Asserts, check2)
     for hexframe, label in _LIVE_FRAMES:
+        total += 1
         raw = bytes.fromhex(hexframe)
         # 1. CRC des geloggten Frames muss stimmen
         body = list(raw[2:-1])
@@ -688,8 +797,10 @@ def selftest():
              bytes.fromhex("f7 01 03 00 02 b3"))
     assert _resync(bytearray(noisy)) == bytes.fromhex("f7 01 03 00 02 b3")
     print("ok resync Müllpräfix")
+    total += 1
     assert _resync(bytearray(b"\x00\x01\x02")) == bytearray()
     print("ok resync ohne Head")
+    total += 1
     # 5. Transaktions-Lock existiert (Schutz bei parallelen Threads)
     import sys
     import types
@@ -713,6 +824,7 @@ def selftest():
         import threading
         assert isinstance(inst._lock, type(threading.Lock()))
         print("ok transact-lock")
+        total += 1
     finally:
         del sys.modules["serial"]
 
@@ -750,7 +862,8 @@ def selftest():
             pass
 
     def check2(name, cond):
-        nonlocal fails
+        nonlocal fails, total
+        total += 1
         print(("ok " if cond else "FAIL ") + name)
         fails += 0 if cond else 1
 
@@ -873,7 +986,161 @@ def selftest():
     ga, gs, gf, gd = bus5.get_response(timeout=0.3)
     check2("get_response", (ga, gs, gf, gd) == (0x01, 0x00, 0x10, bytes([0xB2])))
 
-    print("SELBSTTEST: %d/%d ok" % (len(_LIVE_FRAMES) - fails, len(_LIVE_FRAMES)))
+    # 10b. Empfangs-Robustheit (Review K1-K3, G2, M1/M2)
+    class ChunkSerial(FakeSerial):
+        """Liefert den Empfangspuffer in festen Häppchen: chunks = Liste von
+        Chunkgrößen je read() (letzte wiederholt sich)."""
+
+        def __init__(self, script, chunks):
+            FakeSerial.__init__(self, script)
+            self.chunks = list(chunks)
+            self._ci = 0
+
+        def read(self, n):
+            if self._read_buf:
+                k = self.chunks[min(self._ci, len(self.chunks) - 1)]
+                self._ci += 1
+                return FakeSerial.read(self, min(n, k))
+            return FakeSerial.read(self, n)
+
+    gdata = bytes([0x1A, 0x00, 0xFF, 0x00])
+    for name, chunks in (("3+rest", [3, 64]), ("4-byte", [4])):
+        busf = Serial485("/dev/ttyFAKE1", ser=ChunkSerial([good], chunks))
+        try:
+            ok = busf.transact(0x01, 0x03, [0x0F], timeout=0.2, retries=0) == gdata
+        except TimeoutError:
+            ok = False
+        check2("fragmentiert %s" % name, ok)
+    bigdata = bytes(range(80))
+    big = build_frame(0x01, 0x02, bigdata)  # 86 Byte > read(64)
+    busb = Serial485("/dev/ttyFAKE1", ser=FakeSerial([big]))
+    try:
+        ok = busb.transact(0x01, 0x02, [0x01], timeout=0.2, retries=0) == bigdata
+    except TimeoutError:
+        ok = False
+    check2("frame >64 byte", ok and busb.stats()["crc_errors"] == 0)
+    hb = bytes.fromhex("f7 01 09 00 0a 13 34 00 00 00 00 d7")
+    bush = Serial485("/dev/ttyFAKE1", ser=FakeSerial([hb + good]))
+    t0 = time.monotonic()
+    try:
+        ok = bush.transact(0x01, 0x03, [0x0F], timeout=0.5, retries=0) == gdata
+    except TimeoutError:
+        ok = False
+    check2("herzschlag+antwort ein chunk", ok and time.monotonic() - t0 < 0.4)
+    flash = bytes.fromhex("f7 21 10 00 02 03 00 00 00 93 ff f7 b7 95 ff f3 51 4c 3d")
+    adc = build_frame(0x21, 0x06, [0xFF, 0xF8, 0xC7, 0x12])
+    busx = Serial485("/dev/ttyFAKE1", ser=FakeSerial([]))
+    busx.ser._read_buf += flash + adc
+    try:
+        ok = busx.get_response(timeout=0.3, expect_fun=0x06) == (
+            0x21, 0x00, 0x06, bytes([0xFF, 0xF8, 0xC7, 0x12]))
+    except TimeoutError:
+        ok = False
+    check2("fremd-frame mit 0xF7 in daten", ok and busx.stats()["crc_errors"] == 0)
+    junk = bytes.fromhex("f7 01 00 00 00 00")
+    busj = Serial485("/dev/ttyFAKE1", ser=FakeSerial([junk + good]))
+    try:
+        ok = busj.transact(0x01, 0x03, [0x0F], timeout=0.2, retries=0) == gdata
+    except Exception:  # vorher IndexError
+        ok = False
+    check2("müll len=0 vor antwort", ok)
+    try:
+        parse_frame(junk)
+        ok = False
+    except ValueError:
+        ok = True
+    check2("parse_frame len<3 -> ValueError", ok)
+    busr = Serial485("/dev/ttyFAKE1", ser=FakeSerial([]))
+    busr._rest_buf = good
+    busr._start_session()
+    try:
+        busr.get_response(timeout=0.03)
+        ok = False
+    except TimeoutError:
+        ok = True
+    check2("_start_session leert _rest_buf", ok)
+    # Handler ruft selbst Bus-/Wrapper-Funktionen (früher Deadlock)
+    busd = Serial485("/dev/ttyFAKE1", ser=FakeSerial([good]))
+    nested = []
+    busd.register_response(0x01, 0x03,
+                           lambda a, st, f, d: nested.append(busd.raw_send(0x01, 0x10)))
+    thd = threading.Thread(target=lambda: busd.transact(
+        0x01, 0x03, [0x0F], timeout=0.1, retries=0), daemon=True)
+    thd.start()
+    thd.join(1.5)
+    check2("bus-handler ruft raw_send (kein deadlock)",
+           not thd.is_alive() and len(nested) == 1)
+    wbus = Serial485("/dev/ttyFAKE1", ser=FakeSerial([good, good]))
+    wwrap = Serial_485_Wrapper(bus=wbus)
+    wwire = bytes([0x01, 4, STATUS_OK, 0x03, 0x0F])
+    wnested = []
+    wflag = []
+
+    def _wcb(ds, msg):
+        if not wflag:  # nur einmal verschachtelt senden
+            wflag.append(1)
+            wnested.append(wwrap.cmd_send_data_with_response(wwire, 0.1, False))
+    wwrap.register_response(0x01, 0x03, _wcb)
+    thw = threading.Thread(target=lambda: wwrap.cmd_send_data_with_response(
+        wwire, 0.1, False), daemon=True)
+    thw.start()
+    thw.join(1.5)
+    check2("wrapper-handler sendet selbst (kein deadlock)",
+           not thw.is_alive() and wnested == [good])
+    # Handler-Exception wird geloggt, nicht propagiert
+    buse = Serial485("/dev/ttyFAKE1", ser=FakeSerial([good]))
+
+    def _boom(*a):
+        raise RuntimeError("selbsttest: erwartete Handler-Exception")
+    buse.register_response(0x01, 0x03, _boom)
+    _lg = logging.getLogger(__name__)
+    _old_disabled, _lg.disabled = _lg.disabled, True  # Traceback nicht ausgeben
+    try:
+        ok = buse.transact(0x01, 0x03, [0x0F], timeout=0.1, retries=0) == gdata
+    except Exception:
+        ok = False
+    finally:
+        _lg.disabled = _old_disabled
+    check2("handler-exception nicht propagiert", ok)
+
+    # 11. Kreuzvalidierung gegen Fremd-Referenz ref-hi/ (GPL-3.0, nur lesen;
+    #     Herkunft siehe ref-hi/HERKUNFT.txt). Hex-Strings enthalten teils
+    #     Leerzeichen-Tippfehler -> vor bytes.fromhex alle Leerzeichen entfernen.
+    import json
+    import os
+
+    def _hex(sv):
+        return bytes.fromhex("".join(sv.split()))
+
+    ref_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ref-hi")
+    if not os.path.isdir(ref_dir):
+        print("skip ref-hi (Ordner fehlt: %s)" % ref_dir)
+    else:
+        with open(os.path.join(ref_dir, "test_vectors.json"), encoding="utf-8") as fh:
+            vectors = json.load(fh)
+        for i, vec in enumerate(vectors):
+            full = _hex(vec["full_frame_hex"])
+            scope = _hex(vec["crc_scope_hex"])
+            expected = int(vec["expected_crc"], 16)
+            check2("ref-hi crc #%d %s" % (i, vec.get("description", "")),
+                   crc8_cal(list(scope)) == expected
+                   and full[2:-1] == scope and full[-1] == expected)
+        with open(os.path.join(ref_dir, "valid_messages.json"), encoding="utf-8") as fh:
+            messages = json.load(fh)
+        for i, msg in enumerate(messages):
+            raw = _hex(msg["hex"])
+            func = int(msg["func"], 16)
+            status = int(msg["status"], 16)
+            data = _hex(msg["data_hex"])
+            try:
+                parsed = parse_frame(raw)
+            except ValueError:
+                parsed = None
+            check2("ref-hi msg #%d %s" % (i, msg.get("description", "")),
+                   build_frame(msg["addr"], func, data, status=status) == raw
+                   and parsed == (func, data))
+
+    print("SELBSTTEST: %d/%d ok" % (total - fails, total))
     return fails
 
 

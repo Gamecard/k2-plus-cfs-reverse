@@ -10,7 +10,8 @@ als BoxMini-Klasse ab; diese Datei ergänzt sinngemäß nach API-box_wrapper.md:
    parse_buffer_state / parse_hardware_status (je 1 Byte).
 2) BoxState: Tn-Datenmodell im Speicher (tn_map/tnn_map/save_data als dicts,
    generate/get/modify/update-Methoden sinngemäß nach API-Doku).
-3) BoxAction: belegte Einzel-Step-Sequenz-Builder (Preload arm/disarm/rearm,
+3) BoxAction: belegte Einzel-Step-Sequenz-Builder (Preload enable/disable/
+   force-read,
    Feed-Mode enter, Engage/Release, Print-Mode) + bus-gebundene Klasse.
 
 Bus-Anbindung: serial485.Serial485-Instanz wird übergeben (echte Hardware,
@@ -60,30 +61,68 @@ FUNC_GET_VERSION_SN = 0x14
 FUNC_EXTRUDE = 0x10
 FUNC_RETRUDE = 0x11
 
-# Preload-Phasen (Beleg: Referenzimplementierung + PROTOKOLL-485.md).
-PRELOAD_ARM = 0x00
-PRELOAD_DISARM = 0x01
-PRELOAD_REARM = 0x02
+# Preload-/RFID-Control-Aktion (0x0d, 2. Datenbyte). KORREKTUR 15.10.2026:
+# Die frühere Belegung 00=Arm/01=Disarm/02=Rearm (PROTOKOLL-485.md:98) ist
+# durch KEINEN Live-Frame gestützt (live nur "0x0d len 3" belegt; die ACK-Bytes f7 01 03 00 0d 9e stammen aus ref-hi
+# und sind nicht live gesehen; kein 0x0d-Request mitgeschnitten). Beide unabhängigen
+# Referenzen sagen übereinstimmend das Gegenteil:
+# - nachbau/ref-hi/valid_messages.json: f70105ff0d0f0169 =
+#   "CMD_SET_PRE_LOADING box 1, mask=0x0F enable=0x01"
+# - k2-vanilla files/box_protocol.py (CMD_RFID_CONTROL=0x0D):
+#   set_rfid_insert_reading(enabled) -> (0, int(enabled)),
+#   force_rfid_read(mask) -> (mask, 2)
+# Daher: 0x00 = Insert-Reading/Preload aus, 0x01 = an, 0x02 = Force-Read.
+# TODO (unbelegt): ob das 1. Byte bei 0x00/0x01 die Maske ist (ref-hi: 0x0F)
+#   oder ignoriert wird (vanilla: 0) – hier wird die übergebene Maske gesendet.
+PRELOAD_DISABLE = 0x00
+PRELOAD_ENABLE = 0x01
+PRELOAD_FORCE_READ = 0x02
+PRELOAD_ACTIONS = (PRELOAD_DISABLE, PRELOAD_ENABLE, PRELOAD_FORCE_READ)
 
 
-def _mask(slot):
-    """Slot 0..3 oder 1-hot-Maske -> Maske (vgl. cfsseq._slot)."""
-    if slot in range(4):
-        return 1 << slot
-    if slot in SLOT_MASKS or slot == MASK_ALL or slot == 0x00:
-        return slot
-    raise ValueError("Slot muss 0..3 oder 1-hot-Maske sein: %r" % (slot,))
+def check_mask(mask):
+    """Slotmaske 0x00..0x0f prüfen und zurückgeben (Mehrfachmasken erlaubt).
+
+    Wire-Parameter wie communication_get_rfid(addr, num) sind im Original
+    eine MASKE (API-box_wrapper.md: num=1 -> data b'\\x01', num=15 -> b'\\x0f'),
+    keine Slotnummer – es findet KEINE Umdeutung statt.
+    """
+    if isinstance(mask, bool) or not isinstance(mask, int) \
+            or not 0 <= mask <= MASK_ALL:
+        raise ValueError("Maske muss int 0x00..0x0f sein: %r" % (mask,))
+    return mask
+
+
+def slot_to_mask(index):
+    """Slot-Index 0..3 (A..D) -> 1-hot-Maske 0x01/0x02/0x04/0x08."""
+    if isinstance(index, bool) or index not in range(4):
+        raise ValueError("Slot-Index muss 0..3 sein: %r" % (index,))
+    return SLOT_MASKS[index]
+
+
+def _is_full_frame(raw):
+    """Voll-Frame erkennen: Head 0xF7, Mindestlänge 6 UND Längenfeld passt
+    exakt zur Gesamtlänge (len + 3). Rohdaten, die zufällig mit 0xF7
+    beginnen, gelten damit nur als Frame, wenn auch das Längenfeld stimmt;
+    die CRC prüft danach parse_frame (Fehler -> ValueError).
+    TODO: Restmehrdeutigkeit (Rohdaten mit 0xF7 + passendem Längenbyte) ist
+      nur durch getrennte API (Frame vs. Rohdaten) restlos lösbar.
+    """
+    return (len(raw) >= 6 and raw[0] == serial485.PACK_HEAD
+            and raw[2] + 3 == len(raw))
 
 
 def _response_data(msg, expect_fun):
     """Hilfsfunktion: Voll-Frame oder Rohdaten -> Antwort-Daten (bytes).
 
-    Erkannt wird ein Voll-Frame an Head 0xF7 + Mindestlänge; dann wird per
-    serial485.parse_frame CRC-geprüft und der fun-Code verglichen.
-    Sonst gilt msg als bereits extrahierte Rohdaten (z.B. aus Tests).
+    Voll-Frame (s. _is_full_frame) wird per serial485.parse_frame
+    CRC-geprüft und der fun-Code verglichen. Sonst gilt msg als bereits
+    extrahierte Rohdaten (z.B. Rückgabe von Serial485.transact).
+    TODO (offen): Status-Byte raw[3] wird NICHT ausgewertet (Fehler-/Busy-
+      Codes ≠ 0x00, vgl. vanilla STATUS_*), Antwort wird trotzdem geparst.
     """
     raw = bytes(msg)
-    if len(raw) >= 6 and raw[0] == serial485.PACK_HEAD:
+    if _is_full_frame(raw):
         fun, data = serial485.parse_frame(raw)
         if fun != expect_fun:
             raise ValueError("fun-Mismatch: 0x%02x, erwartet 0x%02x"
@@ -104,8 +143,11 @@ def get_rfid(msg):
     Belegt (Live 12.10.2026): b"A:<hex>;" / b"B:unknown;" / b"C:busy;".
     msg = Voll-Frame (fun 0x02, CRC-geprüft) oder Rohdaten.
     Gibt dict {Slot-Key: Wert} zurück. Leere Antwort -> {}.
-    TODO (.so-offen): Felder nach dem vender-Hex (color/material/remain)
-      sind weitere ';'-Felder – hier bewusst generisch als String belassen.
+    Je Slot-Key wird der Wert bis zum nächsten ';' übernommen; weitere
+    ';'-Felder ohne gültigen Slot-Key ("X:..." mit X in A..D) werden
+    VERWORFEN, ebenso Felder ohne ':'.
+    TODO (.so-offen): ob nach dem vender-Hex weitere Felder (color/material/
+      remain) folgen, ist unbelegt.
     """
     data = _response_data(msg, FUNC_GET_RFID)
     result = {}
@@ -124,25 +166,27 @@ def get_remain_len(data_send, msg):
     """Restmengen-Antwort parsen: 4 Bytes positional A,B,C,D (0-100 %).
 
     Belegt: Live-Frame f7 01 07 00 03 1c ff 00 00 11 -> A=28 %, B=n/a, C/D=0;
-    0xff = nicht ausgewählt, 0x00 = ausgewählt und leer.
+    0xff = kein Wert (nicht ausgewählt / keine Daten), 0x00 s. ACHTUNG.
     data_send = Request-Kontext (Slotmaske, vgl. .so-Signatur) – wird hier
       nur entgegengenommen/dokumentiert, nicht zur Filterung benutzt
       (TODO: ob das .so danach filtert, ist unbelegt).
-    msg = Voll-Frame (fun 0x03) oder 4 Rohbytes.
+    msg = Voll-Frame (fun 0x03) oder 4 Rohbytes; andere Länge -> ValueError.
     Gibt dict {Slot-Key: Prozent oder None} zurück.
+    ACHTUNG Semantik: 0 heißt NICHT sicher „leer“ – live hat Slot B mit
+      remain 0 (Vendor unknown, kein RFID-Restwert) 160 mm gefördert
+      (PROTOKOLL-485.md, Abschnitt T1B). 0 = „kein RFID-Restwert“.
     """
     data = _response_data(msg, FUNC_GET_REMAIN_LEN)
-    raw = list(data)
-    out = {}
-    for i, key in enumerate(SLOT_KEYS):
-        out[key] = None if (i >= len(raw) or raw[i] == NO_DATA) else raw[i]
-    return out
+    if len(data) != 4:
+        raise ValueError("Remain-Antwort muss 4 Bytes haben: %r" % (bytes(data),))
+    return {key: (None if data[i] == NO_DATA else data[i])
+            for i, key in enumerate(SLOT_KEYS)}
 
 
 def get_measuring_wheel(data_send, msg):
     """Messrad-Antwort parsen: 4 Bytes Big-Endian IEEE-754 Float, NEGATIV.
 
-    Belegt/KORREKTUR 13.10.: c4e6fe0b -> -1847,94; c5019149 -> -2073,08;
+    Belegt/KORREKTUR 13.10.: c4e6fe0b -> -1847,94; c5009149 -> -2057,08 (KORREKTUR 15.10.: vorher Tippfehler c5019149/-2073,08);
     c52a4e54 -> -2724,89 (Klippy loggt data_hex -> Float selbst). Der Betrag
     wächst beim Fördern; kein Zähler (vgl. PROTOKOLL-485.md, gitstonelabs).
     data_send = Request-Kontext (belegt [01]) – wie bei remain nur Kontext.
@@ -166,7 +210,7 @@ def get_box_status(msg):
     """
     raw = bytes(msg)
     frame_status = None
-    if len(raw) >= 6 and raw[0] == serial485.PACK_HEAD:
+    if _is_full_frame(raw):
         frame_status = raw[3]
         data = _response_data(raw, FUNC_GET_BOX_STATE)
     else:
@@ -402,34 +446,35 @@ class BoxState:
 #    05/06/07, Retrude START/FINISH): siehe cfsseq.py – hier NICHT dupliziert.
 # =====================================================================
 
-def build_preload(mask, phase):
-    """SET_PRE_LOADING (0x0d): [Slotmaske][Phase].
+def build_preload(mask, action):
+    """SET_PRE_LOADING / RFID-Control (0x0d): [Slotmaske][Aktion].
 
-    Belegt: Referenz-Request 0x0d [Maske][Phase], Phase 00=Arm / 01=Disarm /
-    02=Slot-Rearm (PROTOKOLL-485.md). STATUS 0xff.
+    Aktion 0x00=disable / 0x01=enable / 0x02=Force-Read (Belege s.
+    PRELOAD_*-Konstanten; Referenzvektor f70105ff0d0f0169 = Maske 0x0F,
+    enable). STATUS 0xff. Identische Bytes wie cfsseq.build_preload.
     TODO: .so-Parameter force (communication_set_pre_loading force=False)
-      – Wire-Abbild unbelegt, hier kein Byte dafür erfunden.
+      – Wire-Abbild unbelegt (evtl. = Aktion 0x02), hier kein Byte erfunden.
     """
-    mask = _mask(mask)
-    if phase not in (PRELOAD_ARM, PRELOAD_DISARM, PRELOAD_REARM):
-        raise ValueError("Phase muss 0x00/0x01/0x02 sein")
-    return serial485.build_frame(BOX_ADDR, FUNC_SET_PRE_LOADING, [mask, phase],
+    mask = check_mask(mask)
+    if action not in PRELOAD_ACTIONS:
+        raise ValueError("Aktion muss 0x00/0x01/0x02 sein")
+    return serial485.build_frame(BOX_ADDR, FUNC_SET_PRE_LOADING, [mask, action],
                                  status=STATUS_OPERATIONAL)
 
 
-def build_preload_arm(mask):
-    """Preload-Arm (0x0d [Maske 00]) – belegt, s. build_preload."""
-    return build_preload(mask, PRELOAD_ARM)
+def build_preload_enable(mask=MASK_ALL):
+    """Preload/Insert-Reading an (0x0d [Maske 01]) – Referenz-belegt."""
+    return build_preload(mask, PRELOAD_ENABLE)
 
 
-def build_preload_disarm(mask):
-    """Preload-Disarm (0x0d [Maske 01]) – belegt, s. build_preload."""
-    return build_preload(mask, PRELOAD_DISARM)
+def build_preload_disable(mask=MASK_ALL):
+    """Preload/Insert-Reading aus (0x0d [Maske 00]) – Referenz-belegt."""
+    return build_preload(mask, PRELOAD_DISABLE)
 
 
-def build_preload_rearm(mask):
-    """Slot-Rearm (0x0d [Maske 02]) – belegt, s. build_preload."""
-    return build_preload(mask, PRELOAD_REARM)
+def build_preload_force_read(mask=MASK_ALL):
+    """RFID-Force-Read (0x0d [Maske 02]) – Referenz-belegt (vanilla)."""
+    return build_preload(mask, PRELOAD_FORCE_READ)
 
 
 def build_feed_mode_enter():
@@ -441,7 +486,7 @@ def build_feed_mode_enter():
 def build_print_mode(mask):
     """Print-Mode (0x04 [Slotmaske 00]) – K2-belegt (PROTOKOLL-485.md)."""
     return serial485.build_frame(BOX_ADDR, FUNC_SET_BOX_MODE,
-                                 [_mask(mask), 0x00],
+                                 [check_mask(mask), 0x00],
                                  status=STATUS_OPERATIONAL)
 
 
@@ -464,13 +509,13 @@ def build_release():
 def build_get_rfid(mask=0x0F):
     """GET_RFID-Request ([Maske], 0x02) – Live-Introspektion belegt
     (communication_get_rfid data=b'\\x01'/b'\\x0f', STATUS 0xff, Timeout 2 s)."""
-    return serial485.build_frame(BOX_ADDR, FUNC_GET_RFID, [_mask(mask)],
+    return serial485.build_frame(BOX_ADDR, FUNC_GET_RFID, [check_mask(mask)],
                                  status=STATUS_OPERATIONAL)
 
 
 def build_get_remain(mask=0x0F):
     """GET_REMAIN_LEN-Request ([Maske], 0x03) – wie build_get_rfid belegt."""
-    return serial485.build_frame(BOX_ADDR, FUNC_GET_REMAIN_LEN, [_mask(mask)],
+    return serial485.build_frame(BOX_ADDR, FUNC_GET_REMAIN_LEN, [check_mask(mask)],
                                  status=STATUS_OPERATIONAL)
 
 
@@ -521,15 +566,16 @@ class BoxAction:
 
     # -- Abfragen (alle Timeout 2 s, STATUS 0xff; vgl. API-box_wrapper.md) --
     def communication_get_rfid(self, num=0x0F):
-        """RFID lesen (num = Slotmaske, Default alle). Gibt Rohdaten zurück;
+        """RFID lesen (num = Slotmaske 0x00..0x0f wie im Original, z.B.
+        1 = Slot A, 15 = alle; KEINE Slotnummer). Gibt Rohdaten zurück;
         parsen per get_rfid()."""
-        return self.bus.transact(self.addr, FUNC_GET_RFID, [_mask(num)],
+        return self.bus.transact(self.addr, FUNC_GET_RFID, [check_mask(num)],
                                  status=STATUS_OPERATIONAL,
                                  timeout=TIMEOUT_OPERATIONAL)
 
     def communication_get_remain_len(self, num=0x0F):
-        """Restmengen lesen (num = Slotmaske, Default alle)."""
-        return self.bus.transact(self.addr, FUNC_GET_REMAIN_LEN, [_mask(num)],
+        """Restmengen lesen (num = Slotmaske 0x00..0x0f, Default alle)."""
+        return self.bus.transact(self.addr, FUNC_GET_REMAIN_LEN, [check_mask(num)],
                                  status=STATUS_OPERATIONAL,
                                  timeout=TIMEOUT_OPERATIONAL)
 
@@ -565,17 +611,21 @@ class BoxAction:
                                  timeout=TIMEOUT_OPERATIONAL)
 
     # -- Aktionen (belegte Einzel-Steps; Antwort = Box-ACK, kein Parsen) --
-    def communication_set_pre_loading(self, mask, phase):
-        """Preload setzen (0x0d [Maske][Phase 00/01/02]).
+    def communication_set_pre_loading(self, mask, action):
+        """Preload setzen (0x0d [Maske][Aktion 00 aus/01 an/02 Force-Read]).
 
+        mask = Slotmaske 0x00..0x0f, action = PRELOAD_DISABLE/ENABLE/
+        FORCE_READ (Belege s. Konstanten).
         TODO: .so-Parameter action/num/force-Abbild (num=15 Default,
-        force=False) – hier explizit (mask, phase), nichts erfunden.
+        force=False) – hier explizit (mask, action), nichts erfunden.
         Hinweis: .so-Timeout SET_PRE_LOADING=300 s (lange Mechanik) –
         hier gilt der übergebene timeout, Default operational 2 s nur für
         den Frame-ACK; TODO bei echtem Preload ggf. länger wählen.
         """
+        if action not in PRELOAD_ACTIONS:
+            raise ValueError("Aktion muss 0x00/0x01/0x02 sein")
         return self.bus.transact(self.addr, FUNC_SET_PRE_LOADING,
-                                 [_mask(mask), phase],
+                                 [check_mask(mask), action],
                                  status=STATUS_OPERATIONAL,
                                  timeout=TIMEOUT_OPERATIONAL)
 
@@ -588,7 +638,7 @@ class BoxAction:
     def communication_set_box_mode_print(self, mask):
         """Print-Mode (0x04 [Maske 00])."""
         return self.bus.transact(self.addr, FUNC_SET_BOX_MODE,
-                                 [_mask(mask), 0x00],
+                                 [check_mask(mask), 0x00],
                                  status=STATUS_OPERATIONAL,
                                  timeout=TIMEOUT_OPERATIONAL)
 
@@ -640,7 +690,7 @@ def selftest():
           get_rfid(F("f7 01 0a 00 02 43 3a 62 75 73 79 3b 54"))
           == {"C": "busy"})
     check("rfid roh+multi",
-          get_rfid(b"A:AAAAAA;B:unknown;") == {"A": "AAAAAA", "B": "unknown"})
+          get_rfid(b"A:AAAAA;B:unknown;") == {"A": "AAAAA", "B": "unknown"})
     check("rfid leer", get_rfid(b"") == {})
     try:
         get_rfid(F("f7 01 03 00 03 b3"))  # falscher fun -> muss scheitern
@@ -657,6 +707,13 @@ def selftest():
           == {"A": None, "B": None, "C": None, "D": 0})
     check("remain roh", get_remain_len(b"\x01", bytes.fromhex("1a 00 ff 00"))
           == {"A": 26, "B": 0, "C": None, "D": 0})
+    for bad_len in (b"\x1c", b"", bytes(5)):
+        try:
+            get_remain_len(b"\x0f", serial485.build_frame(
+                BOX_ADDR, FUNC_GET_REMAIN_LEN, bad_len, status=STATUS_REPLY))
+            check("remain laengen-guard %dB" % len(bad_len), False)
+        except ValueError:
+            check("remain laengen-guard %dB" % len(bad_len), True)
 
     # -- 3. Messrad: echte Live-Frames (KORREKTUR 13.10.: BE-Float negativ) --
     w1 = get_measuring_wheel(b"\x01", F("f7 01 07 00 0e c4 e6 fe 0b f3"))
@@ -685,6 +742,10 @@ def selftest():
     st30 = get_box_status(F("f7 01 07 30 0a 03 00 00 00 51"))
     check("boxstate 0x30/4B", st30["len"] == 4 and st30["frame_status"] == 0x30
           and st30["raw"] == bytes.fromhex("03 00 00 00"))
+    # Rohdaten mit erstem Byte 0xF7, aber unpassendem Längenfeld -> Rohdaten
+    st_raw = get_box_status(bytes([0xF7, 0x34, 0, 0, 0, 0]))
+    check("boxstate roh mit 0xF7", st_raw["frame_status"] is None
+          and st_raw["len"] == 6 and st_raw["b0"] == 0xF7)
 
     # -- 5. Version/SN: rekonstruierter K2-Voll-Frame (CRC 0xd4 verifiziert,
     #    SN anonymisiert, gleiche Länge) --
@@ -697,16 +758,44 @@ def selftest():
 
     # -- 6. Buffer/Hardware: echte Frames + synthetische Builder --
     check("buffer 0x00", parse_buffer_state(F("f7 01 04 00 05 00 19")) == 0)
-    check("builder preload-arm",
-          build_preload_arm(0) == F("f7 01 05 ff 0d 01 00 b8"))
-    check("builder preload-disarm",
-          build_preload_disarm(0) == F("f7 01 05 ff 0d 01 01 bf"))
-    check("builder preload-rearm",
-          build_preload(0, 0x02) == F("f7 01 05 ff 0d 01 02 b6"))
+    # Referenzvektor ref-hi/valid_messages.json: mask=0x0F enable=0x01
+    check("builder preload-enable (ref-hi f70105ff0d0f0169)",
+          build_preload_enable(0x0F) == F("f7 01 05 ff 0d 0f 01 69"))
+    check("builder preload-disable",
+          build_preload_disable(0x01) == F("f7 01 05 ff 0d 01 00 b8"))
+    check("builder preload-force-read",
+          build_preload_force_read(0x01) == F("f7 01 05 ff 0d 01 02 b6"))
+    # vanilla set_rfid_insert_reading(True) -> (0, 1)
+    check("builder preload-enable vanilla (0,1)",
+          build_preload(0x00, PRELOAD_ENABLE)[5:7] == bytes([0x00, 0x01]))
+    import cfsseq
+    check("preload box == cfsseq (M1)",
+          all(build_preload(m, a) == cfsseq.build_preload(m, a)
+              for m in range(16) for a in PRELOAD_ACTIONS))
+    # Masken-Semantik: num/mask ist MASKE, keine Slotnummer
+    check("mask 0x01/0x02/0x03 unverändert",
+          [check_mask(m) for m in (0x01, 0x02, 0x03)] == [0x01, 0x02, 0x03])
+    check("mehrfachmaske 0x05/0x0C",
+          build_get_rfid(0x05)[5] == 0x05 and build_get_remain(0x0C)[5] == 0x0C)
+    check("print-mode maske 0x02", build_print_mode(0x02)[5:7] == b"\x02\x00")
+    check("slot_to_mask", [slot_to_mask(i) for i in range(4)]
+          == [0x01, 0x02, 0x04, 0x08])
+    for bad in (0x10, -1, True, "A", 1.0):
+        try:
+            check_mask(bad)
+            check("mask-guard %r" % (bad,), False)
+        except ValueError:
+            check("mask-guard %r" % (bad,), True)
+    for bad in (4, -1, True):
+        try:
+            slot_to_mask(bad)
+            check("slot-guard %r" % (bad,), False)
+        except ValueError:
+            check("slot-guard %r" % (bad,), True)
     check("builder feed-enter",
           build_feed_mode_enter() == F("f7 01 05 ff 04 00 01 90"))
     check("builder print-mode",
-          build_print_mode(0) == F("f7 01 05 ff 04 01 00 82"))
+          build_print_mode(0x01) == F("f7 01 05 ff 04 01 00 82"))
     check("builder engage", build_engage() == F("f7 01 04 ff 0f 01 b7"))
     check("builder release", build_release() == F("f7 01 04 ff 0f 00 b0"))
     check("builder get-rfid", build_get_rfid(0x0F) == F("f7 01 04 ff 02 0f 74"))
@@ -717,9 +806,9 @@ def selftest():
     check("builder get-version", build_get_version() == F("f7 01 03 ff 14 06"))
     try:
         build_preload(0, 0x03)
-        check("preload phasen-guard", False)
+        check("preload aktions-guard", False)
     except ValueError:
-        check("preload phasen-guard", True)
+        check("preload aktions-guard", True)
 
     # -- 7. BoxState: Tn/Tnn-Roundtrip (Modell, kein Bus) --
     bs = BoxState()
@@ -730,7 +819,7 @@ def selftest():
     check("tn map", (1, 0, 0) in bs.generate_Tn_map())
     tnn = BoxState.tnn_key(1, 0)
     check("tnn key", tnn == "T1A")
-    bs.update_Tnn_map(tnn, bs.generate_Tnn_content(tnn, rfid="AAAAAA", remain=28))
+    bs.update_Tnn_map(tnn, bs.generate_Tnn_content(tnn, rfid="AAAAA", remain=28))
     check("tnn content", bs.get_Tnn_content("T1A")["remain"] == 28
           and len(bs.get_Tnn_map()) == 1)
     check("save-layer", bs.update_tn_save_data(1, 0, 0) is not None
@@ -751,16 +840,17 @@ def selftest():
         F("f7 01 03 00 0f 90"),  # engage-ACK (Live-Pollform)
     ])
     act = BoxAction(bus)
-    check("action rfid", get_rfid(act.communication_get_rfid(1))
-          == {"B": "unknown"})
+    # num ist MASKE wie im Original: 0x02 = Slot B -> Live-Antwort B:unknown
+    check("action rfid", get_rfid(act.communication_get_rfid(0x02))
+          == {"B": "unknown"} and bus.calls[0][2] == [0x02])
     check("action remain", get_remain_len(
         b"\x0f", act.communication_get_remain_len(0x0F))["A"] == 28)
     check("action wheel",
           abs(act.communication_measuring_wheel() - (-1847.94)) < 0.02)
-    act.communication_set_pre_loading(0, PRELOAD_ARM)
+    act.communication_set_pre_loading(0x01, PRELOAD_ENABLE)
     act.communication_set_box_mode_feed()
     act.communication_ctrl_connection_motor_action(0x01)
-    check("action preload-payload", bus.calls[3][2] == [0x01, 0x00])
+    check("action preload-payload", bus.calls[3][2] == [0x01, 0x01])
     check("action feed-payload", bus.calls[4][2] == [0x00, 0x01])
     check("action engage-payload", bus.calls[5][2] == [0x01])
     check("action status/timeout",

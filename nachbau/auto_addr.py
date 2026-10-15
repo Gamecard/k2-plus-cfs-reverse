@@ -1,23 +1,35 @@
 #!/usr/bin/env python3
 """auto_addr.py – Klipper-unabhängiger Port von auto_addr_wrapper.py (K2 Plus).
 
-1:1-Port der Protokoll-Logik (Quelle, 729 Zeilen:
- der Klartextquelle auto_addr_wrapper.py (lokal, nicht im Repo)).
+Port der Protokoll-Logik UND der Zustandsmaschine (Quelle, 729 Zeilen:
+ Klartextquelle auto_addr_wrapper.py vom Drucker (lokal, nicht im Repo),
+ im Folgenden "Orig :<zeile>").
 Klipper-Anbindung (config/printer/reactor/gcode/configfile) ist durch
  injizierbare Abhängigkeiten ersetzt:
  - serial: Objekt mit cmd_send_data_with_response(data, timeout, retransmit)
    (z.B. Adapter um serial485.Serial485.transact)
- - store: dict-ähnlich für Uniid-Persistenz (statt CXSAVE_CONFIG)
+ - store: dict-ähnlich für Uniid-Persistenz (statt configfile/CXSAVE_CONFIG);
+   Werte im printer.cfg-Format des Originals ("\\n  0xA0, 0xA1, ...")
  - Hintergrund-Schleife per threading statt Klipper-Reactor
 
+Ablauf wie im Original:
+ 1. startup()      = process_set_addr_table (Orig :650-659):
+                     set_addr_table + get_addr_table je Tabelle
+ 2. online_once()  = EIN Durchlauf von process_all (Orig :699-728):
+                     0xA1-Broadcast (mit Skip) -> 0xA0 für WAIT_FOR_ACK
+                     -> 0xA2 Online-Check -> 0x0B Loader-Check
+ 3. start_background() führt 1. und dann 2. zyklisch aus (1 s, 10 s bei Druck).
+
 Beleg: Live-Verhalten (Discovery-Polls, 0xa2-Sequenz, UUID) in PROTOKOLL-485.md.
-Selbsttest unten OHNE Hardware (FakeSerial mit gültigen Frames).
+Selbsttest unten OHNE Hardware (FakeSerial = Busmodell mit CFS-Geräten).
 """
 
+import logging
 import threading
-import time
 
-# --- Konstanten 1:1 aus der Quelle ---
+log = logging.getLogger("auto_addr")
+
+# --- Konstanten 1:1 aus der Quelle (Orig :19-72) ---
 MODE_APP = 0
 MODE_LOADER = 1
 
@@ -40,6 +52,7 @@ MAX_SET_TIMES = 2
 MAX_LOST_CNT = 3
 
 PACK_HEAD = 0xF7
+BROADCAST_ADDR = 0xFF          # Ziel des Loader-Checks (Orig :27, :624)
 BROADCAST_ADDR_MB = 0xFE
 BROADCAST_ADDR_CLM = 0xFD
 BROADCAST_ADDR_BTM = 0xFC
@@ -63,8 +76,14 @@ CMD_TIMEOUT = {
     CMD_LOADER_TO_APP: TIMEOUT_SHORT_TIME,
 }
 
+# Zyklus-Intervalle von process_all (Orig :701-703)
+CYCLE_INTERVAL = 1.0
+CYCLE_INTERVAL_PRINTING = 10.0
+
 MAX_DATA_LEN = 100
 MAX_UNIID_LEN = 12
+
+VALID_DEV_TYPES = (DEV_TYPE_MB, DEV_TYPE_CLM, DEV_TYPE_BTM, DEV_TYPE_CFS_PRO)
 
 
 class DataPackage:
@@ -99,13 +118,16 @@ class AddrManager:
 
 
 def default_tables():
-    """Adress-Tabellen 1:1 aus der Quelle (nur MB aktiv, Rest auskommentiert)."""
+    """Adress-Tabellen 1:1 aus der Quelle (nur MB aktiv, Rest auskommentiert,
+    Orig :116-156). Reihenfolge der dict-Keys = Reihenfolge von
+    dev_table_map_table (relevant für die Tabellenzuordnung, s. _table_index)."""
     return {
         DEV_TYPE_MB: [
             AddrManager(0x01), AddrManager(0x02),
             AddrManager(0x03), AddrManager(0x04),
         ],
     }
+
 
 def broadcast_addr(dev_type):
     return {
@@ -133,6 +155,62 @@ def cal_pack_crc(length, status, function_code, data):
     return crc8_cal([length, status, function_code] + list(data))
 
 
+# --- Persistenz-Format (Orig save_addr_table_uniids :216-229 / get_ :188-213) ---
+def format_uniids(table):
+    """Erzeugt exakt den String des Originals (printer.cfg-Format):
+    je Eintrag "\\n  " + "0xAA, 0xBB, ..." (Orig :220-225)."""
+    uniids = ""
+    for entry in table:
+        uniids += "\n  "
+        for b in entry.uniid:
+            uniids += "0x%02X, " % b
+        uniids = uniids[:-2]
+    return uniids
+
+
+def _parse_int(value):
+    """custom_int_parser des Originals (Orig :191-198)."""
+    if value.startswith('0x') or value.startswith('0X'):
+        return int(value, 16)
+    return int(value)
+
+
+def parse_uniids(value):
+    """Liest gespeicherte Uniids. Akzeptiert
+     - String im Original-Format (Klipper getlists, seps=(',', '\\n')),
+     - altes Listenformat des Ports ([[0xA0, ...], [0x00], ...]).
+    Rückgabe: Liste von Uniid-Listen, oder None bei unsinnigem Inhalt
+    (bewusste Abweichung: Original wirft dann einen Config-Fehler bzw.
+    crasht später beim Senden – der Port verwirft nur und loggt)."""
+    try:
+        if isinstance(value, str):
+            # Klipper configfile.getlists: Zeilen trimmen, leere Zeilen
+            # verwerfen, Zeileninhalt an ',' trennen und jedes Teil parsen.
+            rows = []
+            for line in value.split('\n'):
+                line = line.strip()
+                if not line:
+                    continue
+                rows.append([_parse_int(p.strip()) for p in line.split(',')])
+        elif isinstance(value, (list, tuple)):
+            rows = []
+            for row in value:
+                if not isinstance(row, (list, tuple)):
+                    return None
+                if not all(isinstance(b, int) and not isinstance(b, bool)
+                           for b in row):
+                    return None
+                rows.append([int(b) for b in row])
+        else:
+            return None
+    except (ValueError, TypeError, AttributeError):
+        return None
+    for row in rows:
+        if any(b < 0 or b > 0xFF for b in row):
+            return None
+    return rows
+
+
 class AutoAddr:
     """Auto-Adress-Vergabe + Online-Überwachung. Entspricht AutoAddrWrapper."""
 
@@ -142,14 +220,16 @@ class AutoAddr:
         self.tables = tables if tables is not None else default_tables()
         self.debug = debug
         self.uniid_changed = False
+        self.next_interval = CYCLE_INTERVAL
         self._stop = threading.Event()
         self._thread = None
+        # Orig :174-176: gespeicherte Uniids je Tabelle laden
         for dev_type, table in self.tables.items():
             self._load_saved_uniids(dev_type, table)
 
     def dprintf(self, msg):
         if self.debug:
-            print("[auto_addr]", msg)
+            log.info(msg)
 
     # --- Persistenz (statt configfile + CXSAVE_CONFIG) ---
     @staticmethod
@@ -159,19 +239,30 @@ class AutoAddr:
                 "dev_%d_uniids" % dev_type)
 
     def _load_saved_uniids(self, dev_type, table):
-        saved = self.store.get(self._store_key(dev_type))
-        if not saved:
+        """Orig get_addr_table_uniids :188-213."""
+        name = self._store_key(dev_type)
+        saved = self.store.get(name)
+        if saved is None:
+            self.dprintf("Error: %s not exist" % name)
             return
-        for i, uniid in enumerate(saved):
-            if i >= len(table):
-                break
-            table[i].uniid = list(uniid)
-            if uniid and uniid[0] != 0:
-                table[i].mapped = 1
-                table[i].online = ONLINE_STATE_INIT
+        uniids = parse_uniids(saved)
+        if uniids is None:
+            log.warning("auto_addr: %s unlesbar (%r), verworfen", name, saved)
+            return
+        if len(uniids) != len(table):  # Orig :200-201: alles verwerfen
+            self.dprintf("Error: %s, uniids len: %d, dev_table_map.size: %d"
+                         % (name, len(uniids), len(table)))
+            return
+        for entry, uniid in zip(table, uniids):
+            entry.uniid = list(uniid)
+            # Orig :207-210: nicht-leere Uniid -> war vergeben, Status INIT
+            if len(uniid) >= 1 and uniid[0] != 0:
+                entry.mapped = 1
+                entry.online = ONLINE_STATE_INIT
 
     def _save_uniids(self, dev_type, table):
-        self.store[self._store_key(dev_type)] = [list(e.uniid) for e in table]
+        """Orig save_addr_table_uniids :216-229 (Original-String-Format)."""
+        self.store[self._store_key(dev_type)] = format_uniids(table)
 
     # --- Framing (1:1 data_pack/send_package, ohne Head/CRC auf die Leitung) ---
     def data_pack(self, slave_addr, cmd, data):
@@ -192,6 +283,9 @@ class AutoAddr:
         self.data_handler(ret)
 
     def data_handler(self, ret):
+        if ret is None or len(ret) < 6:  # Kurz-Frame: Original -> IndexError
+            self.dprintf("Error: frame too short")
+            return
         package = DataPackage(ret[0], ret[1], ret[2], ret[3], ret[4],
                               [b for b in ret[5:-1]], ret[-1])
         if package.status == STATUS_OK:
@@ -199,84 +293,128 @@ class AutoAddr:
         else:
             self.dprintf("Error: status %d" % package.status)
 
-    # --- Antwort-Dispatch (1:1 function_code_cb, gekürzt um Klipper-Logs) ---
+    # --- Antwort-Dispatch (Orig function_code_cb :327-439) ---
+    def _table_index(self, dev_type):
+        """Tabellenzuordnung 1:1 inkl. Original-Eigenheit (Orig :335-341,
+        find_cfs_dev_table_index :319-325): die Schleife bricht bei i=0 ab,
+        daher landet JEDE Antwort in der ERSTEN Tabelle (dev_table_map_table[0]),
+        CFS-Pro in der MB-Tabelle (bzw. ebenfalls Index 0). Mit der Default-
+        Konfiguration (nur MB) ist das ohnehin die einzige Tabelle; bewusst
+        nicht "repariert", damit Sendesequenzen/Zustände identisch bleiben
+        (z.B. ordnet das Original eine CLM-Antwort auf 0xA1 der MB-Tabelle zu)."""
+        keys = list(self.tables.keys())
+        index = 0
+        for i in range(len(keys)):
+            if dev_type == DEV_TYPE_CFS_PRO:
+                index = keys.index(DEV_TYPE_MB) if DEV_TYPE_MB in keys else 0
+            elif dev_type == keys[i]:
+                index = i
+            break
+        return index
+
     def _table_for(self, dev_type):
-        if dev_type == DEV_TYPE_CFS_PRO and DEV_TYPE_MB in self.tables:
-            return self.tables[DEV_TYPE_MB]
-        return self.tables.get(dev_type)
+        """(dev_type der Tabelle, Tabelle) gemäß _table_index."""
+        keys = list(self.tables.keys())
+        if not keys:
+            return None, None
+        key = keys[self._table_index(dev_type)]
+        return key, self.tables[key]
 
     def function_code_cb(self, package):
         fun = package.function_code
+        # Bewusste Verbesserung (G2): Original erzeugt ack_data nur für die
+        # vier Auto-Addr-Codes und crasht bei anderen Codes (z.B. 0x0B-Antwort)
+        # mit AttributeError auf ack_data.dev_type (Orig :333-337). Der Port
+        # ignoriert unbekannte Codes bzw. zu kurze Nutzdaten sauber.
         if fun not in (CMD_SET_SLAVE_ADDR, CMD_GET_SLAVE_INFO,
                        CMD_ONLINE_CHECK, CMD_GET_ADDR_TABLE):
             self.dprintf("unknown function code: %d" % fun)
             return
+        if len(package.data) < 2:
+            self.dprintf("Error: ack data too short")
+            return
         ack = FcAckData(package.data[0], package.data[1], package.data[2:])
-        table = self._table_for(ack.dev_type)
+        table_type, table = self._table_for(ack.dev_type)
         if table is None:
             return
+        # Loader-Kennung merken (Orig :343-352) – auch bei ungültigem dev_type
         for entry in table:
             if entry.uniid == ack.uniid:
                 entry.mode = ack.mode
+                if ack.mode == MODE_LOADER:
+                    self.dprintf("addr 0x%02X in loader mode" % entry.addr)
                 break
-        if fun == CMD_SET_SLAVE_ADDR:
-            for entry in table:
-                if entry.online in (ONLINE_STATE_INIT, ONLINE_STATE_WAIT_FOR_ACK) \
-                        and entry.addr == package.slave_addr \
-                        and entry.uniid == ack.uniid and entry.acked == 0:
-                    entry.acked = 1
-                    entry.online = ONLINE_STATE_ONLINE
-                    entry.lost_cnt = 0
-                    entry.type = ack.dev_type
-                    break
-        elif fun == CMD_GET_SLAVE_INFO:
-            self.addr_allocate(ack.uniid, table)
-        elif fun == CMD_ONLINE_CHECK:
-            for entry in table:
-                if entry.addr == package.slave_addr \
-                        and entry.uniid == ack.uniid:
-                    entry.acked = 1
-                    entry.online = ONLINE_STATE_ONLINE
-                    entry.lost_cnt = 0
-                    entry.type = ack.dev_type
-                    break
-        elif fun == CMD_GET_ADDR_TABLE:
-            for i, entry in enumerate(table):
-                if entry.addr == package.slave_addr:
-                    if any(j != i and e.uniid == ack.uniid
-                           for j, e in enumerate(table)):
-                        return  # Duplikat: alte Adresse behalten
-                    entry.uniid = ack.uniid
-                    entry.mapped = 1
-                    entry.acked = 1
-                    entry.online = ONLINE_STATE_ONLINE
-                    entry.lost_cnt = 0
-                    entry.type = ack.dev_type
-                    self.uniid_changed = True
-                    break
-        if self.uniid_changed:
+        valid = ack.dev_type in VALID_DEV_TYPES  # Orig is_dev_type_valid :315
+        if fun == CMD_SET_SLAVE_ADDR:            # Orig :354-377
+            if valid:
+                for entry in table:
+                    if entry.online in (ONLINE_STATE_INIT, ONLINE_STATE_WAIT_FOR_ACK) \
+                            and entry.addr == package.slave_addr \
+                            and entry.uniid == ack.uniid and entry.acked == 0:
+                        entry.acked = 1
+                        entry.online = ONLINE_STATE_ONLINE
+                        entry.lost_cnt = 0
+                        entry.type = ack.dev_type
+                        break
+        elif fun == CMD_GET_SLAVE_INFO:          # Orig :378-388
+            if valid:
+                addr = self.addr_allocate(ack.uniid, table)
+                self.dprintf("addr: %d" % addr)
+        elif fun == CMD_ONLINE_CHECK:            # Orig :390-407
+            if valid:
+                for entry in table:
+                    if entry.addr == package.slave_addr \
+                            and entry.uniid == ack.uniid:
+                        entry.acked = 1
+                        entry.online = ONLINE_STATE_ONLINE
+                        entry.lost_cnt = 0
+                        entry.type = ack.dev_type
+                        break
+        elif fun == CMD_GET_ADDR_TABLE:          # Orig :409-433
+            if valid:
+                for i, entry in enumerate(table):
+                    if entry.addr == package.slave_addr:
+                        if any(j != i and e.uniid == ack.uniid
+                               for j, e in enumerate(table)):
+                            return  # Duplikat: alte Adresse behalten (Orig :423)
+                        entry.uniid = ack.uniid
+                        entry.mapped = 1
+                        entry.acked = 1
+                        entry.online = ONLINE_STATE_ONLINE
+                        entry.lost_cnt = 0
+                        entry.type = ack.dev_type
+                        self.uniid_changed = True
+                        break
+        if self.uniid_changed:                   # Orig :437-439
             self.uniid_changed = False
-            for dev_type, tab in self.tables.items():
-                if tab is table:
-                    self._save_uniids(dev_type, tab)
+            self._save_uniids(table_type, table)
 
-    # --- Adress-Vergabe (1:1 addr_allocate, 3 Methoden) ---
+    # --- Adress-Vergabe (Orig addr_allocate :246-289) ---
     def addr_allocate(self, uniid, table):
-        for entry in table:  # Methode 1: gemappte, offline/init-Adresse, UUID passt
-            if entry.mapped == 1 and entry.online in (ONLINE_STATE_OFFLINE,
-                                                      ONLINE_STATE_INIT) \
-                    and uniid == entry.uniid:
-                entry.mapped = 1
-                entry.online = ONLINE_STATE_WAIT_FOR_ACK
-                return entry.addr
-        for entry in table:  # Methode 2: ungemappte Adresse
+        for entry in table:
+            if entry.mapped == 1:
+                # Methode 1: gemappt, offline/init, UUID passt (Orig :252-257)
+                if entry.online in (ONLINE_STATE_OFFLINE, ONLINE_STATE_INIT):
+                    if uniid == entry.uniid:
+                        entry.mapped = 1
+                        entry.online = ONLINE_STATE_WAIT_FOR_ACK
+                        return entry.addr
+                # Gerät meldet sich auf Broadcast, obwohl ONLINE: es hat
+                # rebootet und seine Adresse verloren -> erneut 0xA0 senden
+                # (Orig :258-265)
+                elif entry.online == ONLINE_STATE_ONLINE and uniid == entry.uniid:
+                    self.dprintf("addr 0x%02X: slave restarted" % entry.addr)
+                    entry.online = ONLINE_STATE_WAIT_FOR_ACK
+                    entry.acked = 0
+                    return -1
+        for entry in table:  # Methode 2: ungemappte Adresse (Orig :267-274)
             if entry.mapped == 0:
                 entry.mapped = 1
                 entry.online = ONLINE_STATE_WAIT_FOR_ACK
                 entry.uniid = list(uniid)
                 self.uniid_changed = True
                 return entry.addr
-        for entry in table:  # Methode 3: gemappte Offline-Adresse, UUID egal
+        for entry in table:  # Methode 3: gemappt, offline, UUID egal (Orig :277-287)
             if entry.mapped == 1 and entry.online in (ONLINE_STATE_OFFLINE,
                                                       ONLINE_STATE_INIT) \
                     and entry.uniid != uniid:
@@ -287,7 +425,9 @@ class AutoAddr:
                 return entry.addr
         return -1
 
-    # --- Kommando-Schnittstelle (1:1 communication_*) ---
+    # --- Kommando-Schnittstelle (1:1 communication_*, Orig :479-501) ---
+    # Diese Methoden senden UNBEDINGT ein Kommando; die Zustandslogik steckt
+    # in den logic_*-Methoden darunter.
     def get_slave_info(self, dev_type, extra=None):
         bc = broadcast_addr(dev_type)
         self.send_package(self.data_pack(bc, CMD_GET_SLAVE_INFO, [bc, bc]))
@@ -305,17 +445,102 @@ class AutoAddr:
     def loader_to_app(self, dev_type, addr):
         self.send_package(self.data_pack(addr, CMD_LOADER_TO_APP, [0x01]))
 
-    # --- Hintergrund-Schleife (statt Reactor; 1 s, 10 s bei Druck) ---
-    def online_once(self, printing=False):
-        for dev_type, table in self.tables.items():
-            self.get_slave_info(dev_type)
+    # --- Logik-Schnittstelle (Orig :515-626) ---
+    def logic_get_addr_table(self, dev_type):
+        """Orig get_addr_table :515-538: bis MAX_GET_TIMES je nicht-ONLINE-
+        Adresse 0xA3 senden; Abbruch, sobald alle ONLINE."""
+        table = self.tables[dev_type]
+        for _ in range(MAX_GET_TIMES):
             for entry in table:
-                if entry.mapped == 1:
-                    entry.lost_cnt += 1
-                    self.online_check(dev_type, entry.addr)
-                    if entry.lost_cnt > MAX_LOST_CNT:
-                        entry.online = ONLINE_STATE_OFFLINE
-                        entry.acked = 0
+                if entry.online != ONLINE_STATE_ONLINE:
+                    self.get_addr_table(dev_type, entry.addr)
+            if sum(e.online == ONLINE_STATE_ONLINE for e in table) == len(table):
+                return
+
+    def logic_set_addr_table(self, dev_type):
+        """Orig set_addr_table :540-566: bis MAX_SET_TIMES für gemappte
+        INIT-Einträge (aus Store) 0xA0 senden; Abbruch, wenn Anzahl ONLINE
+        == Anzahl in diesem Durchlauf gesendeter (1:1 inkl. dieser Zählweise)."""
+        table = self.tables[dev_type]
+        for _ in range(MAX_SET_TIMES):
+            mapped_cnt = 0
+            for entry in table:
+                if entry.mapped == 1 and entry.online == ONLINE_STATE_INIT:
+                    mapped_cnt += 1
+                    self.set_slave_addr(dev_type, entry.addr, entry.uniid)
+            valid = sum(e.online == ONLINE_STATE_ONLINE for e in table)
+            if valid == mapped_cnt:
+                return
+
+    def logic_get_slave_info(self, dev_type):
+        """Orig get_slave_info :568-583: 0xA1-Broadcast, außer alle Einträge
+        sind ONLINE oder WAIT_FOR_ACK (M1)."""
+        table = self.tables[dev_type]
+        busy = sum(e.online in (ONLINE_STATE_ONLINE, ONLINE_STATE_WAIT_FOR_ACK)
+                   for e in table)
+        if busy == len(table):
+            return False
+        self.get_slave_info(dev_type)
+        return True
+
+    def logic_set_slave_addr(self, dev_type):
+        """Orig set_slave_addr :585-593: 0xA0 für alle WAIT_FOR_ACK-Einträge."""
+        for entry in self.tables[dev_type]:
+            if entry.mapped == 1 and entry.online == ONLINE_STATE_WAIT_FOR_ACK:
+                self.set_slave_addr(dev_type, entry.addr, entry.uniid)
+
+    def logic_online_check(self, dev_type):
+        """Orig online_check :595-614."""
+        for entry in self.tables[dev_type]:
+            if entry.mapped == 1:
+                entry.lost_cnt += 1
+                self.online_check(dev_type, entry.addr)
+                if entry.lost_cnt > MAX_LOST_CNT:
+                    entry.online = ONLINE_STATE_OFFLINE
+                    entry.acked = 0
+                    self.dprintf("Error: addr %.2X offline" % entry.addr)
+
+    def logic_loader_check(self, dev_type):
+        """Orig loader_check :615-626: steht ein Eintrag im Loader, einmal
+        0x0B [0x01] an BROADCAST_ADDR (0xFF) senden."""
+        for entry in self.tables[dev_type]:
+            if entry.mode == MODE_LOADER:
+                self.loader_to_app(dev_type, BROADCAST_ADDR)
+                return True
+        return False
+
+    # --- Prozesse (Orig :650-728) ---
+    def startup(self):
+        """Orig process_set_addr_table :650-659 (vor auto_addr:set_finished):
+        gespeicherte Adressen setzen, Fehlende per 0xA3 abfragen."""
+        for dev_type in list(self.tables.keys()):
+            self.logic_set_addr_table(dev_type)
+            self.logic_get_addr_table(dev_type)
+
+    @staticmethod
+    def _is_printing(printing):
+        """printing: bool oder Klipper-print_stats.state-String."""
+        if isinstance(printing, str):
+            return printing in ("printing", "pause")
+        return bool(printing)
+
+    def online_once(self, printing=False):
+        """EIN Durchlauf von process_all (Orig :699-728). printing (bool oder
+        "printing"/"pause") bestimmt next_interval: 10 s statt 1 s (M4)."""
+        self.next_interval = (CYCLE_INTERVAL_PRINTING if self._is_printing(printing)
+                              else CYCLE_INTERVAL)
+        types = list(self.tables.keys())
+        for dev_type in types:                   # Orig :708-715
+            self.logic_get_slave_info(dev_type)
+            # "kompatibel mit Gerätetypen gleicher Broadcast-Adresse":
+            # nach jedem Broadcast 0xA0 für ALLE Tabellen (1:1)
+            for dev_type2 in types:
+                self.logic_set_slave_addr(dev_type2)
+        for dev_type in types:                   # Orig :718-720
+            self.logic_online_check(dev_type)
+        for dev_type in types:                   # Orig :723-727: 1x pro Zyklus
+            if self.logic_loader_check(dev_type):
+                break
         return self.status_text()
 
     def status_text(self):
@@ -328,17 +553,33 @@ class AutoAddr:
                                 ",".join("0x%02X" % b for b in e.uniid)))
         return "\n".join(lines)
 
-    def start_background(self, interval=1.0):
+    def start_background(self, interval=1.0, printing=None, startup=True):
+        """Hintergrund-Schleife statt Reactor. Erst startup() (wie
+        klippy:ready -> process_set_addr_table), dann sofort der erste
+        process_all-Durchlauf, danach alle `interval` s bzw. 10 s, solange
+        printing() wahr ist (printing: Callable -> bool/State-String, oder
+        fester Wert). Exceptions werden geloggt, die Schleife läuft weiter."""
         if self._thread and self._thread.is_alive():
             return
         self._stop.clear()
 
         def loop():
-            while not self._stop.wait(interval):
+            if startup:
                 try:
-                    self.online_once()
+                    self.startup()
                 except Exception:
-                    pass
+                    log.exception("auto_addr: startup fehlgeschlagen")
+            while not self._stop.is_set():
+                try:
+                    state = printing() if callable(printing) else printing
+                    self.online_once(state)
+                    wait = (CYCLE_INTERVAL_PRINTING if self._is_printing(state)
+                            else interval)
+                except Exception:
+                    log.exception("auto_addr: Zyklus fehlgeschlagen")
+                    wait = interval
+                if self._stop.wait(wait):
+                    break
         self._thread = threading.Thread(target=loop, daemon=True)
         self._thread.start()
 
@@ -346,33 +587,53 @@ class AutoAddr:
         self._stop.set()
 
 
-# --- Selbsttest OHNE Hardware: Skript-Austausch mit gültigen Frames ---
+# --- Selbsttest OHNE Hardware: Busmodell mit realistischen CFS-Geräten ---
+U1 = [0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8, 0xA9, 0xAA, 0xAB]
+U2 = [0x11] * 12
+
+
+class FakeDev:
+    def __init__(self, uuid, addr=None, typ=DEV_TYPE_MB, mode=MODE_APP):
+        self.uuid = list(uuid)
+        self.addr = addr      # None = keine Adresse (frisch gebootet)
+        self.typ = typ
+        self.mode = mode
+        self.alive = True
+
+
 class FakeSerial:
-    """Beantwortet Discovery/Online-Check wie eine CFS (UUID fix)."""
+    """Busmodell: Gerät antwortet auf 0xA1 nur ohne Adresse, auf 0xA0 bei
+    passender UUID (übernimmt dann die Adresse), auf 0xA2/0xA3 nur unter
+    seiner Adresse. 0x0B an 0xFF schaltet Loader-Geräte in die App (keine
+    Antwort). Mehrere adresslose Geräte: es antwortet das erste."""
 
-    UUID = [0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8, 0xA9, 0xAA, 0xAB]
+    UUID = U1
 
-    def __init__(self):
-        self.assigned = {}
-        self.sent = []
+    def __init__(self, devs=None):
+        self.devs = devs if devs is not None else []
+        self.sent = []  # (addr, fun, payload)
 
     def cmd_send_data_with_response(self, data, timeout, retransmit):
-        self.sent.append((list(data), timeout, retransmit))
-        addr, length, status, fun = data[0], data[1], data[2], data[3]
-        payload = list(data[4:])
-        if fun == CMD_GET_SLAVE_INFO:  # Broadcast -> melde Typ MB als UUID-Träger
-            return bytes(_frame(0xFE, CMD_GET_SLAVE_INFO, [DEV_TYPE_MB, MODE_APP] + self.UUID))
-        if fun == CMD_SET_SLAVE_ADDR:  # [addr]+uuid -> ACK mit Typ/Modus/UUID
-            new_addr, uuid = payload[0], payload[1:]
-            self.assigned[new_addr] = uuid
-            return bytes(_frame(new_addr, CMD_SET_SLAVE_ADDR, [DEV_TYPE_MB, MODE_APP] + uuid))
-        if fun == CMD_ONLINE_CHECK:
-            uuid = self.assigned.get(addr, self.UUID)
-            return bytes(_frame(addr, CMD_ONLINE_CHECK, [DEV_TYPE_MB, MODE_APP] + uuid))
-        if fun == CMD_GET_ADDR_TABLE:
-            uuid = self.assigned.get(addr, self.UUID)
-            return bytes(_frame(addr, CMD_GET_ADDR_TABLE, [DEV_TYPE_MB, MODE_APP] + uuid))
+        addr, fun, payload = data[0], data[3], list(data[4:])
+        self.sent.append((addr, fun, payload))
+        for d in self.devs:
+            if not d.alive:
+                continue
+            if fun == CMD_GET_SLAVE_INFO and addr == broadcast_addr(d.typ) \
+                    and d.addr is None:
+                return bytes(_frame(addr, fun, [d.typ, d.mode] + d.uuid))
+            if fun == CMD_SET_SLAVE_ADDR and addr == broadcast_addr(d.typ) \
+                    and payload[1:] == d.uuid:
+                d.addr = payload[0]
+                return bytes(_frame(d.addr, fun, [d.typ, d.mode] + d.uuid))
+            if fun in (CMD_ONLINE_CHECK, CMD_GET_ADDR_TABLE) and addr == d.addr:
+                return bytes(_frame(addr, fun, [d.typ, d.mode] + d.uuid))
+            if fun == CMD_LOADER_TO_APP and addr == BROADCAST_ADDR:
+                d.mode = MODE_APP
         return None
+
+    def cmds(self, start=0):
+        return [(a, f) for a, f, _ in self.sent[start:]]
 
 
 def _frame(addr, fun, data, status=STATUS_OK):
@@ -389,44 +650,230 @@ def selftest():
         print(("ok " if cond else "FAIL ") + name)
         fails += 0 if cond else 1
 
+    def uuids_unique(table):
+        used = [tuple(e.uniid) for e in table if e.mapped]
+        return len(used) == len(set(used))
+
+    A1, A0, A2, A3, LB = (CMD_GET_SLAVE_INFO, CMD_SET_SLAVE_ADDR,
+                          CMD_ONLINE_CHECK, CMD_GET_ADDR_TABLE, CMD_LOADER_TO_APP)
+    FE = BROADCAST_ADDR_MB
+
     # 1. CRC-Identität mit Quelle + Live-Frame
     check("crc quell-identisch",
           crc8_cal([0x07, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04]) == 0xF0)
     live = bytes.fromhex("f7 01 11 00 a2 01 00 a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 aa ab f0")
     check("crc live-a2", crc8_cal(list(live[2:-1])) == live[-1])
 
-    # 2. Discovery -> Adresse 0x01 vergeben, online, UUID persistiert
-    aa = AutoAddr(FakeSerial())
-    aa.get_slave_info(DEV_TYPE_MB)
+    # 2. Neues Gerät, leerer Store: Startphase + 3 Zyklen -> 0x01 ONLINE
+    dev = FakeDev(U1)
+    bus = FakeSerial([dev])
+    aa = AutoAddr(bus)
     t = aa.tables[DEV_TYPE_MB]
-    check("alloc addr", t[0].addr == 0x01 and t[0].online == ONLINE_STATE_WAIT_FOR_ACK)
-    # SET-Antwort aus FakeSerial wurde in function_code_cb verarbeitet:
-    # simuliere den vom Decompile belegten Ablauf: set -> ack -> online
-    aa.send_package(aa.data_pack(BROADCAST_ADDR_MB, CMD_SET_SLAVE_ADDR,
-                                 [0x01] + FakeSerial.UUID))
-    check("set ack online", t[0].online == ONLINE_STATE_ONLINE)
-    aa.online_check(DEV_TYPE_MB, 0x01)
-    check("online bleibt", t[0].online == ONLINE_STATE_ONLINE and t[0].lost_cnt == 0)
-    # GET_ADDR_TABLE-Flow sichert UUIDs (uniid_changed-Pfad)
-    aa.get_addr_table(DEV_TYPE_MB, 0x01)
-    check("store geschrieben", aa.store.get("mb_addr_table_uniids")[0] == FakeSerial.UUID)
+    aa.startup()
+    check("start leer: nur 0xA3 an 1..4 (2x)",
+          bus.cmds() == [(a, A3) for a in (1, 2, 3, 4)] * 2)
+    n = len(bus.sent)
+    for _ in range(3):
+        aa.online_once()
+    check("neu: Sequenz a1,a0,a2 | a1,a2 | a1,a2",
+          bus.cmds(n) == [(FE, A1), (FE, A0), (1, A2)] + [(FE, A1), (1, A2)] * 2)
+    check("neu: 0x01 ONLINE acked", t[0].online == ONLINE_STATE_ONLINE
+          and t[0].acked == 1 and t[0].uniid == U1 and dev.addr == 0x01)
+    check("neu: Rest frei", all(e.mapped == 0 for e in t[1:]))
+    check("neu: Store im Original-Format, UUID genau 1x",
+          aa.store["mb_addr_table_uniids"] == "\n  " + ", ".join(
+              "0x%02X" % b for b in U1) + "\n  0x00\n  0x00\n  0x00")
 
-    # 3. Restart lädt gespeicherte UUID (mapped=1, INIT)
-    aa2 = AutoAddr(FakeSerial(), store=dict(aa.store))
-    check("reload mapped", aa2.tables[DEV_TYPE_MB][0].mapped == 1)
-    check("reload init", aa2.tables[DEV_TYPE_MB][0].online == ONLINE_STATE_INIT)
+    # 3. Zwei neue Geräte -> 0x01 und 0x02, keine Duplikate
+    d1, d2 = FakeDev(U1), FakeDev(U2)
+    aa = AutoAddr(FakeSerial([d1, d2]))
+    t = aa.tables[DEV_TYPE_MB]
+    for _ in range(3):
+        aa.online_once()
+    check("zwei: 0x01/0x02 ONLINE", (d1.addr, d2.addr) == (1, 2)
+          and t[0].online == t[1].online == ONLINE_STATE_ONLINE)
+    check("zwei: keine Duplikat-UUIDs", uuids_unique(t) and t[2].mapped == 0)
 
-    # 4. Offline nach 4 verpassten Checks (FakeSerial ohne Antwort)
-    class Silent:
-        def cmd_send_data_with_response(self, data, timeout, retransmit):
-            return None
-    aa3 = AutoAddr(Silent())
-    aa3.tables[DEV_TYPE_MB][0].mapped = 1
-    aa3.tables[DEV_TYPE_MB][0].online = ONLINE_STATE_ONLINE
+    # 4. Reboot (Adresse verloren) -> -1, WAIT_FOR_ACK, erneut 0xA0 auf 0x01
+    dev = FakeDev(U1)
+    bus = FakeSerial([dev])
+    aa = AutoAddr(bus)
+    t = aa.tables[DEV_TYPE_MB]
+    aa.online_once()
+    dev.addr = None  # Reboot
+    probe = AutoAddr(FakeSerial())
+    pe = probe.tables[DEV_TYPE_MB][0]
+    pe.uniid, pe.mapped, pe.online, pe.acked = list(U1), 1, ONLINE_STATE_ONLINE, 1
+    r = probe.addr_allocate(list(U1), probe.tables[DEV_TYPE_MB])
+    check("reboot: addr_allocate -1 + WAIT_FOR_ACK, acked 0",
+          r == -1 and pe.online == ONLINE_STATE_WAIT_FOR_ACK and pe.acked == 0)
+    n = len(bus.sent)
+    aa.online_once()
+    check("reboot: Sequenz a1,a0,a2", bus.cmds(n) == [(FE, A1), (FE, A0), (1, A2)])
+    check("reboot: wieder 0x01 ONLINE, keine Duplikate",
+          dev.addr == 1 and t[0].online == ONLINE_STATE_ONLINE
+          and uuids_unique(t) and t[1].mapped == 0)
+
+    # 5. Kaltstart mit UUID im Store (Original-String) -> Startphase setzt 0x01
+    saved = "\n  " + ", ".join("0x%02X" % b for b in U1) + "\n  0x00\n  0x00\n  0x00"
+    dev = FakeDev(U1)
+    bus = FakeSerial([dev])
+    aa = AutoAddr(bus, store={"mb_addr_table_uniids": saved})
+    t = aa.tables[DEV_TYPE_MB]
+    check("kalt: geladen mapped/INIT", t[0].mapped == 1
+          and t[0].online == ONLINE_STATE_INIT and t[0].uniid == U1)
+    aa.startup()
+    check("kalt: Startsequenz a0 | a3 2,3,4 (2x)",
+          bus.cmds() == [(FE, A0)] + [(a, A3) for a in (2, 3, 4)] * 2)
+    check("kalt: 0x01 ONLINE nach Startphase",
+          t[0].online == ONLINE_STATE_ONLINE and dev.addr == 1)
+    aa.online_once()
+    check("kalt: Zyklus a1,a2, 0x01 ONLINE",
+          bus.cmds(7) == [(FE, A1), (1, A2)] and t[0].online == ONLINE_STATE_ONLINE)
+    # Kaltstart, Gerät reagiert nicht auf Startphase -> 0xA1-Pfad (Methode 1)
+    dev = FakeDev(U1)
+    dev.alive = False
+    bus = FakeSerial([dev])
+    aa = AutoAddr(bus, store={"mb_addr_table_uniids": saved})
+    aa.startup()
+    check("kalt stumm: 2x a0, bleibt INIT",
+          bus.cmds().count((FE, A0)) == 2
+          and aa.tables[DEV_TYPE_MB][0].online == ONLINE_STATE_INIT)
+    dev.alive = True
+    aa.online_once()
+    check("kalt spät: per a1->a0 auf 0x01 ONLINE",
+          dev.addr == 1 and aa.tables[DEV_TYPE_MB][0].online == ONLINE_STATE_ONLINE)
+
+    # 6. Broadcast-Skip: alle 4 Einträge ONLINE -> kein 0xA1
+    devs = [FakeDev([i] * 12) for i in range(1, 5)]
+    bus = FakeSerial(devs)
+    aa = AutoAddr(bus)
     for _ in range(5):
-        aa3.online_once()
-    check("offline nach timeouts",
-          aa3.tables[DEV_TYPE_MB][0].online == ONLINE_STATE_OFFLINE)
+        aa.online_once()
+    n = len(bus.sent)
+    aa.online_once()
+    check("skip: 4 online, kein a1",
+          bus.cmds(n) == [(a, A2) for a in (1, 2, 3, 4)]
+          and uuids_unique(aa.tables[DEV_TYPE_MB]))
+
+    # 7. Loader-Gerät: 0x0B [01] an 0xFF einmal je Zyklus, bis App-Modus
+    dev = FakeDev(U1, mode=MODE_LOADER)
+    bus = FakeSerial([dev])
+    aa = AutoAddr(bus)
+    aa.online_once()
+    check("loader: Sequenz a1,a0,a2,0b@ff",
+          bus.cmds() == [(FE, A1), (FE, A0), (1, A2), (BROADCAST_ADDR, LB)]
+          and bus.sent[-1][2] == [0x01])
+    n = len(bus.sent)
+    aa.online_once()  # Gerät jetzt App -> 0xA2-Antwort setzt mode 0
+    check("loader: danach kein 0x0B mehr",
+          LB not in [f for _, f in bus.cmds(n)]
+          and aa.tables[DEV_TYPE_MB][0].mode == MODE_APP)
+
+    # 8. Store: Roundtrip, Original-String, altes Listenformat, Fehlwerte
+    aa = AutoAddr(FakeSerial())
+    t = aa.tables[DEV_TYPE_MB]
+    t[0].uniid, t[1].uniid = list(U1), list(U2)
+    aa._save_uniids(DEV_TYPE_MB, t)
+    s = aa.store["mb_addr_table_uniids"]
+    aa2 = AutoAddr(FakeSerial(), store={"mb_addr_table_uniids": s})
+    check("store roundtrip", [e.uniid for e in aa2.tables[DEV_TYPE_MB]]
+          == [U1, U2, [0], [0]] and aa2.tables[DEV_TYPE_MB][1].mapped == 1)
+    # wie Klipper ihn aus printer.cfg liefert (Einrückung entfernt)
+    cfg = "\n0xa0, 0xa1,0xA2 ,0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8, 0xA9, 0xAA, 0xAB\n0x00\n0\n0x00\n"
+    aa2 = AutoAddr(FakeSerial(), store={"mb_addr_table_uniids": cfg})
+    check("store printer.cfg-String", aa2.tables[DEV_TYPE_MB][0].uniid == U1
+          and aa2.tables[DEV_TYPE_MB][2].mapped == 0)
+    aa2 = AutoAddr(FakeSerial(), store={"mb_addr_table_uniids": [U1, [0], [0], [0]]})
+    check("store altes Listenformat", aa2.tables[DEV_TYPE_MB][0].uniid == U1
+          and aa2.tables[DEV_TYPE_MB][0].online == ONLINE_STATE_INIT)
+    ok = True
+    for bad in ("\n  0x%02X\n  0x00" % 0xA0, [U1, [0]], [None], [5], "x", 5,
+                None, "0xZZ\n0\n0\n0", [[256], [0], [0], [0]], [["a"], [0], [0], [0]]):
+        try:
+            aa2 = AutoAddr(FakeSerial(), store={"mb_addr_table_uniids": bad})
+            ok = ok and all(e.mapped == 0 and e.uniid == [0]
+                            for e in aa2.tables[DEV_TYPE_MB])
+        except Exception as ex:  # darf nicht passieren
+            print("   Exception bei %r: %r" % (bad, ex))
+            ok = False
+    check("store falsche Länge/Fehlwerte verworfen, kein Crash", ok)
+
+    # 9. Druck-Intervall
+    aa = AutoAddr(FakeSerial())
+    aa.online_once(printing=True)
+    i1 = aa.next_interval
+    aa.online_once("pause")
+    i2 = aa.next_interval
+    aa.online_once(printing="standby")
+    check("intervall 10 s bei Druck/Pause, sonst 1 s",
+          (i1, i2, aa.next_interval) == (10.0, 10.0, 1.0))
+
+    # 10. Hintergrund: Startphase + erster Zyklus sofort, Exceptions geloggt
+    import time
+    dev = FakeDev(U1)
+    bus = FakeSerial([dev])
+    aa = AutoAddr(bus)
+    aa.start_background(interval=100.0)
+    t0 = time.time()
+    while time.time() - t0 < 2 and dev.addr is None:
+        time.sleep(0.01)
+    aa.stop_background()
+    check("bg: erster Zyklus sofort (Startphase davor)",
+          dev.addr == 1 and bus.cmds()[:8] == [(a, A3) for a in (1, 2, 3, 4)] * 2)
+
+    class Boom:
+        calls = 0
+
+        def cmd_send_data_with_response(self, *a):
+            Boom.calls += 1
+            raise IOError("bus weg")
+
+    records = []
+
+    class H(logging.Handler):
+        def emit(self, rec):
+            records.append(rec)
+    h = H()
+    log.addHandler(h)
+    log.propagate = False
+    aa = AutoAddr(Boom())
+    aa.start_background(interval=0.01)
+    t0 = time.time()
+    while time.time() - t0 < 2 and Boom.calls < 4:
+        time.sleep(0.01)
+    aa.stop_background()
+    aa._thread.join(1)
+    log.removeHandler(h)
+    log.propagate = True
+    check("bg: Exceptions per logging.exception, Schleife läuft weiter",
+          Boom.calls >= 3 and any(r.exc_info for r in records))
+
+    # 11. Offline nach MAX_LOST_CNT, Rückkehr
+    dev = FakeDev(U1)
+    aa = AutoAddr(FakeSerial([dev]))
+    e = aa.tables[DEV_TYPE_MB][0]
+    aa.online_once()
+    dev.alive = False
+    for _ in range(MAX_LOST_CNT):
+        aa.online_once()
+    still = e.online == ONLINE_STATE_ONLINE
+    aa.online_once()
+    check("offline erst nach %d verpassten Checks" % (MAX_LOST_CNT + 1),
+          still and e.online == ONLINE_STATE_OFFLINE and e.acked == 0)
+    dev.alive = True
+    dev.addr = None  # kommt rebootet zurück
+    aa.online_once()
+    check("offline -> Rückkehr per a1 (Methode 1) auf 0x01",
+          e.online == ONLINE_STATE_ONLINE and dev.addr == 1
+          and uuids_unique(aa.tables[DEV_TYPE_MB]))
+
+    # 12. G2: unbekannter Function-Code / Kurz-Frame ohne Crash
+    aa = AutoAddr(FakeSerial())
+    aa.data_handler(bytes(_frame(0x01, CMD_LOADER_TO_APP, [1])))
+    aa.data_handler(bytes(_frame(0x01, CMD_ONLINE_CHECK, [])))
+    aa.data_handler(b"\xf7\x01")
+    check("unbekannter Code/Kurz-Frame ignoriert", True)
 
     print("SELBSTTEST: %s" % ("ok" if fails == 0 else "%d FEHLER" % fails))
     return fails

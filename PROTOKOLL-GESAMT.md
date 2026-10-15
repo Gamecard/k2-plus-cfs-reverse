@@ -37,12 +37,16 @@ crc = CRC-8/ATM (poly 0x07, init 0x00) über [len..data]  ← GEKNACKT 12.10.202
 
 ```
 0x02 = GET_RFID        Antwort ASCII "<Slot>:<hex|unknown|busy>;"
-0x03 = GET_REMAIN_LEN  Request [Slotmaske], Antwort positional A..D
+0x03 = GET_REMAIN_LEN  Request [Slotmaske], Antwort positional A..D (4 Bytes);
+       0xff = keine Daten, 0 = kein RFID-Restwert (NICHT „leer“ – Slot B ist
+       mit remain 0 gefahren; KORRIGIERT 15.10.2026)
 0x04 = SET_BOX_MODE    [00 01] Feed-Modus, [Slotmaske 00] Print-Modus
 0x05 = GET_BUFFER_STATE Box-Bufferstatus (früher fälschlich CUT_STATE)
 0x08 = GET_HARDWARE_STATUS Toolhead-/Hardware-Sensorstatus
 0x0a = Herzschlag/Poll 6 Datenbytes Zustand, alle ~4s
-0x0d = ?               len 3, nach GET_RFID
+0x0d = ~~?~~ SET_PRE_LOADING/RFID-Control [Maske][00 disable|01 enable|02 Force-Read]
+       (KORRIGIERT 15.10.2026, Belege ref-hi + k2-vanilla, s. PROTOKOLL-485.md
+       „Preload-Ablauf“); live nur leeres ACK (len 3, nach GET_RFID), kein Request
 0x0e = MEASURING_WHEEL Request [01], Antwort 4B BE-IEEE754-Float negativ
 0x0f = CTRL_CONNECTION_MOTOR_ACTION [01] Engage / [00] Release
 0x10 = EXTRUDE_PROCESS Requests [Slotmaske, Stufe, Parameter]: 00/04/05/06/07
@@ -81,15 +85,21 @@ crc = CRC-8/ATM (poly 0x07, init 0x00) über [len..data]  ← GEKNACKT 12.10.202
 ### 1.5 Func-Codes – Motor-Boards (`0x81..0x84`)
 
 ```
-0x06 = Encoder/ADC lesen (4 Bytes, z.B. 00 00 96 43)
+0x06 = Sys-Param, sehr wahrscheinlich SCHREIBEN (4 Bytes LE-Float, 00 00 96 43 = 300.0)
+       [~~Encoder/ADC lesen~~ – WIDERLEGT 15.10.2026]
 0x0c = Parameter (8 Datenbytes) an alle Boards gleichzeitig
 0x11 = Modus-Umschaltung (1-2 Datenbytes)
 ```
 
-- Cut-Kalibrierung live: 0x06-Parameter `00 00 96 43` → `00 00 c8 42`
-  (Big-Endian 38467 → 51266, Differenz 12799 Ticks = Cut-Offset),
-  `motor_control.cut.pos_x` -7.5 → -7.6
-  (KORREKTUR 13.10.: ältere Notiz las die Bytes vertauscht als 0x4396/0x42c8)
+- Cut-Kalibrierung live: 0x06-Payload `00 00 96 43` → `00 00 c8 42`
+  = **LE-Float 300.0 → 100.0** = `MOTOR_SYS_PARAM NUM=1 DATA=1 ID=70
+  PARAMS=300|100 PARAMS_TYPE=float` (gcode_macro.cfg:796/799, sensorless.cfg:145/211)
+  – KORREKTUR 15.10.2026, passt zu k2-vanilla (1.9: 0x06 = Sys-Param).
+  ~~(Big-Endian 38467 → 51266, Differenz 12799 Ticks = Cut-Offset)~~ **WIDERLEGT
+  15.10.2026** (Artefakt; ebenso ältere 0x4396/0x42c8-Lesart).
+  `motor_control.cut.pos_x` -7.5 → -7.6 (Ergebnis des Makros, nicht der 0x06-Bytes).
+  OFFEN: wo ID 70 steckt – Live-Frame `f7 81 07 00 06 00 00 96 43 09` hat len 07
+  (3+4) + gültige CRC, enthält nur den Float.
 - `CALIBRATE_CUT_POS`-Ablauf: MOTOR_SYS_PARAM ID=70 (300→100) + MOTOR_CHECK_CUT_POS
 
 ### 1.6 Auto-Addr / Discovery (DEKOMPILIERT aus mcu_util_485 1.1.7.0, 13.10.2026)
@@ -123,17 +133,67 @@ Ablauf in Phasen (param_1+8 = Zustand 1..9), alle Kommandos als **Func 0xf0** mi
 ```
 Sub 0x00 (1B)  = get version         (3 Retries)
 Sub 0x03 (1B)  = get sector size     (3 Retries)
-Sub 0x06 (1B)  = erase private flash sector (nur CFS-Typ 1/10)
+Sub 0x06 (1B)  = erase private flash sector (nur CFS-Typ 1/10; motor.py: nur mit erase=True)
 Sub 0x01 (1B)  = request update      (3 Retries)
 4 Bytes         = send fw len (32-bit LE, 3 Retries)
 Sektor-Chunks   = send fw data (Chunk-Größe aus sector size, 3 Retries)
+Sub 0x02 (1B)  = update_end (Zustand 10, Timeout 500 ms – ERGÄNZT 15.10.2026,
+                  Disassembly mcu_util_485 @0x15a50..0x15a8c: mov r3,#2 → Payload,
+                  Länge 1, Func 0xF0, mov r7,#500 → Timeout; String "update_end")
 Ende            = "update end, wait to startup app" / "startup slave"
+Retries         = max. 3 Versuche (`cmp r6,#3` @0x1562c/0x15b78) → serial485 retries=2
+Sector-Size     = signed Byte (`ldrsb [r4,#40]` @0x15560, ≤0 → Fehlerpfad) → 1..127
 ```
 
 Plus: `duplicate uuid, skip!` (UUID-Dedupe), `-f --force` (alle updaten),
 `update cost time: %lld ms`, Log mit Timestamps + Slave-Adresse.
 
 ### 1.8 Unabhängige Bestätigung: gitstonelabs/creality-cfs-klipper (Hi, 13.10.2026)
+
+### 1.9 Kreuzvergleich: k2-vanilla (Gamecard-Fork, K2-Base) – Subagenten-Abgleich
+
+Stand: `/tmp/opencode/k2-vanilla` (flüchtig; bei Bedarf neu klonen).
+Drei Subagenten-Berichte, Kernpunkte stichprobenweise verifiziert
+(Geometrie 262/296.5/270 vs. live 352.5/400/360 ✓, Func-Konstanten
+0x06/0x0C/0x11 ✓, motor_map-Achsen e/x/y/z/z1 ✓).
+
+**Bestätigt (einig):** Frame-Format, CRC-8/ATM + Scope, STATUS FF/00-Grundsatz,
+0x02/0x03 (Maske/positional), 0x04 Feed/Print-Formen, 0x05 Buffer,
+0x0E BE-Float + Request [01], 0x10-Stufen 00/04/05/06/07 + finalize-Param 03,
+Slot-Bitmasken, A2-Shape, Auto-Addr-Sequenz.
+
+**Abweichend/offen (ehrlich markiert):**
+- ~~0x0D `(mask,02)`: Vanilla Force-Read vs. unsere Phase-2-Rearm – gleiche Bytes,
+  unentschiedene Semantik.~~ **ENTSCHIEDEN 15.10.2026:** Force-Read übernommen
+  (0x00=disable, 0x01=enable, 0x02=Force-Read; ref-hi `f70105ff0d0f0169` =
+  „mask=0x0F enable=0x01“ widerlegt die alte Arm/Disarm/Rearm-Belegung).
+  Offen bleibt nur, ob Byte 1 bei 00/01 die Maske trägt (ref-hi 0x0F) oder 0 (vanilla).
+- 0x08: gleiche Bytes, Vanilla Masken-Abfrage vs. unsere Hardware-Status-Deutung.
+- 0x11 Phase0: Vanilla `(0,0)` vs. unsere `(mask,00)`.
+- Motor-Funcs: Vanilla 0x06 = Sys-Param `[01/02/03,id]`, 0x0C = Protection
+  `[data]` – unsere K2-Plus-Live-Frames zeigen 0x06 mit 4 Datenbytes (NACHTRAG
+  15.10.2026: = LE-Float 300.0/100.0 = Sys-Param ID=70 → stützt Vanilla-Deutung;
+  nur die ID-Position fehlt im Plus-Frame) und 0x0C
+  mit 8 Nullbytes. Keine der beiden Seiten ist damit widerlegt, aber blindes
+  Übernehmen der Vanilla-Formen auf den Plus ist riskant (andere Board-Generation?).
+- Timeouts: Vanilla Default attempts=1 vs. unsere retries=4 (verschiedene Schichten).
+  NACHTRAG 15.10.2026: im Nachbau retries=4 = 1+4 = 5 Sendungen; ob das Original
+  „retries = 4“ als 4 oder 1+4 Sendungen meint, ist am klippy.log nachzuzählen (offen).
+- STATUS/Event: Vanilla kennt zusätzlich `0x16`=UNLOAD_NO_FILAMENT (statt busy).
+
+**Nutzen für motor.py-TODOs:** Vanilla implementiert encoder_calibrate (0x03),
+elec_offset_calibrate (0x04), Sys-/Flash-Params (0x06/0x07), Protection (0x0C),
+Stall-Modes (0x11), read_addr (0x0E), Pin-IO (lokal, kein Frame) – Fundstellen in
+`files/motor_control.py` + `motor_map.json` (227 Params/Achse). Wegen der
+0x06/0x0C-Formdifferenz nur mit Live-Gegenprobe je Methode übernehmen.
+
+**K2-Plus-Adaption (falls k2-vanilla je auf dem Plus laufen soll):**
+Pflicht: Geometrie X/Y/Z (352.5/400/360, Y-Enable `!PA9`, Z-Dir nicht invertiert),
+`stepper_z1`+`z_tilt`+`z_align` statt `gear_ratio`/`tmc2208`/`screws_tilt`,
+Chamber-Heizer + PTC-Lüfter (M141/M191-Stubs entfernen!), Lüfter-Mapping (PA0!),
+Thermistor-Tabellen (Extruder 260k, Bett EPCOS), Box-Koordinaten (Y~374–378/200),
+Mesh 345/9×9, `[prtouch_v3]`-Probe-Stack, `motor_closed_loop x,y,z,z1,e`.
+Details siehe Subagenten-Bericht in der Session-Historie.
 
 Geklonter Stand in `/tmp/opencode/cfs-klipper-ref` (flüchtig – bei Bedarf neu klonen),
 eigene Klipper-Module + Captures + Tests. **Kreuzvalidierung bestanden:**
@@ -178,6 +238,9 @@ app_len: 4-Byte-App-Länge vor den Daten
 
 `FUN_00010e54`: Summe aller Datenbytes, dann **bitweises Komplement** (`~sum`, 8 Bit),
 1 Byte an die Daten angehängt.
+HINWEIS 15.10.2026: im Live-`rootfs-live/usr/bin/mcu_util` liegt die Routine bei
+**0x10e84** (llvm-objdump verifiziert) – Versatz +0x30 zur Ghidra-Adresse, evtl.
+anderes Binary/andere Basis bei der Ghidra-Analyse.
 
 ### 2.3 State-Machine (usart_send_Process, `FUN_00010e80`)
 

@@ -23,6 +23,11 @@ from serial485 import parse_frame, build_frame
 BOX_ADDR = 0x01
 STATUS_OPERATIONAL = 0xFF
 SLOT_MASKS = (0x01, 0x02, 0x04, 0x08)
+MASK_ALL = 0x0F
+# 0x0d-Aktionen – identisch zu box.PRELOAD_* (Belege dort: ref-hi
+# f70105ff0d0f0169 = mask 0x0F enable 0x01; vanilla (0,enabled)/(mask,2)).
+PRELOAD_DISABLE, PRELOAD_ENABLE, PRELOAD_FORCE_READ = 0x00, 0x01, 0x02
+PRELOAD_ACTIONS = (PRELOAD_DISABLE, PRELOAD_ENABLE, PRELOAD_FORCE_READ)
 FUNC_SET_BOX_MODE = 0x04
 FUNC_SET_PRE_LOADING = 0x0D
 FUNC_HARDWARE_STATUS = 0x08
@@ -36,36 +41,63 @@ EXTRUDE_POLL = bytes.fromhex("f7 01 03 00 10 cd")
 RETRUDE_POLL = bytes.fromhex("f7 01 03 00 11 ca")
 
 
-def _slot(slot):
-    if slot in range(4):
-        return 1 << slot
-    if slot in SLOT_MASKS:
-        return slot
-    raise ValueError("Slot muss 0..3 oder eine 1-hot-Maske sein")
+def _check_mask(mask):
+    """Slotmaske 0x00..0x0f (Mehrfachmasken erlaubt), keine Umdeutung."""
+    if isinstance(mask, bool) or not isinstance(mask, int) \
+            or not 0 <= mask <= MASK_ALL:
+        raise ValueError("Maske muss int 0x00..0x0f sein: %r" % (mask,))
+    return mask
 
 
-def build_preload(mask, phase):
-    """Baut SET_PRE_LOADING (0x0d): [Slotmaske][Phase]."""
-    return build_frame(BOX_ADDR, FUNC_SET_PRE_LOADING, [mask, phase],
+def _one_hot(mask):
+    """Genau EIN Slot als 1-hot-Maske (Extrude/Retrude sind nur
+    einzelslotig belegt; Mehrfachmasken dort unbelegt -> ValueError)."""
+    if isinstance(mask, bool) or mask not in SLOT_MASKS:
+        raise ValueError("Maske muss 1-hot 0x01/0x02/0x04/0x08 sein: %r"
+                         % (mask,))
+    return mask
+
+
+def slot_to_mask(index):
+    """Slot-Index 0..3 (A..D) -> 1-hot-Maske (wie box.slot_to_mask)."""
+    if isinstance(index, bool) or index not in range(4):
+        raise ValueError("Slot-Index muss 0..3 sein: %r" % (index,))
+    return SLOT_MASKS[index]
+
+
+def build_preload(mask, action):
+    """Baut SET_PRE_LOADING (0x0d): [Slotmaske][Aktion 00/01/02].
+
+    Bytegleich mit box.build_preload (gleiche Prüfungen).
+    """
+    if action not in PRELOAD_ACTIONS:
+        raise ValueError("Aktion muss 0x00/0x01/0x02 sein")
+    return build_frame(BOX_ADDR, FUNC_SET_PRE_LOADING,
+                       [_check_mask(mask), action],
                        status=STATUS_OPERATIONAL)
 
 
-def build_extrude_stage(slot, stage, parameter=0x00):
+def build_extrude_stage(mask, stage, parameter=0x00):
     """Baut einen echten 0x10-Request: [Slotmaske][Stufe][Parameter].
 
+    mask = 1-hot-Slotmaske (0x01=A … 0x08=D), KEIN Slot-Index – dafür
+    slot_to_mask() verwenden.
     Stufen gemäß unabhängiger, hardwarevalidierter Referenz:
     00 init, 04 engage, 05 push, 06 settle, 07 finalize mit Parameter 03.
     """
-    slot = _slot(slot)
+    mask = _one_hot(mask)
     return build_frame(BOX_ADDR, FUNC_EXTRUDE,
-                       [slot, stage, parameter], status=STATUS_OPERATIONAL)
+                       [mask, stage, parameter], status=STATUS_OPERATIONAL)
 
 
-def build_extrude_sequence(slot, pushes=1):
-    """Baut den CFS-Transportablauf ohne Sensor-/Zeitsteuerung."""
+def build_extrude_sequence(mask, pushes=1):
+    """Baut den CFS-Transportablauf ohne Sensor-/Zeitsteuerung.
+
+    mask = 1-hot-Slotmaske (s. build_extrude_stage).
+    """
     if pushes < 1:
         raise ValueError("pushes muss >= 1 sein")
-    slot = _slot(slot)
+    mask = _one_hot(mask)
     frames = [
         build_frame(BOX_ADDR, FUNC_SET_BOX_MODE, [0x00, 0x01],
                     status=STATUS_OPERATIONAL),
@@ -73,15 +105,15 @@ def build_extrude_sequence(slot, pushes=1):
                     status=STATUS_OPERATIONAL),
         build_frame(BOX_ADDR, FUNC_HARDWARE_STATUS, [0x00],
                     status=STATUS_OPERATIONAL),
-        build_extrude_stage(slot, 0x00),
-        build_extrude_stage(slot, 0x04),
+        build_extrude_stage(mask, 0x00),
+        build_extrude_stage(mask, 0x04),
     ]
-    frames.extend(build_extrude_stage(slot, 0x05) for _ in range(pushes))
+    frames.extend(build_extrude_stage(mask, 0x05) for _ in range(pushes))
     frames.extend([
-        build_extrude_stage(slot, 0x06),
-        build_extrude_stage(slot, 0x07, 0x03),
+        build_extrude_stage(mask, 0x06),
+        build_extrude_stage(mask, 0x07, 0x03),
         build_frame(BOX_ADDR, FUNC_05, [], status=STATUS_OPERATIONAL),
-        build_frame(BOX_ADDR, FUNC_SET_BOX_MODE, [slot, 0x00],
+        build_frame(BOX_ADDR, FUNC_SET_BOX_MODE, [mask, 0x00],
                     status=STATUS_OPERATIONAL),
         build_frame(BOX_ADDR, FUNC_MOTOR_ACTION, [0x00],
                     status=STATUS_OPERATIONAL),
@@ -89,30 +121,35 @@ def build_extrude_sequence(slot, pushes=1):
     return frames
 
 
-def build_retrude_sequence(slot):
-    """Baut den CFS-START/FINISH-Retrude-Ablauf.
+def build_retrude_sequence(mask):
+    """Baut den CFS-START/FINISH-Retrude-Ablauf (mask = 1-hot-Slotmaske).
 
     Der Toolhead-Pull (G1 E-15) liegt zwischen den beiden 0x11-Requests
     und ist bewusst nicht Teil des RS485-Frames.
     """
-    slot = _slot(slot)
+    mask = _one_hot(mask)
     return [
         build_frame(BOX_ADDR, FUNC_SET_BOX_MODE, [0x00, 0x01],
                     status=STATUS_OPERATIONAL),
         build_frame(BOX_ADDR, FUNC_HARDWARE_STATUS, [0x00],
                     status=STATUS_OPERATIONAL),
-        build_frame(BOX_ADDR, FUNC_RETRUDE, [slot, 0x00],
+        build_frame(BOX_ADDR, FUNC_RETRUDE, [mask, 0x00],
                     status=STATUS_OPERATIONAL),
         build_frame(BOX_ADDR, FUNC_HARDWARE_STATUS, [0x01],
                     status=STATUS_OPERATIONAL),
-        build_frame(BOX_ADDR, FUNC_RETRUDE, [slot, 0x01],
+        build_frame(BOX_ADDR, FUNC_RETRUDE, [mask, 0x01],
                     status=STATUS_OPERATIONAL),
     ]
 
 
 def check_frames(frames):
-    """Prüft Liste roher Frames: CRC + Reihenfolge. Gibt [(addr, fun, daten)]."""
-    return [parse_frame(bytes(f)) and _parsed(bytes(f)) for f in frames]
+    """Prüft Liste roher Frames einzeln (Head/Länge/CRC via parse_frame).
+
+    KEINE Reihenfolgeprüfung – die erfolgt (bewusst locker, s. dort) in
+    verify_extrude/verify_retrude. Gibt [(addr, fun, daten)] zurück;
+    fehlerhafter Frame -> ValueError.
+    """
+    return [_parsed(bytes(f)) for f in frames]
 
 
 def _parsed(raw):
@@ -194,10 +231,25 @@ def selftest():
     check("extrude-poll", EXTRUDE_POLL == bytes.fromhex("f7 01 03 00 10 cd"))
     check("retrude-poll", RETRUDE_POLL == bytes.fromhex("f7 01 03 00 11 ca"))
     check("build extrude request",
-          build_extrude_stage(0, 0x05) ==
+          build_extrude_stage(slot_to_mask(0), 0x05) ==
           bytes.fromhex("f7 01 06 ff 10 01 05 00 82"))
     check("build retrude start",
-          build_retrude_sequence(1)[2][5:-1] == bytes.fromhex("02 00"))
+          build_retrude_sequence(0x02)[2][5:-1] == bytes.fromhex("02 00"))
+    check("slot_to_mask(1) == 0x02", slot_to_mask(1) == 0x02)
+    check("preload ref-hi f70105ff0d0f0169",
+          build_preload(0x0F, PRELOAD_ENABLE) == bytes.fromhex("f70105ff0d0f0169"))
+    check("preload mehrfachmaske 0x05", build_preload(0x05, 0x02)[5] == 0x05)
+    for name, call in (("extrude 0x03", lambda: build_extrude_stage(0x03, 0)),
+                       ("extrude 0", lambda: build_extrude_stage(0, 0)),
+                       ("retrude 0x0f", lambda: build_retrude_sequence(0x0F)),
+                       ("preload 0x10", lambda: build_preload(0x10, 1)),
+                       ("preload aktion 3", lambda: build_preload(0x01, 3)),
+                       ("slot 4", lambda: slot_to_mask(4))):
+        try:
+            call()
+            check("guard " + name, False)
+        except ValueError:
+            check("guard " + name, True)
 
     print("SELBSTTEST: %s" % ("ok" if fails == 0 else "%d FEHLER" % fails))
     return fails

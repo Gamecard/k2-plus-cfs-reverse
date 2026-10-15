@@ -95,7 +95,20 @@ Die K2-High-Level-Kette löst vor `SET_PRE_LOADING` Abfragen aus: 0x04,
 0x14 (Version+SN) und 0x0d. Die im Log sichtbaren Frames `0x03[ff ff 1d 00]`
 waren Antworten/Statusframes, nicht sicher der Request. Unabhängig belegt ist
 der eigentliche Wire-Request aus der Referenzimplementierung:
-`0x0d [Slotmaske][Phase]`, Phase 0x00=Arm, 0x01=Disarm, 0x02=Slot-Rearm.
+`0x0d [Slotmaske][Aktion]` ~~Phase 0x00=Arm, 0x01=Disarm, 0x02=Slot-Rearm~~
+**KORRIGIERT 15.10.2026:** Aktion **0x00 = disable** (Insert-Reading/Preload aus),
+**0x01 = enable**, **0x02 = Force-RFID-Read** (`SET_PRE_LOADING`/RFID-Control).
+Belege: `nachbau/ref-hi/valid_messages.json` `f70105ff0d0f0169` =
+„CMD_SET_PRE_LOADING box 1, mask=0x0F enable=0x01“; k2-vanilla
+`files/box_protocol.py` (`CMD_RFID_CONTROL=0x0D`): `set_rfid_insert_reading(enabled)`
+→ `(0, int(enabled))`, `force_rfid_read(mask)` → `(mask, 2)`. Die alte
+Arm/Disarm-Belegung war durch keinen Frame gestützt und widerspricht beiden Referenzen.
+**Kein Live-0x0d-Request auf dem K2 Plus belegt** – live nur ein leeres ACK
+(len 3, nach GET_RFID); Byte-Form `f7 01 03 00 0d 9e` = ref-hi-ACK (CRC 0x9e ✓).
+Offen: ob das 1. Byte bei 0x00/0x01 die Maske
+ist (ref-hi: 0x0F) oder ignoriert wird (vanilla: 0). Nachbau:
+`box.build_preload(mask, action)` / `cfsseq.build_preload(mask, action)`,
+Konstanten `PRELOAD_DISABLE/ENABLE/FORCE_READ = 0x00/0x01/0x02`.
 Alle K2-Frames CRC-verifiziert; der Versuch blieb ohne Mechanik, weil kein
 neuer Insert-/Feed-Zustand vorlag.
 
@@ -157,19 +170,26 @@ früheren Fehlschläge). Display-Flow bleibt zusätzlich belegt.
 ```
 0x02 = GET_RFID        (Antwort ASCII "<Slot>:<hex|unknown|busy>;")
 0x03 = GET_REMAIN_LEN  (Request [Slotmaske], Antwort positional A..D;
-                         0xff=nicht ausgewählt, 0=ausgewählt+leer)
+                         0xff=nicht ausgewählt/keine Daten,
+                         ~~0=ausgewählt+leer~~ KORRIGIERT 15.10.2026:
+                         0 = kein RFID-Restwert (Slot B ist mit remain 0
+                         gefahren, 160 mm, s. T1B) – nicht „leer“)
 0x04 = SET_BOX_MODE (Request [00 01] = Feed-Modus; [Slotmaske 00] = Print-Modus)
 0x05 = GET_BUFFER_STATE (Box-Adresse 0x01, Request leer; 1 Byte Buffer-State;
                          die frühere Bezeichnung CUT_STATE war falsch)
 0x08 = GET_HARDWARE_STATUS (Request [Kanal], Toolhead-/Hardware-Sensorstatus)
 0x0a = Herzschlag/Poll (6 Datenbytes, Zustand; alle ~4s)
-0x0d = ?               (len 3, nach GET_RFID)
+0x0d = ~~?~~ SET_PRE_LOADING / RFID-Control (KORRIGIERT 15.10.2026; Request
+       [Maske][00 disable|01 enable|02 Force-Read], s. Preload-Ablauf oben;
+       live nur leeres ACK len 3 nach GET_RFID; Form wie ref-hi `f7 01 03 00 0d 9e`)
 0x0e = MEASURING_WHEEL (Request [01], Antwort 4 Bytes Big-Endian IEEE-754 Float,
        NEGATIV – kein Zähler!
-       KORREKTUR 13.10.: c4e6fe0b→-1847,94, c5019149→-2073,08; Betrag wächst beim Fördern.
+       KORREKTUR 13.10.: c4e6fe0b→-1847,94, ~~c5019149→-2073,08~~ (Tippfehler,
+       KORRIGIERT 15.10.2026: CRC-gültiger Live-Frame `f7 01 07 00 0e c5 00 91 49 a9`
+       → c5009149 = −2057,08); Betrag wächst beim Fördern.
        Gilt auch für 0x10-Push-Replies. Unabhängig bestätigt: gitstonelabs.)
 0x14 = GET_VERSION_SN (Hi- wie K2-BELEGT: Hi-Request `f7 01 03 ff 14 06`;
-       K2-Response 13.10.: `f7 01 19 00 14 ... 8d`, Daten ASCII "153"+
+       K2-Response 13.10.: `f7 01 19 00 14 ... d4`, Daten ASCII "153"+
        "SN-DEMO-1234567890X" = CFS-App-Version + SN, CRC ok)
 0x0f = CTRL_CONNECTION_MOTOR_ACTION (Request [01] Engage / [00] Release)
 0x10 = EXTRUDE_PROCESS (Request [Slotmaske, Stufe, Parameter]:
@@ -229,7 +249,9 @@ Device-Typen (MB=1 CFS-Box, CLM=2 Closed-loop, BTM=3 Belt, CFS_PRO=10),
 Timeouts (kurz 0,05 s / mittel 0,1 s / lang 1,0 s je Command, kein Low-Level-Retransmit),
 Adress-Tabellen (MB 0x01-0x04, Motoren 0x81-0x84, Belt 0x91-0x92),
 Uniid-Persistenz in `printer.cfg` (`mb_addr_table_uniids`), Online-Logik
-(3 verpasste Checks = offline). Nur MB-Auto-Addr ist aktiv (CLM/BTM/CFS_PRO
+(~~3 verpasste Checks = offline~~ KORRIGIERT 15.10.2026: `lost_cnt > MAX_LOST_CNT=3`,
+also offline erst beim 4. unbeantworteten Check – Klartextquelle `auto_addr_wrapper.py`:604-607, lokal, nicht im Repo;
+Selbsttest `nachbau/auto_addr.py`). Nur MB-Auto-Addr ist aktiv (CLM/BTM/CFS_PRO
 in `dev_table_map_table` auskommentiert).
 
 ### raw_send_wait_ack im .so (13.10.2026, ehrlicher Befund)
@@ -257,7 +279,8 @@ als Quelle und ist an 10+ Live-Frames verifiziert.
 - 0x10-Frames: `f7 01 07 00 10 c4 xx xx xx xx` – Byte1 konstant `0xc4`, 4 variable Bytes
   (Encoder/Position); der Slot steckt NICHT im Frame – die Box kennt ihn kontextuell
 - `change_color_num`: A=1, B=1 nach beiden Extrudes; remain B bleibt 0, vender B "unknown"
-  (RFID-Tag von Slot 2 wurde bislang nicht eingelesen)
+  (RFID-Tag von Slot 2 wurde bislang nicht eingelesen) → Beleg: remain 0 = kein
+  RFID-Restwert, NICHT „leer“ (Nachbau: `has_filament` → None statt False, 15.10.2026)
 - RETRUDE (0x11) zuvor: `extrude = -10.0` (10 mm Rückzug), Messrad rückwärts
 
 ### Slot-Wechsel T1A→T1B (13.10.2026, Display-Flow, live beobachtet)
@@ -286,13 +309,22 @@ Host: `motor_control_wrapper`: `motor_version/sys_param/flash_param`, `motor_rea
 
 - Adressen `0x81..0x84` = closed-loop Motor-Boards (X/Y/Z/Z1, F008 mot-Boards)
 - `0x11` = Modus-Umschaltung (1-2 Datenbytes: `01`, `02 00`, `03`)
-- `0x06` = Motor-Parameter-/Registerpfad (Cut-Kalibrierung beobachtet):
-  Frames trugen `00 00 96 43` → `00 00 c8 42`; Big-Endian dekodiert sind das
-  38467 → 51266 (Diff 12799). Ob diese Bytes Request-Register oder Antwortwert
-  sind, ist ohne getrennten TX/RX-Mitschnitt nicht endgültig bewiesen.
-  (KORREKTUR 13.10.: ältere Notiz las vertauscht als 0x4396/0x42c8.)
+- `0x06` = **Sys-Param (sehr wahrscheinlich Schreiben)** – KORREKTUR 15.10.2026:
+  Frames trugen `00 00 96 43` → `00 00 c8 42`. Das sind **Little-Endian-Float
+  300.0 → 100.0** = exakt `MOTOR_SYS_PARAM NUM=1 DATA=1 ID=70 PARAMS=300|100
+  PARAMS_TYPE=float` (`config/F008_CR0CN240319C13/gcode_macro.cfg:796/799`,
+  `sensorless.cfg:145/211`, Makro CALIBRATE_CUT_POS). Passt zu k2-vanilla
+  (PROTOKOLL-GESAMT.md 1.9: 0x06 = Sys-Param).
+  ~~Big-Endian dekodiert 38467 → 51266 (Diff 12799)~~ – **WIDERLEGT 15.10.2026**
+  (Artefakt der falschen Deutung; ebenso die ältere 0x4396/0x42c8-Lesart).
+  OFFEN: Position der ID 70 (0x46). Der dokumentierte Frame
+  `f7 81 07 00 06 00 00 96 43 09` hat len=`07` (= 3 + 4 Datenbytes) und gültige
+  CRC – im Frame fehlt also kein Byte, er trägt NUR den Float. Vanilla-Form wäre
+  `[01, id] + <f` (→ hypothetisch `f7 81 09 00 06 01 46 00 00 96 43 8f`), auf dem
+  Plus NICHT live gesehen. `read_encoder` in motor*.py ist deshalb gesperrt.
 - `0x0c` = Parameter (8 Datenbytes `00*8`) an alle 4 Boards gleichzeitig
-- Ablauf `CALIBRATE_CUT_POS`: Modus→ADC lesen→Parameter→ADC lesen→Modus zurück
+- Ablauf `CALIBRATE_CUT_POS`: Modus→~~ADC lesen~~ Sys-Param 300.0 (0x06)→Parameter
+  →~~ADC lesen~~ Sys-Param 100.0 (0x06)→Modus zurück (KORREKTUR 15.10.2026)
   (MOTOR_SYS_PARAM ID=70 PARAMS=300/100 = Cut-Kraft rampen)
 
 ## 4. Update-Werkzeuge
@@ -317,6 +349,9 @@ State 13/14/15/16: Thread-Ende (exit 0/2/1)
 ```
 
 `FUN_00010e54` = Checksumme: **Summe aller Bytes, dann bitweises Komplement** (`~sum`, 8 Bit) – klassische 1er-Komplement-Summe, wird als 1 Byte an die Daten angehängt.
+(HINWEIS 15.10.2026: im Live-`rootfs-live/usr/bin/mcu_util` liegt diese Routine bei
+**0x10e84** (`llvm-objdump`: add/ldrb-Schleife, `mvn`+`uxtb`) – Versatz +0x30 zum
+Ghidra-Namen, evtl. anderes Binary/andere Basis bei der Ghidra-Analyse.)
 
 `mcu_util_485`: zusätzlich JSON-Scan (`CFSs`, `uuid`, `/version.json`, `000_000`), `duplicate uuid, skip!`, `keep only one firmware file for %s board!`.
 

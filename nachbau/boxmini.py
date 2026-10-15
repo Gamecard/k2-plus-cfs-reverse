@@ -5,15 +5,21 @@ Ersetzt: box_wrapper.cpython-39.so (armhf, CPython 3.9, proprietär).
 
 Umfang:
 - get_rfid: RFID-Tag eines Slots lesen (Func 0x02)
-- has_filament: Belegung pro Slot (Func 0x03, Restmenge != 0/leer)
+- has_filament: Belegung pro Slot aus Restmenge (Func 0x03): True oder
+  None (unbekannt) – remain 0 belegt KEIN „leer“ (s. has_filament)
 - remain percent: Restmenge in Prozent (Func 0x03)
 
 Belege (alle in /home/pro/k2-fw-live-1.1.7.0/ dokumentiert):
 - Func-Codes + ASCII-Format: PROTOKOLL-485.md, PROTOKOLL-GESAMT.md
 - `A:<hex>;` / `B:unknown;` / `C:busy;`: Live-Frames 12.10.2026
 - GET_REMAIN_LEN: Slotmaske im Request, Antwort positional A..D;
-  0xff = nicht ausgewählt, 0 = ausgewählt+leer (Live: 1a 00 ff 00 = A 26%)
-- NUM=0..3 numerisch (FALLE: NUM=A wirft key60-Shutdown)
+  0xff = kein Wert, 0 = kein RFID-Restwert (Live: 1a 00 ff 00 = A 26%;
+  Slot B mit remain 0 hat live 160 mm gefördert, PROTOKOLL-485.md T1B)
+- Klipper-G-Code NUM=0..3 numerisch (FALLE: NUM=A wirft key60-Shutdown).
+  Wire/.so-Parameter num ist dagegen eine MASKE (API-box_wrapper.md:
+  communication_get_rfid(1, 1) -> data b'\x01'). BoxMini.get_rfid/
+  has_filament nehmen bewusst einen Slot-INDEX 0..3 und wandeln ihn per
+  slot_to_mask() um; get_remain nimmt eine Maske.
 
 Benutzung: Serial485-Instanz aus serial485.py übergeben (echte Hardware, pyserial).
 Der Selbsttest unten läuft OHNE Hardware (Fake-Transport mit Live-Frames).
@@ -28,13 +34,21 @@ BOX_ADDR = 0x01
 STATUS_OPERATIONAL = 0xFF
 TIMEOUT_OPERATIONAL = 2.0
 NO_DATA = 0xFF
-SLOT_KEYS = "ABCD"  # NUM 0..3 -> A/B/C/D (Beleg: Live-Frames)
+SLOT_KEYS = "ABCD"  # Slot-Index 0..3 -> A/B/C/D (Beleg: Live-Frames)
+SLOT_MASKS = (0x01, 0x02, 0x04, 0x08)
+
+
+def slot_to_mask(index):
+    """Slot-Index 0..3 (A..D) -> 1-hot-Maske 0x01/0x02/0x04/0x08."""
+    if isinstance(index, bool) or index not in range(4):
+        raise ValueError("Slot-Index muss 0..3 sein: %r" % (index,))
+    return SLOT_MASKS[index]
 
 
 def parse_rfid_response(data):
     """Parst GET_RFID-Antwort (ASCII, ';'-getrennt, Key=Slot-Buchstabe).
 
-    Beispiele (anonymisiert): b"A:AAAAAA...;" / b"B:unknown;" / b"C:busy;"
+    Beispiele (live, anonymisiert): b"A:AAAAAAAA...AAAAAA;" / b"B:unknown;" / b"C:busy;"
     Gibt dict {Slot-Key: Wert} zurück. Leere Antwort -> {}.
     """
     result = {}
@@ -53,13 +67,14 @@ def parse_remain_response(data):
     """Parst GET_REMAIN_LEN-Antwort: 4 Bytes A,B,C,D (0-100 %, 0xff = nicht ausgewählt).
 
     Beleg: Live-Frame f7 01 07 00 03 1a 00 ff 00 99 -> A=26 %.
-    Gibt dict {Slot-Key: Prozent oder None} zurück.
+    Gibt dict {Slot-Key: Prozent oder None} zurück. Genau 4 Bytes nötig,
+    sonst ValueError (z.B. leere Antwort bei Fehler-Status).
     """
-    raw = list(bytes(data))
-    out = {}
-    for i, key in enumerate(SLOT_KEYS):
-        out[key] = None if (i >= len(raw) or raw[i] == NO_DATA) else raw[i]
-    return out
+    raw = bytes(data)
+    if len(raw) != 4:
+        raise ValueError("Remain-Antwort muss 4 Bytes haben: %r" % (raw,))
+    return {key: (None if raw[i] == NO_DATA else raw[i])
+            for i, key in enumerate(SLOT_KEYS)}
 
 
 class BoxMini:
@@ -70,14 +85,13 @@ class BoxMini:
         self.addr = addr
 
     def get_rfid(self, slot=0):
-        """RFID-Tag von Slot 0..3 lesen.
+        """RFID-Tag von Slot-INDEX 0..3 (A..D) lesen.
 
-        Der Request trägt eine 1-hot-Slotmaske, nicht die Slotnummer. Die
+        Komfort-API (nicht die .so-Signatur): der Index wird per
+        slot_to_mask() in die 1-hot-Slotmaske des Requests umgesetzt. Die
         Antwort ist ASCII (`A:...;`). STATUS=0xff ist der Operational-Modus.
         """
-        if slot not in range(4):
-            raise ValueError("Slot muss 0..3 sein")
-        mask = 1 << slot
+        mask = slot_to_mask(slot)
         raw = self.bus.transact(self.addr, FUNC_GET_RFID, [mask],
                                 status=STATUS_OPERATIONAL,
                                 timeout=TIMEOUT_OPERATIONAL)
@@ -88,9 +102,11 @@ class BoxMini:
         """Restmengen der ausgewählten Slots: {A/B/C/D: Prozent oder None}.
 
         Request: eine 1-hot-/Mehrfach-Slotmaske; Antwort positional A..D,
-        0xff bedeutet „nicht ausgewählt“, 0 bedeutet ausgewählt und leer.
+        0xff bedeutet „kein Wert“, 0 bedeutet „kein RFID-Restwert“ (NICHT
+        sicher leer, s. has_filament).
         """
-        if not 0 <= mask <= 0x0F:
+        if isinstance(mask, bool) or not isinstance(mask, int) \
+                or not 0 <= mask <= 0x0F:
             raise ValueError("Maske muss 0x00..0x0f sein")
         raw = self.bus.transact(self.addr, FUNC_GET_REMAIN_LEN, [mask],
                                 status=STATUS_OPERATIONAL,
@@ -98,9 +114,19 @@ class BoxMini:
         return parse_remain_response(raw)
 
     def has_filament(self, slot=0):
-        """True wenn Slot belegt (Restmenge bekannt und > 0)."""
-        remain = self.get_remain()[SLOT_KEYS[slot]]
-        return remain is not None and remain > 0
+        """Belegung von Slot-INDEX 0..3 aus der Restmenge ableiten.
+
+        Rückgabe: True  = Restmenge > 0 (RFID-Restwert vorhanden -> belegt);
+                  None  = unbekannt (remain 0 oder 0xff).
+        Bewusst NIE False: remain 0 heißt nur „kein RFID-Restwert“ – live
+        hat Slot B mit remain 0 (Vendor unknown) 160 mm gefördert
+        (PROTOKOLL-485.md, Abschnitt T1B). Echte Leer-Erkennung bräuchte
+        den Filament-Sensorstatus (Wire-Abbild unbelegt, TODO).
+        Ungültiger Index -> ValueError.
+        """
+        mask = slot_to_mask(slot)
+        remain = self.get_remain(mask)[SLOT_KEYS[slot]]
+        return True if (remain is not None and remain > 0) else None
 
 
 # --- Selbsttest mit Live-Frames (keine Hardware nötig) ---
@@ -130,7 +156,7 @@ def selftest():
 
     # 1. RFID-Parsing (Live-Frames 12.10.2026)
     check("rfid A", parse_rfid_response(
-        bytes.fromhex("41 3a 41 41 41 41 41 41")) == {"A": "AAAAAA"})
+        bytes.fromhex("41 3a 41 41 41 41 41")) == {"A": "AAAAA"})
     check("rfid unknown", parse_rfid_response(b"B:unknown;") == {"B": "unknown"})
     check("rfid busy", parse_rfid_response(b"C:busy;") == {"C": "busy"})
     check("rfid leer", parse_rfid_response(b"") == {})
@@ -148,7 +174,31 @@ def selftest():
     check("box remain", box.get_remain() == {"A": 26, "B": 0, "C": None, "D": 0})
     check("remain request mask", bus.calls[0][2] == [0x0F] and
           bus.calls[0][3]["status"] == STATUS_OPERATIONAL)
-    check("box filament A", box.has_filament(0) is True)
+    check("box filament A", box.has_filament(0) is True
+          and bus.calls[1][2] == [0x01])
+
+    # 4. has_filament: remain 0 = unbekannt (Slot B live 160 mm trotz 0)
+    bus = _FakeBus([
+        bytes.fromhex("f7 01 07 00 03 1a 00 ff 00 99"),  # B = 0
+        bytes.fromhex("f7 01 07 00 03 1c ff 00 00 11"),  # B = 0xff
+    ])
+    box = BoxMini(bus)
+    check("filament B remain 0 -> None", box.has_filament(1) is None
+          and bus.calls[0][2] == [0x02])
+    check("filament B 0xff -> None", box.has_filament(1) is None)
+    for bad in (-1, 4, True):
+        try:
+            box.has_filament(bad)
+            check("filament index-guard %r" % (bad,), False)
+        except ValueError:
+            check("filament index-guard %r" % (bad,), True)
+    try:
+        parse_remain_response(bytes.fromhex("1a 00 ff"))
+        check("remain laengen-guard", False)
+    except ValueError:
+        check("remain laengen-guard", True)
+    check("slot_to_mask", [slot_to_mask(i) for i in range(4)]
+          == [0x01, 0x02, 0x04, 0x08])
     print("SELBSTTEST: %s" % ("ok" if fails == 0 else "%d FEHLER" % fails))
     return fails
 

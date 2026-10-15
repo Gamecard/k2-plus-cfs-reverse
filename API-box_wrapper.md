@@ -49,6 +49,16 @@ nicht die Slotnummer. Operational-Requests werden mit STATUS `0xff` gebaut;
 die geloggten `status=0x00`-Frames waren häufig Antworten. `boxmini.py` wurde
 deshalb korrigiert: Payload `[mask]`, STATUS `0xff`, Timeout 2 Sekunden.
 
+NACHBAU-HINWEIS (KORRIGIERT 15.10.2026, Review): `num`/`mask` wird in `nachbau/`
+durchgängig als **Maske** behandelt – `check_mask()` akzeptiert 0x00..0x0F inkl.
+Mehrfachmasken und deutet NICHTS um. Der frühere Helfer ~~`_mask()`~~ (deutete
+0x01..0x03 als Slotindex → falscher Slot, z.B. Maske 0x02 = B wurde zu C=0x04)
+ist entfernt. Slot-Indizes 0..3 gehen nur noch explizit über `slot_to_mask(index)`
+(A=0x01..D=0x08). Die `cfsseq`-Builder (`build_extrude_stage`,
+`build_extrude_sequence`, `build_retrude_sequence`) nehmen jetzt eine **1-hot-Maske**
+statt eines Index (`build_preload` jede Maske 0x00..0x0F); Preload-Aktionen im Nachbau:
+`PRELOAD_DISABLE/ENABLE/FORCE_READ = 0x00/0x01/0x02`.
+
 ```
 communication_get_rfid(self, addr, num=15)
 communication_get_remain_len(self, addr, num=15)
@@ -75,7 +85,9 @@ box_extrude_material_stage8(self, tnn)
 ```
 
 `num=15` Default = 0x0F = alle 4 Slots (Bitmaske). Die Antwort ist positional
-A..D; `0xff` darin bedeutet „nicht ausgewählt“, `0x00` „ausgewählt und leer“.
+A..D; `0xff` darin bedeutet „nicht ausgewählt“, ~~`0x00` „ausgewählt und leer“~~
+**KORRIGIERT 15.10.2026:** `0x00` = kein RFID-Restwert (Slot B ist live mit remain 0
+gefahren, 160 mm) – nicht „leer“; `boxmini.has_filament` liefert dafür None, nie False.
 
 ## Timeouts (Modul-Konstanten box_wrapper, Sekunden!)
 
