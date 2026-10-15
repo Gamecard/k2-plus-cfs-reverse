@@ -12,8 +12,14 @@ Ablauf Extrude (Func 0x10): Requests [Slotmaske, Stufe, Parameter] mit Stufen
 00/04/05/06/07; 0x05-Push wiederholt sich sensor-/Messrad-gesteuert.
 High-Level flankiert das mit 0x04 Feed-Mode, 0x0f Engage/Release, 0x08 Sensor
 und 0x05 Buffer-Read. K2-Logframes mit `status=0x00` sind häufig ACKs.
-Ablauf Retrude (Func 0x11): Requests [Slotmaske,00] START und [Slotmaske,01]
-FINISH, dazwischen einmaliger Toolhead-Pull; 0x0e liefert den Float.
+Ablauf Retrude (Func 0x11): ~~Requests [Slotmaske,00] START und [Slotmaske,01]
+FINISH, dazwischen einmaliger Toolhead-Pull + 0x08 [01]~~ KORRIGIERT
+15.10.2026 (LIVE, klippy.log 12.-16.10.): 04 [00 01] -> 08 [00] ->
+11 [m 00] meist 4x (16 von 26 Retrudes; je Antwort nach 0,24-0,72 s,
+Abstand ~2,5 s, dazwischen 0x0e-/0x03-Abfragen) -> 11 [m 01]. In 10 Fällen
+(nach Extrude-Abbruch/Entladen) direkt 04 [00 01] -> 11 [m 01] ohne p0.
+0x08 [01] kommt zwischen p0 und p1 NIE vor (0 von 23), nur vor 0x04.
+0x0e liefert den Float.
 
 BELEGT 15.10.2026 (Ghidra CFS-FW R153, GHIDRA-CFS-BEFUND-2026-10-15.md §4):
 die „Stufen“ sind die 8 Modi von cmd_feed_process_2 (FUN_080045c6), s.
@@ -23,7 +29,9 @@ Wiederholung ist ein Poll, Antwort 4 B Float BE), 06 Fördern beenden +
 Buffer-Check, 07 03 = Extruder-Check mit p = 3 mm. 0x0f ist NICHT Motor-
 Engage/Release, sondern die Auto-Preload-Sperre ([01] sperren, [00] frei).
 0x04 [00 01] = Box-Mode IDLE (Print verlassen), [mask 00] = STATE_PRINT.
-0x08 [00]/[01] = Bitmaske Sensor A/B. 0x11 p=0 = Rückzug bis Buffer-Sensor,
+0x08 [00]/[01] = Bitmaske Sensor A/B (Host-Name 0x08 = GET_FILAMENT_SENSOR_
+STATE, nicht GET_HARDWARE_STATUS – das ist 0x15; 0x0f Host-Name
+TIGHTEN_UP_ENABLE). 0x11 p=0 = Rückzug bis Buffer-Sensor,
 p=1 = pull_back_hub (FUN_08004d90). Bytes der Sequenzen unverändert.
 Messrad-Nutzdaten (0x0e + 0x10-Replies): 4-Byte Big-Endian IEEE-754 Float, negativ
 (KORREKTUR 13.10., vgl. PROTOKOLL-485.md – kein Zähler).
@@ -69,8 +77,10 @@ RETRUDE_P_TO_BUFFER = 0x00  # Feeder+Hauptmotor rückwärts bis Buffer-Sensor (l
 RETRUDE_P_PULL_HUB = 0x01   # rfid_mgr_fila_back + pull_back_hub (live „FINISH“)
 FUNC_SET_BOX_MODE = 0x04
 FUNC_SET_PRE_LOADING = 0x0D
-FUNC_HARDWARE_STATUS = 0x08
-FUNC_MOTOR_ACTION = 0x0F  # KORRIGIERT 15.10.2026: Auto-Preload-Sperre (s. oben)
+FUNC_FILAMENT_SENSOR_STATE = 0x08  # Host: GET_FILAMENT_SENSOR_STATE (live 15.10.)
+FUNC_HARDWARE_STATUS = FUNC_FILAMENT_SENSOR_STATE  # ALT-NAME (falsch), Alias
+FUNC_TIGHTEN_UP_ENABLE = 0x0F  # Host: TIGHTEN_UP_ENABLE (live 15.10.)
+FUNC_MOTOR_ACTION = FUNC_TIGHTEN_UP_ENABLE  # KORRIGIERT 15.10.2026: Auto-Preload-Sperre (s. oben)
 FUNC_PRELOAD_INHIBIT = FUNC_MOTOR_ACTION
 FUNC_EXTRUDE = 0x10
 FUNC_RETRUDE = 0x11
@@ -138,6 +148,8 @@ def build_extrude_sequence(mask, pushes=1):
     """Baut den CFS-Transportablauf ohne Sensor-/Zeitsteuerung.
 
     mask = 1-hot-Slotmaske (s. build_extrude_stage).
+    LIVE BESTÄTIGT 15.10.2026: Request-Folge identisch mit klippy.log.2026-
+    10-13 03:01 (Slot B, pushes=5), s. EXTRUDE_LIVE_REQ_B im Selbsttest.
     """
     if pushes < 1:
         raise ValueError("pushes muss >= 1 sein")
@@ -147,7 +159,7 @@ def build_extrude_sequence(mask, pushes=1):
                     status=STATUS_OPERATIONAL),
         build_frame(BOX_ADDR, FUNC_MOTOR_ACTION, [0x01],
                     status=STATUS_OPERATIONAL),
-        build_frame(BOX_ADDR, FUNC_HARDWARE_STATUS, [0x00],
+        build_frame(BOX_ADDR, FUNC_FILAMENT_SENSOR_STATE, [0x00],
                     status=STATUS_OPERATIONAL),
         build_extrude_stage(mask, EXTRUDE_MODE_STAGE1),
         build_extrude_stage(mask, EXTRUDE_MODE_FEED_START),
@@ -168,25 +180,55 @@ def build_extrude_sequence(mask, pushes=1):
     return frames
 
 
-def build_retrude_sequence(mask):
-    """Baut den CFS-START/FINISH-Retrude-Ablauf (mask = 1-hot-Slotmaske).
+RETRUDE_TO_BUFFER_REPEATS = 4  # live: 11 [m 00] meist 4x vor [m 01]
 
-    Der Toolhead-Pull (G1 E-15) liegt zwischen den beiden 0x11-Requests
-    und ist bewusst nicht Teil des RS485-Frames.
+
+def build_retrude_sequence(mask, to_buffer_repeats=RETRUDE_TO_BUFFER_REPEATS):
+    """Baut den CFS-Retrude-Ablauf (mask = 1-hot-Slotmaske) wie LIVE.
+
+    KORRIGIERT 15.10.2026 (klippy.log 12.-16.10., 26 Retrudes):
+      04 [00 01], 08 [00], 11 [m 00] x to_buffer_repeats (live meist 4),
+      11 [m 01].
+    ~~08 [01] zwischen p0 und p1~~ WIDERLEGT (live 0 von 23).
+    to_buffer_repeats=0: live belegte Kurzform (10x, nach Extrude-Abbruch/
+      Entladen) 04 [00 01] -> 11 [m 01] (ohne 08 [00]).
+    Dazwischen liegende Abfragen (0x0e Messrad, 0x03 Restmenge) und der
+    Toolhead-Pull (G1 E-…) sind bewusst nicht Teil der Sequenz.
     """
     mask = _one_hot(mask)
-    return [
-        build_frame(BOX_ADDR, FUNC_SET_BOX_MODE, [0x00, 0x01],
-                    status=STATUS_OPERATIONAL),
-        build_frame(BOX_ADDR, FUNC_HARDWARE_STATUS, [0x00],
-                    status=STATUS_OPERATIONAL),
-        build_frame(BOX_ADDR, FUNC_RETRUDE, [mask, RETRUDE_P_TO_BUFFER],
-                    status=STATUS_OPERATIONAL),
-        build_frame(BOX_ADDR, FUNC_HARDWARE_STATUS, [0x01],
-                    status=STATUS_OPERATIONAL),
-        build_frame(BOX_ADDR, FUNC_RETRUDE, [mask, RETRUDE_P_PULL_HUB],
-                    status=STATUS_OPERATIONAL),
-    ]
+    if isinstance(to_buffer_repeats, bool) or not isinstance(
+            to_buffer_repeats, int) or to_buffer_repeats < 0:
+        raise ValueError("to_buffer_repeats muss int >= 0 sein")
+    frames = [build_frame(BOX_ADDR, FUNC_SET_BOX_MODE, [0x00, 0x01],
+                          status=STATUS_OPERATIONAL)]
+    if to_buffer_repeats:
+        frames.append(build_frame(BOX_ADDR, FUNC_FILAMENT_SENSOR_STATE, [0x00],
+                                  status=STATUS_OPERATIONAL))
+        frames.extend(build_frame(BOX_ADDR, FUNC_RETRUDE,
+                                  [mask, RETRUDE_P_TO_BUFFER],
+                                  status=STATUS_OPERATIONAL)
+                      for _ in range(to_buffer_repeats))
+    frames.append(build_frame(BOX_ADDR, FUNC_RETRUDE, [mask, RETRUDE_P_PULL_HUB],
+                              status=STATUS_OPERATIONAL))
+    return frames
+
+
+def requests_from_log_cmds(cmds):
+    """Log-Request-Zeilen ("retries = N, cmd = 0x1 0x5 0xff 0x11 0x1 0x0",
+    nur der cmd-Teil, OHNE F7/CRC) in Voll-Frames wandeln (CRC berechnet)."""
+    out = []
+    for c in cmds:
+        b = [int(x, 16) for x in c.split()]
+        addr, length, status, fun, data = b[0], b[1], b[2], b[3], b[4:]
+        if length != len(data) + 3:
+            raise ValueError("Längenfeld passt nicht: %r" % (c,))
+        out.append(build_frame(addr, fun, data, status=status))
+    return out
+
+
+def filter_funs(frames, funs):
+    """Nur Frames mit fun in funs behalten (z.B. Poll-Abfragen entfernen)."""
+    return [bytes(f) for f in frames if parse_frame(bytes(f))[0] in funs]
 
 
 def check_frames(frames):
@@ -243,6 +285,31 @@ T1A_EXTRUDE = [  # 23:11:55-23:12:21, tnn T1A, 229 mm
     "f7 01 07 00 0e c4 e6 fe 0b f3",
     "f7 01 07 00 0e c4 e6 fe 05 d9",
 ]
+# LIVE 15.10.2026 (klippy.log.2026-10-13, Request-Zeilen „retries = 4,
+# cmd = …“ in Reihenfolge, nur Box-0x01, ohne 0x0a-/0xa2-Polls; keine SN/UUID).
+RETRUDE_LIVE_CMDS_A = [  # 02:34:16-02:34:42, Slot A
+    "0x1 0x5 0xff 0x4 0x0 0x1", "0x1 0x4 0xff 0x8 0x0",
+    "0x1 0x5 0xff 0x11 0x1 0x0", "0x1 0x4 0xff 0xe 0x1",
+    "0x1 0x5 0xff 0x11 0x1 0x0", "0x1 0x4 0xff 0xe 0x1",
+    "0x1 0x5 0xff 0x11 0x1 0x0", "0x1 0x4 0xff 0xe 0x1",
+    "0x1 0x5 0xff 0x11 0x1 0x0", "0x1 0x5 0xff 0x11 0x1 0x1",
+    "0x1 0x4 0xff 0xe 0x1",
+]
+RETRUDE_LIVE_RX_A = [  # zugehörige Antworten (params:-Zeilen), Auszug
+    "f7 01 03 00 04 a1", "f7 01 04 00 08 07 e5", "f7 01 03 00 11 ca",
+    "f7 01 07 00 0e c5 1f d1 e4 5d", "f7 01 03 00 11 ca",
+    "f7 01 07 00 0e c5 1f 36 90 3e", "f7 01 03 00 11 ca",
+    "f7 01 07 00 0e c5 1f 36 9d 1d", "f7 01 03 00 11 ca",
+    "f7 01 03 00 11 ca", "f7 01 07 00 0e c4 29 7e 91 40",
+]
+EXTRUDE_LIVE_CMDS_B = [  # 03:01, Slot B (0x0e-Polls entfernt)
+    "0x1 0x5 0xff 0x4 0x0 0x1", "0x1 0x4 0xff 0xf 0x1", "0x1 0x4 0xff 0x8 0x0",
+    "0x1 0x6 0xff 0x10 0x2 0x0 0x0", "0x1 0x6 0xff 0x10 0x2 0x4 0x0",
+] + ["0x1 0x6 0xff 0x10 0x2 0x5 0x0"] * 5 + [
+    "0x1 0x6 0xff 0x10 0x2 0x6 0x0", "0x1 0x6 0xff 0x10 0x2 0x7 0x3",
+    "0x1 0x3 0xff 0x5", "0x1 0x5 0xff 0x4 0x2 0x0", "0x1 0x4 0xff 0xf 0x0",
+]
+
 RETRUDE = [  # 23:16, -10 mm, Messrad rückwärts
     "f7 01 03 00 11 ca",
     "f7 01 07 00 0e c5 00 91 49 a9",
@@ -282,6 +349,27 @@ def selftest():
           bytes.fromhex("f7 01 06 ff 10 01 05 00 82"))
     check("build retrude start",
           build_retrude_sequence(0x02)[2][5:-1] == bytes.fromhex("02 00"))
+    # LIVE 15.10.2026: Retrude-Requests Slot A == build_retrude_sequence
+    live_r = requests_from_log_cmds(RETRUDE_LIVE_CMDS_A)
+    check("retrude live A (04,08[00],11p0 x4,11p1) == build",
+          filter_funs(live_r, (FUNC_SET_BOX_MODE, FUNC_FILAMENT_SENSOR_STATE,
+                               FUNC_RETRUDE)) == build_retrude_sequence(0x01))
+    check("retrude live: kein 08 [01] zwischen p0 und p1",
+          all(parse_frame(f) != (0x08, b"\x01") for f in live_r))
+    mixed = []
+    for tx, rx in zip(live_r, RETRUDE_LIVE_RX_A):
+        mixed += [tx, bytes.fromhex(rx)]
+    ok, msg = verify_retrude(mixed)
+    check("retrude live TX+RX (%s)" % msg, ok)
+    check("retrude kurzform (0 Wiederholungen)",
+          [parse_frame(f) for f in build_retrude_sequence(0x02, 0)]
+          == [(0x04, b"\x00\x01"), (0x11, b"\x02\x01")])
+    live_e = requests_from_log_cmds(EXTRUDE_LIVE_CMDS_B)
+    check("extrude live B == build_extrude_sequence(0x02, pushes=5)",
+          live_e == build_extrude_sequence(0x02, pushes=5))
+    check("namen 0x08/0x0f (Host) + Aliase",
+          FUNC_FILAMENT_SENSOR_STATE == FUNC_HARDWARE_STATUS == 0x08
+          and FUNC_TIGHTEN_UP_ENABLE == FUNC_MOTOR_ACTION == 0x0F)
     check("slot_to_mask(1) == 0x02", slot_to_mask(1) == 0x02)
     check("preload ref-hi f70105ff0d0f0169",
           build_preload(0x0F, PRELOAD_ENABLE) == bytes.fromhex("f70105ff0d0f0169"))
@@ -297,14 +385,18 @@ def selftest():
           [f[5:7] for f in seq[3:9]] == [b"\x01\x00", b"\x01\x04", b"\x01\x05",
                                           b"\x01\x05", b"\x01\x06", b"\x01\x07"]
           and seq[8][7] == 0x03)
+    rs = build_retrude_sequence(0x04)
     check("retrude p 00/01",
-          build_retrude_sequence(0x04)[4][5:7] == b"\x04\x01")
+          rs[-1][5:7] == b"\x04\x01" and rs[2][5:7] == b"\x04\x00"
+          and len(rs) == 2 + RETRUDE_TO_BUFFER_REPEATS + 1)
     for name, call in (("extrude 0x03", lambda: build_extrude_stage(0x03, 0)),
                        ("extrude 0", lambda: build_extrude_stage(0, 0)),
                        ("retrude 0x0f", lambda: build_retrude_sequence(0x0F)),
                        ("preload 0x10", lambda: build_preload(0x10, 1)),
                        ("preload aktion 4", lambda: build_preload(0x01, 4)),
-                       ("slot 4", lambda: slot_to_mask(4))):
+                       ("slot 4", lambda: slot_to_mask(4)),
+                       ("retrude repeats -1",
+                        lambda: build_retrude_sequence(0x01, -1))):
         try:
             call()
             check("guard " + name, False)

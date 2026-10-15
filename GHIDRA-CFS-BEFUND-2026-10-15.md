@@ -359,3 +359,39 @@ Arbeitsdateien lokal (`/tmp/claude-0/ghidra-cfs/`, flüchtig, nicht im Repo):
   Die Host-Angabe „remain B = 0“ (T1B, Klipper-Zustand) ist ein Host-Wert, kein Wire-Byte.
 - **0x10 mode 5** (`FUN_080045c6`): Odometer-Float wird byteweise umgedreht gesendet (BE) –
   passt zu den Live-0x10-Antworten `f7 01 07 00 10 c4 …` (= negativer Float, Status 0).
+
+## 11. Live-Gegenprobe 15.10.2026 (klippy.log 05.–16.10., Drucker-Zugriff nur lesend)
+
+Details und Belegzeilen: PROTOKOLL-485.md §6. Achtung: Logs vor dem 12.10.2026 00:23
+(Log-Uhr, UTC+8) stammen von Box-FW **113**, danach R153 (= dieser Befund).
+
+**Bestätigt (LIVE BELEGT 15.10.2026):**
+- CRC-Scope `len..data` (alle 36 626 RX-Frames, auch ein defekter Frame mit gleicher Host-CRC).
+- 0x0d op 0/1 sofort (Host sendet Maske 0x0F), op 2 antwortet erst nach dem Vorgang
+  (31–37 s je Slot, eine Sendung); op 2 in IDLE mit belegtem Hub: Pull-back-Blockade (~11 s,
+  Flags 0x90).
+- 0x10 Modi 0/4/5/6/7 wie Tabelle (mode 5 = Odometer-Float BE, st=0c einmal je mode-4-Lauf);
+  0x11 p0/p1 inkl. Fehler 0x14 und **0x19** (Motorblock, Flags 0x91).
+- 0x0a: Byte 3 Zustand (0,1,2,4 gesehen), Byte 4 Sensor-B-/Hub-Maske (= 0x08 [01]), Byte 2
+  Flags (Slotmaske einmalig, 0x90/0x91), in ERROR Status = S[3].
+- 0x04 mode 0/1, 0x08 sel 0/1, 0x03 0xFF/0x00-Semantik, 0x15-Layout, 0x14 „153“+SN.
+- 0x30-Ereignis mit 4 Byte; Werte 1/2/3 passen zu Einstecken / Herausziehen / Preload fertig
+  (Deutung, gestützt).
+- An die Box gehen nur 02/03/04/05/08/0a/0d/0e/0f/10/11/14/15/a2/a3 – alle in §2.
+
+**Widersprochen / neu:**
+- **0x0a Byte 5** („Slot hat gültige RFID-Daten“, §6 Tabelle Zeile 5, V): live **immer 0**
+  (8 268 Frames, auch mit RFID-Spule) → Deutung **unbelegt/widersprochen**.
+- **0x51** (§5: „nur LED-Mapping“): live **echter Fehlercode** in STATE_ERROR, Host-Name
+  SPEED_ERR, key846 „box speed is smaller than extruder“ (452× am 12.10.). Quelle im Code
+  weiter nicht verfolgt.
+- **0x0a Byte 0/1** (§9 offen): langsam gegenläufig variierend → Vermutung Temp °C / Feuchte %
+  (AHT30); nicht gegengeprüft.
+- **FW 113** liefert 0x0a mit nur 4 Datenbytes (Status 0) – nicht mit dem 0x30-Ereignis verwechseln.
+- Fehler löschen: Host nutzt 0x04 [00 01] (ERROR → IDLE), nie 0x10 mode 3.
+- Host-Namen: 0x08 GET_FILAMENT_SENSOR_STATE, 0x0f TIGHTEN_UP_ENABLE (Semantik „Auto-
+  Preload-Sperre“ aus §2 bleibt unsere Deutung), 0x15 GET_HARDWARE_STATUS, Status 0x30
+  UPDATE_STATE.
+
+**Nicht prüfbar (nie live):** 0x0d op 3, Status 0x50, Zustände RELOAD/TEST, 0x06-FW-Bug
+(0x06/0x07/0x09 nie an die Box), Adressen 0xEA/0xEB.

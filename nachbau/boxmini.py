@@ -26,6 +26,11 @@ Belege (alle in /home/pro/k2-fw-live-1.1.7.0/ dokumentiert):
   has_filament nehmen bewusst einen Slot-INDEX 0..3 und wandeln ihn per
   slot_to_mask() um; get_remain nimmt eine Maske.
 
+- LIVE 15.10.2026 (klippy.log 05.-16.10.): Original sendet 0x02/0x03 mit
+  retries=4 (= 5 Sendungen, je 2 s Timeout) -> hier explizit RETRIES_OPERATIONAL.
+  Live 0x03 nach Herausziehen von A: `00 ff 1d 00` (A=0 = Sensor A leer),
+  Filament ohne Tag: 0xff – bestätigt die Ghidra-Deutung oben.
+
 Benutzung: Serial485-Instanz aus serial485.py übergeben (echte Hardware, pyserial).
 Der Selbsttest unten läuft OHNE Hardware (Fake-Transport mit Live-Frames).
 """
@@ -38,6 +43,7 @@ FUNC_GET_REMAIN_LEN = 0x03
 BOX_ADDR = 0x01
 STATUS_OPERATIONAL = 0xFF
 TIMEOUT_OPERATIONAL = 2.0
+RETRIES_OPERATIONAL = 4  # wie Original (live retries=4 für 0x02/0x03, 15.10.2026)
 NO_DATA = 0xFF
 SLOT_KEYS = "ABCD"  # Slot-Index 0..3 -> A/B/C/D (Beleg: Live-Frames)
 SLOT_MASKS = (0x01, 0x02, 0x04, 0x08)
@@ -99,7 +105,8 @@ class BoxMini:
         mask = slot_to_mask(slot)
         raw = self.bus.transact(self.addr, FUNC_GET_RFID, [mask],
                                 status=STATUS_OPERATIONAL,
-                                timeout=TIMEOUT_OPERATIONAL)
+                                timeout=TIMEOUT_OPERATIONAL,
+                                retries=RETRIES_OPERATIONAL)
         parsed = parse_rfid_response(raw)
         return parsed.get(SLOT_KEYS[slot])
 
@@ -115,7 +122,8 @@ class BoxMini:
             raise ValueError("Maske muss 0x00..0x0f sein")
         raw = self.bus.transact(self.addr, FUNC_GET_REMAIN_LEN, [mask],
                                 status=STATUS_OPERATIONAL,
-                                timeout=TIMEOUT_OPERATIONAL)
+                                timeout=TIMEOUT_OPERATIONAL,
+                                retries=RETRIES_OPERATIONAL)
         return parse_remain_response(raw)
 
     def has_filament(self, slot=0):
@@ -127,8 +135,11 @@ class BoxMini:
         hat Slot B mit remain 0 (Vendor unknown) 160 mm gefördert
         (PROTOKOLL-485.md, Abschnitt T1B; „remain 0“ war dort ein Host-Wert).
         Echte Leer-Erkennung bräuchte den Filament-Sensorstatus – laut Ghidra
-        (15.10.2026) liefert 0x08 [00] eine Bitmaske Sensor A (Deutung
-        „Einlauf“ unbelegt, nicht live geprüft) -> TODO, hier nicht genutzt.
+        (15.10.2026) liefert 0x08 [00] eine Bitmaske Sensor A; LIVE BELEGT
+        15.10.2026 (Host-Name GET_FILAMENT_SENSOR_STATE, [00] -> 07 bei
+        A,B,C belegt / D leer, deckungsgleich mit remain D 00) -> nutzbar
+        über box.BoxAction.communication_get_filament_sensor_state; hier
+        bewusst nicht eingebaut (BoxMini bleibt minimal).
         Ungültiger Index -> ValueError.
         """
         mask = slot_to_mask(slot)
@@ -180,7 +191,8 @@ def selftest():
     box = BoxMini(bus)
     check("box remain", box.get_remain() == {"A": 26, "B": 0, "C": None, "D": 0})
     check("remain request mask", bus.calls[0][2] == [0x0F] and
-          bus.calls[0][3]["status"] == STATUS_OPERATIONAL)
+          bus.calls[0][3]["status"] == STATUS_OPERATIONAL
+          and bus.calls[0][3]["retries"] == RETRIES_OPERATIONAL == 4)
     check("box filament A", box.has_filament(0) is True
           and bus.calls[1][2] == [0x01])
 
@@ -204,6 +216,12 @@ def selftest():
         check("remain laengen-guard", False)
     except ValueError:
         check("remain laengen-guard", True)
+    # 5. LIVE 15.10.2026: remain nach Herausziehen A (klippy.log.2026-10-13)
+    check("live remain 00 ff 1d 00", parse_remain_response(
+        bytes.fromhex("00 ff 1d 00")) == {"A": 0, "B": None, "C": 29, "D": 0})
+    bus = _FakeBus([bytes.fromhex("f7 01 07 00 03 00 ff 1d 00 20")])
+    check("live remain frame A=0 -> has_filament None",
+          BoxMini(bus).has_filament(0) is None)
     check("slot_to_mask", [slot_to_mask(i) for i in range(4)]
           == [0x01, 0x02, 0x04, 0x08])
     print("SELBSTTEST: %s" % ("ok" if fails == 0 else "%d FEHLER" % fails))

@@ -25,15 +25,15 @@ Audit und Änderungsbegründungen: `/home/pro/k2-fw-live-1.1.7.0/AUDIT-UND-AENDE
 ## Offen – Mitschnitt
 - [x] `klippy.log` loggt ALLE 485-Frames selbst (`cmd_485_send_data_with_response params:`) – kein Hardware-Mitschnitt nötig
 - [x] CRC geknackt: CRC-8/ATM (poly 0x07, init 0x00) über `[len..data]`, head/addr NICHT enthalten
-- [x] Belt-Frames live verifiziert (Version/Flash/ADC), UUID `a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 aa ab`
+- [x] Belt-Frames live verifiziert (Version/Flash/ADC), UUID `b0 5d … (12 B UUID, gekürzt)`
 - [x] Box-Func-Codes live (Stand: 0x02 RFID, 0x03 Remain, 0x04 Box-Mode, 0x05 Buffer,
   0x08 HW-Status, 0x0a Box-State/Event, 0x0d SET_PRE_LOADING/RFID-Control (live nur ACK len 3; Aktionen 00/01/02 =
   disable/enable/Force-Read, KORRIGIERT 15.10.2026), 0x0e Messrad-Float,
   0x0f ~~Motor-Action~~ Auto-Preload-Sperre (KORRIGIERT 15.10.2026, Ghidra), 0x10/0x11 Extrude/Retrude, 0x14 Version/SN, 0xa2 Auto-Addr;
   Details in PROTOKOLL-485.md – Zeile 25 oben war ein veralteter Zwischenstand)
 - [x] Falsche-Syntax-Falle dokumentiert: `NUM=A` → Shutdown, `NUM=0..3` korrekt
-- [x] CFS-Antworten eingefangen: Slot 1 mit Spule → `remain A=26%` (`f7 01 07 00 03 1a 00 ff 00 99`), RFID-Tag-Daten via Query (SN `SN-DEMO-1234567890X`, Tag 1.5.3, vender `101250000001010010FFFFFF0000000000000000`, color `0FFFFFF/0ce58f8/026eeee`, material `101001/000001/000001`)
-- [x] RFID-Vollantwort dekodiert: `A:101250000001010010FFFFFF0000000000000000;...` (ASCII, `:`/`;`-Separatoren, Key=Slot-Buchstabe)
+- [x] CFS-Antworten eingefangen: Slot 1 mit Spule → `remain A=26%` (`f7 01 07 00 03 1a 00 ff 00 99`), RFID-Tag-Daten via Query (SN `SN-DEMO-…(SN gekürzt)`, Tag 1.5.3, vender `1012…(gekürzt, mat 101001/col 0FFFFFF)…`, color `0FFFFFF/0ce58f8/026eeee`, material `101001/000001/000001`)
+- [x] RFID-Vollantwort dekodiert: `A:1012…(gekürzt, mat 101001/col 0FFFFFF)…;...` (ASCII, `:`/`;`-Separatoren, Key=Slot-Buchstabe)
 - [x] RFID-Zustände: `unknown` / `busy` / Hex-Daten; preloading_mask 0x1/0x2 = Slot-Bitmaske
 - [x] Extrude-Sequenz T1A live: Func `0x10` State-Machine, `0x0e`=MEASURING_WHEEL, `0x05/0x04/0x0f` Aufräumen
 - [x] CRC-Quelle als Python-Source gesichert (lokal, nicht im Repo; Beleg im
@@ -44,7 +44,7 @@ Audit und Änderungsbegründungen: `/home/pro/k2-fw-live-1.1.7.0/AUDIT-UND-AENDE
   das Log-Format nutzt unpadded `%x` (`0x2` statt `0x02`), was wie Abschneiden aussah.
   Nachgezählt: 49 Tokens, len=0x2e=46 → 46+3=49 ✓, CRC-8/ATM über [len..data] = 0xd7 ✓
   (anonymisierter Frame; Original-CRC 0x02 bezog sich auf die echten Bytes).
-  Kompletter Inhalt: `A:101250000001010010FFFFFF0000000000000000;` (43 Datenbytes, endet mit `;`).
+  Kompletter Inhalt: `A:1012…(gekürzt, mat 101001/col 0FFFFFF)…;` (43 Datenbytes, endet mit `;`).
   Farbe/Material/Restmenge kommen aus SEPARATEN Abfragen, nicht aus diesem Frame.
 
 ## Offen – Pi-Ersatz (VOLL – Belt + PrTouch + CFS müssen laufen)
@@ -128,6 +128,8 @@ Audit und Änderungsbegründungen: `/home/pro/k2-fw-live-1.1.7.0/AUDIT-UND-AENDE
 Details je Befund: `AUDIT-UND-AENDERUNGEN.md`, Abschnitt „Review 15.10.2026 (Agents) + Korrekturen“.
 Selbsttests 15.10.2026 (ausgeführt in `nachbau/`, `ok`-Zeilen gezählt, alle grün):
 serial485 81/81 · box 68 (nach fake-name-Einarbeitung 83, nach Ghidra-Einarbeitung 101) · boxmini 15 · cfsseq 17 (nach Ghidra 21) · motor 65 · motor_mini 20 · auto_addr 31.
+**Stand 15.10.2026 nach Live-Log-Einarbeitung:** serial485 81 · box 126 · boxmini 17 · cfsseq 28 ·
+motor 98 · motor_mini 30 · auto_addr 31 – alle grün.
 
 - [x] `serial485.py`: Empfangspfad (fragmentierte/>64-B-Frames weitergelesen, Puffer
   komplett abgearbeitet, fremde gültige Frames als Ganzes übersprungen, len außerhalb
@@ -144,14 +146,18 @@ serial485 81/81 · box 68 (nach fake-name-Einarbeitung 83, nach Ghidra-Einarbeit
   Store im printer.cfg-Format)
 - [x] Doku: Preload-Belegung, 0x0d, Remain-0-Semantik, Offline-Schwelle (`> 3` = 4. Check),
   Masken-Hinweis in API-box_wrapper.md korrigiert
-- [ ] Retry-Zählung am klippy.log nachzählen: meint Original `retries = 4` 4 oder 1+4
-  Sendungen? (Nachbau: 5 Sendungen)
+- [x] Retry-Zählung am klippy.log nachzählen: meint Original `retries = 4` 4 oder 1+4
+  Sendungen? (Nachbau: 5 Sendungen) – **ERLEDIGT, LIVE BELEGT 15.10.2026:** 1+4 = 5
+  Sendungen, je ~2 s (`klippy.log.2026-10-05:63472–63521`); retries=0 für 0x0a-Poll,
+  Auto-Addr, Motoren, Broadcasts → `box.FUNC_RETRIES` (PROTOKOLL-485.md §6.2)
 - [x] 0x0d-Semantik (ERLEDIGT 15.10.2026, Ghidra `FUN_0800f0da`): op 0/1 = disable/enable
   global (Maske ignoriert), op 2 = Forced Preload mit RFID, op 3 = ohne RFID; Status
   0/1/3/0x16 (+ Pull-back-Fehler); Antwort bei op 2/3 erst nach Vorgang (~3 min pro Slot)
-- [ ] Preload/Force-Read **live mitschneiden – bleibt sinnvoll als Gegenprobe** zum
+- [~] Preload/Force-Read **live mitschneiden – bleibt sinnvoll als Gegenprobe** zum
   Ghidra-Befund (bisher nur leeres ACK len 3; Request-Bytes des Hosts, Laufzeit bis zur
-  Antwort, Status-Byte, Ablauf op 2 vs. 3)
+  Antwort, Status-Byte, Ablauf op 2 vs. 3) – **TEILWEISE ERLEDIGT 15.10.2026 (Live-Logs):**
+  op 0/1/2 live (55 Requests; [0f 01]/[0f 00] sofort, [01 02] nach 31–37 s, Status 0);
+  **op 3 nie live**; [00 02]-Bursts ohne Antwort offen (PROTOKOLL-485.md §6.4)
 - [x] Status-Byte-Werte belegt (15.10.2026, Ghidra): 0 ok, 1 ungültig, 2 CRC, 3 busy/
   Zustand, Ablauf-Fehler 0x05–0x19, 0x30/0x50 nur bei 0x0a – `box.STATUS_NAMES`
 - [ ] Status-Byte (`raw[3]`) der Antworten auswerten (Fehler/Busy) –
@@ -164,19 +170,29 @@ serial485 81/81 · box 68 (nach fake-name-Einarbeitung 83, nach Ghidra-Einarbeit
 - [ ] `serial485.Wrapper._done` wächst unbegrenzt (nie abgeholte Antworten) – Aufräumen/Limit
 - [ ] Hintergrund-Thread kann `get_response` Antworten wegschnappen, wenn zwischen
   `raw_send` und `get_response` eine Lücke ist – Registry/Zuordnung klären
-- [ ] Motor 0x06: Position der ID 70 im Frame klären – getrennter TX/RX-Mitschnitt
-  (Live-Frame `f7 81 07 00 06 00 00 96 43 09` trägt nur den Float)
+- [x] Motor 0x06: Position der ID 70 im Frame klären – getrennter TX/RX-Mitschnitt
+  (Live-Frame `f7 81 07 00 06 00 00 96 43 09` trägt nur den Float) – **ERLEDIGT 15.10.2026:**
+  ID im Request (`[02,id]` lesen, `[01,id]+<f>` schreiben, `[03]` übernehmen); der Frame
+  war die Antwort; Werte flüchtig (PROTOKOLL-485.md §3.1, umgesetzt in motor.py)
 - [ ] Erase (0xF0/0x06) belegen: nur CFS-Typ 1/10 dekompiliert, für Motoren unbelegt
   (im Nachbau nur mit `erase=True`)
 - [ ] Motor 0x08 (laut grant0013 „get feedback“) live prüfen – Kandidat fürs echte
   Encoder-Lesen; `read_encoder` bleibt bis dahin gesperrt
-- [ ] Motor 0x0C: Protection-Semantik (grant0013/k2-vanilla) gegen Plus-Frame `00*8` prüfen
-- [ ] Motor 0x12 (dev_uuid) und 0x0E (read/set_addr) am Plus mitschneiden
-  (Stock-Bootsequenz laut grant0013: `FF 0E 01`, `8x 12 02`, `8x 0E 02`)
-- [ ] Transparent-Pfad über Main-MCU (`transparent_send`/`transparent_response`) für
-  Pi-Ersatz klären: Motoren am Plus direkt am Bus oder nur via MCU erreichbar?
-- [ ] 226-Param-Map (grant0013 `motor_params_map.md`) mit Plus-klippy.log abgleichen
-  (flash_param-Enumeration), ID 70 = Kp bestätigen
+- [x] Motor 0x0C: Protection-Semantik (grant0013/k2-vanilla) gegen Plus-Frame `00*8` prüfen
+  – **ERLEDIGT 15.10.2026:** Request `[0b]` → 8 B Status (00 = ok), `[05]` ohne Antwort;
+  „8-Byte-Parameter“ WIDERLEGT (`motor.check_protection`)
+- [x] Motor 0x12 (dev_uuid) und 0x0E (read/set_addr) am Plus mitschneiden
+  (Stock-Bootsequenz laut grant0013: `FF 0E 01`, `8x 12 02`, `8x 0E 02`) – **ERLEDIGT
+  15.10.2026 (Live-Logs):** beide live, Bootsequenz Plus in PROTOKOLL-485.md §3.1
+  (`motor.read_485_addr`/`read_uuid`)
+- [x] Transparent-Pfad über Main-MCU (`transparent_send`/`transparent_response`) für
+  Pi-Ersatz klären: Motoren am Plus direkt am Bus oder nur via MCU erreichbar? –
+  **GEKLÄRT 15.10.2026:** X/Y/Z/Z1 direkt am ttyS5, **nur der Extruder** über transparent
+  (Adresse 0x81; 0x85 auf ttyS5 antwortet nie)
+- [x] 226-Param-Map (grant0013 `motor_params_map.md`) mit Plus-klippy.log abgleichen
+  (flash_param-Enumeration), ID 70 = Kp bestätigen – **ERLEDIGT 15.10.2026:** **227** IDs
+  (0–226), Namen identisch; ID 70 = Kp bestätigt; Log-Falle `value:N` = ID
+  (`motor.SYS_PARAM_NAMES`)
 - [x] Code-Restwiderspruch: `box.get_measuring_wheel`-Docstring nennt noch
   `c5019149 -> -2073,08` (Tippfehler, korrekt c5009149 = −2057,08) – Code-Agent
   (ERLEDIGT: Docstring nennt c5009149 und markiert den Tippfehler als KORREKTUR)
@@ -202,14 +218,18 @@ PROTOKOLL-GESAMT.md 1.9.
 ## Offen – aus Ghidra-Neuanalyse CFS-FW (15.10.2026)
 
 Details: `GHIDRA-CFS-BEFUND-2026-10-15.md` §9/§10.
-- [ ] Quelle von 0x0a Byte 0/1 (S[1]/S[0], live 0x13 0x34; = 0x52-Antwort)
+- [ ] Quelle von 0x0a Byte 0/1 (S[1]/S[0], live 0x13 0x34; = 0x52-Antwort) – LIVE 15.10.2026:
+  langsam gegenläufig (b0 0x11–0x1c, b1 0x2d–0x39) → Vermutung Temp °C / rel. Feuchte;
+  mit Hygrometer gegenprüfen
 - [ ] R[3]-Quelle (0x0a Byte 2, Flag 0x80 – Motorblock?)
 - [ ] Bedeutung Config #6 (0x0c lesen / 0x50 schreiben + Reset) – NICHT senden (0x50 resettet)
-- [ ] Inhalt 0x15 (6 Einträge `((i+1)<<4)|X[i]`)
+- [ ] Inhalt 0x15 (6 Einträge `((i+1)<<4)|X[i]`) – live `10 20 30 40 50 60 00…` (alle X = 0),
+  Host-Name GET_HARDWARE_STATUS; Bedeutung von X weiter offen
 - [ ] Init der Auto-Addr-Tabelle (0xA0–0xA3 in der App)
 - [ ] Physische Zuordnung Sensor A/B (Pin-Tabelle @0x20000218; Deutung A = Einlauf, B = Hub)
 - [ ] cfs6-Handler 0x16–0x19/0x57 (Trockner?) im Detail
-- [ ] Weitere Fehlercodes nur im LED-Mapping (0x1a, 0x20, 0x22, 0x51–0x53) – Quellen
+- [ ] Weitere Fehlercodes nur im LED-Mapping (0x1a, 0x20, 0x22, ~~0x51~~, 0x52, 0x53) – Quellen
+  (0x51 LIVE 15.10.2026 als SPEED_ERR belegt, key846)
 - [ ] 0x0d op 2 mit Mehrfachmaske: Laufzeit summiert sich je Slot (bis > 12 min bei 4 Slots)
   – live prüfen, ob der Host (box_wrapper) dafür eigene Timeouts hat (.so: SET_PRE_LOADING=300 s)
 - [ ] 0x06 Feeder-Kommando: FW-Bug (Maske aus r7) → am Bus praktisch immer Status 1; nicht
@@ -230,3 +250,37 @@ Details: `GHIDRA-CFS-BEFUND-2026-10-15.md` §9/§10.
 - [x] CFS-FW R153 analysiert (942 Funktionen, RT-Thread/MS3791/at8236/AHT30, Details in PROTOKOLL-GESAMT.md)
 - [x] `raw_send_wait_ack`: Dispatcher dekompiliert; CRC-Algorithmus als Source (`auto_addr_wrapper.py`) + 10 Live-Frames belegt – für Nachbau abgeschlossen
 - [x] CFS-Details: 942 Funktionen, RT-Thread/MS3791/at8236/AHT30, finsh-Shell, RFID-Frame vollständig verifiziert (unpädded `%x`-Format, kein Abschneiden)
+
+## Live-Logs 15.10.2026 – Pi-Ersatz, Kanal A, offene Punkte
+
+Quelle: `live-logs-2026-10-15/` (lokal, nicht fürs Repo), Auswertung PROTOKOLL-485.md §3.1/§6.
+
+### Pi-Ersatz (Folgerungen aus der Live-Bootsequenz)
+- [ ] **Ein** RS485-Port (Stock ttyS5, 230400) reicht für X/Y/Z/Z1 + CFS + Belt – eine
+  gemeinsame Queue, kein paralleler Zugriff (Motor-, CFS- und Auto-Addr-Frames verschränkt)
+- [ ] Pi muss die **Motor-Init** übernehmen (Broadcast `FF 0E 01`, `0E 02`/`12 02`, Stall-Mode,
+  Protection `0C [0b]`, flash_param-Lesen) und die **Sys-Params nach jedem Kaltstart neu
+  schreiben** (0x06 Sub 01/03 flüchtig, sonst Board-Defaults Kp 300 / err_time 0,01 / …)
+- [ ] GPIO-Phase („initial/restore set_pin_io“ der Motor-dir/step-Pins) vor/nach der
+  Adressabfrage braucht die **Main-MCU**
+- [ ] Extruder-Motor nur über `transparent_send` (nozzle_mcu, Adresse 0x81) – Creality-
+  Klipper-MCU-FW mit `config_transparent` oder eigene Lösung nötig
+
+### Kanal-A-Diagnose (Slot A zieht nicht ein) – Live-Befund 13.–16.10.
+- Einzug bricht **reproduzierbar nach ≈ 240–250 mm** ab: Status **0x0c** (Odometer-Stillstand),
+  Odometer steht (`klippy.log.2026-10-13:104571→104608`, 128278, 128451) → key836
+  „blockage between the connections and the filament sensor“ (128530), Box ERROR 0x0c
+- **0x19 Motorblock beim Rückzug** (0x11 [01 01], 2×, key865, Flags 0x91; 13:95746/95885);
+  Pull-back per 0x0d [00 02] mit A im Hub: 11 s Blockade, Hub bleibt belegt
+- Vorgeschichte 12.10.: **0x51 SPEED_ERR** mit A im Hub während Druck (key846), key845 Düse blockiert
+- **Aktuell (14./16.10.):** Box IDLE, **Hub-Sensor meldet weiterhin Slot A** (0x0a Byte 4 = 01)
+  → Verdacht **Filamentrest im Hub / Förderrolle bzw. Pfad A** (mechanisch, nicht Bus –
+  alle A-Kommandos sauber quittiert); **B/C/D fehlerfrei**
+- RFID A: Spule ohne Tag (A:unknown, remain 0xFF) – kein Defektbeleg
+- [ ] Hub/Pfad A mechanisch prüfen (Filamentrest entfernen), danach 0x0a Byte 4 = 00 kontrollieren
+
+### Offen nach den Live-Logs
+- [ ] 0x0d op 3 und Status 0x50 – live nie gesehen
+- [ ] 0x0d [00 02]-Bursts (5 Sendungen in ~20 ms) – warum keine Antwort?
+- [ ] 0x0a Byte 0/1 = Temp/Feuchte gegenprüfen (Hygrometer)
+- [ ] Motor 0x05 (`[01]/[02]` bei BELT_TENSION, nie Antwort) – Semantik

@@ -21,7 +21,7 @@ len = len(data) + 3
   - `f7 21 07 00 00 01 02 03 04 f0` (Version-Resp: hal 0102 / soft 0304)
   - `f7 21 10 00 02 03 ... 3d` (Flash-Resp: place=147)
   - `f7 21 07 00 06 ff f8 c7 12 4c` (ADC-Resp -> 135,18 N)
-  - `f7 01 11 00 a2 01 00 a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 aa ab f0` (Auto-Addr)
+  - `f7 01 11 00 a2 01 00 b0 5d … (12 B UUID, gekürzt) a3` (Auto-Addr)
   - `f7 01 07 00 03 ff ff ff 00 98` (GET_REMAIN_LEN: 255 = keine Daten)
   - `f7 01 09 00 0a 13 34 00 00 00 00 d7`
 - Antwort: `[0]==0xF7`, `[1]==addr`, `[2]=len`, `[4]=fun`, Daten `rec[5 : len-3+5]`
@@ -60,11 +60,14 @@ GCode: `BELT_MDL_INFO/MOVE(POS)/SET(MDL_N)/CALI(DIR,TEN)/TEST`, Fehler `key712-k
   Host-MCU `linux` K2_1.1.3.2; Mainboard-Klipper `1.1.0.48-293-g493f9a0f-dirty`
 - Live-Serials: `[mcu]=/dev/ttyS2`, `[nozzle]=/dev/ttyS3`, `[485]=/dev/ttyS5 @230400`
   (Image 1.1.3.13 hatte ttyS7/ttyS1/ttyS6 @460800 → Board-Revision anders!)
-- `auto_addr` UUID (mb_addr_table_uniids): `a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 aa ab`
+- `auto_addr` UUID (mb_addr_table_uniids): `b0 5d … (12 B UUID, gekürzt)`
   = exakt die 12 Bytes im 0xa2-Frame nach `01 00`
-- Bus-Polling idle: alle ~2s `0xa2`-Frame an addr 0x01, 4 Retries, dann Timeout (CFS aus)
+- Bus-Polling idle: alle ~2s `0xa2`-Frame an addr 0x01, ~~4 Retries, dann Timeout~~ (CFS aus)
+  **KORRIGIERT – LIVE BELEGT 15.10.2026:** 0xa2 läuft mit `retries = 0` (eine Sendung je ~2 s,
+  19 684× in den Logs, z.B. `klippy.log.2026-10-12:2106`), passt zu
+  Klartextquelle `auto_addr_wrapper.py`:468 (lokal, nicht im Repo) (`retransmit=False`). Details §6.2.
 - Box-Live-State: `disconnect` (CFS nicht angeschlossen), T1 hat aber gespeicherte
-  RFID-Daten (vender `101250000001010010FFFFFF0000000000000000`, remain 32/0/100/0)
+  RFID-Daten (vender `1012…(gekürzt, mat 101001/col 0FFFFFF)…`, remain 32/0/100/0)
 
 ## 2. CFS (Filament-Box) – RS485-Bus
 
@@ -105,10 +108,13 @@ Belege: `nachbau/ref-hi/valid_messages.json` `f70105ff0d0f0169` =
 `files/box_protocol.py` (`CMD_RFID_CONTROL=0x0D`): `set_rfid_insert_reading(enabled)`
 → `(0, int(enabled))`, `force_rfid_read(mask)` → `(mask, 2)`. Die alte
 Arm/Disarm-Belegung war durch keinen Frame gestützt und widerspricht beiden Referenzen.
-**Kein Live-0x0d-Request auf dem K2 Plus belegt** – live nur ein leeres ACK
+~~**Kein Live-0x0d-Request auf dem K2 Plus belegt** – live nur ein leeres ACK
 (len 3, nach GET_RFID); Byte-Form `f7 01 03 00 0d 9e` = ref-hi-ACK (CRC 0x9e ✓).
 Offen: ob das 1. Byte bei 0x00/0x01 die Maske
-ist (ref-hi: 0x0F) oder ignoriert wird (vanilla: 0). Nachbau:
+ist (ref-hi: 0x0F) oder ignoriert wird (vanilla: 0).~~ **ÜBERHOLT – LIVE BELEGT
+15.10.2026:** 55 0x0d-Requests in den klippy.logs (Host sendet `[0f 01]` 22×, `[0f 00]`
+3×, `[01 02]` 4×, `[00 02]` 26 Sendungen in Bursts); der Host schickt bei op 0/1 die
+Maske 0x0F. Latenzen und offene Punkte s. §6.4. Nachbau:
 `box.build_preload(mask, action)` / `cfsseq.build_preload(mask, action)`,
 Konstanten `PRELOAD_DISABLE/ENABLE/FORCE_READ = 0x00/0x01/0x02`
 (+ `PRELOAD_FORCE_TENSION_ONLY = 0x03` seit 15.10.2026, s. unten).
@@ -168,25 +174,23 @@ früheren Fehlschläge). Display-Flow bleibt zusätzlich belegt.
 
 ### RFID-Frame LIVE DEKODIERT (12.10.2026, 22:52:19)
 
-`f7 01 2e 00 02 41 3a 31 30 31 32 35 30 30 30 30 30 30 31 30 31 30 30 31 30 46 46 46 46 46 46 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 3b d7`
-(Vendor-Bytes anonymisiert, gleiche Länge und Feldstruktur; CRC 0xd7 neu berechnet und verifiziert)
+`f7 01 2e 00 02 41 3a 33 41 39 32 … (Vendor-ASCII gekürzt) … 3b ...`
 
 - Func `0x02` = GET_RFID-Antwort, Daten als **ASCII**: `A:<hex>;...`
-- `A:` = Slot-Key, dann Vendor-Hex `101250000001010010FFFFFF0000000000000000`, dann `;` –
+- `A:` = Slot-Key, dann Vendor-Hex `1012…(gekürzt, mat 101001/col 0FFFFFF)…`, dann `;` –
   VOLLSTÄNDIG (13.10. nachverifiziert: 49 Tokens, len=0x2e → 46+3=49 ✓, CRC=0xd7 ✓
   über dem anonymisierten Frame;
   das `0x2` am Ende ist unpadded `%x`-Format, KEIN Abschneiden).
   Farbe/Material/Restmenge kommen aus separaten Abfragen.
 - **Kurzform:** `f7 01 0d 00 02 42 3a 75 6e 6b 6e 6f 77 6e 3b 8e` = `B:unknown;` (len 0x0d, Slot ohne erkannten Tag → ASCII "unknown")
 - **Weitere Zustände:** `f7 01 0a 00 02 43 3a 62 75 73 79 3b 54` = `C:busy;` (len 0x0a, Slot dreht/ließt gerade), später `C:unknown;` (Tag noch nicht gelesen)
-- Passt exakt zum Query: `vender=101250000001010010FFFFFF0000000000000000`; ~~danach folgen vermutlich color / material_type / remain als weitere `;`-Felder~~
+- Passt exakt zum Query: `vender=1012…(gekürzt, mat 101001/col 0FFFFFF)…`; ~~danach folgen vermutlich color / material_type / remain als weitere `;`-Felder~~
   **KORRIGIERT 15.10.2026:** keine weiteren Felder – Farbe und Material stecken IM
   40-Zeichen-vender (20 Byte als Hex/ASCII). Feldlayout (Quelle fake-name `firmware.md:340-352`
   printf-Feldnamen, `firmware.md:521-523` Beispiel 11+13+16 = 40 Zeichen; Belegstärke
   mittel-stark): `month(1) day(2) year(2) supplier(4) batch(2) · mat_id(6) col(7) ·
-  len(4) number(6) reserve(6)`. Unser Live-Vendor zerfällt sauber (Repo: Platzhalter mit gleicher Struktur; echte
-  day/year/supplier/batch/len/number entfernt):
-  `1|01|25|0000|00 · 101001|0FFFFFF · 0000|000000|000000` → mat_id `101001` (= Hyper PLA,
+  len(4) number(6) reserve(6)`. Unser Live-Vendor zerfällt sauber:
+  `1|01|…(Platzhalter, gekürzt)… · 101001|0FFFFFF · …` → mat_id `101001` (= Hyper PLA,
   deckt sich mit Query `material_type`), col `0FFFFFF` (= Query `color_value`, weiß).
   Offen: Datumskodierung (der echte day-Wert ist nicht dezimal), Einheit von `len`.
   Nachbau: `nachbau/box.py` `split_rfid_vendor()` (Selbsttest feldweise).
@@ -221,8 +225,13 @@ früheren Fehlschläge). Display-Flow bleibt zusätzlich belegt.
        PRELOAD/RELOAD
 0x05 = GET_BUFFER_STATE (Box-Adresse 0x01, Request leer; 1 Byte Buffer-State;
                          die frühere Bezeichnung CUT_STATE war falsch)
-0x08 = GET_HARDWARE_STATUS (Request [Kanal], Toolhead-/Hardware-Sensorstatus)
-0x0a = Herzschlag/Poll (6 Datenbytes, Zustand; alle ~4s)
+0x08 = ~~GET_HARDWARE_STATUS (Request [Kanal], Toolhead-/Hardware-Sensorstatus)~~
+       **KORRIGIERT – LIVE BELEGT 15.10.2026 (Host-Name im klippy.log):
+       GET_FILAMENT_SENSOR_STATE** (`.so` `communication_get_filament_sensor_state(addr,
+       pos)`): [00] → Bitmaske Sensor A (live `07` = A,B,C belegt), [01] → Bitmaske
+       Sensor B/Hub (= 0x0a Byte 4). GET_HARDWARE_STATUS ist **0x15** (s. unten)
+0x0a = Herzschlag/Poll (6 Datenbytes, Zustand; alle ~4s; Host-Name GET_BOX_STATE;
+       **LIVE 15.10.2026:** Poll mit `retries = 0`; Box-FW 113 liefert nur 4 Datenbytes)
        ~~Kandidaten für das Zustandsbyte (SCHWACH, nur FW-Strings ohne Zahlenwerte,
        fake-name firmware.md:322/562-567): STATE_IDLE/PRELOAD/PRINT/RELOAD/ERROR/
        TEST/CHECK_HUB – Zuordnung zu b0/b1 unbelegt.~~
@@ -243,13 +252,19 @@ früheren Fehlschläge). Display-Flow bleibt zusätzlich belegt.
        → c5009149 = −2057,08); Betrag wächst beim Fördern.
        Gilt auch für 0x10-Push-Replies. Unabhängig bestätigt: gitstonelabs.)
 0x14 = GET_VERSION_SN (Hi- wie K2-BELEGT: Hi-Request `f7 01 03 ff 14 06`;
-       K2-Response 13.10.: `f7 01 19 00 14 ... d4`, Daten ASCII "153"+
-       "SN-DEMO-1234567890X" = CFS-App-Version + SN, CRC ok)
+       K2-Response 13.10.: `f7 01 19 00 14 ...`, Daten ASCII "153"+
+       SN (19 Zeichen, `SN-DEMO-…`, gekürzt) = CFS-App-Version + SN, CRC ok;
+       LIVE 15.10.2026: bis 12.10. 00:23 „113“+SN, danach „153“+SN)
+0x15 = GET_HARDWARE_STATUS (Host-Name, LIVE BELEGT 15.10.2026; Request leer,
+       Antwort 16 B `10 20 30 40 50 60` + 10×`00`, 10 Requests)
 0x0f = ~~CTRL_CONNECTION_MOTOR_ACTION (Request [01] Engage / [00] Release)~~
        WIDERLEGT 15.10.2026 (Ghidra, inline im Dispatcher): **Auto-Preload-Sperr-
        Flag** S[8] (0x200037d8): [01] = automatisches Preload gesperrt, [00] =
        freigegeben; KEINE Motor-Aktion. Bytes/Live-Flanke unverändert gültig
        (Host sperrt Auto-Preload während Load). Motor-Kommandos: 0x06/0x07/0x09
+       **Host-Name (LIVE 15.10.2026): TIGHTEN_UP_ENABLE** (`.so`
+       `communication_tighten_up_enable(addr, enable)`); [01] vor dem Load, [00] nach
+       0x04 [m 00]. Unsere Ghidra-Semantik „Auto-Preload-Sperre“ bleibt als Deutung.
 0x10 = EXTRUDE_PROCESS (Request [Slotmaske, Stufe, Parameter]:
        [slot 00 00] init, [slot 04 00] engage, [slot 05 00] push,
        [slot 06 00] settle, [slot 07 03] finalize; 0x05-Push wiederholt
@@ -261,10 +276,13 @@ früheren Fehlschläge). Display-Flow bleibt zusätzlich belegt.
        + Buffer-Check, 07 03 = **Extruder-Check mit p = 3 mm**. Tabelle unten.
 0x11 = RETRUDE_PROCESS (Request START [Slotmaske 00], FINISH [Slotmaske 01];
        K2-Logs zeigen die dazugehörigen kurzen ACKs `f7 01 03 00 11 ca`)
+       **LIVE 15.10.2026:** Folge `04[00 01] 08[00] 11[m 00]`×(meist 4) `11[m 01]`,
+       KEIN `08[01]` dazwischen (0/23) – s. §6.5
        BELEGT 15.10.2026 (Ghidra `FUN_08004d90`): p=0 = Feeder+Hauptmotor
        rückwärts bis Buffer-Sensor (≤5 s, sonst 0x13); p=1 = rfid_mgr_fila_back
        + pull_back_hub (0x17/0x19/0x14); sonst Status 1; mask 0 = alle Slots
-0xa2 = Auto-Addr/SN-Query (f7 01 11 00 a2 01 00 <12B uuid> <crc>, Poll alle ~2s)
+0xa2 = Auto-Addr/SN-Query (f7 01 11 00 a2 01 00 <12B uuid> <crc>, Poll alle ~2s,
+       retries = 0 – LIVE 15.10.2026)
 ```
 
 STATUS-Byte: Die unabhängige Referenz nutzt `0xFF` für CFS-Operational-Requests
@@ -399,24 +417,28 @@ Filament → 0x16 + ERROR. p=0: Feeder + Hauptmotor rückwärts P[7] bis Buffer-
 | 0x16 | Slot ohne Filament (setzt STATE_ERROR) |
 | 0x17 | pull_back_hub: Sensor A nicht aktiv |
 | 0x18 | intern „kein Slot belegt“ → auf 0x16 abgebildet |
-| 0x19 | pull_back_hub motor block |
-| 0x30 | **nur 0x0a**: Preload-Ereignis anstehend (4 B je Slot 1/2/3) (B+L) |
-| 0x50 | **nur 0x0a** in STATE_PRINT: Sensorprüfung ≠ 0 (V: Runout) |
+| 0x19 | pull_back_hub motor block (LIVE 15.10.2026: 2× bei 0x11 [01 01], key865) |
+| 0x30 | **nur 0x0a**: Preload-Ereignis anstehend (4 B je Slot 1/2/3) (B+L); Host-Name **UPDATE_STATE** (LIVE 15.10.2026) |
+| 0x50 | **nur 0x0a** in STATE_PRINT: Sensorprüfung ≠ 0 (V: Runout); live nie gesehen |
+| 0x51 | **LIVE BELEGT 15.10.2026:** Fehlercode in STATE_ERROR, Host-Name **SPEED_ERR**, key846 „empty printing, box speed is smaller than extruder“ (452× am 12.10.); vorher nur aus LED-Mapping bekannt |
 | S[3] | nur 0x0a in STATE_ERROR: gespeicherter Fehlercode |
 
 Fehler ∉ {1,3} setzen STATE_ERROR mit S[3]=Code (`FUN_08003e3a`); löschen per 0x10 mode 3.
-Weitere Codes nur im LED-Mapping (0x1a, 0x20, 0x22, 0x51–0x53), Quellen offen.
+**LIVE 15.10.2026:** der Host löscht Fehler stattdessen per 0x04 [00 01] (ERROR → IDLE),
+0x10 mode 3 wird nie gesendet.
+Weitere Codes nur im LED-Mapping (0x1a, 0x20, 0x22, ~~0x51~~, 0x52, 0x53), Quellen offen
+(0x51 inzwischen live als SPEED_ERR belegt, s. oben).
 
 **0x0a Box-State** (`FUN_0800ed26`, Antwort 6 Datenbytes, B+L):
 
 | Byte | Inhalt |
 |---|---|
-| 0 | S[1] (live 0x13; Quelle offen, = 0x52-Antwort Byte 0) |
-| 1 | S[0] (live 0x34) |
+| 0 | S[1] (live 0x13; Quelle offen, = 0x52-Antwort Byte 0). **LIVE 15.10.2026 (V):** variiert langsam 0x11–0x1c → Kandidat **Temperatur °C** (AHT30) |
+| 1 | S[0] (live 0x34). **LIVE 15.10.2026 (V):** 0x2d–0x39, gegenläufig zu Byte 0 → Kandidat **rel. Feuchte %** |
 | 2 | Flags: `R[3] | 0x80` einmalig wenn R[3]≠0 (V: Motorblock), sonst R[5] (wird zurückgesetzt) |
 | 3 | **Box-Zustand** S[2]: IDLE=0, PRELOAD=1, PRINT=2, RELOAD=3, ERROR=4, TEST=5 (≥6 „unknown“) |
-| 4 | Bitmaske Sensor B (aktiv = 1) |
-| 5 | Bitmaske „Slot hat gültige RFID-Daten“ (V) |
+| 4 | Bitmaske Sensor B (aktiv = 1); LIVE 15.10.2026: = Slot im Hub, deckungsgleich mit 0x08 [01] |
+| 5 | ~~Bitmaske „Slot hat gültige RFID-Daten“ (V)~~ **UNBELEGT** – live in 8 268 R153-Frames immer 0, auch mit RFID-Spule (WIDERSPRICHT der Deutung, LIVE 15.10.2026) |
 
 **STATE_CHECK_HUB ist KEIN Box-Zustand**, sondern Zustand 2 der Preload-Statemachine
 `FUN_080064b8` (0 forced-Start, 1 idle/Queue, 2 CHECK_HUB, 3 pretension, 4 read rfid +
@@ -424,6 +446,11 @@ margin estimation) – taucht in 0x0a nicht auf. Status der 0x0a-Antwort: ERROR 
 PRINT → 0x50 oder 0; Preload-Ereignis → 0x30 mit 4 Byte (dann anderes Layout!); sonst 0.
 Live `09 00 0a 13 34 00 00 00 00` = Zustand IDLE, keine Sensoren/RFID-Bits ✓;
 `07 30 0a 03 00 00 00` = Ereignis Slot A Wert 3 ✓.
+**Gilt erst ab Box-FW 153** – FW 113 (bis 12.10.2026) liefert 4 Datenbytes `b0 b1 ?? Zustand`
+mit Status 0 (`f7 01 07 00 0a 17 34 00 00 81`, `klippy.log.2026-10-05:4452`); ein 4-Byte-
+Frame ist also nur mit Status 0x30 sicher ein Ereignis (Nachbau `parse_box_state(msg,
+box_fw)`). Ereigniswerte (Deutung, LIVE 15.10.2026 gestützt): **1 = Einstecken/Preload-
+Start, 2 = Herausziehen, 3 = Preload fertig** (Details §6.6).
 
 ### CRC-Quelle: auto_addr_wrapper.py im Klartext (13.10.2026)
 
@@ -608,6 +635,8 @@ Host: `motor_control_wrapper`: `motor_version/sys_param/flash_param`, `motor_rea
 
 - Adressen `0x81..0x84` = closed-loop Motor-Boards (X/Y/Z/Z1, F008 mot-Boards)
 - `0x11` = Modus-Umschaltung (1-2 Datenbytes: `01`, `02 00`, `03`)
+  **PRÄZISIERT 15.10.2026 (live):** `[01]`/`[02]`/`[03]` = Stall-Mode setzen (Echo),
+  `[04]` = Modus lesen → Antwort `[mode, 00]`; `02 00` war eine **Antwort**, kein Request.
 - `0x06` = **Sys-Param (sehr wahrscheinlich Schreiben)** – KORREKTUR 15.10.2026:
   Frames trugen `00 00 96 43` → `00 00 c8 42`. Das sind **Little-Endian-Float
   300.0 → 100.0** = exakt `MOTOR_SYS_PARAM NUM=1 DATA=1 ID=70 PARAMS=300|100
@@ -616,16 +645,22 @@ Host: `motor_control_wrapper`: `motor_version/sys_param/flash_param`, `motor_rea
   (PROTOKOLL-GESAMT.md 1.9: 0x06 = Sys-Param).
   ~~Big-Endian dekodiert 38467 → 51266 (Diff 12799)~~ – **WIDERLEGT 15.10.2026**
   (Artefakt der falschen Deutung; ebenso die ältere 0x4396/0x42c8-Lesart).
-  OFFEN: Position der ID 70 (0x46). Der dokumentierte Frame
+  ~~OFFEN: Position der ID 70 (0x46).~~ **GEKLÄRT – LIVE BELEGT 15.10.2026:** die ID
+  steht im **Request**: Schreiben `[01, id] + <f LE>`, Lesen `[02, id]`, Übernahme `[03]`;
+  der unten zitierte Frame ist die **Antwort** (Echo des Werts). S. §3.1. Der dokumentierte Frame
   `f7 81 07 00 06 00 00 96 43 09` hat len=`07` (= 3 + 4 Datenbytes) und gültige
   CRC – im Frame fehlt also kein Byte, er trägt NUR den Float. Vanilla-Form wäre
-  `[01, id] + <f` (→ hypothetisch `f7 81 09 00 06 01 46 00 00 96 43 8f`), auf dem
-  Plus NICHT live gesehen. `read_encoder` in motor*.py ist deshalb gesperrt.
+  `[01, id] + <f` (→ hypothetisch `f7 81 09 00 06 01 46 00 00 96 43 8f`), ~~auf dem
+  Plus NICHT live gesehen~~ **LIVE BELEGT 15.10.2026** (exakt dieser Frame, per
+  `build_frame` verifiziert). `read_encoder` in motor*.py bleibt gesperrt (0x08 nie live).
   NACHTRAG 15.10.2026: **ID 70 = `controller_pos_loop_pid_param_kp`
   (Positionsregler-Kp, CONFIGURABLE)** laut grant0013/k2-reverse-engineering
   `docs/motor_params_map.md:103` (Fremdquelle K2, Namen aus klippy.log) →
   CALIBRATE_CUT_POS setzt Kp auf 300 und danach zurück auf 100.
-- `0x0c` = Parameter (8 Datenbytes `00*8`) an alle 4 Boards gleichzeitig
+- ~~`0x0c` = Parameter (8 Datenbytes `00*8`) an alle 4 Boards gleichzeitig~~
+  **WIDERLEGT – LIVE BELEGT 15.10.2026:** 0x0C ist eine **Schutz-/Protection-Abfrage**:
+  Request 1 Byte `[0b]` (= `MOTOR_CHECK_PROTECTION_AFTER_HOME DATA=11`), Antwort 8 Byte
+  Status (live immer 8×`00` = kein Fehler); die `00*8` waren die Antwort. S. §3.1.
 - Ablauf `CALIBRATE_CUT_POS`: Modus→~~ADC lesen~~ Sys-Param 300.0 (0x06)→Parameter
   →~~ADC lesen~~ Sys-Param 100.0 (0x06)→Modus zurück (KORREKTUR 15.10.2026)
   (MOTOR_SYS_PARAM ID=70 PARAMS=300/100 = Positionsregler-Kp hoch/zurück,
@@ -645,27 +680,97 @@ selbst, dass sein eigener Code nur leere Motor-Antworten bekommt. Gesichtet:
 | `0x01` | reboot | unbelegt |
 | `0x03` | encoder_cal | unbelegt (Stub `encoder_calibrate`) |
 | `0x04` | elec_offset_cal | unbelegt (Stub `elec_offset_calibrate`) |
-| `0x05` | control | unbelegt |
-| `0x06` | sys_param read/write | **live**: 4 B LE-Float 300.0/100.0 = ID 70 (Kp) – passt |
+| `0x05` | control | **live 15.10.2026**: `[01]`/`[02]` an X/Y bei BELT_TENSION, nie Antwort; Semantik offen |
+| `0x06` | sys_param read/write | **live**: `[02,id]` lesen / `[01,id]+<f>` schreiben / `[03]` übernehmen; flüchtig (§3.1) |
 | `0x07` | flash_param read/write | unbelegt (Stubs `get/set_flash_param`) |
 | `0x08` | get feedback | unbelegt – Kandidat fürs echte Encoder-Lesen |
 | `0x0B` | boot | unbelegt (Motoren); bei CFS = Loader-Check an 0xFF |
-| `0x0C` | protection status | **live**: 8× `00` an alle Boards; Semantik offen |
+| `0x0C` | protection status | **live**: Request `[0b]` → 8 B Status (8×`00` = ok); `[05]` ohne Antwort – „protection status“ bestätigt |
 | `0x0D` | systemid | unbelegt |
-| `0x0E` | read/set_addr | unbelegt (Stub `read_485_addr`) |
+| `0x0E` | read/set_addr | **live 15.10.2026**: `addr 0E [02]` → `[addr]`; `FF 0E [01]` Broadcast ohne Antwort |
 | `0x0F` | version | unbelegt (belegt nur F0/00 via `query_version`) |
-| `0x11` | stall_mode | **live**: 1–2 B (`01`/`02 00`/`03`) – „Modus“ passt dazu |
-| `0x12` | dev_uuid | unbelegt |
+| `0x11` | stall_mode | **live**: `[01]/[02]/[03]` setzen, `[04]` lesen → `[mode,00]` |
+| `0x12` | dev_uuid | **live 15.10.2026**: `addr 12 [02]` → 8 B, Präfix `cd ab` + 6 B individuell |
 
 Adressen dort: `0x81..0x84` = X/Y/Z/Z1 über Main-MCU-Transparent-Pfad
 (`transparent_send`/`transparent_response`), `0x85` = Extruder über Nozzle-MCU
-transparent. Stock-Bootsequenz (aus Logs): Broadcast-Addr-Set `FF 0E 01`, UUID-Abfrage
+transparent. **LIVE 15.10.2026: gilt für den K2, NICHT für den K2 Plus** – dort laufen
+X/Y/Z/Z1 ausschließlich über serial_485 (`/dev/ttyS5`), nur der Extruder über
+`transparent_send` (Adresse 0x81 auf dessen eigenem Bus); 0x85 auf ttyS5 antwortet nie (§3.1). Stock-Bootsequenz (aus Logs): Broadcast-Addr-Set `FF 0E 01`, UUID-Abfrage
 `81/82 12 02`, Adress-Lesen `81/82 0E 02`, dann Stall-Mode und Protection-Check.
 
-**Bewertung:** Die drei auf dem Plus live gesehenen Bytes (0x06/0x0C/0x11) passen
+**Bewertung (Stand vor 15.10.2026):** Die drei auf dem Plus live gesehenen Bytes (0x06/0x0C/0x11) passen
 widerspruchsfrei zur Fremdtabelle, ID 70 erklärt die 300/100-Werte. Alles Übrige sind
 **Hypothesen (Fremdquelle K2, auf dem Plus unbelegt)** – kein sendender Code im Nachbau,
 Stubs bleiben gesperrt, bis je Kommando ein Plus-Mitschnitt vorliegt (CHECKLISTE.md).
+**NACHTRAG 15.10.2026:** live belegt sind jetzt zusätzlich 0x05, 0x0E, 0x12 (s. Tabelle);
+weiterhin nie gesehen: 0x01, 0x03, 0x04, 0x07, 0x08, 0x0B (an Motoren), 0x0D, 0x0F, 0xF0.
+
+### 3.1 LIVE BELEGT 15.10.2026: Motor-Kommunikation K2 Plus (klippy.log 05.–16.10.)
+
+Quelle: Live-Logs `live-logs-2026-10-15/` (lokal, nicht im Repo; 10 vollständige Boot-Enumerationen; Zeilen ohne
+Suffix = `klippy.log`, Boot 16.10. 01:15 Druckerzeit). Alle Motor-RX-Frames + 88/61
+transparent-TX/RX CRC-OK; `serial485.build_frame` reproduziert die Stock-Frames
+byte-genau (z.B. `f7 81 04 00 0c 0b 95`, `f7 ff 04 00 0e 01 89`).
+
+- **0x06 Sys-Param** – ID im Request, Antwort nur der Wert:
+  - Lesen `addr 05 00 06 02 <id>` → `f7 addr 07 00 06 <f LE> crc` (ID 9 → 123,58).
+    ID 10 antwortet mit 2 Byte, ID 226 mit 0 Byte (Motor kennt ID nicht).
+  - Schreiben `addr 09 00 06 01 <id> <f LE>` → Echo des Werts
+    (`klippy.log.2026-10-12:10700-10707`); Vollframe `f7 81 09 00 06 01 46 00 00 96 43 8f`
+    (ID 70 = 300.0) verifiziert. Der frühere „einzige Live-Frame“
+    `f7 81 07 00 06 00 00 96 43 09` ist die **Antwort**.
+  - Übernahme `addr 04 00 06 03` → `[01]` = Erfolg, einmal je Motor am Enumerationsende.
+  - `MOTOR_SYS_PARAM NUM=1 DATA=1 ID=70 …`: NUM = Motorindex (1 → 0x81), DATA=1 = Sub 01.
+  - **Flüchtig:** nach Soft-Restart liest der Host die geschriebenen Werte, nach Kaltstart
+    wieder Board-Defaults (Kp 300, err_time 0,01, spd_kp 0,028, spd_ki 6,0) → Sub 01/03
+    schreibt NICHT dauerhaft; der Host muss nach jedem Power-on neu setzen (Stock tut das).
+- **0x0C** Request `[0b]` → 8 B Status (live 8×00); `[05]` nie beantwortet. ~~8-Byte-Parameter
+  an alle~~ WIDERLEGT.
+- **0x11** `[01]/[02]/[03]` setzen (Echo), `[04]` lesen → `[mode, 00]`
+  (`klippy.log.2026-10-12:31417-31455`). Homing: `DATA=1` → `[01]` nur X/Y, `DATA=2` → `[02]` an alle.
+- **0x0E** `addr 0e 02` → `[addr]`; `FF 0e 01` Broadcast ohne Antwort.
+- **0x12** `addr 12 02` → 8 B UUID, Präfix `cd ab` (Rest individuell, hier nicht wiedergegeben).
+- **0x05** `[01]`/`[02]` an X/Y während BELT_TENSION, **nie Antwort**
+  (`klippy.log.2026-10-12:28621-28636`); Semantik offen (grant: „control“).
+- **Extruder:** 0x85 über serial_485 antwortet nie (≈10 s Timeouts je Boot,
+  `klippy.log.2026-10-05:4013-4280`); erreichbar nur über `transparent_send` (oid 1,
+  sehr wahrscheinlich nozzle_mcu) unter **Adresse 0x81**. Stock-Mapping stepper 5 → 0x85
+  auf ttyS5 ist ein Stock-Fehlgriff.
+- **Retries:** alle Motor-, Broadcast- und Belt-Anfragen laufen mit `retries = 0`
+  (Belt 0x21/0x22: `retries = 4`); Motoren antworten in < 20 ms.
+- **Pfade:** X/Y/Z/Z1 + CFS 0x01 + Belt 0x21/0x22 teilen sich **einen** RS485-Port
+  (ttyS5, 230400, eine Queue; Motor-, CFS- und Auto-Addr-Frames verschränkt, `klippy.log:4315-4373`).
+
+**Stock-Bootsequenz K2 Plus** (`klippy.log`, Boot 16.10.):
+1. 2127–2150 MCU-Connect (mcu ttyS2, nozzle_mcu ttyS3, rpi); 2167 serial_485 ttyS5.
+2. 2259–2267 „initial set_pin_io“: dir/step-Pins der 4 Motoren über die Main-MCU auf
+   Config-Werte (vermutlich Strapping/Adresswahl der Motorboards).
+3. 2269 S485 `FF 0E 01` (Timeout) → 2313 transparent `FF 0E 01` (leer).
+4. 2317–2371 je Motor `0E 02` + `12 02` (erste Runde antwortet nur Z).
+5. 2376 transparent `81 0E 02` → Extruder meldet 0x81.
+6. 2379–2420 zweite Runde, alle antworten → 2422 „All motors are normal“.
+7. 2424–2439 Stall-Mode `[02]` an Z, Z1 (S485) und E (transparent); X/Y erst beim Homing.
+8. 2442–2469 `0C [0b]` an 0x81–0x84 + E → 8×00; 2471–2491 `0C [05]` → keine Antwort.
+9. 2492–2500 „restore set_pin_io“ (alle Pins 0).
+10. 2501–4303 flash_param-Enumeration stepper 1–5 (0x06 Sub 02/01/03), stepper 5 = 0x85 Timeouts.
+11. 4315–4373 `12 02` UUID erneut, verschränkt mit CFS-Auto-Addr (0xA2/0xA3).
+Abweichungen zu grant (K2): alle vier Achsen antworten (grant: Z/Z1 stumm), Stall/Protection
+an X–Z1 über serial_485 statt transparent, GPIO-Setzen vor **und** nach der Abfrage.
+
+**flash_param-Enumeration: 227 IDs (0–226), nicht 226** – Namen identisch zu grant (inkl.
+Tippfehler). **Log-Falle:** in `update_flash_param key:… value:N` ist N die **Param-ID**,
+nicht der Wert. Gelesen werden nur IDs 9/10/25 + in `[motor_control]` konfigurierte;
+grants „result is None“ für 9/10/25 ist ein Artefakt des Extruders (0x85-Timeout).
+Volle Tabelle (lokal, nicht im Repo): `/tmp/claude-0/livelog-motor/params.csv`.
+
+**Nachbau (parallel umgesetzt 15.10.2026, `nachbau/motor.py` / `motor_mini.py`):**
+`read_sys_param` ([02,id], 4/2/0-Byte-Antwort), `build_sys_param_write_payload`
+([01,id]+<f>) / `build_sys_param_update_payload` ([03]), `write_sys_param` nur mit
+`confirm=True`, `check_protection` (0x0C [0b] → 8 B), `get_stall_mode` (0x11 [04]),
+`read_485_addr` (0x0E [02]), `read_uuid` (0x12 [02]), `SYS_PARAM_NAMES` (227 Einträge),
+`MOTOR_RETRIES = 0`, Timeouts 0x06/0x12 1,0 s (live 0x85-Timeouts 1,002–1,009 s),
+0x0E/0x0C 0,05 s (live 0,052–0,066 s); `read_encoder` bleibt gesperrt.
 
 ## 4. Update-Werkzeuge
 
@@ -707,3 +812,134 @@ Wer Tradrack o.ä. anbinden will, muss `serial_485_wrapper.cmd_send_data_with_re
 Damit ist ein reiner Python-Nachbau von `serial_485_wrapper` + `box_wrapper` ohne Hardware-Mitschnitt möglich:
 Frames aus dem Log extrahieren, CRC-8/ATM verifizieren, `ParseData`-Semantik aus den Log-Kommandos
 (`GET_BOX_STATE`, `GET_REMAIN_LEN`, `GET_RFID`, `BOX_SET_PRE_LOADING`) ableiten.
+
+## 6. Live-Gegenprobe CFS (LIVE BELEGT 15.10.2026, klippy.log 05.–16.10.)
+
+Quelle: `live-logs-2026-10-15/klippy.log*` (6 Dateien, Drucker-Zugriff nur lesend; lokal,
+**nicht fürs Repo**). Zeilenangaben `05:`/`12:`/`13:`/`14:` = `klippy.log.2026-10-<TT>`,
+`cur:` = `klippy.log`. 58 567 TX, 36 626 RX, 21 684 Timeouts (fast alle 0xa1-Discovery
+by design), 253 × „do not get response“, 27 × „Discard bytes“. Alle 36 626 RX-Frames
+CRC-8/ATM über `len..data` gültig; nie Status 0x01/0x02 von der Box (Host-CRC/Länge stets
+korrekt). Datenschutz: SN/UUID/Vendor hier nur gekürzt.
+
+### 6.1 Logformat (wichtig zum Auswerten)
+
+- **Requests** stehen nur als `reactor:_check_timers … retries = N, cmd = <addr len status
+  fun data…>` – **ohne F7, ohne CRC** (CRC selbst berechnen, z.B. `cfsseq.requests_from_log_cmds`).
+  Eine solche Zeile = **eine Sendung**. `data_send:` ist die Anforderung aus box_wrapper vor der Queue.
+- **Antworten:** `Serial_485: got {'#msgid': <len>, '#msg': b'…'}` (Rohframe, Empfangsthread)
+  und `cmd_485_send_data_with_response params: 0xf7 …` (zugestellte Antwort, Duplikat) –
+  `params:` ist also **immer RX** (frühere Fehlinterpretationen als Request, s. §2).
+- Fehlschlag je Versuch: `do not get response, retries = N, cmd = b'…'`; endgültig:
+  `cmd_485_send_data_with_response timeout` + `key831` „serial_485 communication timeout“.
+- **Log-Uhr = UTC+8** (letzter Eintrag 16.10. 01:27:39 ↔ Datei-mtime 15.10. 19:27 MESZ, +6 h);
+  Boots beginnen mit `2020-01-01 08:00` (keine RTC).
+- **Box-FW-Wechsel 113 → 153 am 12.10.2026** (`12:7053` „version: 1.1.3“, `12:12485`
+  „version: 1.5.3“, dazwischen Bootloader-Frames von 0xFE, `12:6973`). Alles vor 12.10.
+  00:23 Log-Uhr (inkl. ganz 05.10.) ist **FW 113**, nicht R153.
+
+### 6.2 Retry-Semantik – `retries = 4` ⇒ 5 Sendungen
+
+Beleg `05:63472–63521` (0x0e [01]): TX `retries = 4` → „do not get response, retries = 4“ →
+TX `retries = 3` … TX `retries = 0` (63518) → timeout + key831 (63521); Abstand 2,00–2,12 s,
+gesamt ≈ 10 s. 47 weitere vollständige Ketten 4→0; Antworten beim 2.–5. Versuch kommen vor
+(`05:70721`, `05:67122`). **Nie mehr als 5 Sendungen.** Der Zähler zählt herunter, die Zeile
+steht vor jeder Sendung ⇒ `serial485.py` (1 + 4) bestätigt.
+
+Startwert je fun (Box 0x01; Nachbau `box.FUNC_RETRIES`/`func_retries`):
+
+| fun | Host-Name | retries | n (Start) | Timeout (.so-Konstante) / Live |
+|---|---|---|---|---|
+| 0x02 | GET_RFID | 4 | 18 | 2 s |
+| 0x03 | GET_REMAIN_LEN | 4 | 844 | 2 s |
+| 0x04 | SET_BOX_MODE | 4 | 154 | 2 s (Retry-Abstand 2,00–2,06 s) |
+| 0x05 | GET_BUFFER_STATE | 4 | 16 | 2 s |
+| 0x08 | GET_FILAMENT_SENSOR_STATE | 4 | 96 | 2 s |
+| **0x0a** | GET_BOX_STATE | **0** | 10 560 | Poll alle ~4 s, Antwort 3 ms…0,39 s |
+| 0x0d | SET_PRE_LOADING | 4 | 55 | 300 s (op 2: Antwort nach 31–37 s, 1 Sendung) |
+| 0x0e | MEASURING_WHEEL | 4 | 5 415 | 2 s |
+| 0x0f | TIGHTEN_UP_ENABLE | 4 | 35 | 2 s |
+| 0x10 | EXTRUDE_PROCESS | 4 | 191 | 15 s (mode 0: ≤ 7,25 s) |
+| 0x11 | RETRUDE_PROCESS | 4 | 90 | 150 s (p1: ≤ 23,0 s) |
+| 0x14 | GET_VERSION_SN | 4 | 78 | 2 s |
+| 0x15 | GET_HARDWARE_STATUS | 4 | 10 | 2 s |
+
+**`retries = 0` (eine Sendung, kein Retransmit):** 0x0a-Poll, Auto-Addr 0xa0/0xa1/0xa2/0xa3
+(z.B. `12:2106`), alle Motor-Kommandos 0x81–0x85, Broadcasts 0xff/0x0b, 0xff/0x0e. Belt 0x21/0x22: 4.
+Nachbau-Abweichung (bewusst): `box.communication_set_pre_loading` op 2/3 mit retries=0 und
+Ghidra-Timeout ≥ 380 s statt 4 × 300 s (ein Retransmit würde den Force-Preload neu starten).
+
+Sonderfall: 0x0d **[00 02]** aus dem G-Code-Pfad („filament_sensor false“) – 5 Sendungen in
+≈ 16–23 ms, je Versuch „get response or timeout“ nach 2–3 ms (`13:69366–69385`,
+`13:71509–71529`, `13:130620–130635`), **nie beantwortet** → erzeugt key831-Meldungen
+ohne echten Box-Ausfall (0x0a-Polls davor/danach beantwortet). Ursache offen (Host-Timeout
+kürzer als Box-Latenz 3–5 ms, oder Busy/Kollision).
+
+### 6.3 Host-Namen (aus `cmd: …`-Zeilen)
+
+02 GET_RFID, 03 GET_REMAIN_LEN, 04 SET_BOX_MODE, 05 GET_BUFFER_STATE,
+**08 GET_FILAMENT_SENSOR_STATE** (bisher bei uns GET_HARDWARE_STATUS), 0a GET_BOX_STATE,
+0d SET_PRE_LOADING, 0e MEASURING_WHEEL, **0f TIGHTEN_UP_ENABLE** (bei uns PRELOAD_INHIBIT/
+MOTOR_ACTION), 10 EXTRUDE_PROCESS, 11 RETRUDE_PROCESS, 14 GET_VERSION_SN,
+**15 GET_HARDWARE_STATUS**; Status `OK[0x0]`, **`UPDATE_STATE[0x30]`**, **`SPEED_ERR[0x51]`**.
+Im Nachbau umbenannt, alte Namen als Aliase (`box.py`, `cfsseq.py`).
+An die Box gesendet werden nur 02/03/04/05/08/0a/0d/0e/0f/10/11/14/15/a2/a3 – alle in der
+Ghidra-Tabelle. **0x06/0x07/0x09 nie an die Box** (0x06 nur an Motoren) → FW-Bug 0x06 nicht
+prüfbar. **Adressen 0xEA/0xEB kommen nie vor**; 0xFE nur bei a1/a0 und Bootloader-Antworten.
+
+### 6.4 0x0d SET_PRE_LOADING live (55 Requests)
+
+| Request | n | Antwort | Bewertung |
+|---|---|---|---|
+| `[0f 01]` (enable) | 22 (+9 Sendungen) | st=0 nach 3–10 ms (`13:69418/69421`, `12:65812`) | bestätigt: op 0/1 sofort, Host sendet Maske 0x0F |
+| `[0f 00]` (disable) | 3 | st=0 sofort | bestätigt |
+| `[01 02]` (Force A) | 4 | st=0 nach **31,0 / 37,0 / 35,0 / 31,0 s**, 1 Sendung (`13:90197→90211`, `13:134512→134526`, `13:135603`, `13:137449`); Host pollt solange nicht | bestätigt (≈ 30–37 s je Slot, < 3 min) |
+| `[00 02]` (Force alle) | 26 Sendungen in Bursts | leerer Hub: st=0 nach 5 ms (`13:48753/48755`); Hub belegt: Box ≈ 11 s stumm (0x04 5× unbeantwortet `13:130637–130652`), danach 0x0a Flags 0x90 (`13:130760`), Hub bleibt belegt; Bursts sonst unbeantwortet | Blockade bestätigt; Burst-Antwort **offen** |
+| op 3 (`[m 03]`) | 0 | – | **offen** (nie live) |
+
+### 6.5 0x10 / 0x11 / 0x04 / 0x08 live
+
+- **0x10:** Modi live nur 0, 4, 5, 6, 7 (p=3); nie 1–3. mode 0: `00` nach 4,3–5,4 s;
+  Fehler st=05 mit Daten `04`=ERROR nach 7,24 s (`12:84996`, key835). mode 4 sofort (0–10 ms).
+  mode 5: 104 × Float BE (≈ −1,1…−3,0 m); st=0c genau einmal je mode-4-Lauf, Odometer dabei
+  unverändert (`12:80299/80319`). mode 6/7: 20–101 ms / 44–125 ms. Ghidra-Tabelle bestätigt.
+  Extrude-Request-Folge identisch mit `cfsseq.build_extrude_sequence` (Selbsttest mit
+  `13:` 03:01, Slot B).
+- **0x11:** p0 64× (Antwort 0,24–0,72 s), p1 26× (0,8–21,5 s); 0x14 nach 23,0 s (`12:82188`,
+  key849), **0x19 nach 11,6/12,2 s** (`13:95746`, `13:95885`, key865); Maske nie 0.
+  **Retrude-Folge live:** `04[00 01] 08[00] 11[m 00]`×n `11[m 01]` mit n meist 4 (16×; ~2,5 s
+  Abstand, dazwischen 0x0e-/0x03-Abfragen), Kurzform `04[00 01] 11[m 01]` (10×, nach
+  Extrude-Abbruch/Entladen). **`08[01]` zwischen p0 und p1: 0 von 23** – ~~frühere
+  cfsseq-Sequenz mit 08[01]~~ WIDERLEGT, korrigiert.
+- **0x04:** `[m 00]` ⇒ 0x0a PRINT; `[00 01]` ⇒ IDLE, **auch aus ERROR** (`13:96151→96184`) –
+  der Host löscht Fehler so (0x10 mode 3 nie gesendet). Status 3 nie gesehen.
+- **0x08:** `[00]` → `07` (A,B,C Filament; D leer = remain D 00), `[01]` → Hub-Maske
+  (deckungsgleich mit 0x0a Byte 4, `13:72763`). **0x02** `[00]` → st=0 ohne Daten (`13:48567`).
+- **0x03:** `ff ff 1d 00`; nach Herausziehen A `00 ff 1d 00` (`13:132971`) – 0xFF = Filament
+  ohne RFID, 0x00 = kein Filament bestätigt. **0x15:** `10 20 30 40 50 60 00…` (`13:80094`).
+
+### 6.6 0x0a GET_BOX_STATE live
+
+- R153: immer 6 Byte; Zustände 0, 1, 2, 4 beobachtet (RELOAD 3/TEST 5 nie); in ERROR ist der
+  Status = S[3] (live 05/0c/14/19/51). Status-Verteilung: 00 9 826, 05 11, 0c 116, 14 56,
+  19 8, 30 63, **51 452**.
+- Byte 2 Flags: `01/02/04/08` einmalig nach 0x11 p1 bzw. Preload (= Slotmaske);
+  `0x90` (`13:130760`), `0x91` bei Fehler 0x19 (`13:95774`) – R[3]-Deutung „Motorblock“ gestützt.
+- Byte 4 = Slot am Hub (1-hot), deckungsgleich mit 0x08 [01].
+- **Byte 5: immer 0** (8 268 Frames, auch mit RFID-Spule in C, remain 29 %) → Deutung
+  „gültige RFID-Daten“ **WIDERSPRICHT/unbelegt**.
+- **Byte 0/1:** variieren langsam und gegenläufig (b0 0x11–0x1c, b1 0x2d–0x39; z.B. `13:7924`
+  16/2f … `14:19447` 14/37) → **Vermutung: Temperatur °C / rel. Feuchte % (AHT30)**, mit
+  Hygrometer gegenprüfen.
+- **FW 113:** nur 4 Datenbytes `b0 b1 ?? Zustand` mit Status 0 (`05:4452` `17 34 00 00`, `18 33 00 02`).
+- **0x30 UPDATE_STATE** (nur 12./13.10., 63×): **2 = Herausziehen** (remain danach 00,
+  `13:132699→132971`), **1 = Einstecken/Preload-Start** (`13:133324`), **3 = Preload fertig**
+  (danach GET_RFID, `12:42031→42107`) – Deutung, gestützt (Nachbau `box.EVENT_*`).
+- **0x51 SPEED_ERR:** S[3] in ERROR, key846 „empty printing, box speed is smaller than
+  extruder“ (`12:15733/15748`, 452× am 12.10. 00:28–01:11 Log-Uhr, Hub = Slot A).
+- Status 0x50 (PRINT-Sensorprüfung): nie gesehen – offen.
+
+### 6.7 Offen nach der Live-Gegenprobe
+
+0x0d op 3; Status 0x50; Zustände RELOAD/TEST im 0x0a; warum die [00 02]-Bursts nie beantwortet
+werden; 0x06/0x07/0x09 an die Box; Byte 0/1 = Temp/Feuchte gegenprüfen; Bedeutung 0x15-Nibbles.

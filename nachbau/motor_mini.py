@@ -2,57 +2,98 @@
 """motor_mini.py – Python-Nachbau von motor_control (K2 Closed-loop-Motoren, Kernfunktionen).
 
 Ersetzt: motor_control_wrapper.cpython-39.so (armhf, proprietär).
+Eigenständig (importiert motor.py NICHT); gleiche Regeln wie motor.py –
+Details, Param-Namen-Tabelle und Update-Pfad dort.
 
-Umfang:
-- read_encoder: GESPERRT (NotImplementedError, sendet nichts) – KORREKTUR
-  15.10.2026: Func 0x06 ist KEIN Encoder-Lesen, sondern sehr wahrscheinlich
-  Sys-Param-Schreiben (Live-Payload = LE-Float 300.0/100.0 = MOTOR_SYS_PARAM
-  ID=70, s. motor.py FUNC_SYS_PARAM)
-- decode_sys_param_float: reine Dekodier-Hilfe 0x06-Payload (<f, ohne Bus)
-- set_mode: Modus-Umschaltung (Func 0x11, live belegt, Pflichtparameter)
-- query_version: Versionsabfrage über Update-Pfad (Func 0xf0/Sub 0x00,
-  belegt aus mcu_util_485-Decompile, FUN_00014a08)
+LIVE-STAND 15.10.2026 (live-logs-2026-10-15/klippy.log*, lokal, nicht im Repo; s. motor.py):
+- LESEND (senden erlaubt): read_sys_param (0x06 [02, id]),
+  check_protection (0x0C [0b] -> 8 B), get_stall_mode (0x11 [04]),
+  read_485_addr (0x0E [02]), read_uuid (0x12 [02] -> 8 B)
+- set_mode (0x11 [01]/[02]/[03], Antwort = Echo) – sendet, live belegt
+- write_sys_param: 0x06 [01, id] + <f – sendet NUR mit confirm=True
+  (sonst PermissionError); verändert Motorregelparameter, FLÜCHTIG bis
+  Kaltstart. Reine Builder: build_sys_param_write_payload,
+  build_sys_param_update_payload ([03])
+- read_encoder: GESPERRT (0x08 nie beobachtet, 0x06 = Sys-Param)
+- query_version: Update-Pfad (0xF0/00, Decompile; live nie beobachtet)
 
-Belege: PROTOKOLL-GESAMT.md Abschnitt 1.5 + 1.7, Live-Frames Cut-Kalibrierung
-12.10.2026 (Motor-Boards 0x81-0x84 = X/Y/Z/Z1).
+Adressen: X/Y/Z/Z1 = 0x81-0x84 nur über serial_485 (ttyS5). Der Extruder ist
+NICHT 0x85 auf dem RS485 (antwortet nie, klippy.log.2026-10-05:4013-4280),
+sondern nur transparent über die (vermutlich) Nozzle-MCU unter 0x81
+(klippy.log:2375/2376) – nicht in diesem Modul.
 
-OFFEN (nicht erfunden): welcher Func-Code dem Wrapper-Kommando `motor_version`
-im Normalbetrieb entspricht – implementiert ist der belegte Update-Pfad.
+Retries/Timeouts wie Stock: alle Motor-Kommandos retries=0 (1 Sendung);
+Timeout 0x06/0x12 = 1.0 s, 0x0C/0x0E = 0.05 s, 0x11 unbelegt (1.0 s).
 """
 
+import math
 import struct
 
 from serial485 import Serial485  # noqa: F401 (für echten Betrieb)
 
-# Func-Codes Motor-Boards (Beleg: Cut-Kalibrierung 12.10.2026, 23:51)
-# 0x06 = vermutlich Sys-Param-Schreiben: 4 Bytes LE-Float (00 00 96 43 =
-# 300.0, 00 00 c8 42 = 100.0 = MOTOR_SYS_PARAM ID=70 PARAMS=300/100 aus
-# gcode_macro.cfg:796/799). WIDERLEGT 15.10.2026: "Encoder lesen, BE 38467".
-# ID 70 = controller_pos_loop_pid_param_kp (Positionsregler-Kp) laut grant0013/
-# k2-reverse-engineering motor_params_map.md:103 (Fremdquelle K2) ->
-# CALIBRATE_CUT_POS setzt Kp 300, danach zurück auf 100. Fremd-Hypothese
-# (K2, auf dem Plus unbelegt): 0x08 get feedback = Kandidat fürs Encoder-Lesen.
 FUNC_SYS_PARAM = 0x06
 FUNC_READ_ENCODER = FUNC_SYS_PARAM  # Alt-Name, nur Kompatibilität – nicht senden!
-FUNC_SET_MODE = 0x11       # 1-2 Datenbytes (01 / 02 00 / 03 gesehen)
+FUNC_PROTECTION = 0x0C
+FUNC_ADDR = 0x0E
+FUNC_SET_MODE = 0x11
+FUNC_UUID = 0x12
 FUNC_FW_UPDATE = 0xF0      # Update-Pfad, Sub-Codes aus Decompile
+SUB_SYS_WRITE = 0x01
+SUB_SYS_READ = 0x02
+SUB_SYS_UPDATE = 0x03
+SUB_PROT_CHECK = 0x0B      # [05] nie beantwortet -> wird nie gesendet
+SUB_STALL_GET = 0x04
+STALL_MODES = (0x01, 0x02, 0x03)
 SUB_GET_VERSION = 0x00
 SUB_GET_SECTOR = 0x03
 SUB_REQUEST_UPDATE = 0x01
-# Retries wie motor.py: Binary bricht nach 3 Fehlversuchen ab (mcu_util_485
+SYS_PARAM_COUNT = 227      # live IDs 0..226
+
+MOTOR_RETRIES = 0          # live "retries = 0" bei allen Motor-Sendungen
+TIMEOUT_SYS_PARAM = 1.0
+TIMEOUT_PROTECTION = 0.05
+TIMEOUT_ADDR = 0.05
+TIMEOUT_UUID = 1.0
+TIMEOUT_STALL = 1.0        # unbelegt (nie Timeout beobachtet)
+# Update-Pfad: Binary bricht nach 3 Fehlversuchen ab (mcu_util_485
 # `cmp r6,#3` @0x1562c), serial485 macht retries+1 Versuche -> 2.
 UPDATE_RETRIES = 2
 
-MOTOR_ADDRS = (0x81, 0x82, 0x83, 0x84)  # X/Y/Z/Z1 (Beleg: Cut-Kalibrierung)
+MOTOR_ADDRS = (0x81, 0x82, 0x83, 0x84)  # X/Y/Z/Z1 über serial_485
 
 
 def decode_sys_param_float(data):
-    """4 Bytes 0x06-Payload -> Float (`<f`), ohne Bus-Zugriff.
-    Beleg: 00 00 96 43 -> 300.0, 00 00 c8 42 -> 100.0 (MOTOR_SYS_PARAM ID=70)."""
+    """4 Bytes 0x06-Antwort -> Float (`<f`), ohne Bus-Zugriff.
+    Beleg: 00 00 96 43 -> 300.0, 00 00 c8 42 -> 100.0 (ID 70)."""
     raw = bytes(data)
     if len(raw) != 4:
         raise ValueError("0x06-Payload muss 4 Bytes haben: %r" % (raw,))
     return struct.unpack("<f", raw)[0]
+
+
+def _check_param_id(param_id):
+    if isinstance(param_id, bool) or not isinstance(param_id, int) \
+            or not 0 <= param_id < SYS_PARAM_COUNT:
+        raise ValueError("Param-ID muss int 0..226 sein: %r" % (param_id,))
+
+
+def build_sys_param_write_payload(param_id, value):
+    """[01, id] + <f LE – REINER BUILDER, sendet nichts.
+    Live: klippy.log.2026-10-05:16596 `81 09 00 06 01 46 00 00 96 43`
+    (ID 70 = 300.0), Vollframe f7 81 09 00 06 01 46 00 00 96 43 8f."""
+    _check_param_id(param_id)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) \
+            or not math.isfinite(value):
+        raise ValueError("Sys-Param-Wert muss endliche Zahl sein: %r" % (value,))
+    try:
+        return [SUB_SYS_WRITE, param_id] + list(struct.pack("<f", value))
+    except OverflowError:
+        raise ValueError("Sys-Param-Wert passt nicht in float32: %r" % (value,))
+
+
+def build_sys_param_update_payload():
+    """[03] "Updata param" -> Antwort [01] (klippy.log:2869/2875). Builder."""
+    return [SUB_SYS_UPDATE]
 
 
 class MotorMini:
@@ -64,22 +105,85 @@ class MotorMini:
         self.bus = bus
         self.addr = addr
 
-    def read_encoder(self, *args, **kwargs):
-        """GESPERRT (15.10.2026) – sendet KEINEN Frame (s. motor.py)."""
-        raise NotImplementedError(
-            "read_encoder gesperrt: Func 0x06 ist vermutlich Sys-Param-Schreiben "
-            "(Live-Payload = LE-Float 300.0/100.0 = MOTOR_SYS_PARAM ID=70), "
-            "kein Encoder-Lesen; Encoder-Lesen ist unbelegt, Senden könnte "
-            "Motorparameter ändern")
+    def _tx(self, fun, payload, timeout):
+        return bytes(self.bus.transact(self.addr, fun, payload, timeout=timeout,
+                                       retries=MOTOR_RETRIES))
+
+    def read_sys_param(self, param_id):
+        """0x06 [02, id] -> float; 0-Byte-Antwort -> None (ID unbekannt,
+        live ID 226, klippy.log:2859/2865); andere Länge -> ValueError (live
+        ID 10 mit 2 B, Format unbelegt). Live: klippy.log:2511/2517 ID 9 -> 123.58."""
+        _check_param_id(param_id)
+        raw = self._tx(FUNC_SYS_PARAM, [SUB_SYS_READ, param_id], TIMEOUT_SYS_PARAM)
+        if not raw:
+            return None
+        if len(raw) != 4:
+            raise ValueError("0x06 ID %d: %d-Byte-Antwort %r (Format unbelegt)"
+                             % (param_id, len(raw), raw))
+        return decode_sys_param_float(raw)
+
+    def write_sys_param(self, param_id, value, confirm=False):
+        """0x06 SCHREIBEN – nur mit confirm=True, sonst PermissionError ohne
+        Senden. Verändert Motorregelparameter (flüchtig bis Kaltstart).
+        Live-Echo: klippy.log.2026-10-12:10700/10706. Echo-Fehler -> RuntimeError."""
+        payload = build_sys_param_write_payload(param_id, value)
+        if confirm is not True:
+            raise PermissionError("write_sys_param gesperrt: verändert Motorregel"
+                                  "parameter – nur mit confirm=True")
+        echo = self._tx(FUNC_SYS_PARAM, payload, TIMEOUT_SYS_PARAM)
+        if echo != bytes(payload[2:]):
+            raise RuntimeError("0x06 Schreib-Echo passt nicht: %s" % echo.hex())
+        return decode_sys_param_float(echo)
+
+    def check_protection(self):
+        """0x0C [0b] -> 8 B Schutzstatus (live immer 8×00; klippy.log:2441/2447).
+        [05] wird nie gesendet (nie beantwortet)."""
+        ans = self._tx(FUNC_PROTECTION, [SUB_PROT_CHECK], TIMEOUT_PROTECTION)
+        if len(ans) != 8:
+            raise ValueError("0x0C: 8 Bytes erwartet: %r" % (ans,))
+        return ans
 
     def set_mode(self, mode, *extra):
-        """Modus setzen (Func 0x11, z.B. (0x01,) / (0x02, 0x00)).
-        Mind. 1 Byte, jedes int 0..255 (kein bool) – sonst ValueError."""
-        raw = [mode] + list(extra)
-        for b in raw:
-            if isinstance(b, bool) or not isinstance(b, int) or not 0 <= b <= 0xFF:
-                raise ValueError("Modus-Byte muss int 0..255 sein: %r" % (b,))
-        self.bus.transact(self.addr, FUNC_SET_MODE, raw)
+        """Stall-Mode setzen (0x11 [01]/[02]/[03]), Antwort = Echo.
+        Live: klippy.log.2026-10-12:2864/2870, klippy.log:2439, 10-12:31436/31454.
+        Genau 1 Byte – das frühere "[02 00]" war die Antwort auf [04]."""
+        if extra or isinstance(mode, bool) or not isinstance(mode, int) \
+                or mode not in STALL_MODES:
+            raise ValueError("Stall-Mode muss genau ein Byte 1/2/3 sein: %r"
+                             % ((mode,) + extra,))
+        echo = self._tx(FUNC_SET_MODE, [mode], TIMEOUT_STALL)
+        if echo != bytes([mode]):
+            raise RuntimeError("0x11 Echo passt nicht: %s" % echo.hex())
+        return mode
+
+    def get_stall_mode(self):
+        """0x11 [04] -> [mode, 00] (klippy.log.2026-10-12:31409/31432)."""
+        ans = self._tx(FUNC_SET_MODE, [SUB_STALL_GET], TIMEOUT_STALL)
+        if len(ans) != 2:
+            raise ValueError("0x11 [04]: 2 Bytes erwartet: %r" % (ans,))
+        return ans[0]
+
+    def read_485_addr(self):
+        """0x0E [02] -> eigene Adresse (klippy.log:2345/2356)."""
+        ans = self._tx(FUNC_ADDR, [0x02], TIMEOUT_ADDR)
+        if len(ans) != 1:
+            raise ValueError("0x0E: 1 Byte erwartet: %r" % (ans,))
+        return ans[0]
+
+    def read_uuid(self):
+        """0x12 [02] -> 8 B UUID, Präfix cd ab (klippy.log:2349/2362)."""
+        ans = self._tx(FUNC_UUID, [0x02], TIMEOUT_UUID)
+        if len(ans) != 8:
+            raise ValueError("0x12: 8 Bytes erwartet: %r" % (ans,))
+        return ans
+
+    dev_uuid = read_uuid
+
+    def read_encoder(self, *args, **kwargs):
+        """GESPERRT – sendet KEINEN Frame (0x08 nie beobachtet, s. motor.py)."""
+        raise NotImplementedError(
+            "read_encoder gesperrt: 0x06 = Sys-Param (live), 0x08 'get feedback' "
+            "nie beobachtet – Encoder-Lesen unbelegt")
 
     def query_version(self):
         """Version über Update-Pfad abfragen (Func 0xf0/Sub 0x00). Gibt Rohdaten zurück."""
@@ -96,63 +200,101 @@ def selftest():
         print(("ok " if cond else "FAIL ") + name)
         fails += 0 if cond else 1
 
+    def raises(exc, fn, *a, **kw):
+        try:
+            fn(*a, **kw)
+        except exc:
+            return True
+        except Exception:
+            return False
+        return False
+
     from serial485 import parse_frame, build_frame
 
-    # 1. 0x06-Payload = LE-Float (Beleg gegen Config MOTOR_SYS_PARAM ID=70)
-    check("0x06 = 300.0", decode_sys_param_float(bytes.fromhex("00 00 96 43")) == 300.0)
-    check("0x06 = 100.0", decode_sys_param_float(bytes.fromhex("00 00 c8 42")) == 100.0)
-
-    # 2. Live-Frames parsen + CRC prüfen
-    for hexframe, label in [
-        ("f7 81 07 00 06 00 00 96 43 09", "sys-param 0x06 (300.0)"),
-        ("f7 81 04 00 11 01 1d", "mode-set 01"),
-        ("f7 81 04 00 11 02 14", "mode-set 02"),
-        ("f7 81 0b 00 0c 00 00 00 00 00 00 00 00 fb", "params 0x0c"),
-    ]:
-        raw = bytes.fromhex(hexframe)
-        fun, data = parse_frame(raw)
-        check("parse %s" % label, True)
-        check("rebuild %s" % label,
-              build_frame(raw[1], fun, data, status=raw[3]) == raw)
-
-    # 3. Adress-Guard
-    try:
-        MotorMini(None, 0x05)
-        check("addr-guard", False)
-    except ValueError:
-        check("addr-guard", True)
-
-    # 4. read_encoder gesperrt + sendet nichts; set_mode/query_version
     class _Bus:
-        def __init__(self):
+        """Prüft TX gegen Log-Bytes (data_send-Form ohne f7/CRC) und spielt
+        Log-Antworten (mit Geräte-CRC) ab."""
+
+        def __init__(self, script):
+            self.script = list(script)
             self.calls = []
 
         def transact(self, addr, fun, data=(), **kw):
             self.calls.append((addr, fun, list(data), kw))
-            return b""
+            assert self.script, "unerwarteter Sendeversuch"
+            want_tx, rx = self.script.pop(0)
+            assert build_frame(addr, fun, list(data))[1:-1] == bytes.fromhex(want_tx)
+            raw = bytes.fromhex(rx)
+            rfun, rdata = parse_frame(raw)
+            assert raw[1] == addr and rfun == fun
+            return rdata
 
-    bus = _Bus()
+    # 1. Dekodierung / Builder gegen Log
+    check("0x06 = 300.0", decode_sys_param_float(bytes.fromhex("00 00 96 43")) == 300.0)
+    check("0x06 = 100.0", decode_sys_param_float(bytes.fromhex("00 00 c8 42")) == 100.0)
+    check("write-builder = Log-TX + verifizierter Vollframe",
+          build_frame(0x81, 6, build_sys_param_write_payload(70, 300.0))
+          == bytes.fromhex("f7 81 09 00 06 01 46 00 00 96 43 8f")
+          and bytes(build_sys_param_write_payload(70, 100.0))
+          == bytes.fromhex("01 46 00 00 c8 42"))
+    check("update-builder [03]", build_sys_param_update_payload() == [3])
+    for bad in [(227, 1.0), (True, 1.0), (70, float("nan")), (70, True)]:
+        check("builder guard %r" % (bad,),
+              raises(ValueError, build_sys_param_write_payload, *bad))
+
+    # 2. Lesende Kommandos gegen Live-Frames
+    bus = _Bus([
+        ("81 05 00 06 02 09", "f7 81 07 00 06 20 29 f7 42 59"),  # klippy.log:2511/2517
+        ("81 05 00 06 02 0a", "f7 81 05 00 06 00 00 90"),        # :2520/2526
+        ("81 05 00 06 02 e2", "f7 81 03 00 06 af"),              # :2859/2865
+        ("81 04 00 0c 0b", "f7 81 0b 00 0c 00 00 00 00 00 00 00 00 fb"),  # :2441/2447
+        ("81 04 00 11 04", "f7 81 05 00 11 02 00 0e"),           # 10-12:31409/31432
+        ("81 04 00 11 03", "f7 81 04 00 11 03 13"),              # 10-12:31436/31454
+        ("81 04 00 0e 02", "f7 81 04 00 0e 81 00"),              # :2387/2393
+        # 0x12: TX klippy.log:2349-Form; Antwort PLATZHALTER-UUID, CRC neu
+        ("81 04 00 12 02", "f7 81 0b 00 12 cd ab 00 00 00 00 00 00 ad"),
+        ("81 09 00 06 01 46 00 00 c8 42", "f7 81 07 00 06 00 00 c8 42 d4"),  # 10-12:10700/10706
+    ])
     mm = MotorMini(bus, 0x81)
+    check("ID 9 = 123.58", abs(mm.read_sys_param(9) - 123.58) < 1e-3
+          and bus.calls[0][3] == {"timeout": 1.0, "retries": 0})
+    check("ID 10 (2 B) -> ValueError", raises(ValueError, mm.read_sys_param, 10))
+    check("ID 226 (0 B) -> None", mm.read_sys_param(226) is None)
+    check("check_protection 8x00", mm.check_protection() == bytes(8)
+          and bus.calls[3][3] == {"timeout": 0.05, "retries": 0})
+    check("get_stall_mode -> 2", mm.get_stall_mode() == 2)
+    check("set_mode 3 Echo", mm.set_mode(3) == 3)
+    check("read_485_addr -> 0x81", mm.read_485_addr() == 0x81)
+    check("read_uuid 8 B cd ab", mm.read_uuid()[:2] == b"\xcd\xab")
+    nobus = _Bus([])
+    check("write ohne confirm gesperrt",
+          raises(PermissionError, MotorMini(nobus, 0x81).write_sys_param, 70, 100.0)
+          and nobus.calls == [])
+    check("write confirm=True Echo", mm.write_sys_param(70, 100.0, confirm=True) == 100.0)
+    check("alle Script-Frames verbraucht", not bus.script)
+
+    # 3. Guards / Sperren senden nichts
+    check("addr-guard 0x85", raises(ValueError, MotorMini, None, 0x85))
     for args in [(), (0x9643,)]:
-        try:
-            mm.read_encoder(*args)
-            check("read_encoder%r wirft" % (args,), False)
-        except NotImplementedError:
-            check("read_encoder%r wirft" % (args,), True)
-    check("read_encoder sendet nichts", bus.calls == [])
-    for bad in [(), (256,), (True,)]:
-        try:
-            mm.set_mode(*bad)
-            check("set_mode guard %r" % (bad,), False)
-        except (TypeError, ValueError):
-            check("set_mode guard %r" % (bad,), True)
-    check("set_mode guards senden nichts", bus.calls == [])
-    mm.set_mode(0x02, 0x00)
-    mm.query_version()
-    check("set_mode [02 00]", bus.calls[0][1:3] == (FUNC_SET_MODE, [0x02, 0x00]))
+        check("read_encoder%r wirft" % (args,),
+              raises(NotImplementedError, MotorMini(nobus, 0x81).read_encoder, *args))
+    for bad in [(), (0,), (4,), (256,), (True,), (0x02, 0x00)]:
+        check("set_mode guard %r" % (bad,),
+              raises((TypeError, ValueError), MotorMini(nobus, 0x81).set_mode, *bad))
+    check("Guards senden nichts", nobus.calls == [])
+
+    # 4. query_version (Update-Pfad, retries=2 = 3 Versuche)
+    class _Rec:
+        calls = []
+
+        def transact(self, addr, fun, data=(), **kw):
+            self.calls.append((addr, fun, list(data), kw))
+            return b""
+    rec = _Rec()
+    MotorMini(rec, 0x82).query_version()
     check("query_version retries=2 (3 Versuche)",
-          bus.calls[1][2] == [SUB_GET_VERSION]
-          and bus.calls[1][3].get("retries") == UPDATE_RETRIES == 2)
+          rec.calls[0][1:3] == (FUNC_FW_UPDATE, [SUB_GET_VERSION])
+          and rec.calls[0][3].get("retries") == UPDATE_RETRIES == 2)
 
     print("SELBSTTEST: %s" % ("ok" if fails == 0 else "%d FEHLER" % fails))
     return fails

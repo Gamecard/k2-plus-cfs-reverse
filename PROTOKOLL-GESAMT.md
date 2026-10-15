@@ -1,10 +1,20 @@
-# K2 Plus – Gesamt-Protokoll-Inventar (Stand 13.10.2026)
+# K2 Plus – Gesamt-Protokoll-Inventar (Stand 13.10.2026, Live-Log-Abgleich 15.10.2026)
 
 Audit/Korrekturen der Nachbau-Module: `/home/pro/k2-fw-live-1.1.7.0/AUDIT-UND-AENDERUNGEN.md`.
 
 Drucker: Creality K2 Plus (`K2Plus-XXXX`), Upper-Board T113 (Tina/OpenWrt 21.02, Kernel 5.4.61 armv7l)
 FW live: **1.1.7.0** · Image-Dump 1.1.3.13 (entpackt, Verzeichnis gelöscht; Original in `~/Downloads/`)
 Alle Angaben mit Belegquelle (Log-Frame, Decompile, Query, Config).
+
+**LIVE-LOGS 15.10.2026** (`live-logs-2026-10-15/`, nur lesend vom Drucker, lokal, nicht
+fürs Repo): Ports **mcu = `/dev/ttyS2`, nozzle_mcu = `/dev/ttyS3`, serial_485 = `/dev/ttyS5`**
+(`klippy.log:1464/1719/1724`; grant/K2: Main-MCU ttyS7, Nozzle ttyS1 – gilt nicht für den Plus).
+Versionen: OpenWrt 21.02-SNAPSHOT r0-4487dfa83, Board `t113_i-…`, Klipper `09faed31-dirty`,
+MCU-FW mcu/nozzle `1.1.0.48-293-g493f9a0f-dirty-20241220` (GD32F303xE/xB), rpi `K2_1.1.3.2-…`.
+**Display-FW (c440x) 1.1.4.12 → 1.1.7.0 am 12.10.2026 (~00:39 Log-Uhr)**; Box-App 113 → 153 am
+selben Tag (s. 1.3). `.so`-md5 (box/filament_rack/motor_control/prtouch_v3/serial_485)
+**identisch mit `rootfs-live/`**; `prtouch_v1/v2_wrapper.so` fehlen lokal (bei Bedarf
+nachkopieren). Log-Uhr = UTC+8. Auswertung: PROTOKOLL-485.md §3.1 (Motoren) und §6 (CFS).
 
 ---
 
@@ -24,14 +34,21 @@ crc = CRC-8/ATM (poly 0x07, init 0x00) über [len..data]  ← GEKNACKT 12.10.202
 | Adresse | Gerät | Belegt durch |
 |---|---|---|
 | `0x01` | CFS/Box (MultiColorMeterialBox) | Live-Frames |
-| `0x11` | Filament-Rack (Trockner) | Config `filament_rack addr: 17` – **noch NICHT live gesehen** |
+| `0x11` | Filament-Rack (Trockner) | Config `filament_rack addr: 17` – **noch NICHT live gesehen** (auch nicht in den Logs 05.–16.10.) |
 | `0x21` | Belt-Modul mdlx | Live-Frames |
 | `0x22` | Belt-Modul mdly | Code (`config_addr`) |
-| `0x81..0x84` | Closed-loop Motor-Boards (X/Y/Z/Z1) | Cut-Kalibrierung 23:51 |
+| `0x81..0x84` | Closed-loop Motor-Boards (X/Y/Z/Z1) | Cut-Kalibrierung 23:51; LIVE 15.10.2026: alle 4 am ttyS5 (Boot-Enumeration) |
+| `0x85` | Extruder-Motor (Stock-Mapping) | **LIVE 15.10.2026: antwortet auf ttyS5 nie**; Extruder nur via `transparent_send` (nozzle_mcu) unter 0x81 |
+| `0xff` | Broadcast (`0E 01` Adresse setzen, `0B`) | live, ohne Antwort |
 | `0xfe` | ADDR_CFS-Discovery (Func `0xa1`, Daten `fe 01`) | Dekompiliert |
 | `0xfd` | ADDR_MOTOR-Discovery (Func `0xa1`) | Dekompiliert |
 | `0xfc` | ADDR_BELT-Discovery (Func `0xa1`) | Dekompiliert |
 | `0xfb` | ADDR_RFID-Discovery (Func `0xa1`) | Dekompiliert |
+| `0xea`/`0xeb` | CFS-App-Broadcasts (Ghidra) | **LIVE 15.10.2026: nie gesehen** |
+
+Retries (LIVE BELEGT 15.10.2026): `retries = 4` = 5 Sendungen (je ~2 s); CFS-Operational
+retries=4 außer **0x0a-Poll retries=0**; Auto-Addr 0xa0–0xa3, Motoren 0x81–0x85,
+Broadcasts: retries=0; Belt: 4. Tabelle PROTOKOLL-485.md §6.2.
 
 ### 1.3 Func-Codes – CFS/Box (`0x01`)
 
@@ -45,24 +62,33 @@ crc = CRC-8/ATM (poly 0x07, init 0x00) über [len..data]  ← GEKNACKT 12.10.202
 0x04 = SET_BOX_MODE    [00 01] Feed-Modus, [Slotmaske 00] Print-Modus
        (BELEGT 15.10.2026: [mask, mode] mode 0 = PRINT, mode 1 = IDLE)
 0x05 = GET_BUFFER_STATE Box-Bufferstatus (früher fälschlich CUT_STATE)
-0x08 = GET_HARDWARE_STATUS Toolhead-/Hardware-Sensorstatus
-0x0a = Herzschlag/Poll 6 Datenbytes Zustand, alle ~4s
+0x08 = ~~GET_HARDWARE_STATUS Toolhead-/Hardware-Sensorstatus~~ KORRIGIERT 15.10.2026
+       (Host-Name live): GET_FILAMENT_SENSOR_STATE [00] Sensor A / [01] Sensor B (Hub)
+0x0a = Herzschlag/Poll 6 Datenbytes Zustand, alle ~4s (retries=0; FW 113: 4 Datenbytes;
+       LIVE 15.10.2026: Byte 5 immer 0 → „RFID gültig“ unbelegt; Byte 0/1 V: Temp/Feuchte)
        ~~(Kandidaten STATE_IDLE/PRELOAD/PRINT/RELOAD/ERROR/TEST/CHECK_HUB – schwach,
        FW-Strings ohne Zahlenwerte, fake-name; s. PROTOKOLL-485.md)~~
        BELEGT 15.10.2026 (Ghidra): Byte 3 = Zustand IDLE=0…TEST=5, CHECK_HUB ist
        Preload-Statemachine, kein Box-Zustand
 0x0d = ~~?~~ SET_PRE_LOADING/RFID-Control [Maske][00 disable|01 enable|02 Force-Read]
        (KORRIGIERT 15.10.2026, Belege ref-hi + k2-vanilla, s. PROTOKOLL-485.md
-       „Preload-Ablauf“); live nur leeres ACK (len 3, nach GET_RFID), kein Request
+       „Preload-Ablauf“); ~~live nur leeres ACK (len 3, nach GET_RFID), kein Request~~
+       LIVE BELEGT 15.10.2026: 55 Requests ([0f 01]/[0f 00]/[01 02]/[00 02]), op 2 Antwort
+       nach 31–37 s; op 3 nie live
        BELEGT 15.10.2026 (Ghidra): op 0/1 global (Maske ignoriert), op 2 = Forced
        Preload mit RFID, op 3 = ohne RFID; Antwort bei 2/3 erst nach ~3 min/Slot
 0x0e = MEASURING_WHEEL Request [01], Antwort 4B BE-IEEE754-Float negativ
 0x0f = ~~CTRL_CONNECTION_MOTOR_ACTION [01] Engage / [00] Release~~
-       WIDERLEGT 15.10.2026 (Ghidra): Auto-Preload-Sperr-Flag [01] sperren / [00] frei
+       WIDERLEGT 15.10.2026 (Ghidra): Auto-Preload-Sperr-Flag [01] sperren / [00] frei;
+       Host-Name (live): TIGHTEN_UP_ENABLE
 0x10 = EXTRUDE_PROCESS Requests [Slotmaske, Stufe, Parameter]: 00/04/05/06/07
        (BELEGT 15.10.2026: 8 Modi; 05 = Odometer-Abfrage, 07 03 = Extruder-Check 3 mm)
 0x11 = RETRUDE_PROCESS Requests [Slotmaske, 00] START / [Slotmaske, 01] FINISH
-0x14 = GET_VERSION_SN ASCII-Version+SN
+       (LIVE 15.10.2026: [m 00] meist 4×, dann [m 01]; kein 0x08 [01] dazwischen)
+0x14 = GET_VERSION_SN ASCII-Version+SN ("113" bis 12.10.2026, danach "153")
+0x15 = GET_HARDWARE_STATUS (Host-Name live 15.10.2026) – 16 B `10 20 30 40 50 60 00…`
+Status 0x30 = UPDATE_STATE (Ereignis 1 Einstecken / 2 Herausziehen / 3 Preload fertig, V);
+       0x51 = SPEED_ERR (live echter Fehlercode, key846)
 NEU 15.10.2026 (Ghidra, R153): 0x01 LED-Refresh, 0x06 Feeder (FW-Bug: immer Status 1),
        0x07 Hauptmotor, 0x09 Speeds, 0x0b LED, 0x0c Config#6, 0x12/0x13 Feed-Prozesse,
        0x15, 0x30 GPIO, 0x50–0x56, 0x5b UID, 0x5c I2C-Auth, 0x5d Testmodus –
@@ -71,13 +97,13 @@ NEU 15.10.2026 (Ghidra, R153): 0x01 LED-Refresh, 0x06 Feeder (FW-Bug: immer Stat
 ```
 
 - RFID-Daten: `vender` = ~~24B-Hex~~ **40 Hex-Zeichen / 20 Byte** (KORRIGIERT 15.10.2026)
-  (`101250000001010010FFFFFF0000000000000000`), `color_value` (0FFFFFF = weiß),
+  (`1012…(gekürzt, mat 101001/col 0FFFFFF)…`), `color_value` (0FFFFFF = weiß),
   `material_type` (101001), `remain_len` (%).
   Feldlayout des vender (mittel-stark, fake-name firmware.md:340-352/521-523):
   `month(1) day(2) year(2) supplier(4) batch(2) · mat_id(6) col(7) · len(4) number(6)
   reserve(6)` – color/material stecken IM vender (mat 101001 = Hyper PLA, col 0FFFFFF);
   Nachbau `box.split_rfid_vendor()`, Details PROTOKOLL-485.md „RFID-Frame“.
-  ~~Tag-SN (`SN-DEMO-1234567890X`), Tag-FW (`1.5.3`)~~ KORRIGIERT 15.10.2026: das sind
+  ~~Tag-SN (`SN-DEMO-…(SN gekürzt)`), Tag-FW (`1.5.3`)~~ KORRIGIERT 15.10.2026: das sind
   **Box-SN + CFS-App-Version** (aus 0x14 GET_VERSION_SN, „153“), nicht Tag-Daten
   (PROTOKOLL-485.md Func-Tabelle 0x14 war korrekt)
 - `preloading_mask` = Slot-Bitmaske: 0x1=A, 0x2=B, 0x4=C, 0x8=D
@@ -109,9 +135,23 @@ NEU 15.10.2026 (Ghidra, R153): 0x01 LED-Refresh, 0x06 Feeder (FW-Bug: immer Stat
 ```
 0x06 = Sys-Param, sehr wahrscheinlich SCHREIBEN (4 Bytes LE-Float, 00 00 96 43 = 300.0)
        [~~Encoder/ADC lesen~~ – WIDERLEGT 15.10.2026]
-0x0c = Parameter (8 Datenbytes) an alle Boards gleichzeitig
-0x11 = Modus-Umschaltung (1-2 Datenbytes)
+       LIVE BELEGT 15.10.2026: [02,id] lesen → 4 B <f (ID 10: 2 B, unbekannte ID: 0 B),
+       [01,id]+<f> schreiben → Echo, [03] übernehmen → [01]; FLÜCHTIG (Kaltstart = Defaults)
+0x0c = ~~Parameter (8 Datenbytes) an alle Boards gleichzeitig~~ WIDERLEGT 15.10.2026:
+       Protection-Abfrage, Request [0b] → 8 B Status (00 = ok); [05] ohne Antwort
+0x11 = Modus-Umschaltung (1-2 Datenbytes) – LIVE: [01]/[02]/[03] Stall-Mode setzen (Echo),
+       [04] lesen → [mode, 00]
+0x0e = (LIVE 15.10.2026) addr 0E [02] → [addr]; FF 0E [01] Broadcast ohne Antwort
+0x12 = (LIVE 15.10.2026) addr 12 [02] → 8 B UUID (Präfix cd ab)
+0x05 = (LIVE 15.10.2026) [01]/[02] an X/Y bei BELT_TENSION, nie Antwort (Semantik offen)
 ```
+
+- **Pfad (LIVE 15.10.2026):** X/Y/Z/Z1 ausschließlich über serial_485 ttyS5 (geteilt mit
+  CFS 0x01 + Belt), Extruder nur über `transparent_send`/0x81. Alle Motor-Requests
+  `retries = 0`. Bootsequenz + 227 flash_params (IDs 0–226; Log-Falle `value:N` = ID):
+  PROTOKOLL-485.md §3.1. Nachbau: `motor.py`/`motor_mini.py` (parallel umgesetzt:
+  read_sys_param, check_protection, get_stall_mode, read_485_addr, read_uuid,
+  write_sys_param nur mit confirm=True, MOTOR_RETRIES=0, SYS_PARAM_NAMES 227).
 
 - Cut-Kalibrierung live: 0x06-Payload `00 00 96 43` → `00 00 c8 42`
   = **LE-Float 300.0 → 100.0** = `MOTOR_SYS_PARAM NUM=1 DATA=1 ID=70
@@ -122,8 +162,9 @@ NEU 15.10.2026 (Ghidra, R153): 0x01 LED-Refresh, 0x06 Feeder (FW-Bug: immer Stat
   ~~(Big-Endian 38467 → 51266, Differenz 12799 Ticks = Cut-Offset)~~ **WIDERLEGT
   15.10.2026** (Artefakt; ebenso ältere 0x4396/0x42c8-Lesart).
   `motor_control.cut.pos_x` -7.5 → -7.6 (Ergebnis des Makros, nicht der 0x06-Bytes).
-  OFFEN: wo ID 70 steckt – Live-Frame `f7 81 07 00 06 00 00 96 43 09` hat len 07
-  (3+4) + gültige CRC, enthält nur den Float.
+  ~~OFFEN: wo ID 70 steckt – Live-Frame `f7 81 07 00 06 00 00 96 43 09` hat len 07
+  (3+4) + gültige CRC, enthält nur den Float.~~ GEKLÄRT 15.10.2026 (live): ID im
+  Request `[01, 0x46] + <f>`; der zitierte Frame ist die Antwort (Echo).
 - `CALIBRATE_CUT_POS`-Ablauf: MOTOR_SYS_PARAM ID=70 (300→100) + MOTOR_CHECK_CUT_POS
 
 ### 1.6 Auto-Addr / Discovery (DEKOMPILIERT aus mcu_util_485 1.1.7.0, 13.10.2026)
@@ -204,9 +245,12 @@ Slot-Bitmasken, A2-Shape, Auto-Addr-Sequenz.
   nur die ID-Position fehlt im Plus-Frame) und 0x0C
   mit 8 Nullbytes. Keine der beiden Seiten ist damit widerlegt, aber blindes
   Übernehmen der Vanilla-Formen auf den Plus ist riskant (andere Board-Generation?).
+  **LIVE BELEGT 15.10.2026:** Vanilla-Formen gelten auch am Plus – 0x06 `[01/02/03,id]`,
+  0x0C `[0b]` → 8 B Status (die 8 Nullbytes waren die Antwort).
 - Timeouts: Vanilla Default attempts=1 vs. unsere retries=4 (verschiedene Schichten).
-  NACHTRAG 15.10.2026: im Nachbau retries=4 = 1+4 = 5 Sendungen; ob das Original
-  „retries = 4“ als 4 oder 1+4 Sendungen meint, ist am klippy.log nachzuzählen (offen).
+  NACHTRAG 15.10.2026: im Nachbau retries=4 = 1+4 = 5 Sendungen; ~~ob das Original
+  „retries = 4“ als 4 oder 1+4 Sendungen meint, ist am klippy.log nachzuzählen (offen).~~
+  **LIVE BELEGT 15.10.2026:** 5 Sendungen (`klippy.log.2026-10-05:63472–63521`).
 - STATUS/Event: Vanilla kennt zusätzlich `0x16`=UNLOAD_NO_FILAMENT (statt busy).
   **BELEGT 15.10.2026 (Ghidra):** 0x16 = Slot ohne Filament (Vanilla korrekt), busy = 0x03.
 
@@ -245,6 +289,8 @@ Details siehe Subagenten-Bericht in der Session-Historie.
   Stall-Mode → Protection-Check; Motoren antworten erst nach dem Stock-`_build_config`
   (UART-Init in der MCU-FW). Für einen Pi-Ersatz also zu klären, ob die Motoren am
   Plus direkt am `/dev/ttyS5`-Bus oder nur über die Main-MCU erreichbar sind.
+  **GEKLÄRT 15.10.2026 (live):** am Plus direkt am ttyS5; nur der Extruder über
+  transparent – die grant-Architektur gilt für den K2, nicht den Plus.
 
 **Kreuzvergleich: fake-name/cfs-reverse-engineering (CFS-Hardware, 15.10.2026 gesichtet)**
 
@@ -270,8 +316,9 @@ eigene Klipper-Module + Captures + Tests. **Kreuzvalidierung bestanden:**
 
 Übernommene Korrekturen (Hi-belegt, K2-Status jeweils vermerkt):
 - Messrad = BE-Float negativ (statt Zähler) – an K2-Frames nachverifiziert
-- 0x05=GET_BUFFER_STATE (frühere CUT_STATE-Zuordnung korrigiert), 0x0F=Motor-Aktion,
-  0x08=GET_HARDWARE_STATUS, 0x14=Version/SN,
+- 0x05=GET_BUFFER_STATE (frühere CUT_STATE-Zuordnung korrigiert), 0x0F=Motor-Aktion
+  (live-Host-Name: TIGHTEN_UP_ENABLE), ~~0x08=GET_HARDWARE_STATUS~~ (live: GET_FILAMENT_SENSOR_STATE;
+  GET_HARDWARE_STATUS = 0x15), 0x14=Version/SN,
   0x0A=Box-State (0x08 ist separat) – K2 plausibel, einzeln unverifiziert
 - STATUS-Semantik: Hi `0xFF`=Host-Kommandos / `0x00`=Addressing+Replies
   (+Event-Kanal 0x30/0x16); K2 nutzt `0x00` auch hostseitig

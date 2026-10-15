@@ -409,6 +409,49 @@ selbst gegengeprüft; bei der Einarbeitung zusätzlich nachgeprüft (Abschnitt �
 - Selbsttests danach alle grün: serial485 81/81 · box 101 · boxmini 15 · cfsseq 21 ·
   motor 65 · motor_mini 20 · auto_addr 31.
 
+## 15.10.2026 – Live-Logs ausgewertet (Drucker-Zugriff nur lesend)
+
+- **Quelle:** `live-logs-2026-10-15/` (6× klippy.log 05.–16.10., moonraker.log, versionen.txt;
+  lokal, nicht fürs Repo). Auswertungen: PROTOKOLL-485.md §3.1 (Motoren) und §6 (CFS),
+  GHIDRA-CFS-BEFUND-2026-10-15.md §11. Log-Uhr UTC+8; Box-FW 113 → 153 und Display-FW
+  1.1.4.12 → 1.1.7.0 am 12.10.2026.
+- **`nachbau/box.py`:**
+  - `FUNC_RETRIES`/`func_retries()` + `FUNC_TIMEOUTS_SO` (Startwerte aus dem Log je fun:
+    alle CFS-Operational 4, **0x0a-Poll 0**); alle `BoxAction.communication_*` übergeben
+    `retries` explizit. Bewusste Abweichung: 0x0d op 2/3 bleibt retries=0 + Ghidra-Timeout
+    (Original 4 × 300 s würde den Force-Preload neu auslösen).
+  - Namen: `FUNC_GET_FILAMENT_SENSOR_STATE` = 0x08 (alt `FUNC_HARDWARE_STATUS_LEGACY_08`,
+    `build_get_hardware`, `parse_hardware_status` als Aliase), `FUNC_GET_HARDWARE_STATUS` =
+    **0x15** (neu `build_get_hardware_status`, `parse_get_hardware_status`;
+    `communication_get_hardware_status()` sendet 0x15, mit altem `channel`-Argument wie
+    früher 0x08), `FUNC_TIGHTEN_UP_ENABLE` = 0x0f (+ `build_tighten_up_enable`,
+    `communication_tighten_up_enable`; PRELOAD_INHIBIT/MOTOR_ACTION bleiben Aliase),
+    `STATUS_UPDATE_STATE` = 0x30, `STATUS_SPEED_ERR` = 0x51, `EVENT_*` (1/2/3).
+  - `parse_box_state(msg, box_fw=None)`: Byte 5 als `b5` (unbelegt; `rfid_valid_mask` nur
+    Alias), `temp_c_guess`/`rh_guess` (Vermutung), `hub_mask`; FW-113-Frames (4 Byte, Status 0)
+    → `state_v113`; 4-Byte-**Rohdaten** ohne Status nicht mehr als Ereignis, sondern
+    `ambiguous` (mit `box_fw` entscheidbar).
+  - Selbsttest: echte Live-Frames (IDLE, SPEED_ERR, Motorblock 0x19/0x91, FW 113, 3 ×
+    UPDATE_STATE, 0x08, 0x15); SN und RFID-vender im Test durch Platzhalter ersetzt (CRC neu).
+- **`nachbau/cfsseq.py`:** `build_retrude_sequence(mask, to_buffer_repeats=4)` wie live
+  (`04[00 01] 08[00] 11[m 00]×4 11[m 01]`, Kurzform bei 0); das frühere `08 [01]` zwischen
+  p0 und p1 entfernt (live 0/23). Neu `requests_from_log_cmds`, `filter_funs`,
+  Live-Sequenzen `RETRUDE_LIVE_CMDS_A`/`RX_A`, `EXTRUDE_LIVE_CMDS_B` als Tests (Extrude-
+  Folge bytegleich mit `build_extrude_sequence`). Namen `FUNC_FILAMENT_SENSOR_STATE`,
+  `FUNC_TIGHTEN_UP_ENABLE` (alte als Aliase).
+- **`nachbau/boxmini.py`:** `RETRIES_OPERATIONAL = 4` explizit (wie Original), Live-Remain-
+  Frame `00 ff 1d 00` als Test, Docstrings (0x08 live belegt).
+- **Motor-Code:** parallel umgesetzt, siehe `motor.py`/`motor_mini.py` (read_sys_param,
+  Schreib-/Update-Builder, write_sys_param mit confirm-Schutz, check_protection,
+  get_stall_mode, read_485_addr, read_uuid, MOTOR_RETRIES=0, Timeouts 0x06/0x12 1,0 s,
+  0x0E/0x0C 0,05 s, SYS_PARAM_NAMES 227).
+- **Doku:** PROTOKOLL-485.md (Logformat, Retry-Tabelle, 0xa2 retries=0 statt „4 Retries“,
+  0x0d live, Host-Namen, 0x51, Motor §3.1), PROTOKOLL-GESAMT.md (Ports, Versionen, §1.2/1.3/
+  1.5/1.9), CHECKLISTE.md (6 Punkte geschlossen, Pi-Ersatz, Kanal A), lokale Übergabenotiz (nicht im Repo).
+  Datenschutz: vollständige SN/UUID/RFID-vender in allen Markdown-Dateien gekürzt.
+- Selbsttests danach alle grün: serial485 81 · box 126 · boxmini 17 · cfsseq 28 · motor 98 ·
+  motor_mini 30 · auto_addr 31.
+
 ## Anonymisierung (Repo-Fassung)
 
 Gegenüber der lokalen Forschungsablage sind im Repo folgende Werte durch syntaktisch
@@ -425,8 +468,11 @@ verifizierte CRCs (CRC-8/ATM über `[len..data]`), die Selbsttests laufen damit 
 | Version/SN-Frame 0x14 | `f7 01 19 00 14 … 58 d4` (CRC neu: `0xd4`; Original-CRC `0x8d`) |
 | RFID-Vendor (40 Zeichen) | `101250000001010010FFFFFF0000000000000000` – strukturierter, synthetischer Platzhalter (ersetzt den früheren 40×`A`), zerfällt per `box.split_rfid_vendor()` in month `1` · day `01` · year `25` · supplier `0000` · batch `00` · mat_id `101001` · col `0FFFFFF` · len `0000` · number `000000` · reserve `000000`. mat_id/col sind nicht identifizierend und wurden beibehalten; die echten day/year/supplier/batch/len/number sind entfernt. Auch als ASCII-Hex im 0x02-Frame und als gekürzte Präfixe (`10125`) |
 | RFID-Frame 0x02 `A:<vendor>;` | `f7 01 2e 00 02 41 3a 31 30 … 30 3b d7` (CRC neu: `0xd7`; Original-CRC `0x02` bezog sich auf die echten Bytes) |
+| Motor-UUID (0x12-Antwort, 8 Byte, Präfix `cd ab`) | `cd ab 00 00 00 00 00 00` (Antwortframe `f7 81 0b 00 12 cd ab 00×6 ad`, CRC neu: `0xad`) |
+| Gekürzte Angaben (`…`) in der Doku | nur Platzhalter-Präfixe (`SN-DEMO-…`, `1012…`, Vendor-Felder `1`·`01`·…), nie echte Teilstücke |
 
 Nicht im Repo: Klartextquelle `auto_addr_wrapper.py` (Creality, 729 Zeilen; Zeilenangaben
-„Orig :<zeile>“ bzw. „:604-607“ beziehen sich auf sie), Firmware-/Config-Tarball und
-lokale Übergabenotizen. Die Seriennummer aus den Dumps von `fake-name/cfs-reverse-engineering`
+„Orig :<zeile>“ bzw. „:604-607“ beziehen sich auf sie), Firmware-/Config-Tarball,
+lokale Übergabenotizen, die Live-Logs `live-logs-2026-10-15/` (Zeilenangaben wie
+`klippy.log:2512` beziehen sich auf sie) sowie Zugangsdaten/Login-Hinweise zum Drucker. Die Seriennummer aus den Dumps von `fake-name/cfs-reverse-engineering`
 ist nicht übernommen.

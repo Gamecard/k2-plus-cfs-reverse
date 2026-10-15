@@ -35,9 +35,22 @@ done
 Echte Hardware braucht `pyserial`; der Import erfolgt erst bei Benutzung
 (`Serial485(port, baud)`), die Tests laufen ohne.
 
-Stand der Selbsttests (15.10.2026, `ok`-Zeilen, 0 FAIL): `serial485` 81/81
-(inkl. ref-hi: 16 CRC-Vektoren + 12 Nachrichten), `box` 101, `boxmini` 15, `cfsseq` 21,
-`motor` 65, `motor_mini` 20, `auto_addr` 31.
+Stand der Selbsttests (15.10.2026 nach Live-Log-Einarbeitung, `ok`-Zeilen, 0 FAIL):
+`serial485` 81/81 (inkl. ref-hi: 16 CRC-Vektoren + 12 Nachrichten), `box` 126,
+`boxmini` 17, `cfsseq` 28, `motor` 98, `motor_mini` 30, `auto_addr` 31.
+
+Live-Gegenprobe 15.10.2026 (Drucker-Logs `klippy.log` 05.–16.10., nur lesend geholt;
+die Logs selbst sind nicht im Repo, Details: `PROTOKOLL-485.md` §3.1 und §6):
+
+- Retry-Semantik belegt: `retries = 4` ⇒ 1 + 4 = 5 Sendungen im 2-s-Abstand (Zähler
+  zählt herunter); 0x0a-Box-Poll und 0xa2-Auto-Addr laufen mit `retries = 0`.
+  Nachbau: `box.FUNC_RETRIES`/`func_retries`, Motoren durchgehend `retries = 0`.
+- Motor-Lesebefehle (live belegt) freigegeben: Sys-Param lesen `0x06 [02, id]`,
+  Schutzstatus `0x0C [0b]`, Stall-Mode `0x11 [04]`, Adresse `0x0E [02]`, UUID `0x12 [02]`.
+- Schreibende Motor-Kommandos (`0x06 [01, id] + float`) senden **nur mit
+  `confirm=True`** (sonst `PermissionError`, kein Frame); `read_encoder` bleibt gesperrt.
+- Stock-Frames werden von `serial485.build_frame` byte-genau reproduziert, alle
+  Motor-RX-Frames CRC-OK.
 
 Ghidra-Neuanalyse 15.10.2026 (Details: `GHIDRA-CFS-BEFUND-2026-10-15.md`):
 
@@ -60,7 +73,7 @@ Wichtige Korrekturen aus dem Review 15.10.2026 (Details: `AUDIT-UND-AENDERUNGEN.
 
 ## Anonymisierung
 
-IP, Hostname, Geräte-SN, RFID-Vendor-Bytes und CFS-UUID sind anonymisiert
+IP, Hostname, Geräte-SN, RFID-Vendor-Bytes, CFS-UUID und Motor-UUIDs sind anonymisiert
 (syntaktisch gültige Platzhalter gleicher Länge, CRCs neu berechnet und
 verifiziert). Details in `AUDIT-UND-AENDERUNGEN.md`.
 
@@ -72,7 +85,16 @@ RS485 protocol between the Creality K2 Plus host board and its lower boards
 by live captures and Ghidra analysis. License: GPL-3.0-or-later.
 
 Status 15.10.2026: all self-tests green (serial485 81/81 incl. Hi reference
-vectors, box 101, boxmini 15, cfsseq 21, motor 65, motor_mini 20, auto_addr 31).
+vectors, box 126, boxmini 17, cfsseq 28, motor 98, motor_mini 30, auto_addr 31).
+
+Live cross-check 15.10.2026 against the printer's own logs (klippy.log, read-only;
+logs not included in the repo): retry semantics confirmed (`retries = 4` means
+1 + 4 = 5 transmissions 2 s apart; box poll 0x0a and auto-addr 0xa2 use
+`retries = 0`; all motor commands use `retries = 0`). Motor read commands observed
+live are now enabled (sys-param read `0x06 [02, id]`, protection `0x0C [0b]`,
+stall mode `0x11 [04]`, address `0x0E [02]`, UUID `0x12 [02]`); the parameter write
+`0x06 [01, id] + float` only transmits with `confirm=True`, otherwise it raises
+`PermissionError` without sending.
 Corrections: motor func `0x06` is a system-parameter write (LE float), not an
 encoder read (`read_encoder` disabled); CFS preload `0x0d` actions are
 `0x00` disable / `0x01` enable / `0x02` force RFID read; slot arguments are
