@@ -138,6 +138,15 @@ serial485 81/81 · box 68 · boxmini 15 · cfsseq 17 · motor 65 · motor_mini 2
   (Live-Frame `f7 81 07 00 06 00 00 96 43 09` trägt nur den Float)
 - [ ] Erase (0xF0/0x06) belegen: nur CFS-Typ 1/10 dekompiliert, für Motoren unbelegt
   (im Nachbau nur mit `erase=True`)
+- [ ] Motor 0x08 (laut grant0013 „get feedback“) live prüfen – Kandidat fürs echte
+  Encoder-Lesen; `read_encoder` bleibt bis dahin gesperrt
+- [ ] Motor 0x0C: Protection-Semantik (grant0013/k2-vanilla) gegen Plus-Frame `00*8` prüfen
+- [ ] Motor 0x12 (dev_uuid) und 0x0E (read/set_addr) am Plus mitschneiden
+  (Stock-Bootsequenz laut grant0013: `FF 0E 01`, `8x 12 02`, `8x 0E 02`)
+- [ ] Transparent-Pfad über Main-MCU (`transparent_send`/`transparent_response`) für
+  Pi-Ersatz klären: Motoren am Plus direkt am Bus oder nur via MCU erreichbar?
+- [ ] 226-Param-Map (grant0013 `motor_params_map.md`) mit Plus-klippy.log abgleichen
+  (flash_param-Enumeration), ID 70 = Kp bestätigen
 - [ ] Code-Restwiderspruch: `box.get_measuring_wheel`-Docstring nennt noch
   `c5019149 -> -2073,08` (Tippfehler, korrekt c5009149 = −2057,08) – Code-Agent
 

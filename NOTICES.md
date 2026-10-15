@@ -24,6 +24,9 @@ License v3.0 or later** (siehe `LICENSE`).
 - Protokoll-Kenntnisse aus `gitstonelabs/creality-cfs-klipper` (GPL-3.0) und
   `prestonbrown/helixscreen`-Recherche-Dokumenten wurden zum Abgleich und zur
   Korrektur eigener Befunde verwendet; übernommene Fakten sind jeweils belegt.
+- `grant0013/k2-reverse-engineering` (GPL-3.0, Creality K2): Motor-Parameter-IDs
+  (z. B. ID 70 = Positionsregler-Kp) und Motor-Kommandobytes wurden zum Abgleich
+  genutzt und als Fremd-Hypothesen gekennzeichnet; keine Dateien übernommen.
 
 ## Hinweis
 

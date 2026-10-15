@@ -322,10 +322,51 @@ Host: `motor_control_wrapper`: `motor_version/sys_param/flash_param`, `motor_rea
   CRC – im Frame fehlt also kein Byte, er trägt NUR den Float. Vanilla-Form wäre
   `[01, id] + <f` (→ hypothetisch `f7 81 09 00 06 01 46 00 00 96 43 8f`), auf dem
   Plus NICHT live gesehen. `read_encoder` in motor*.py ist deshalb gesperrt.
+  NACHTRAG 15.10.2026: **ID 70 = `controller_pos_loop_pid_param_kp`
+  (Positionsregler-Kp, CONFIGURABLE)** laut grant0013/k2-reverse-engineering
+  `docs/motor_params_map.md:103` (Fremdquelle K2, Namen aus klippy.log) →
+  CALIBRATE_CUT_POS setzt Kp auf 300 und danach zurück auf 100.
 - `0x0c` = Parameter (8 Datenbytes `00*8`) an alle 4 Boards gleichzeitig
 - Ablauf `CALIBRATE_CUT_POS`: Modus→~~ADC lesen~~ Sys-Param 300.0 (0x06)→Parameter
   →~~ADC lesen~~ Sys-Param 100.0 (0x06)→Modus zurück (KORREKTUR 15.10.2026)
-  (MOTOR_SYS_PARAM ID=70 PARAMS=300/100 = Cut-Kraft rampen)
+  (MOTOR_SYS_PARAM ID=70 PARAMS=300/100 = Positionsregler-Kp hoch/zurück,
+  Name laut grant0013; frühere Deutung „Cut-Kraft rampen“ damit präzisiert)
+
+### Fremdquelle grant0013/k2-reverse-engineering (K2, 15.10.2026 gesichtet)
+
+Upstream https://github.com/grant0013/k2-reverse-engineering (GPL-3.0, Stand
+2026-04/05). Bezieht sich auf den **K2, nicht den K2 Plus**. Belege dort aus
+klippy.log-Auswertung und Namen – **keine Frames, keine CRCs**; der Autor schreibt
+selbst, dass sein eigener Code nur leere Motor-Antworten bekommt. Gesichtet:
+`docs/motor_params_map.md` (226 Motor-Parameter-IDs), `docs/k2_architecture.md`,
+`docs/rs485_protocol.md`. Keine Dateien übernommen.
+
+| Byte | laut Fremdquelle (K2) | unser Stand (K2 Plus) |
+|---|---|---|
+| `0x01` | reboot | unbelegt |
+| `0x03` | encoder_cal | unbelegt (Stub `encoder_calibrate`) |
+| `0x04` | elec_offset_cal | unbelegt (Stub `elec_offset_calibrate`) |
+| `0x05` | control | unbelegt |
+| `0x06` | sys_param read/write | **live**: 4 B LE-Float 300.0/100.0 = ID 70 (Kp) – passt |
+| `0x07` | flash_param read/write | unbelegt (Stubs `get/set_flash_param`) |
+| `0x08` | get feedback | unbelegt – Kandidat fürs echte Encoder-Lesen |
+| `0x0B` | boot | unbelegt (Motoren); bei CFS = Loader-Check an 0xFF |
+| `0x0C` | protection status | **live**: 8× `00` an alle Boards; Semantik offen |
+| `0x0D` | systemid | unbelegt |
+| `0x0E` | read/set_addr | unbelegt (Stub `read_485_addr`) |
+| `0x0F` | version | unbelegt (belegt nur F0/00 via `query_version`) |
+| `0x11` | stall_mode | **live**: 1–2 B (`01`/`02 00`/`03`) – „Modus“ passt dazu |
+| `0x12` | dev_uuid | unbelegt |
+
+Adressen dort: `0x81..0x84` = X/Y/Z/Z1 über Main-MCU-Transparent-Pfad
+(`transparent_send`/`transparent_response`), `0x85` = Extruder über Nozzle-MCU
+transparent. Stock-Bootsequenz (aus Logs): Broadcast-Addr-Set `FF 0E 01`, UUID-Abfrage
+`81/82 12 02`, Adress-Lesen `81/82 0E 02`, dann Stall-Mode und Protection-Check.
+
+**Bewertung:** Die drei auf dem Plus live gesehenen Bytes (0x06/0x0C/0x11) passen
+widerspruchsfrei zur Fremdtabelle, ID 70 erklärt die 300/100-Werte. Alles Übrige sind
+**Hypothesen (Fremdquelle K2, auf dem Plus unbelegt)** – kein sendender Code im Nachbau,
+Stubs bleiben gesperrt, bis je Kommando ein Plus-Mitschnitt vorliegt (CHECKLISTE.md).
 
 ## 4. Update-Werkzeuge
 

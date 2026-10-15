@@ -309,6 +309,22 @@ Test: `offline erst nach 4 verpassten Checks`.
 - Die lokale Übergabenotiz (nicht im Repo) verweist auf `README.md`, `LICENSE`, `NOTICES.md`,
   die in der lokalen Projektablage fehlen – im Repo sind alle drei vorhanden.
 
+## 15.10.2026 – Fremdquelle grant0013 eingearbeitet
+
+Gesichtet: `grant0013/k2-reverse-engineering` (GPL-3.0, K2 – nicht K2 Plus; Belege aus
+klippy.log/Namen, keine Frames/CRCs). Eingearbeitet nur als Kommentar/Doku, **kein neuer
+sendender Code**, Stubs und `read_encoder` bleiben gesperrt:
+
+- `nachbau/motor.py`, `nachbau/motor_mini.py`: ID 70 = `controller_pos_loop_pid_param_kp`
+  (Positionsregler-Kp, `motor_params_map.md:103`) im FUNC_SYS_PARAM-Beleg; Fremd-Hypothesen
+  der Kommandobytes (0x03/0x04/0x07/0x08/0x0C/0x0E/0x0F/0x11/0x12) an den passenden
+  Stubs bzw. bei FUNC_SET_PARAMS, jeweils als „Fremdquelle K2, auf dem Plus unbelegt“.
+- `PROTOKOLL-485.md` §3: ID-70-Nachtrag + Abschnitt mit Kommandotabelle und Bewertung.
+- `PROTOKOLL-GESAMT.md` 1.5/1.9: ID-70-Hinweis, Projekteintrag inkl. Transparent-Pfad/
+  Bootsequenz als Hinweis für den Pi-Ersatz.
+- `CHECKLISTE.md`: 5 offene Prüfpunkte (0x08, 0x0C, 0x12/0x0E, Transparent-Pfad, Param-Map).
+- Selbsttests danach unverändert grün (alle 7 Module).
+
 ## Anonymisierung (Repo-Fassung)
 
 Gegenüber der lokalen Forschungsablage sind im Repo folgende Werte durch syntaktisch

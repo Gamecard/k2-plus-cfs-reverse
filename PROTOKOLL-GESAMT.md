@@ -95,6 +95,8 @@ crc = CRC-8/ATM (poly 0x07, init 0x00) über [len..data]  ← GEKNACKT 12.10.202
   = **LE-Float 300.0 → 100.0** = `MOTOR_SYS_PARAM NUM=1 DATA=1 ID=70
   PARAMS=300|100 PARAMS_TYPE=float` (gcode_macro.cfg:796/799, sensorless.cfg:145/211)
   – KORREKTUR 15.10.2026, passt zu k2-vanilla (1.9: 0x06 = Sys-Param).
+  ID 70 = `controller_pos_loop_pid_param_kp` (Positionsregler-Kp) laut
+  grant0013 `motor_params_map.md:103` (Fremdquelle K2, s. 1.9).
   ~~(Big-Endian 38467 → 51266, Differenz 12799 Ticks = Cut-Offset)~~ **WIDERLEGT
   15.10.2026** (Artefakt; ebenso ältere 0x4396/0x42c8-Lesart).
   `motor_control.cut.pos_x` -7.5 → -7.6 (Ergebnis des Makros, nicht der 0x06-Bytes).
@@ -194,6 +196,28 @@ Chamber-Heizer + PTC-Lüfter (M141/M191-Stubs entfernen!), Lüfter-Mapping (PA0!
 Thermistor-Tabellen (Extruder 260k, Bett EPCOS), Box-Koordinaten (Y~374–378/200),
 Mesh 345/9×9, `[prtouch_v3]`-Probe-Stack, `motor_closed_loop x,y,z,z1,e`.
 Details siehe Subagenten-Bericht in der Session-Historie.
+
+**Kreuzvergleich: grant0013/k2-reverse-engineering (K2, 15.10.2026 gesichtet)**
+
+- Was: Recherche-Repo (GPL-3.0, Stand 2026-04/05) zum **K2 (nicht Plus)**, Upstream
+  von `k2-adaptive-bedmesh`; Notizen zu Kommunikationspfaden, RS485-Frameformat,
+  Motor-Kommandobytes und einer Map aller 226 Motor-Parameter-IDs (mit
+  CONFIGURABLE-Flag), gewonnen aus klippy.log-Auswertung und Namen.
+- Nützlich: ID 70 = `controller_pos_loop_pid_param_kp` (`motor_params_map.md:103`)
+  erklärt unser live gesehenes 0x06 300.0→100.0 (CALIBRATE_CUT_POS hebt Kp an und
+  setzt zurück). Kommandotabelle 0x01–0x12 (Details PROTOKOLL-485.md §3) deckt sich mit
+  den Plus-Live-Bytes 0x06/0x0C/0x11 und mit k2-vanilla (0x0C = Protection) und liefert
+  Kandidaten für die motor.py-Stubs (0x08 get feedback, 0x07 flash_param, 0x0E addr,
+  0x0F version, 0x12 uuid).
+- Einschränkungen: keine Frames/CRCs, keine Payload-Formen; der Autor bekommt mit
+  eigenem Code nur leere Motor-Antworten. Alles nur Hypothese für den Plus.
+- Hinweis Pi-Ersatz: Motoren hängen dort am **Transparent-Pfad der Main-MCU**
+  (`config_transparent`, `transparent_send oid=%c write=%*s timeout_ms=%u` /
+  `transparent_response`), Extruder 0x85 über Nozzle-MCU. Stock-Bootsequenz:
+  Broadcast `FF 0E 01` (Timeout normal) → UUID `8x 12 02` → Adresse `8x 0E 02` →
+  Stall-Mode → Protection-Check; Motoren antworten erst nach dem Stock-`_build_config`
+  (UART-Init in der MCU-FW). Für einen Pi-Ersatz also zu klären, ob die Motoren am
+  Plus direkt am `/dev/ttyS5`-Bus oder nur über die Main-MCU erreichbar sind.
 
 Geklonter Stand in `/tmp/opencode/cfs-klipper-ref` (flüchtig – bei Bedarf neu klonen),
 eigene Klipper-Module + Captures + Tests. **Kreuzvalidierung bestanden:**

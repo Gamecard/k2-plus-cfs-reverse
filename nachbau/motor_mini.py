@@ -28,6 +28,10 @@ from serial485 import Serial485  # noqa: F401 (für echten Betrieb)
 # 0x06 = vermutlich Sys-Param-Schreiben: 4 Bytes LE-Float (00 00 96 43 =
 # 300.0, 00 00 c8 42 = 100.0 = MOTOR_SYS_PARAM ID=70 PARAMS=300/100 aus
 # gcode_macro.cfg:796/799). WIDERLEGT 15.10.2026: "Encoder lesen, BE 38467".
+# ID 70 = controller_pos_loop_pid_param_kp (Positionsregler-Kp) laut grant0013/
+# k2-reverse-engineering motor_params_map.md:103 (Fremdquelle K2) ->
+# CALIBRATE_CUT_POS setzt Kp 300, danach zurück auf 100. Fremd-Hypothese
+# (K2, auf dem Plus unbelegt): 0x08 get feedback = Kandidat fürs Encoder-Lesen.
 FUNC_SYS_PARAM = 0x06
 FUNC_READ_ENCODER = FUNC_SYS_PARAM  # Alt-Name, nur Kompatibilität – nicht senden!
 FUNC_SET_MODE = 0x11       # 1-2 Datenbytes (01 / 02 00 / 03 gesehen)

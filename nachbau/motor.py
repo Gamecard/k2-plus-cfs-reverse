@@ -46,9 +46,23 @@ import struct
 # OFFEN: wo die ID 70 (0x46) steckt – der einzige dokumentierte Live-Frame
 # f7 81 07 00 06 00 00 96 43 09 hat len=07 (=3+4) und gültige CRC, enthält
 # also NUR die 4 Float-Bytes (kein übersehenes Byte im Frame).
+# NACHTRAG 15.10.2026: ID 70 = `controller_pos_loop_pid_param_kp`
+# (Positionsregler-Kp, CONFIGURABLE) laut Fremdquelle grant0013/
+# k2-reverse-engineering docs/motor_params_map.md:103 (K2, nicht K2 Plus;
+# Namen aus klippy.log-Auswertung) -> CALIBRATE_CUT_POS setzt Kp auf 300
+# und danach zurück auf 100. Auf dem Plus belegt sind nur die Werte 300/100.
+#
+# Fremd-Hypothesen Motor-Kommandobytes (grant0013 docs/k2_architecture.md,
+# Fremdquelle K2, auf dem Plus UNBELEGT – nur Abgleich, NICHT senden):
+#   0x01 reboot, 0x03 encoder_cal, 0x04 elec_offset_cal, 0x05 control,
+#   0x06 sys_param, 0x07 flash_param, 0x08 get feedback (Kandidat fürs
+#   echte Encoder-Lesen), 0x0B boot, 0x0C protection status, 0x0D systemid,
+#   0x0E read/set_addr, 0x0F version, 0x11 stall_mode, 0x12 dev_uuid.
 FUNC_SYS_PARAM = 0x06      # Sys-Param (vermutlich Schreiben), Payload <f
 FUNC_READ_ENCODER = FUNC_SYS_PARAM  # Alt-Name, NUR für Kompatibilität – nicht senden!
 FUNC_SET_PARAMS = 0x0C     # 8 Datenbytes (nur 8x 00 beobachtet, Semantik offen)
+                           # Fremdquelle K2 (grant0013): 0x0C = protection status
+                           # – auf dem Plus unbelegt, Name bleibt bewusst neutral
 FUNC_SET_MODE = 0x11       # 1-2 Datenbytes ([01] / [02] / [02 00] / [03] gesehen)
 FUNC_FW_UPDATE = 0xF0      # Update-Pfad, Sub-Codes aus Decompile (Abschnitt 1.7)
 
@@ -232,6 +246,8 @@ class Motor:
         Func 0x06 ist vermutlich Sys-Param-SCHREIBEN (Live-Bytes = Float
         300.0/100.0 = MOTOR_SYS_PARAM ID=70), Encoder-Lesen ist unbelegt.
         Senden könnte Motorparameter ändern.
+        Fremdquelle K2 (grant0013): 0x08 = get feedback – Kandidat fürs echte
+        Encoder-Lesen, auf dem Plus unbelegt (bleibt gesperrt bis Live-Beleg).
         """
         raise NotImplementedError(
             "read_encoder gesperrt: Func 0x06 ist vermutlich Sys-Param-Schreiben "
@@ -301,38 +317,46 @@ class Motor:
 
     def encoder_calibrate(self):
         """TODO: Func-Code + Payload von `motor_encoder_calibrate` UNBELEGT
-        (nur Wrapper-Name bekannt, PROTOKOLL-GESAMT.md 4)."""
+        (nur Wrapper-Name bekannt, PROTOKOLL-GESAMT.md 4).
+        Fremdquelle K2 (grant0013): 0x03 encoder_cal – auf dem Plus unbelegt."""
         raise NotImplementedError("TODO motor_encoder_calibrate: Func-Code/Payload "
                                   "unbelegt (PROTOKOLL-GESAMT.md 4)")
 
     def elec_offset_calibrate(self):
         """TODO: Func-Code + Payload von `motor_elec_offset_calibrate` UNBELEGT
-        (nur Wrapper-Name bekannt, PROTOKOLL-GESAMT.md 4)."""
+        (nur Wrapper-Name bekannt, PROTOKOLL-GESAMT.md 4).
+        Fremdquelle K2 (grant0013): 0x04 elec_offset_cal – auf dem Plus unbelegt."""
         raise NotImplementedError("TODO motor_elec_offset_calibrate: Func-Code/Payload "
                                   "unbelegt (PROTOKOLL-GESAMT.md 4)")
 
     def set_e_stall_mode(self, *args):
         """TODO: Abbildung von `set_e_stall_mode` auf Bus-Frames UNBELEGT
-        (nur Wrapper-Name + Stall-Pins je Achse aus Config bekannt)."""
+        (nur Wrapper-Name + Stall-Pins je Achse aus Config bekannt).
+        Fremdquelle K2 (grant0013): 0x11 stall_mode – auf dem Plus unbelegt
+        (live gesehen nur 0x11 mit [01]/[02 00]/[03], s. set_mode)."""
         raise NotImplementedError("TODO set_e_stall_mode: Func-Code/Payload "
                                   "unbelegt (PROTOKOLL-GESAMT.md 4)")
 
     def set_z_stall_mode(self, *args):
         """TODO: Abbildung von `set_z_stall_mode` auf Bus-Frames UNBELEGT
-        (nur Wrapper-Name + Stall-Pins je Achse aus Config bekannt)."""
+        (nur Wrapper-Name + Stall-Pins je Achse aus Config bekannt).
+        Fremdquelle K2 (grant0013): 0x11 stall_mode – auf dem Plus unbelegt."""
         raise NotImplementedError("TODO set_z_stall_mode: Func-Code/Payload "
                                   "unbelegt (PROTOKOLL-GESAMT.md 4)")
 
     def check_protection_code(self):
         """TODO: `check_protection_code`-Tabelle UNBELEGT (kein Code live
-        gesehen, kein Decompile – PROTOKOLL-GESAMT.md 4)."""
+        gesehen, kein Decompile – PROTOKOLL-GESAMT.md 4).
+        Fremdquelle K2 (grant0013): 0x0C protection status – auf dem Plus
+        unbelegt (live nur 8x 00 an alle Boards, s. write_params_raw)."""
         raise NotImplementedError("TODO check_protection_code: Code-Tabelle "
                                   "unbelegt (PROTOKOLL-GESAMT.md 4)")
 
     def get_sys_param(self, param_id):
         """TODO: `MOTOR_SYS_PARAM` (z.B. ID=70, 300->100 aus
         CALIBRATE_CUT_POS, 1.5) – Func 0x06 vermutlich (Live-Payload = Float),
-        Lese-Form auf dem K2 Plus UNBELEGT."""
+        Lese-Form auf dem K2 Plus UNBELEGT. ID 70 = controller_pos_loop_pid_param_kp
+        (Positionsregler-Kp) laut grant0013 motor_params_map.md:103 (Fremdquelle K2)."""
         raise NotImplementedError("TODO MOTOR_SYS_PARAM lesen: Func-Code für ID=%r "
                                   "unbelegt (PROTOKOLL-GESAMT.md 1.5/4)" % (param_id,))
 
@@ -344,7 +368,8 @@ class Motor:
 
     def get_flash_param(self, param_id):
         """TODO: `MOTOR_FLASH_PARAM` (`motor_flash_param`) – Func-Code UNBELEGT
-        (nur Wrapper-Name bekannt, PROTOKOLL-GESAMT.md 4)."""
+        (nur Wrapper-Name bekannt, PROTOKOLL-GESAMT.md 4).
+        Fremdquelle K2 (grant0013): 0x07 flash_param – auf dem Plus unbelegt."""
         raise NotImplementedError("TODO MOTOR_FLASH_PARAM lesen: Func-Code für ID=%r "
                                   "unbelegt (PROTOKOLL-GESAMT.md 4)" % (param_id,))
 
@@ -355,7 +380,9 @@ class Motor:
 
     def read_485_addr(self):
         """TODO: `motor_read485_addr` – Antwortformat UNBELEGT
-        (nur Wrapper-Name bekannt, PROTOKOLL-GESAMT.md 4)."""
+        (nur Wrapper-Name bekannt, PROTOKOLL-GESAMT.md 4).
+        Fremdquelle K2 (grant0013): 0x0E read/set_addr, 0x12 dev_uuid – auf dem
+        Plus unbelegt."""
         raise NotImplementedError("TODO motor_read485_addr: Antwortformat "
                                   "unbelegt (PROTOKOLL-GESAMT.md 4)")
 
@@ -368,7 +395,8 @@ class Motor:
     def motor_version_normal(self):
         """TODO: welcher Func dem Wrapper-Kommando `motor_version` im
         Normalbetrieb entspricht, ist OFFEN (motor_mini.py-Docstring) –
-        belegt ist nur der Update-Pfad; nutze query_version()."""
+        belegt ist nur der Update-Pfad; nutze query_version().
+        Fremdquelle K2 (grant0013): 0x0F version – auf dem Plus unbelegt."""
         raise NotImplementedError("TODO motor_version (Normalbetrieb): Func-Code offen; "
                                   "belegt nur F0/00 via query_version()")
 
