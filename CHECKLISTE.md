@@ -1,0 +1,99 @@
+# K2-Protokoll-Checkliste
+
+Audit und Änderungsbegründungen: `/home/pro/k2-fw-live-1.1.7.0/AUDIT-UND-AENDERUNGEN.md`.
+
+## Erledigt
+- [x] OTA-Image 1.1.3.13 entpackt (CPIO + Squashfs) – Dump-Verzeichnis gelöscht (486M),
+  Original-Image liegt in `~/Downloads/`, alle Inhalte in Live-Version übernommen
+- [x] Live-Artefakte gesichert: `fw/` (1.1.7.0), `config/`, `klippy/extras/` (inkl. `.so`),
+  `rootfs-live/` (Subset), `belt_mdl-live.py` (GPLv3, aus Firmware)
+  (Hinweis: `sw-description`/uboot/kernel-Parts existierten nur im gelöschten Dump;
+  bei Bedarf aus `~/Downloads/`-Image re-extrahierbar)
+- [x] Klipper-Configs (`F008/printer.cfg`, `box.cfg`) ausgewertet: live: ttyS2/ttyS3/ttyS5 (Dump-F008: ttyS7/ttyS1/ttyS6)
+- [x] Blobs inventarisiert: `klipper_mcu`, `mcu_util*`, `libcrealitycloud.so`, `fw/*`, `*.wrapper.so`
+- [x] `PROTOKOLL-485.md` geschrieben (Belt-Frame, CFS-Kommandos, Wrapper-APIs)
+- [x] Festgestellt: kein Crypto, kein CAN – UART + RS485, `.so` nur armhf/cpython-39
+
+## Offen – Drucker-Zugang
+- [x] SSH aktiv, IP 192.168.1.100 (root, K2Plus-XXXX), Moonraker-API 7125 offen
+- [x] `ls /dev/ttyS*` + `/proc/cmdline` ausgewertet
+- [x] `klippy.log`-Auswertung laufend (alle 485-Frames werden selbst geloggt)
+- [x] `printer-live.cfg` + `box-live.cfg` gesichert in `/home/pro/k2-fw-live-1.1.7.0/live-1.1.7.0-configs/`
+- [x] Live-FW 1.1.7.0-Dump nach `/home/pro/k2-fw-live-1.1.7.0/` (`fw/`, `config/`,
+  `klippy/extras/belt_mdl.py`, `rootfs-live/`-Subset)
+
+## Offen – Mitschnitt
+- [x] `klippy.log` loggt ALLE 485-Frames selbst (`cmd_485_send_data_with_response params:`) – kein Hardware-Mitschnitt nötig
+- [x] CRC geknackt: CRC-8/ATM (poly 0x07, init 0x00) über `[len..data]`, head/addr NICHT enthalten
+- [x] Belt-Frames live verifiziert (Version/Flash/ADC), UUID `a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 aa ab`
+- [x] Box-Func-Codes live (Stand: 0x02 RFID, 0x03 Remain, 0x04 Box-Mode, 0x05 Buffer,
+  0x08 HW-Status, 0x0a Box-State/Event, 0x0d Preload-ACK, 0x0e Messrad-Float,
+  0x0f Motor-Action, 0x10/0x11 Extrude/Retrude, 0x14 Version/SN, 0xa2 Auto-Addr;
+  Details in PROTOKOLL-485.md – Zeile 25 oben war ein veralteter Zwischenstand)
+- [x] Falsche-Syntax-Falle dokumentiert: `NUM=A` → Shutdown, `NUM=0..3` korrekt
+- [x] CFS-Antworten eingefangen: Slot 1 mit Spule → `remain A=26%` (`f7 01 07 00 03 1a 00 ff 00 99`), RFID-Tag-Daten via Query (SN `SN-DEMO-1234567890X`, Tag 1.5.3, vender `AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA`, color `0FFFFFF/0ce58f8/026eeee`, material `101001/000001/000001`)
+- [x] RFID-Vollantwort dekodiert: `A:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA;...` (ASCII, `:`/`;`-Separatoren, Key=Slot-Buchstabe)
+- [x] RFID-Zustände: `unknown` / `busy` / Hex-Daten; preloading_mask 0x1/0x2 = Slot-Bitmaske
+- [x] Extrude-Sequenz T1A live: Func `0x10` State-Machine, `0x0e`=MEASURING_WHEEL, `0x05/0x04/0x0f` Aufräumen
+- [x] CRC-Quelle als Python-Source gesichert (lokal, nicht im Repo; Beleg im
+  Projekt-Root): POLY=0x07, Timeouts, Broadcast-Addrs, Device-Typen, Adress-Tabellen
+- [x] CFS-FW R153 analysiert: 942 Funktionen, RT-Thread, MS3791/at8236/AHT30, 4 Feeder-PID, RFID-Manager, finsh-Shell-Kommandos
+- [x] Ghidra-Skripte gesichert (`ghidra-scripts/`): SetCfsBase, CfsDetail, ListFuncs, FindCrc6
+- [x] RFID-Antwort VOLLSTÄNDIG verifiziert (13.10.): Die `0x2e`-Frames waren NIE abgeschnitten –
+  das Log-Format nutzt unpadded `%x` (`0x2` statt `0x02`), was wie Abschneiden aussah.
+  Nachgezählt: 49 Tokens, len=0x2e=46 → 46+3=49 ✓, CRC-8/ATM über [len..data] = 0x78 ✓
+  (anonymisierter Frame; Original-CRC 0x02 bezog sich auf die echten Bytes).
+  Kompletter Inhalt: `A:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA;` (43 Datenbytes, endet mit `;`).
+  Farbe/Material/Restmenge kommen aus SEPARATEN Abfragen, nicht aus diesem Frame.
+
+## Offen – Pi-Ersatz (VOLL – Belt + PrTouch + CFS müssen laufen)
+- [ ] 32-bit Pi OS (armhf) + Python-3.9-Venv aufsetzen (nur so laden die Creality-`.so`)
+- [ ] Original-Klippy (`klippy/`-Tree + `.so` aus `rootfs-live/`, venv auf Pi neu
+  aufsetzen) auf den Pi kopieren
+- [ ] `printer.cfg` voll übernehmen, nur Serials auf `/dev/ttyUSB*` umbiegen (live: ttyS2/ttyS3/ttyS5 (Dump-F008: ttyS7/ttyS1/ttyS6))
+- [ ] Pi mit 2x USB-Serial (Mainboard/Toolhead) + 1x USB-RS485 (CFS/Belt), 24V→5V-Buck
+- [ ] Testreihe: Belt-CALI/TEST, PrTouch `BED_MESH_CALIBRATE`, CFS Load/Unload mit RFID
+
+## Offen – Nachbau VOLLUMFANG (alle Funktionen; Module in `/home/pro/k2-fw-live-1.1.7.0/nachbau/`)
+- [x] `serial485.py`: Frame-Bau, CRC-8/ATM, Retry, Timeouts – Selbsttest 11/11 Live-Frames ok
+- [x] `serial485.py` vollständig (Subagent, verifiziert): Session (`connect_uart`,
+  `_start_session`, `_bg_thread`), Sende-Queue (FIFO, Lock), Response-Registry,
+  Stats, Disconnect/Shutdown, `raw_send`/`raw_send_wait_ack`/`get_response`,
+  `Serial_485_Wrapper` (`cmd_send_data_with_response`, Queue-Draining);
+  Altsignaturen unverändert, alle Regressionstests grün
+- [x] `boxmini.py`: get_rfid, has_filament, remain percent – Selbsttest 7/7 ok
+- [x] `box.py` (Subagent, verifiziert): ParseData-vollständig (rfid/remain/wheel/
+  box-state/version-sn/buffer/hw-status, 50/50 Checks), BoxState-Tn-Modell,
+  BoxAction-Step-Builder; Unbelegtes (Dryer, force-Flag) als TODO markiert
+- [ ] `filament_rack.py` vollständig: FilamentRackWrapper (send_data, blow, beep,
+  check_rfid_valid, Material-Temps/Speeds, Heating-Waits) – braucht Rack-Hardware
+- [x] `motor_mini.py`: read_encoder (0x06), set_mode (0x11), query_version (0xf0/0x00) –
+  Selbsttest ok (dabei Doku-Fehler repariert: Big-Endian 38467→51266)
+- [x] `motor.py` (Subagent, verifiziert): belegte Ops + Update-Sequenz-Builder
+  (40/40 Checks); unbelegte Methoden als NotImplementedError-Stubs mit Beleg-Lücken
+  (Kalibrierung, Stall-Modes, Protection, Sys-/Flash-Params, Pin-IO, motor_version normal)
+- [x] `cfsseq.py`: Extrude/Retrude als prüfbare Abläufe – Selbsttest 6/6 ok
+- [ ] CFS-Stufen-Semantik vollständig: 0x10/0x11-Datenbytes je Stufe belegen
+  (weitere Extrudes mitschneiden + mit Klippy-Stage-Logs korrelieren)
+- [ ] Kanal-A-Diagnose (13.10. spät): Slot A zieht seit Klemm-Episode (key865) nicht mehr ein,
+  kein Insert-Event im Log; Gegenbeweis RFID-Theorie: Insert ist mechanisch, B lief ohne Tag.
+  Nächster Test: dieselbe Spule in Slot C – zieht C ein → Kanal A defekt
+- Abend-Stand 13.10.: Hub hält A (API-Preload), Heizungen aus (M104/M140 S0),
+  Drucker ready, CFS connect. API-Kette: Heizen/Cut/Retrude/Error-Clear ok,
+  volle Loads nur per Display (s. PROTOKOLL-485.md „API-Kettensteuerung“).
+- [x] `auto_addr.py`: Port der 729-zeiligen Klartextquelle (nur lokal vorhanden),
+  Klipper-unabhängig – Selbsttest 9/9 ok
+
+## Offen – Tiefenanalyse (mit Ghidra + REA)
+- [x] Ghidra 12.1.4 + JDK installiert (/opt/ghidra), REA 6.4.0 global, MCP für OpenCode registriert
+- [x] `rea analyze mcu_util` läuft (116 Prozeduren, ARM-ELF)
+- [x] Update-Protokoll dekompiliert: State-Machine + Commands `0x04FB/0x05FA/0x00FF/0x03FC/0x01FE/0x02FD`
+- [x] Checksumme geknackt: 1er-Komplement-Summe über Datenbytes (`FUN_00010e54`)
+- [x] `box_wrapper.so` importiert (2,3 MB); `get_rfid`-Generator dekompiliert (Cython-Glue, echte Logik in Generator-Bodies)
+- [x] `serial_485_wrapper.so` importiert (141K); Symbole liegen in Cython-`__pyx_mstate`-Tabellen → keine direkten String-XRefs
+- [x] Live-`.so` von FW 1.1.7.0 gesichert: `/home/pro/k2-fw-live-1.1.7.0/rootfs-live/` (box 2,3M / motor 1,1M / prtouch_v3 1,3M / serial_485 141K / libcrealitycloud 222K / mcu_util* )
+- [x] `mcu_util_485` dekompiliert: Auto-Addr (0xa1: 0xfd/0xfc/0xfb/0xfe + 0xa0-Zuweisung) + 485-Update (Func 0xf0-Subs)
+- [x] CFS-FW `cfs6_222_000.bin` geladen (Basis 0x08000000, 798 Funktionen, Rezept in PROTOKOLL-GESAMT.md)
+- [x] CFS-FW R153 analysiert (942 Funktionen, RT-Thread/MS3791/at8236/AHT30, Details in PROTOKOLL-GESAMT.md)
+- [x] `raw_send_wait_ack`: Dispatcher dekompiliert; CRC-Algorithmus als Source (`auto_addr_wrapper.py`) + 10 Live-Frames belegt – für Nachbau abgeschlossen
+- [x] CFS-Details: 942 Funktionen, RT-Thread/MS3791/at8236/AHT30, finsh-Shell, RFID-Frame vollständig verifiziert (unpädded `%x`-Format, kein Abschneiden)
