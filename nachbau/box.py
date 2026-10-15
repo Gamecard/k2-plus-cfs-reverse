@@ -7,12 +7,20 @@ als BoxMini-Klasse ab; diese Datei ergänzt sinngemäß nach API-box_wrapper.md:
 1) ParseData (reine Funktionen, keine Hardware):
    get_rfid / get_remain_len / get_measuring_wheel (BE-Float via struct) /
    get_box_status, dazu belegt: parse_version_sn (ASCII "153"+SN),
-   parse_buffer_state / parse_hardware_status (je 1 Byte).
+   parse_buffer_state / parse_hardware_status (je 1 Byte),
+   split_rfid_vendor (40-Zeichen-vender -> Felder, ab 15.10.2026).
 2) BoxState: Tn-Datenmodell im Speicher (tn_map/tnn_map/save_data als dicts,
    generate/get/modify/update-Methoden sinngemäß nach API-Doku).
 3) BoxAction: belegte Einzel-Step-Sequenz-Builder (Preload enable/disable/
-   force-read,
-   Feed-Mode enter, Engage/Release, Print-Mode) + bus-gebundene Klasse.
+   force-read/force-tension-only,
+   Feed-Mode enter, Auto-Preload-Sperre (0x0f, früher „Engage/Release“),
+   Print-Mode) + bus-gebundene Klasse.
+
+GHIDRA 15.10.2026: Semantik der CFS-App R153 (= FW in der Box des Users)
+belegt – GHIDRA-CFS-BEFUND-2026-10-15.md, PROTOKOLL-485.md „Func-Tabelle
+CFS-App R153“. Daraus hier: STATUS_* / STATUS_NAMES, BOX_STATE_*,
+parse_box_state, Preload op 3 + langer Timeout, 0x0f-Umbenennung,
+EXTRUDE_MODE_* (Re-Export aus cfsseq).
 
 Bus-Anbindung: serial485.Serial485-Instanz wird übergeben (echte Hardware,
 pyserial). Der Selbsttest läuft OHNE Hardware (FakeBus + Live-Frames).
@@ -54,12 +62,95 @@ FUNC_GET_HARDWARE_STATUS = 0x08
 FUNC_GET_BOX_STATE = 0x0A
 FUNC_SET_PRE_LOADING = 0x0D
 FUNC_MEASURING_WHEEL = 0x0E
-FUNC_MOTOR_ACTION = 0x0F
+# 0x0f: ~~Motor-Engage/Release~~ WIDERLEGT 15.10.2026 (Ghidra, inline im
+# Dispatcher FUN_0800f27c): Auto-Preload-Sperr-Flag S[8] (0x200037d8),
+# x in {0,1} -> Status 0, sonst 1; S[8]!=0 sperrt das automatische Preload
+# (FUN_080053b0). KEINE Motor-Aktion. Alter Name bleibt als Alias.
+FUNC_PRELOAD_INHIBIT = 0x0F
+FUNC_MOTOR_ACTION = FUNC_PRELOAD_INHIBIT  # Alias (alter Name, kompatibel)
 FUNC_GET_VERSION_SN = 0x14
 # 0x10/0x11 (Extrude/Retrude): siehe cfsseq.py, hier nur als Konstanten zum
 # Referenzieren (keine eigenen Builder – kein Duplikat).
 FUNC_EXTRUDE = 0x10
 FUNC_RETRUDE = 0x11
+# 0x10-Modi / 0x11-Parameter: definiert in cfsseq.py (belegt, Ghidra
+# FUN_080045c6 / FUN_08004d90), hier nur re-exportiert – kein Duplikat.
+from cfsseq import (  # noqa: E402,F401
+    EXTRUDE_MODE_STAGE1, EXTRUDE_MODE_FEED_TO_STALL, EXTRUDE_MODE_FEED_CHECKED,
+    EXTRUDE_MODE_CLEAR_ERROR, EXTRUDE_MODE_FEED_START, EXTRUDE_MODE_QUERY,
+    EXTRUDE_MODE_STOP_BUFFER, EXTRUDE_MODE_EXTRUDER_CHECK, EXTRUDE_MODES,
+    EXTRUDER_CHECK_MM, RETRUDE_P_TO_BUFFER, RETRUDE_P_PULL_HUB)
+
+# --- Status-Byte der ANTWORTEN (BELEGT 15.10.2026, Ghidra CFS-FW R153;
+# GHIDRA-CFS-BEFUND-2026-10-15.md §5). Nur Bereitstellung – die Auswertung
+# in _response_data bleibt TODO (keine Logikänderung).
+# Hinweis: das Status-Byte im REQUEST ignoriert die App (Dispatcher liest
+# frame[2] nie) – STATUS_OPERATIONAL 0xFF bleibt aus Kompatibilität.
+STATUS_OK = 0x00
+STATUS_INVALID = 0x01        # len/Maske/Subcode ungültig, fun unbekannt (FUN_0800ebc2/eb88)
+STATUS_CRC = 0x02            # CRC-Fehler im Request (FUN_0800f880)
+STATUS_BUSY = 0x03           # busy / falscher Box-Zustand; 0x50: Wert unverändert
+STATUS_FEED_OUT = 0x05       # cmd_parse_out: Feeder-Out-Fehler (FUN_08004df2)
+STATUS_BUFFER_FILL_TIMEOUT = 0x06  # buffer_fill_timeout (FUN_08004df2)
+STATUS_PRETENSION = 0x08     # Pretension-Warten erfolglos (FUN_08004460)
+STATUS_HUB_NO_MOVE = 0x09    # feed_top_to_hub: Odometer bewegt sich nicht (FUN_08004190)
+STATUS_FEED_TIMEOUT = 0x0A   # 25-s-Timeout bzw. <5 mm in 3 s (FUN_08025c4e/08003efa)
+STATUS_FEED_MAX_LEN = 0x0B   # Fördern > 3000 mm
+STATUS_ODOMETER_STALL = 0x0C  # Odometer-Stillstand 500 ms
+STATUS_BUFFER_NOT_FULL = 0x0D  # Buffer nicht voll (FUN_08025d96)
+STATUS_EXTRUDER_TIMEOUT = 0x0E  # feed extruder timeout, 0x10 mode 7 (FUN_08025dea)
+STATUS_RETRACT_BUFFER_TIMEOUT = 0x13  # Rückzug: Buffer-Sensor 5 s (FUN_08004c9a)
+STATUS_PULL_HUB_TIMEOUT = 0x14  # pull back hub PE timeout (FUN_08004884)
+STATUS_NO_FILAMENT = 0x16    # Slot ohne Filament (FUN_08004d4a/0800e81a), setzt ERROR
+STATUS_PULL_HUB_SENSOR = 0x17  # pull_back_hub: Sensor A nicht aktiv (FUN_08004c5a)
+STATUS_NO_SLOT_INTERNAL = 0x18  # intern, wird auf 0x16 abgebildet
+STATUS_PULL_HUB_BLOCK = 0x19  # pull_back_hub motor block (FUN_0800494e)
+STATUS_PRELOAD_EVENT = 0x30  # NUR 0x0a: Preload-Ereignis anstehend (+4 B)
+STATUS_PRINT_SENSOR = 0x50   # NUR 0x0a in STATE_PRINT: Sensorprüfung != 0 (Deutung offen)
+STATUS_NAMES = {
+    STATUS_OK: "ok",
+    STATUS_INVALID: "ungültig (len/Maske/Subcode/fun)",
+    STATUS_CRC: "CRC-Fehler im Request",
+    STATUS_BUSY: "busy / falscher Zustand",
+    STATUS_FEED_OUT: "Feeder-Out-Fehler",
+    STATUS_BUFFER_FILL_TIMEOUT: "buffer_fill_timeout",
+    STATUS_PRETENSION: "Pretension erfolglos",
+    STATUS_HUB_NO_MOVE: "feed_top_to_hub: Odometer steht",
+    STATUS_FEED_TIMEOUT: "Förder-Timeout (25 s / <5 mm in 3 s)",
+    STATUS_FEED_MAX_LEN: "Fördern > 3000 mm",
+    STATUS_ODOMETER_STALL: "Odometer-Stillstand 500 ms",
+    STATUS_BUFFER_NOT_FULL: "Buffer nicht voll",
+    STATUS_EXTRUDER_TIMEOUT: "feed extruder timeout",
+    STATUS_RETRACT_BUFFER_TIMEOUT: "Rückzug: Buffer-Sensor-Timeout",
+    STATUS_PULL_HUB_TIMEOUT: "pull back hub PE timeout",
+    STATUS_NO_FILAMENT: "Slot ohne Filament",
+    STATUS_PULL_HUB_SENSOR: "pull_back_hub: Sensor A nicht aktiv",
+    STATUS_NO_SLOT_INTERNAL: "kein Slot belegt (intern)",
+    STATUS_PULL_HUB_BLOCK: "pull_back_hub motor block",
+    STATUS_PRELOAD_EVENT: "Preload-Ereignis (nur 0x0a)",
+    STATUS_PRINT_SENSOR: "Sensorprüfung in PRINT (nur 0x0a)",
+}
+
+
+def status_name(code):
+    """Klartext zu einem Antwort-Status-Byte (unbekannt -> 'unbekannt 0x..')."""
+    return STATUS_NAMES.get(code, "unbekannt 0x%02x" % code)
+
+
+# --- Box-Zustand (0x0a Byte 3), BELEGT 15.10.2026 (Ghidra FUN_0800fa0c/
+# FUN_0800ed26). STATE_CHECK_HUB ist KEIN Box-Zustand, sondern Zustand 2 der
+# Preload-Statemachine FUN_080064b8 (taucht in 0x0a nicht auf).
+BOX_STATE_IDLE = 0
+BOX_STATE_PRELOAD = 1
+BOX_STATE_PRINT = 2
+BOX_STATE_RELOAD = 3
+BOX_STATE_ERROR = 4
+BOX_STATE_TEST = 5
+BOX_STATE_NAMES = {
+    BOX_STATE_IDLE: "STATE_IDLE", BOX_STATE_PRELOAD: "STATE_PRELOAD",
+    BOX_STATE_PRINT: "STATE_PRINT", BOX_STATE_RELOAD: "STATE_RELOAD",
+    BOX_STATE_ERROR: "STATE_ERROR", BOX_STATE_TEST: "STATE_TEST",
+}
 
 # Preload-/RFID-Control-Aktion (0x0d, 2. Datenbyte). KORREKTUR 15.10.2026:
 # Die frühere Belegung 00=Arm/01=Disarm/02=Rearm (PROTOKOLL-485.md:98) ist
@@ -72,12 +163,39 @@ FUNC_RETRUDE = 0x11
 #   set_rfid_insert_reading(enabled) -> (0, int(enabled)),
 #   force_rfid_read(mask) -> (mask, 2)
 # Daher: 0x00 = Insert-Reading/Preload aus, 0x01 = an, 0x02 = Force-Read.
-# TODO (unbelegt): ob das 1. Byte bei 0x00/0x01 die Maske ist (ref-hi: 0x0F)
-#   oder ignoriert wird (vanilla: 0) – hier wird die übergebene Maske gesendet.
+# ~~TODO (unbelegt): ob das 1. Byte bei 0x00/0x01 die Maske ist (ref-hi: 0x0F)
+#   oder ignoriert wird (vanilla: 0)~~ BELEGT 15.10.2026 (Ghidra, Handler
+#   FUN_0800f0da @CFS-App R153): bei op 0/1 wird die Maske IGNORIERT
+#   (FUN_08005376 disable / FUN_0800536e enable wirken global); die
+#   übergebene Maske wird trotzdem unverändert gesendet (ref-hi-Vektor).
+# op 2 = FUN_08004ec4(mask, 1): Forced Preload MIT RFID (pretension ->
+#   STATE_CHECK_HUB -> read rfid + margin estimation) = Force-Read.
+# op 3 = FUN_08004ec4(mask, 0): Forced Preload OHNE RFID (nur pretension) – NEU.
+# op > 3 -> Status 1. Antwort bei op 2/3 erst NACH dem Vorgang (s.
+#   preload_force_timeout).
 PRELOAD_DISABLE = 0x00
 PRELOAD_ENABLE = 0x01
 PRELOAD_FORCE_READ = 0x02
-PRELOAD_ACTIONS = (PRELOAD_DISABLE, PRELOAD_ENABLE, PRELOAD_FORCE_READ)
+PRELOAD_FORCE_RFID = PRELOAD_FORCE_READ  # Alias (Ghidra-Name)
+PRELOAD_FORCE_TENSION_ONLY = 0x03
+PRELOAD_ACTIONS = (PRELOAD_DISABLE, PRELOAD_ENABLE, PRELOAD_FORCE_READ,
+                   PRELOAD_FORCE_TENSION_ONLY)
+PRELOAD_FORCE_ACTIONS = (PRELOAD_FORCE_READ, PRELOAD_FORCE_TENSION_ONLY)
+
+# Laufzeit Forced Preload (BELEGT 15.10.2026, Ghidra): FUN_08004ec4 wartet in
+# Zustand PRELOAD bis 179 s (0xb3 x 1 s) auf ein laufendes Preload bzw. zieht
+# in IDLE erst alle Slots am Hub zurück (FUN_08004cd0(4,1)); dann je Slot der
+# Maske NACHEINANDER FUN_08004e80: 5 s + bis 180 s Polling (0xb4 x 1 s).
+# Die 0x0d-Antwort kommt erst danach. -> Timeout = Vorlauf + je Slot.
+PRELOAD_FORCE_TIMEOUT_BASE = 180.0      # s, Vorlauf (Warten/Pull-back)
+PRELOAD_FORCE_TIMEOUT_PER_SLOT = 200.0  # s, 5 s + 180 s + Reserve je Slot
+
+
+def preload_force_timeout(mask):
+    """Host-Timeout (s) für 0x0d op 2/3: Vorlauf + 200 s je Slot der Maske
+    (mind. 1 Slot). Beispiel Maske 0x01 -> 380 s, 0x0F -> 980 s."""
+    n = bin(check_mask(mask)).count("1")
+    return PRELOAD_FORCE_TIMEOUT_BASE + PRELOAD_FORCE_TIMEOUT_PER_SLOT * max(1, n)
 
 
 def check_mask(mask):
@@ -146,8 +264,10 @@ def get_rfid(msg):
     Je Slot-Key wird der Wert bis zum nächsten ';' übernommen; weitere
     ';'-Felder ohne gültigen Slot-Key ("X:..." mit X in A..D) werden
     VERWORFEN, ebenso Felder ohne ':'.
-    TODO (.so-offen): ob nach dem vender-Hex weitere Felder (color/material/
-      remain) folgen, ist unbelegt.
+    ERLEDIGT 15.10.2026 (vorher TODO): nach dem vender-Hex folgen KEINE
+      weiteren Felder (Frame live vollständig, 49 Tokens/CRC ok). Farbe und
+      Material stecken IM 40-Zeichen-vender selbst -> split_rfid_vendor();
+      remain kommt separat über 0x03.
     """
     data = _response_data(msg, FUNC_GET_RFID)
     result = {}
@@ -160,6 +280,44 @@ def get_rfid(msg):
         if len(key) == 1 and key in SLOT_KEYS:
             result[key] = value
     return result
+
+
+# Feldlayout des 40-Zeichen-RFID-vender-Strings (Reihenfolge + Breite).
+# Quelle: fake-name/cfs-reverse-engineering firmware.md:340-352 (Feldnamen
+# aus dem printf-Format der CFS-FW, month=%c -> 1 Zeichen, Rest %.*s) und
+# firmware.md:521-523 (Beispiel-String, 11+13+16 Zeichen = 40). Breiten
+# daraus abgeleitet + gegen unseren Live-Query geprüft (mat 101001 und
+# col 0FFFFFF stehen exakt an Pos. 11..16 bzw. 17..23). Belegstärke:
+# mittel-stark (Grenzen konsistent; Datums-/Supplier-Semantik unbelegt).
+RFID_VENDOR_FIELDS = (
+    ("month", 1), ("day", 2), ("year", 2), ("supplier", 4), ("batch", 2),
+    ("mat_id", 6), ("col", 7),
+    ("len", 4), ("number", 6), ("reserve", 6),
+)
+RFID_VENDOR_LEN = 40
+
+
+def split_rfid_vendor(s):
+    """40-Zeichen-RFID-vender-String in seine Felder zerlegen (rein, kein Bus).
+
+    s = str oder bytes (ASCII), exakt 40 Zeichen, sonst ValueError.
+    Gibt dict {month, day, year, supplier, batch, mat_id, col, len, number,
+    reserve} mit den Roh-Teilstrings zurück – KEINE Interpretation (z.B.
+    mat_id 101001 = Hyper PLA laut Live-Query/Display, col 0FFFFFF = weiß;
+    Einheit von len und Datumskodierung sind unbelegt).
+    """
+    if isinstance(s, (bytes, bytearray)):
+        s = bytes(s).decode("ascii")
+    if not isinstance(s, str):
+        raise ValueError("vender muss str/bytes sein: %r" % (s,))
+    if len(s) != RFID_VENDOR_LEN:
+        raise ValueError("vender muss %d Zeichen haben, hat %d: %r"
+                         % (RFID_VENDOR_LEN, len(s), s))
+    out, pos = {}, 0
+    for name, width in RFID_VENDOR_FIELDS:
+        out[name] = s[pos:pos + width]
+        pos += width
+    return out
 
 
 def get_remain_len(data_send, msg):
@@ -175,6 +333,11 @@ def get_remain_len(data_send, msg):
     ACHTUNG Semantik: 0 heißt NICHT sicher „leer“ – live hat Slot B mit
       remain 0 (Vendor unknown, kein RFID-Restwert) 160 mm gefördert
       (PROTOKOLL-485.md, Abschnitt T1B). 0 = „kein RFID-Restwert“.
+    PRÄZISIERT 15.10.2026 (Ghidra FUN_0800ef66): Wire-0xff = nicht in Maske /
+      Slot preloadet / Filament da OHNE RFID-Daten (Live B:unknown -> 0xff ✓);
+      Wire-0 = Sensor A meldet kein Filament ODER gespeicherter Wert 0 %.
+      „remain 0“ bei T1B war ein Host-Zustand, kein Wire-Byte. Parsing
+      unverändert (Werte sind mehrdeutig, None/0 bleiben wie geliefert).
     """
     data = _response_data(msg, FUNC_GET_REMAIN_LEN)
     if len(data) != 4:
@@ -204,8 +367,9 @@ def get_box_status(msg):
 
     Belegt: f7 01 09 00 0a 13 34 00 00 00 00 d7 (6 Datenbytes);
     Variante f7 01 07 30 0a 03 00 00 00 51 (4 Datenbytes, Status 0x30).
-    Die Status-/Datenbytes sind firmwareabhängige Zustandswerte – Semantik
-    der Einzelbytes ist UNBELEGT und wird hier NICHT interpretiert (TODO).
+    ~~Semantik der Einzelbytes ist UNBELEGT~~ BELEGT 15.10.2026 (Ghidra
+    FUN_0800ed26) – benannte Felder liefert parse_box_state(); diese
+    Funktion bleibt generisch (b0..bN, unverändert).
     Gibt dict {raw, len, frame_status (None bei Rohdaten), b0..bN} zurück.
     """
     raw = bytes(msg)
@@ -221,10 +385,44 @@ def get_box_status(msg):
     return out
 
 
+def parse_box_state(msg):
+    """0x0a-Antwort mit Namen (BELEGT 15.10.2026, Ghidra FUN_0800ed26).
+
+    Normal (6 Datenbytes): b0 = S[1], b1 = S[0] (Quelle offen; live 0x13
+    0x34, = 0x52-Antwort), b2 = Flags (R[3]|0x80 einmalig bzw. R[5]),
+    b3 = Box-Zustand (BOX_STATE_*), b4 = Bitmaske Sensor B, b5 = Bitmaske
+    „Slot hat gültige RFID-Daten“ (Deutung). Frame-Status: ERROR -> S[3]
+    (gespeicherter Fehlercode), PRINT -> 0x50 oder 0, sonst 0.
+    Ereignis (Status 0x30, 4 Datenbytes): je Slot A..D ein Ereigniswert
+    (1/2/3 aus FUN_080065f4, Bedeutung offen) – dann KEIN Zustandsbyte.
+    Rohdaten ohne Frame: Layout nach Länge (6 -> normal, 4 -> Ereignis).
+    Gibt dict zurück: kind ('state'/'event'/'unknown'), frame_status,
+    status_name, raw, und je nach kind die benannten Felder.
+    """
+    base = get_box_status(msg)
+    data, fst = base["raw"], base["frame_status"]
+    out = {"raw": data, "frame_status": fst,
+           "status_name": None if fst is None else status_name(fst)}
+    if (fst == STATUS_PRELOAD_EVENT or fst is None) and len(data) == 4:
+        out["kind"] = "event"
+        out["events"] = {k: data[i] for i, k in enumerate(SLOT_KEYS)}
+    elif len(data) == 6 and fst != STATUS_PRELOAD_EVENT:
+        out["kind"] = "state"
+        out.update({"s1": data[0], "s0": data[1], "flags": data[2],
+                    "state": data[3],
+                    "state_name": BOX_STATE_NAMES.get(data[3], "unknown"),
+                    "sensor_b_mask": data[4], "rfid_valid_mask": data[5]})
+        if data[3] == BOX_STATE_ERROR and fst is not None:
+            out["error_code"] = fst
+    else:
+        out["kind"] = "unknown"
+    return out
+
+
 def parse_version_sn(msg):
     """Version/SN-Antwort parsen: ASCII "153"+SN (Func 0x14).
 
-    Belegt (K2 13.10.): Voll-Frame f7 01 19 00 14 ... 8d, Daten ASCII
+    Belegt (K2 13.10.): Voll-Frame f7 01 19 00 14 ... d4, Daten ASCII
       "153"+"SN-DEMO-1234567890X" = CFS-App-Version + SN, CRC ok.
     Hi-Request belegt: f7 01 03 ff 14 06 (STATUS 0xff, leer).
     Gibt (app_version, sn) zurück, z.B. ("153", "SN-DEMO-1234567890X").
@@ -449,15 +647,18 @@ class BoxState:
 def build_preload(mask, action):
     """SET_PRE_LOADING / RFID-Control (0x0d): [Slotmaske][Aktion].
 
-    Aktion 0x00=disable / 0x01=enable / 0x02=Force-Read (Belege s.
-    PRELOAD_*-Konstanten; Referenzvektor f70105ff0d0f0169 = Maske 0x0F,
-    enable). STATUS 0xff. Identische Bytes wie cfsseq.build_preload.
+    Aktion 0x00=disable / 0x01=enable / 0x02=Force-Read (mit RFID) /
+    0x03=Forced Preload ohne RFID (Belege s. PRELOAD_*-Konstanten, Ghidra
+    FUN_0800f0da; Referenzvektor f70105ff0d0f0169 = Maske 0x0F, enable).
+    Maske wirkt nur bei 02/03 (bei 00/01 von der FW ignoriert).
+    STATUS 0xff. Identische Bytes wie cfsseq.build_preload.
     TODO: .so-Parameter force (communication_set_pre_loading force=False)
-      – Wire-Abbild unbelegt (evtl. = Aktion 0x02), hier kein Byte erfunden.
+      – Wire-Abbild unbelegt; laut FW gibt es KEIN separates force-Byte,
+      naheliegend ist force -> Aktion 0x02/0x03 (Host-Seite unbelegt).
     """
     mask = check_mask(mask)
     if action not in PRELOAD_ACTIONS:
-        raise ValueError("Aktion muss 0x00/0x01/0x02 sein")
+        raise ValueError("Aktion muss 0x00..0x03 sein")
     return serial485.build_frame(BOX_ADDR, FUNC_SET_PRE_LOADING, [mask, action],
                                  status=STATUS_OPERATIONAL)
 
@@ -473,37 +674,61 @@ def build_preload_disable(mask=MASK_ALL):
 
 
 def build_preload_force_read(mask=MASK_ALL):
-    """RFID-Force-Read (0x0d [Maske 02]) – Referenz-belegt (vanilla)."""
+    """RFID-Force-Read (0x0d [Maske 02]) – Referenz-belegt (vanilla);
+    Ghidra 15.10.2026: Forced Preload MIT RFID (FUN_08004ec4(mask,1))."""
     return build_preload(mask, PRELOAD_FORCE_READ)
 
 
+def build_preload_force_tension_only(mask=MASK_ALL):
+    """Forced Preload OHNE RFID (0x0d [Maske 03]) – Ghidra-belegt 15.10.2026
+    (FUN_0800f0da -> FUN_08004ec4(mask, 0): nur pretension, kein RFID-Lesen);
+    nicht live gesehen. Antwort erst nach dem Vorgang (preload_force_timeout)."""
+    return build_preload(mask, PRELOAD_FORCE_TENSION_ONLY)
+
+
 def build_feed_mode_enter():
-    """Feed-Mode betreten (0x04 [00 01]) – K2-belegt (PROTOKOLL-485.md)."""
+    """Feed-Mode betreten (0x04 [00 01]) – K2-belegt (PROTOKOLL-485.md).
+    Ghidra 15.10.2026 (FUN_0800f014): mode 1 = Print verlassen -> STATE_IDLE."""
     return serial485.build_frame(BOX_ADDR, FUNC_SET_BOX_MODE, [0x00, 0x01],
                                  status=STATUS_OPERATIONAL)
 
 
 def build_print_mode(mask):
-    """Print-Mode (0x04 [Slotmaske 00]) – K2-belegt (PROTOKOLL-485.md)."""
+    """Print-Mode (0x04 [Slotmaske 00]) – K2-belegt (PROTOKOLL-485.md).
+    Ghidra 15.10.2026: mode 0 = Slot -> STATE_PRINT (mask != 0 nötig)."""
     return serial485.build_frame(BOX_ADDR, FUNC_SET_BOX_MODE,
                                  [check_mask(mask), 0x00],
                                  status=STATUS_OPERATIONAL)
 
 
-def build_engage():
-    """Motor-Engage (0x0f [01]) – Hi-belegt, K2-plausibel (PROTOKOLL-485.md).
+def build_preload_inhibit(inhibit):
+    """Auto-Preload-Sperre (0x0f [01] sperren / [00] freigeben).
 
-    VORSICHT K2: Func-Zuordnung 0x0f auf K2 einzeln unverifiziert
-    (CAN-Remap-Warnung), passt aber zum Hi-Map + K2-Logflanke.
+    BELEGT 15.10.2026 (Ghidra, inline im Dispatcher FUN_0800f27c): setzt
+    S[8] (0x200037d8); S[8] != 0 sperrt das automatische Preload
+    (FUN_080053b0). KEINE Motor-Aktion. Live-Flanke: Host sperrt vor dem
+    Load ([01]) und gibt danach frei ([00]).
     """
-    return serial485.build_frame(BOX_ADDR, FUNC_MOTOR_ACTION, [0x01],
+    return serial485.build_frame(BOX_ADDR, FUNC_PRELOAD_INHIBIT,
+                                 [0x01 if inhibit else 0x00],
                                  status=STATUS_OPERATIONAL)
+
+
+def build_engage():
+    """Alias (alter Name): 0x0f [01] = Auto-Preload SPERREN.
+
+    ~~Motor-Engage~~ WIDERLEGT 15.10.2026 (Ghidra) – s. build_preload_inhibit.
+    Bytes unverändert.
+    """
+    return build_preload_inhibit(True)
 
 
 def build_release():
-    """Motor-Release (0x0f [00]) – wie build_engage (VORSICHT s. dort)."""
-    return serial485.build_frame(BOX_ADDR, FUNC_MOTOR_ACTION, [0x00],
-                                 status=STATUS_OPERATIONAL)
+    """Alias (alter Name): 0x0f [00] = Auto-Preload FREIGEBEN.
+
+    ~~Motor-Release~~ WIDERLEGT 15.10.2026 (Ghidra) – s. build_preload_inhibit.
+    """
+    return build_preload_inhibit(False)
 
 
 def build_get_rfid(mask=0x0F):
@@ -611,23 +836,37 @@ class BoxAction:
                                  timeout=TIMEOUT_OPERATIONAL)
 
     # -- Aktionen (belegte Einzel-Steps; Antwort = Box-ACK, kein Parsen) --
-    def communication_set_pre_loading(self, mask, action):
-        """Preload setzen (0x0d [Maske][Aktion 00 aus/01 an/02 Force-Read]).
+    def communication_set_pre_loading(self, mask, action, timeout=None):
+        """Preload setzen (0x0d [Maske][Aktion 00 aus/01 an/02 Force-Read/
+        03 Force ohne RFID]).
 
         mask = Slotmaske 0x00..0x0f, action = PRELOAD_DISABLE/ENABLE/
-        FORCE_READ (Belege s. Konstanten).
+        FORCE_READ/FORCE_TENSION_ONLY (Belege s. Konstanten).
         TODO: .so-Parameter action/num/force-Abbild (num=15 Default,
         force=False) – hier explizit (mask, action), nichts erfunden.
-        Hinweis: .so-Timeout SET_PRE_LOADING=300 s (lange Mechanik) –
-        hier gilt der übergebene timeout, Default operational 2 s nur für
-        den Frame-ACK; TODO bei echtem Preload ggf. länger wählen.
+        ~~TODO bei echtem Preload ggf. länger wählen~~ ERLEDIGT 15.10.2026
+        (Ghidra FUN_0800f0da/FUN_08004ec4/FUN_08004e80): bei op 2/3 kommt die
+        Antwort erst NACH dem Vorgang (~3 min je Slot, + Vorlauf). Daher
+        Default-Timeout preload_force_timeout(mask) und retries=0 – ein
+        2-s-Timeout mit Retries würde den Force-Preload mehrfach auslösen.
+        op 0/1 antworten sofort: operational 2 s, Retries wie bisher.
+        timeout = expliziter Override (s).
         """
         if action not in PRELOAD_ACTIONS:
-            raise ValueError("Aktion muss 0x00/0x01/0x02 sein")
+            raise ValueError("Aktion muss 0x00..0x03 sein")
+        mask = check_mask(mask)
+        if action in PRELOAD_FORCE_ACTIONS:
+            return self.bus.transact(
+                self.addr, FUNC_SET_PRE_LOADING, [mask, action],
+                status=STATUS_OPERATIONAL,
+                timeout=(preload_force_timeout(mask) if timeout is None
+                         else timeout),
+                retries=0)
         return self.bus.transact(self.addr, FUNC_SET_PRE_LOADING,
-                                 [check_mask(mask), action],
+                                 [mask, action],
                                  status=STATUS_OPERATIONAL,
-                                 timeout=TIMEOUT_OPERATIONAL)
+                                 timeout=(TIMEOUT_OPERATIONAL if timeout is None
+                                          else timeout))
 
     def communication_set_box_mode_feed(self):
         """Feed-Mode betreten (0x04 [00 01])."""
@@ -642,13 +881,27 @@ class BoxAction:
                                  status=STATUS_OPERATIONAL,
                                  timeout=TIMEOUT_OPERATIONAL)
 
-    def communication_ctrl_connection_motor_action(self, act):
-        """Motor-Engage (0x01) / Release (0x00) – 0x0f."""
-        if act not in (0x00, 0x01):
-            raise ValueError("act muss 0x00 (release) / 0x01 (engage) sein")
-        return self.bus.transact(self.addr, FUNC_MOTOR_ACTION, [act],
+    def communication_set_preload_inhibit(self, inhibit):
+        """Auto-Preload-Sperre setzen (0x0f [01] sperren / [00] frei).
+
+        BELEGT 15.10.2026 (Ghidra, s. build_preload_inhibit): FW akzeptiert
+        nur 0/1 (sonst Status 1), Antwort sofort ohne Daten.
+        """
+        if isinstance(inhibit, bool):
+            inhibit = int(inhibit)
+        if inhibit not in (0x00, 0x01):
+            raise ValueError("inhibit muss 0/1 bzw. False/True sein")
+        return self.bus.transact(self.addr, FUNC_PRELOAD_INHIBIT, [inhibit],
                                  status=STATUS_OPERATIONAL,
                                  timeout=TIMEOUT_OPERATIONAL)
+
+    def communication_ctrl_connection_motor_action(self, act):
+        """Alias (.so-Name): 0x0f [act]. ~~Motor-Engage (0x01) / Release
+        (0x00)~~ KORRIGIERT 15.10.2026 (Ghidra): 0x01 = Auto-Preload sperren,
+        0x00 = freigeben – keine Motor-Aktion. Bytes/Guard unverändert."""
+        if act not in (0x00, 0x01):
+            raise ValueError("act muss 0x00 (release) / 0x01 (engage) sein")
+        return self.communication_set_preload_inhibit(act)
 
     # -- TODO (unbelegt, bewusst NICHT implementiert) ---------------------
     # communication_extrude_process / retrude_process (Stufen + lange
@@ -690,8 +943,29 @@ def selftest():
           get_rfid(F("f7 01 0a 00 02 43 3a 62 75 73 79 3b 54"))
           == {"C": "busy"})
     check("rfid roh+multi",
-          get_rfid(b"A:AAAAA;B:unknown;") == {"A": "AAAAA", "B": "unknown"})
+          get_rfid(b"A:10125;B:unknown;") == {"A": "10125", "B": "unknown"})
     check("rfid leer", get_rfid(b"") == {})
+    # Live-Vendor (PROTOKOLL-485.md, RFID-Frame 12.10.2026) feldweise –
+    # Repo: anonymisierter Platzhalter gleicher Länge/Struktur (echte
+    # day/year/supplier/batch/len/number entfernt; mat_id/col beibehalten):
+    live_vendor = "101250000001010010FFFFFF0000000000000000"
+    vf = split_rfid_vendor(live_vendor)
+    for name, exp in (("month", "1"), ("day", "01"), ("year", "25"),
+                      ("supplier", "0000"), ("batch", "00"),
+                      ("mat_id", "101001"), ("col", "0FFFFFF"),
+                      ("len", "0000"), ("number", "000000"),
+                      ("reserve", "000000")):
+        check("vendor %s=%s" % (name, exp), vf.get(name) == exp)
+    check("vendor bytes == str",
+          split_rfid_vendor(live_vendor.encode("ascii")) == vf)
+    check("vendor felder lückenlos",
+          "".join(vf[n] for n, _ in RFID_VENDOR_FIELDS) == live_vendor)
+    for bad_v in (live_vendor[:-1], live_vendor + "0", ""):
+        try:
+            split_rfid_vendor(bad_v)
+            check("vendor laengen-guard %d" % len(bad_v), False)
+        except ValueError:
+            check("vendor laengen-guard %d" % len(bad_v), True)
     try:
         get_rfid(F("f7 01 03 00 03 b3"))  # falscher fun -> muss scheitern
         check("rfid fun-guard", False)
@@ -746,6 +1020,28 @@ def selftest():
     st_raw = get_box_status(bytes([0xF7, 0x34, 0, 0, 0, 0]))
     check("boxstate roh mit 0xF7", st_raw["frame_status"] is None
           and st_raw["len"] == 6 and st_raw["b0"] == 0xF7)
+
+    # 0x0a benannt (Ghidra 15.10.2026) – Live-Frames passen zum Layout
+    nb = parse_box_state(F("f7 01 09 00 0a 13 34 00 00 00 00 d7"))
+    check("parse_box_state live IDLE", nb["kind"] == "state"
+          and nb["state"] == BOX_STATE_IDLE and nb["state_name"] == "STATE_IDLE"
+          and nb["s1"] == 0x13 and nb["s0"] == 0x34 and nb["flags"] == 0
+          and nb["sensor_b_mask"] == 0 and nb["rfid_valid_mask"] == 0
+          and nb["status_name"] == "ok")
+    ne = parse_box_state(F("f7 01 07 30 0a 03 00 00 00 51"))
+    check("parse_box_state live 0x30-Ereignis", ne["kind"] == "event"
+          and ne["events"] == {"A": 3, "B": 0, "C": 0, "D": 0}
+          and "state" not in ne)
+    nerr = parse_box_state(serial485.build_frame(
+        BOX_ADDR, FUNC_GET_BOX_STATE, [0x13, 0x34, 0, BOX_STATE_ERROR, 0, 0],
+        status=STATUS_NO_FILAMENT))
+    check("parse_box_state ERROR -> Fehlercode", nerr["state_name"] == "STATE_ERROR"
+          and nerr["error_code"] == 0x16)
+    check("parse_box_state unbekannt", parse_box_state(b"\x01\x02")["kind"]
+          == "unknown")
+    check("box-state-enum 0..5", [BOX_STATE_NAMES[i] for i in range(6)] ==
+          ["STATE_IDLE", "STATE_PRELOAD", "STATE_PRINT", "STATE_RELOAD",
+           "STATE_ERROR", "STATE_TEST"])
 
     # -- 5. Version/SN: rekonstruierter K2-Voll-Frame (CRC 0xd4 verifiziert,
     #    SN anonymisiert, gleiche Länge) --
@@ -805,10 +1101,33 @@ def selftest():
     check("builder get-hw", build_get_hardware(0) == F("f7 01 04 ff 08 00 db"))
     check("builder get-version", build_get_version() == F("f7 01 03 ff 14 06"))
     try:
-        build_preload(0, 0x03)
+        build_preload(0, 0x04)
         check("preload aktions-guard", False)
     except ValueError:
         check("preload aktions-guard", True)
+    # -- 6b. Ghidra 15.10.2026: op 3, 0x0f-Alias, Timeout-Formel --
+    check("builder preload-op3 tension-only",
+          build_preload_force_tension_only(0x01)[5:7] == b"\x01\x03"
+          and serial485.parse_frame(build_preload_force_tension_only(0x01))
+          == (FUNC_SET_PRE_LOADING, b"\x01\x03"))
+    check("preload op3 box == cfsseq",
+          build_preload(0x02, PRELOAD_FORCE_TENSION_ONLY)
+          == cfsseq.build_preload(0x02, cfsseq.PRELOAD_FORCE_TENSION_ONLY))
+    check("preload-inhibit == alter engage/release",
+          build_preload_inhibit(True) == build_engage()
+          == F("f7 01 04 ff 0f 01 b7")
+          and build_preload_inhibit(False) == build_release())
+    check("FUNC_MOTOR_ACTION alias 0x0f",
+          FUNC_MOTOR_ACTION == FUNC_PRELOAD_INHIBIT == 0x0F)
+    check("force-timeout 1 slot 380 s", preload_force_timeout(0x01) == 380.0)
+    check("force-timeout 4 slots 980 s", preload_force_timeout(0x0F) == 980.0)
+    check("force-timeout maske 0 -> 1 slot", preload_force_timeout(0x00) == 380.0)
+    check("extrude-modi re-export",
+          EXTRUDE_MODE_EXTRUDER_CHECK == 7 and EXTRUDE_MODE_QUERY == 5
+          and EXTRUDER_CHECK_MM == 3 and RETRUDE_P_PULL_HUB == 1)
+    check("status-namen", status_name(0x16) == "Slot ohne Filament"
+          and status_name(STATUS_CRC) == "CRC-Fehler im Request"
+          and status_name(0x7f) == "unbekannt 0x7f")
 
     # -- 7. BoxState: Tn/Tnn-Roundtrip (Modell, kein Bus) --
     bs = BoxState()
@@ -819,7 +1138,7 @@ def selftest():
     check("tn map", (1, 0, 0) in bs.generate_Tn_map())
     tnn = BoxState.tnn_key(1, 0)
     check("tnn key", tnn == "T1A")
-    bs.update_Tnn_map(tnn, bs.generate_Tnn_content(tnn, rfid="AAAAA", remain=28))
+    bs.update_Tnn_map(tnn, bs.generate_Tnn_content(tnn, rfid="10125", remain=28))
     check("tnn content", bs.get_Tnn_content("T1A")["remain"] == 28
           and len(bs.get_Tnn_map()) == 1)
     check("save-layer", bs.update_tn_save_data(1, 0, 0) is not None
@@ -838,6 +1157,9 @@ def selftest():
         F("f7 01 03 00 0d 9e"),  # preload-ACK (synthetisch, CRC-echt)
         F("f7 01 03 00 04 a1"),  # feed-ACK (Live-Pollform)
         F("f7 01 03 00 0f 90"),  # engage-ACK (Live-Pollform)
+        F("f7 01 03 00 0d 9e"),  # force-preload-ACK (synthetisch)
+        F("f7 01 03 00 0d 9e"),  # force-tension-only-ACK (synthetisch)
+        F("f7 01 03 00 0f 90"),  # preload-inhibit-ACK
     ])
     act = BoxAction(bus)
     # num ist MASKE wie im Original: 0x02 = Slot B -> Live-Antwort B:unknown
@@ -857,6 +1179,23 @@ def selftest():
           all(c[3].get("status") == STATUS_OPERATIONAL
               and c[3].get("timeout") == TIMEOUT_OPERATIONAL
               for c in bus.calls))
+    # 0x0d op 2/3: langer Timeout + retries=0 (Ghidra: Antwort nach Vorgang)
+    act.communication_set_pre_loading(0x01, PRELOAD_FORCE_READ)
+    act.communication_set_pre_loading(0x03, PRELOAD_FORCE_TENSION_ONLY,
+                                      timeout=123.0)
+    check("action force: timeout 380 s, retries 0",
+          bus.calls[6][2] == [0x01, 0x02]
+          and bus.calls[6][3].get("timeout") == 380.0
+          and bus.calls[6][3].get("retries") == 0)
+    check("action force op3: override-timeout, retries 0",
+          bus.calls[7][2] == [0x03, 0x03]
+          and bus.calls[7][3].get("timeout") == 123.0
+          and bus.calls[7][3].get("retries") == 0)
+    check("action enable: kein retries-Override",
+          "retries" not in bus.calls[3][3])
+    act.communication_set_preload_inhibit(True)
+    check("action preload-inhibit payload", bus.calls[8][1] == 0x0F
+          and bus.calls[8][2] == [0x01])
     try:
         act.communication_ctrl_connection_motor_action(0x02)
         check("motor act-guard", False)

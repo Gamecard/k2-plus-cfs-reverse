@@ -325,6 +325,90 @@ sendender Code**, Stubs und `read_encoder` bleiben gesperrt:
 - `CHECKLISTE.md`: 5 offene Prüfpunkte (0x08, 0x0C, 0x12/0x0E, Transparent-Pfad, Param-Map).
 - Selbsttests danach unverändert grün (alle 7 Module).
 
+## 15.10.2026 – Fremdquelle fake-name eingearbeitet + Ghidra-Basis korrigiert
+
+Gesichtet: `fake-name/cfs-reverse-engineering` (Connor Wolf, Stand 2025-04, ältere CFS-FW
+App 108/113; keine Lizenzdatei außer GPL3 für die Adapter-PCBs → nur Fakten mit
+Quellenangabe übernommen, keine Texte/Fotos/Dumps, keine Seriennummer des Autors).
+Belegstärke je Befund in den Zieldokumenten vermerkt.
+
+- **Ghidra-Basis KORRIGIERT (stark, selbst verifiziert per String-Zeiger-Test):**
+  Bootloader 12 KiB @0x08000000, cfs0-App @0x08003000 (179 vs. 1 Treffer), cfs6-App
+  @0x08004000 (55 vs. 0), DB-Page @0x0807F800. Alte Angaben (0x08000000) in
+  PROTOKOLL-485.md §2 und PROTOKOLL-GESAMT.md §5 als „KORRIGIERT 15.10.2026“ markiert;
+  fehlende Code-XRefs vermutlich Folge der falschen Basis. Neuanalyse ausstehend.
+  `ghidra-scripts/` NICHT geändert (anderer Agent).
+- `PROTOKOLL-485.md` §2: neue Abschnitte „CFS-Firmware: Flash-Map, Bootloader, Shell“
+  (Bootloader-Protokoll 0xA0/0xA1/0x0B, finsh nur via RTT), „CFS-Hardware“
+  (MS8828-BLDC statt „Stepper“, HTD8236, FM17622, AHT30, MT6826S), „CFS-Bus physisch“
+  (J4-Pinout, Bias/Terminierung, Buffer als Direktleitungen); RFID-vender-Feldlayout,
+  0x0a-Zustandskandidaten, Force-Preload-Strings.
+- `PROTOKOLL-GESAMT.md`: vender „24B“ → 40 Hex-Zeichen/20 Byte; „Tag-SN/Tag-FW“ →
+  Box-SN + CFS-App-Version (0x14); MCU GD32F303VET6 + RT-Thread 5.0.2; MS3791-Korrektur;
+  offener Punkt 8 erledigt, Punkt 9 (Neuanalyse) neu; §1.9 Projekteintrag fake-name.
+- `nachbau/box.py`: reine Hilfsfunktion `split_rfid_vendor(s)` + `RFID_VENDOR_FIELDS`
+  (40 Zeichen, sonst ValueError; kein Buszugriff), TODO in `get_rfid` aufgelöst,
+  Selbsttest feldweise mit Live-Vendor + Längen-Guards (box 68 → 83 Checks).
+- `CHECKLISTE.md`: Pi-Ersatz-Elektrik, Kanal-A-Diagnose (optische Lichtschranke),
+  neuer Block „Offen – aus fake-name“ (MT6826S, Adresse 0xF0, len 0xFC vs. 255,
+  0x10 `[mask 07 03]`, 0x0a-Enum, Neuanalyse).
+- Selbsttests danach alle grün: serial485 81/81 · box 83 · boxmini 15 · cfsseq 17 ·
+  motor 65 · motor_mini 20 · auto_addr 31.
+
+## 15.10.2026 – Ghidra-Neuanalyse CFS-FW eingearbeitet
+
+Eingabe: Ghidra-Neuanalyse `cfs0_000_153` (= FW in der Box des Users, App 153 live per 0x14)
+mit korrigierter Basis 0x08003000 (+ Gegenprobe R150, cfs6_222 @0x08004000). Bericht als
+`GHIDRA-CFS-BEFUND-2026-10-15.md` ins Projekt-Root übernommen; /tmp-Pfade als „Arbeitsdateien
+lokal“ gekennzeichnet, Dekompilat-Auszug zu 0x0d auf Belegzeilen mit Adressen gekürzt (keine
+größeren Creality-Code-Rekonstruktionen im Repo). 0x0d-Handler `FUN_0800f0da` vom Auftraggeber
+selbst gegengeprüft; bei der Einarbeitung zusätzlich nachgeprüft (Abschnitt §10 im Befund):
+0x0d-Laufzeit je Slot (5 s + bis 180 s, nacheinander), 0x03-Wire-Semantik (`FUN_0800ef66`),
+0x10 mode 5 = Live-`c4…`-Replies.
+
+- **Widerlegt/korrigiert:** 0x0f ist die Auto-Preload-Sperre (S[8]), KEIN Motor-Engage/
+  Release (Bytes und Live-Flanke bleiben gültig). 0x10 „push“ (05) ist eine Odometer-
+  Abfrage, 07 03 = Extruder-Check p=3 mm (Hypothese bestätigt). 0x0a-Zustand steht in
+  Byte 3 (IDLE 0…TEST 5); CHECK_HUB ist kein Box-Zustand. Status 0x16 = Slot ohne Filament
+  (nicht busy; busy = 0x03), 0x30 nur bei 0x0a. 0x03: Wire-0xFF auch „Filament ohne
+  RFID-Daten“, Wire-0 = kein Filament (Sensor A) oder 0 % – „remain 0“ bei T1B war ein
+  Host-Wert. Request-Status-Byte wird von der App ignoriert. App akzeptiert nur
+  eigene/0xEA/0xEB (Bootloader: 0xFF/0xFE/eigene/0xF0) – Unterschied notiert.
+- **Neu belegt:** 0x0d op 3 (Forced Preload ohne RFID), Maske bei op 0/1 ignoriert, Status
+  0/1/3/0x16, Antwort erst nach dem Vorgang (~3 min je Slot); neue fun-Codes 0x01, 0x06
+  (FW-Bug: Maske aus r7 → praktisch immer Status 1, auch R150), 0x07, 0x09, 0x0b, 0x0c, 0x12,
+  0x13, 0x15, 0x30, 0x50–0x56, 0x5b–0x5d; vollständige Status-Tabelle.
+- **Doku:** PROTOKOLL-485.md (neuer Abschnitt „Func-Tabelle CFS-App R153“ mit Rahmen,
+  Handler-Tabelle, 0x10-Modi, 0x11, Status-Tabelle, 0x0a-Layout; Altbefunde durchgestrichen/
+  markiert; Platzhalter „Neuanalyse ausstehend“ ersetzt), PROTOKOLL-GESAMT.md (1.3, 1.9,
+  §5 neuer Abschnitt „CFS-FW Neuanalyse“ mit Funktionszahlen cfs0 1063 / cfs6 936 und
+  XRef-Vergleich, cfs6 = Trockner-Variante; §8 offene Punkte), CHECKLISTE.md (abgehakt:
+  0x0d-Semantik, Stufen-Semantik, Status-Werte, 0x0a-Enum, Neuanalyse, `[mask 07 03]`,
+  0x0d-Timeout; neuer Block „Offen – aus Ghidra-Neuanalyse“).
+- **Code (`nachbau/`):**
+  - `box.py`: `PRELOAD_FORCE_TENSION_ONLY = 0x03` (+ Alias `PRELOAD_FORCE_RFID`),
+    `build_preload_force_tension_only()`; `communication_set_pre_loading` bei op 2/3 mit
+    `preload_force_timeout(mask)` (180 s + 200 s je Slot) und `retries=0` (vorher 2 s + 4
+    Retries → hätte den Force-Preload bis zu 5× gesendet), optionaler `timeout`-Override;
+    0x0f: `FUNC_PRELOAD_INHIBIT`, `build_preload_inhibit()`,
+    `communication_set_preload_inhibit()` – alte Namen (`FUNC_MOTOR_ACTION`,
+    `build_engage/release`, `communication_ctrl_connection_motor_action`) als
+    kompatible Aliase; `STATUS_*` + `STATUS_NAMES` + `status_name()` (nur Bereitstellung,
+    Status-Auswertung in `_response_data` bleibt TODO); `BOX_STATE_*`/`BOX_STATE_NAMES` +
+    neuer `parse_box_state()` (benanntes 6-Byte-Layout bzw. 0x30-Ereignis);
+    `get_box_status` unverändert (Bytes stimmten bereits); Docstrings 0x03/0x04.
+    Re-Export der 0x10/0x11-Konstanten aus cfsseq.
+  - `cfsseq.py`: `EXTRUDE_MODE_*` 0…7 + `EXTRUDE_MODES`, `EXTRUDER_CHECK_MM`,
+    `RETRUDE_P_TO_BUFFER/PULL_HUB`, Preload op 3; Sequenzen nur umbenannt (Bytegleichheit
+    im Selbsttest geprüft), Modul-Doku korrigiert.
+  - `boxmini.py`: nur Docstrings (0x03-Semantik, 0x08 als möglicher Sensorpfad); Logik
+    `has_filament` unverändert.
+- **Widersprüche BEFUND ↔ Live-Frames:** keine harten. Präzisiert: BEFUND „bis zu ~3 min“
+  gilt je Slot (Mehrfachmaske summiert sich); 0x03-Bedeutung von 0 gegenüber der bisherigen
+  Doku verschoben (Host- vs. Wire-Wert), Live-Frames passen zur FW-Logik.
+- Selbsttests danach alle grün: serial485 81/81 · box 101 · boxmini 15 · cfsseq 21 ·
+  motor 65 · motor_mini 20 · auto_addr 31.
+
 ## Anonymisierung (Repo-Fassung)
 
 Gegenüber der lokalen Forschungsablage sind im Repo folgende Werte durch syntaktisch
@@ -337,11 +421,12 @@ verifizierte CRCs (CRC-8/ATM über `[len..data]`), die Selbsttests laufen damit 
 | Hostname | `K2Plus-XXXX` |
 | CFS-UUID (12 Byte, `mb_addr_table_uniids`) | `a0 a1 … ab` (auch als `0xA0, …`-Liste/Store-String) |
 | Auto-Addr-Frame 0xa2 mit UUID | `f7 01 11 00 a2 01 00 a0 … ab f0` (CRC neu: `0xf0`) |
-| RFID-Tag-SN (19 Zeichen) | `SN-DEMO-1234567890X` (auch als ASCII-Hex im 0x14-Frame) |
-| Version/SN-Frame 0x14 | `f7 01 19 00 14 … 58 d4` (CRC neu: `0xd4`) |
-| RFID-Vendor-Hex (40 Zeichen) | `AAAA…` (40×`A`, auch als ASCII-Hex `41 …` und gekürzte Präfixe) |
-| RFID-Frame 0x02 `A:<vendor>;` | CRC neu: `0x78` (Original-CRC `0x02` bezog sich auf die echten Bytes) |
+| Tag-/Box-SN (19 Zeichen, 0x14) | `SN-DEMO-1234567890X` (auch als ASCII-Hex im 0x14-Frame) |
+| Version/SN-Frame 0x14 | `f7 01 19 00 14 … 58 d4` (CRC neu: `0xd4`; Original-CRC `0x8d`) |
+| RFID-Vendor (40 Zeichen) | `101250000001010010FFFFFF0000000000000000` – strukturierter, synthetischer Platzhalter (ersetzt den früheren 40×`A`), zerfällt per `box.split_rfid_vendor()` in month `1` · day `01` · year `25` · supplier `0000` · batch `00` · mat_id `101001` · col `0FFFFFF` · len `0000` · number `000000` · reserve `000000`. mat_id/col sind nicht identifizierend und wurden beibehalten; die echten day/year/supplier/batch/len/number sind entfernt. Auch als ASCII-Hex im 0x02-Frame und als gekürzte Präfixe (`10125`) |
+| RFID-Frame 0x02 `A:<vendor>;` | `f7 01 2e 00 02 41 3a 31 30 … 30 3b d7` (CRC neu: `0xd7`; Original-CRC `0x02` bezog sich auf die echten Bytes) |
 
 Nicht im Repo: Klartextquelle `auto_addr_wrapper.py` (Creality, 729 Zeilen; Zeilenangaben
 „Orig :<zeile>“ bzw. „:604-607“ beziehen sich auf sie), Firmware-/Config-Tarball und
-lokale Übergabenotizen.
+lokale Übergabenotizen. Die Seriennummer aus den Dumps von `fake-name/cfs-reverse-engineering`
+ist nicht übernommen.

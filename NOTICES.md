@@ -19,14 +19,18 @@ License v3.0 or later** (siehe `LICENSE`).
 - `fw/`, `rootfs-live/`, `klippy/`, `config/`, `live-1.1.7.0-configs/`:
   Firmware-Artefakte und Konfigurationen vom Gerät (Creality), beigelegt als
   Forschungs-/Referenzmaterial für die Protokollanalyse.
-- Ghidra-Decompile-Auszüge in der Doku: eigene Analyseergebnisse, keine
-  Creality-Quelltexte.
+- Ghidra-Decompile-Auszüge in der Doku (inkl. `GHIDRA-CFS-BEFUND-2026-10-15.md`): eigene
+  Analyseergebnisse, auf Belegzeilen mit Adressen gekürzt, keine Creality-Quelltexte.
 - Protokoll-Kenntnisse aus `gitstonelabs/creality-cfs-klipper` (GPL-3.0) und
   `prestonbrown/helixscreen`-Recherche-Dokumenten wurden zum Abgleich und zur
   Korrektur eigener Befunde verwendet; übernommene Fakten sind jeweils belegt.
 - `grant0013/k2-reverse-engineering` (GPL-3.0, Creality K2): Motor-Parameter-IDs
   (z. B. ID 70 = Positionsregler-Kp) und Motor-Kommandobytes wurden zum Abgleich
   genutzt und als Fremd-Hypothesen gekennzeichnet; keine Dateien übernommen.
+- `fake-name/cfs-reverse-engineering` (https://github.com/fake-name/cfs-reverse-engineering,
+  Connor Wolf; keine Lizenz außer GPL3 für die Adapter-PCBs): CFS-Hardware-/Firmware-Fakten
+  (Flash-Map/Bootloader, Bauteile, RFID-vender-Feldlayout) nur als Fakten mit Quellenangabe
+  übernommen; keine Texte, Fotos oder Dumps, keine Seriennummern.
 
 ## Hinweis
 

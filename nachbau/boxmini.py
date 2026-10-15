@@ -15,6 +15,11 @@ Belege (alle in /home/pro/k2-fw-live-1.1.7.0/ dokumentiert):
 - GET_REMAIN_LEN: Slotmaske im Request, Antwort positional A..D;
   0xff = kein Wert, 0 = kein RFID-Restwert (Live: 1a 00 ff 00 = A 26%;
   Slot B mit remain 0 hat live 160 mm gefördert, PROTOKOLL-485.md T1B)
+  PRÄZISIERT 15.10.2026 (Ghidra CFS-FW R153 FUN_0800ef66, GHIDRA-CFS-BEFUND-
+  2026-10-15.md §10): Wire-0xff = nicht in Maske / Slot preloadet gerade /
+  Filament da, aber KEINE RFID-Daten; Wire-0 = Sensor A meldet kein Filament
+  ODER gespeicherter Prozentwert 0. Beide Werte bleiben für has_filament
+  mehrdeutig -> Logik unverändert (True nur bei >0, sonst None).
 - Klipper-G-Code NUM=0..3 numerisch (FALLE: NUM=A wirft key60-Shutdown).
   Wire/.so-Parameter num ist dagegen eine MASKE (API-box_wrapper.md:
   communication_get_rfid(1, 1) -> data b'\x01'). BoxMini.get_rfid/
@@ -48,7 +53,7 @@ def slot_to_mask(index):
 def parse_rfid_response(data):
     """Parst GET_RFID-Antwort (ASCII, ';'-getrennt, Key=Slot-Buchstabe).
 
-    Beispiele (live, anonymisiert): b"A:AAAAAAAA...AAAAAA;" / b"B:unknown;" / b"C:busy;"
+    Beispiele (live, anonymisiert): b"A:10125000...000000;" / b"B:unknown;" / b"C:busy;"
     Gibt dict {Slot-Key: Wert} zurück. Leere Antwort -> {}.
     """
     result = {}
@@ -120,8 +125,10 @@ class BoxMini:
                   None  = unbekannt (remain 0 oder 0xff).
         Bewusst NIE False: remain 0 heißt nur „kein RFID-Restwert“ – live
         hat Slot B mit remain 0 (Vendor unknown) 160 mm gefördert
-        (PROTOKOLL-485.md, Abschnitt T1B). Echte Leer-Erkennung bräuchte
-        den Filament-Sensorstatus (Wire-Abbild unbelegt, TODO).
+        (PROTOKOLL-485.md, Abschnitt T1B; „remain 0“ war dort ein Host-Wert).
+        Echte Leer-Erkennung bräuchte den Filament-Sensorstatus – laut Ghidra
+        (15.10.2026) liefert 0x08 [00] eine Bitmaske Sensor A (Deutung
+        „Einlauf“ unbelegt, nicht live geprüft) -> TODO, hier nicht genutzt.
         Ungültiger Index -> ValueError.
         """
         mask = slot_to_mask(slot)
@@ -156,7 +163,7 @@ def selftest():
 
     # 1. RFID-Parsing (Live-Frames 12.10.2026)
     check("rfid A", parse_rfid_response(
-        bytes.fromhex("41 3a 41 41 41 41 41")) == {"A": "AAAAA"})
+        bytes.fromhex("41 3a 31 30 31 32 35")) == {"A": "10125"})
     check("rfid unknown", parse_rfid_response(b"B:unknown;") == {"B": "unknown"})
     check("rfid busy", parse_rfid_response(b"C:busy;") == {"C": "busy"})
     check("rfid leer", parse_rfid_response(b"") == {})

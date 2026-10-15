@@ -40,24 +40,46 @@ crc = CRC-8/ATM (poly 0x07, init 0x00) über [len..data]  ← GEKNACKT 12.10.202
 0x03 = GET_REMAIN_LEN  Request [Slotmaske], Antwort positional A..D (4 Bytes);
        0xff = keine Daten, 0 = kein RFID-Restwert (NICHT „leer“ – Slot B ist
        mit remain 0 gefahren; KORRIGIERT 15.10.2026)
+       BELEGT 15.10.2026 (Ghidra): Wire-0 = Sensor A ohne Filament (oder 0 %),
+       0xff = nicht in Maske / preloadet / Filament ohne RFID-Daten
 0x04 = SET_BOX_MODE    [00 01] Feed-Modus, [Slotmaske 00] Print-Modus
+       (BELEGT 15.10.2026: [mask, mode] mode 0 = PRINT, mode 1 = IDLE)
 0x05 = GET_BUFFER_STATE Box-Bufferstatus (früher fälschlich CUT_STATE)
 0x08 = GET_HARDWARE_STATUS Toolhead-/Hardware-Sensorstatus
 0x0a = Herzschlag/Poll 6 Datenbytes Zustand, alle ~4s
+       ~~(Kandidaten STATE_IDLE/PRELOAD/PRINT/RELOAD/ERROR/TEST/CHECK_HUB – schwach,
+       FW-Strings ohne Zahlenwerte, fake-name; s. PROTOKOLL-485.md)~~
+       BELEGT 15.10.2026 (Ghidra): Byte 3 = Zustand IDLE=0…TEST=5, CHECK_HUB ist
+       Preload-Statemachine, kein Box-Zustand
 0x0d = ~~?~~ SET_PRE_LOADING/RFID-Control [Maske][00 disable|01 enable|02 Force-Read]
        (KORRIGIERT 15.10.2026, Belege ref-hi + k2-vanilla, s. PROTOKOLL-485.md
        „Preload-Ablauf“); live nur leeres ACK (len 3, nach GET_RFID), kein Request
+       BELEGT 15.10.2026 (Ghidra): op 0/1 global (Maske ignoriert), op 2 = Forced
+       Preload mit RFID, op 3 = ohne RFID; Antwort bei 2/3 erst nach ~3 min/Slot
 0x0e = MEASURING_WHEEL Request [01], Antwort 4B BE-IEEE754-Float negativ
-0x0f = CTRL_CONNECTION_MOTOR_ACTION [01] Engage / [00] Release
+0x0f = ~~CTRL_CONNECTION_MOTOR_ACTION [01] Engage / [00] Release~~
+       WIDERLEGT 15.10.2026 (Ghidra): Auto-Preload-Sperr-Flag [01] sperren / [00] frei
 0x10 = EXTRUDE_PROCESS Requests [Slotmaske, Stufe, Parameter]: 00/04/05/06/07
+       (BELEGT 15.10.2026: 8 Modi; 05 = Odometer-Abfrage, 07 03 = Extruder-Check 3 mm)
 0x11 = RETRUDE_PROCESS Requests [Slotmaske, 00] START / [Slotmaske, 01] FINISH
 0x14 = GET_VERSION_SN ASCII-Version+SN
+NEU 15.10.2026 (Ghidra, R153): 0x01 LED-Refresh, 0x06 Feeder (FW-Bug: immer Status 1),
+       0x07 Hauptmotor, 0x09 Speeds, 0x0b LED, 0x0c Config#6, 0x12/0x13 Feed-Prozesse,
+       0x15, 0x30 GPIO, 0x50–0x56, 0x5b UID, 0x5c I2C-Auth, 0x5d Testmodus –
+       vollständige Tabelle PROTOKOLL-485.md „Func-Tabelle CFS-App R153“
 0xa2 = Auto-Addr/SN-Query f7 01 11 00 a2 01 00 <12B uuid> crc (Poll ~2s)
 ```
 
-- RFID-Daten: `vender` = 24B-Hex (`AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA`),
-  `color_value` (0FFFFFF = weiß), `material_type` (101001), `remain_len` (%),
-  Tag-SN (`SN-DEMO-1234567890X`), Tag-FW (`1.5.3`)
+- RFID-Daten: `vender` = ~~24B-Hex~~ **40 Hex-Zeichen / 20 Byte** (KORRIGIERT 15.10.2026)
+  (`101250000001010010FFFFFF0000000000000000`), `color_value` (0FFFFFF = weiß),
+  `material_type` (101001), `remain_len` (%).
+  Feldlayout des vender (mittel-stark, fake-name firmware.md:340-352/521-523):
+  `month(1) day(2) year(2) supplier(4) batch(2) · mat_id(6) col(7) · len(4) number(6)
+  reserve(6)` – color/material stecken IM vender (mat 101001 = Hyper PLA, col 0FFFFFF);
+  Nachbau `box.split_rfid_vendor()`, Details PROTOKOLL-485.md „RFID-Frame“.
+  ~~Tag-SN (`SN-DEMO-1234567890X`), Tag-FW (`1.5.3`)~~ KORRIGIERT 15.10.2026: das sind
+  **Box-SN + CFS-App-Version** (aus 0x14 GET_VERSION_SN, „153“), nicht Tag-Daten
+  (PROTOKOLL-485.md Func-Tabelle 0x14 war korrekt)
 - `preloading_mask` = Slot-Bitmaske: 0x1=A, 0x2=B, 0x4=C, 0x8=D
 - FALLE: `BOX_GET_RFID NUM=A/B/C/D` → `key60 Internal error` + Shutdown;
   korrekt `NUM=0..3`. FALLE 2: nicht zurückgezogener Slot blockiert alle Einzüge
@@ -169,9 +191,13 @@ Slot-Bitmasken, A2-Shape, Auto-Addr-Sequenz.
   unentschiedene Semantik.~~ **ENTSCHIEDEN 15.10.2026:** Force-Read übernommen
   (0x00=disable, 0x01=enable, 0x02=Force-Read; ref-hi `f70105ff0d0f0169` =
   „mask=0x0F enable=0x01“ widerlegt die alte Arm/Disarm/Rearm-Belegung).
-  Offen bleibt nur, ob Byte 1 bei 00/01 die Maske trägt (ref-hi 0x0F) oder 0 (vanilla).
+  ~~Offen bleibt nur, ob Byte 1 bei 00/01 die Maske trägt (ref-hi 0x0F) oder 0 (vanilla).~~
+  **BELEGT 15.10.2026 (Ghidra):** Masken-Byte wird bei 00/01 ignoriert – beide Formen gleichwertig.
 - 0x08: gleiche Bytes, Vanilla Masken-Abfrage vs. unsere Hardware-Status-Deutung.
-- 0x11 Phase0: Vanilla `(0,0)` vs. unsere `(mask,00)`.
+  **BELEGT 15.10.2026 (Ghidra):** [sel] → 1 B Bitmaske Sensor A (sel 0) / B (sel 1) –
+  Vanilla-Deutung „Masken-Abfrage“ trifft es; Box-Sensoren, nicht Toolhead.
+- 0x11 Phase0: Vanilla `(0,0)` vs. unsere `(mask,00)`. **BELEGT 15.10.2026:** beides
+  gültig – mask 0 = alle Slots mit Sensor B aktiv, 1-hot = ein Slot.
 - Motor-Funcs: Vanilla 0x06 = Sys-Param `[01/02/03,id]`, 0x0C = Protection
   `[data]` – unsere K2-Plus-Live-Frames zeigen 0x06 mit 4 Datenbytes (NACHTRAG
   15.10.2026: = LE-Float 300.0/100.0 = Sys-Param ID=70 → stützt Vanilla-Deutung;
@@ -182,6 +208,7 @@ Slot-Bitmasken, A2-Shape, Auto-Addr-Sequenz.
   NACHTRAG 15.10.2026: im Nachbau retries=4 = 1+4 = 5 Sendungen; ob das Original
   „retries = 4“ als 4 oder 1+4 Sendungen meint, ist am klippy.log nachzuzählen (offen).
 - STATUS/Event: Vanilla kennt zusätzlich `0x16`=UNLOAD_NO_FILAMENT (statt busy).
+  **BELEGT 15.10.2026 (Ghidra):** 0x16 = Slot ohne Filament (Vanilla korrekt), busy = 0x03.
 
 **Nutzen für motor.py-TODOs:** Vanilla implementiert encoder_calibrate (0x03),
 elec_offset_calibrate (0x04), Sys-/Flash-Params (0x06/0x07), Protection (0x0C),
@@ -219,7 +246,24 @@ Details siehe Subagenten-Bericht in der Session-Historie.
   (UART-Init in der MCU-FW). Für einen Pi-Ersatz also zu klären, ob die Motoren am
   Plus direkt am `/dev/ttyS5`-Bus oder nur über die Main-MCU erreichbar sind.
 
-Geklonter Stand in `/tmp/opencode/cfs-klipper-ref` (flüchtig – bei Bedarf neu klonen),
+**Kreuzvergleich: fake-name/cfs-reverse-engineering (CFS-Hardware, 15.10.2026 gesichtet)**
+
+- Was: Hardware-/Firmware-Recherche von Connor Wolf (Stand 2025-04) mit dem Ziel, die
+  CFS als AMS an beliebigen Klipper-Druckern zu betreiben (Klipper auf dem GD32 bzw.
+  RS485→CAN-Interposer). Inhalt: PCB-Fotos + Pinouts (PCBs.md), FW-String-Listen
+  (firmware.md), Logic-Analyzer-Mitschnitte (probing/), Ghidra-Projekt, Adapter-PCBs.
+- Nützlich: Flash-Map/Ghidra-Basis (App @0x08003000 bzw. cfs6 @0x08004000 – von uns
+  verifiziert), MCU GD32F303VET6 + RT-Thread 5.0.2, Bauteile (BLDC MS8828 statt
+  „Stepper“, 4× HTD8236, 2× FM17622, AHT30, MT6826S) mit Pins, J4-Pinout + Bus-Elektrik
+  (TPT75176H, 300-Ω-Bias, 120 Ω unbestückt), Buffer-Signale als Direktleitungen,
+  RFID-vender-Feldlayout, finsh nur via RTT. Eingearbeitet in PROTOKOLL-485.md §2
+  („CFS-Firmware“, „CFS-Hardware“, „CFS-Bus physisch“) und `box.split_rfid_vendor()`.
+- Einschränkungen: **ältere FW** (App 108/113 vs. unsere 150/153), **kein RS485-Nachbau**
+  (Autor ersetzt die Original-FW), **keine Lizenzdatei** (nur Adapter-PCBs GPL3) → nur
+  Fakten mit Quellenangabe übernommen, keine Texte/Fotos/Dumps. Steckertypen extern
+  laut Autor „guesswork“; A/B-Benennung widersprüchlich.
+
+**(Fortsetzung gitstonelabs/Hi, 1.8 – nicht fake-name):** Geklonter Stand in `/tmp/opencode/cfs-klipper-ref` (flüchtig – bei Bedarf neu klonen),
 eigene Klipper-Module + Captures + Tests. **Kreuzvalidierung bestanden:**
 16/16 Hi-CRC-Vektoren + 12/12 Hi-Frames laufen durch UNSEREN Parser
 (`nachbau/serial485.py`) fehlerfrei – beide Projekte beschreiben dasselbe Protokoll.
@@ -314,7 +358,7 @@ ein FW-File pro Board. Noch nicht dekompiliert.
 | `prtouch_v1/v2/v3_wrapper.so` | Druck-Leveling | v3 live belegt |
 | `motor_control_wrapper.so` | Closed-loop | live belegt (Cut) |
 | `load_ai` + `usr/lib/yolov5/*.bin` | AI-Abfall-Erkennung (Kamera+Inference) | NICHT analysiert |
-| `cfs6` | `cfs6_100_G31-cfs6_222_000.bin` (145K Cortex-M) | Geladen in Ghidra: Basis `0x08000000`, Reset `0x08004144`, SP `0x20008030`, **798 Funktionen** | Import-Rezept unten |
+| `cfs6` | `cfs6_100_G31-cfs6_222_000.bin` (145K Cortex-M) | Geladen in Ghidra: Basis ~~`0x08000000`~~ (**KORRIGIERT 15.10.2026: richtig `0x08004000`**, App-Image ohne Bootloader – passt zum Reset `0x08004144`), SP `0x20008030`, ~~798 Funktionen (alte Basis; Neuanalyse 15.10.2026 ausstehend)~~ **936 Funktionen @0x08004000 (Neuanalyse 15.10.2026)**; andere Gerätevariante (Heizung/Lüfter, Bus RS485 oder CAN), s. „CFS-FW Neuanalyse“ unten | Import-Rezept unten |
 
 ### cfs6-Import-Rezept (analyzeHeadless, Java-Skript)
 
@@ -326,6 +370,9 @@ ein FW-File pro Board. Noch nicht dekompiliert.
 
 Skript `SetCfsBase.java`: BinaryLoader legt Raw-Bin als Block `ram` @0x0 an →
 PostScript erstellt `flash`-Block @0x08000000 aus den FileBytes (`getAllFileBytes()`),
+(**KORRIGIERT 15.10.2026:** falsche Basis – cfs0-App gehört nach 0x08003000, cfs6-App
+nach 0x08004000; Bootloader 12 KiB @0x08000000, DB-Page @0x0807F800; Beleg
+String-Zeiger-Test 179 vs. 1 bzw. 55 vs. 0, s. PROTOKOLL-485.md „CFS-Firmware: Flash-Map“)
 markiert Reset, ruft `analyzeAll()`. Ergebnis: 798 Funktionen.
 Für Detail-Analysen: Ghidra-GUI öffnen (`ghidraRun`) mit Projekt, oder REA-Seeds
 (`REA_GHIDRA_SEED_FILE`) für gezielte Adressen.
@@ -335,14 +382,45 @@ DumpIns nur in der Session-Historie, nicht gesichert).
 
 ### CFS-Firmware-Details: cfs0_050_G32 R153 (Build 02.09.2026, analysiert 13.10.2026)
 
-Import wie oben: **942 Funktionen** @ Basis 0x08000000, Heartbeat-Strings @
-080004ec/0800beac/0800c318/0800c32c (keine direkten Code-XRefs – RT-Thread-Tabellen).
+Import wie oben: **942 Funktionen** @ Basis ~~0x08000000~~ (**KORRIGIERT 15.10.2026:
+richtig 0x08003000**, Versionsstring bei App+0x200), Heartbeat-Strings @
+080004ec/0800beac/0800c318/0800c32c (Adressen relativ zur alten Basis; ~~keine direkten
+Code-XRefs – RT-Thread-Tabellen~~ – die fehlenden XRefs lagen vermutlich an der um 0x3000
+verschobenen Basis). ~~Neuanalyse 15.10.2026 ausstehend~~ → ERLEDIGT, s. nächster Abschnitt.
+
+### CFS-FW Neuanalyse mit korrigierter Basis (Ghidra, 15.10.2026)
+
+Bericht: `GHIDRA-CFS-BEFUND-2026-10-15.md` (Projekt-Root); Protokoll-Semantik eingearbeitet
+in PROTOKOLL-485.md („Func-Tabelle CFS-App R153“, „Preload-Ablauf“). Skripte
+`ghidra-scripts/SetCfsBase.java` (neu, Basis per Argument/Dateiname), `CfsDetail.java`,
+`CfsDispatch.java` (neu: TBB-Tabellen-Reparatur, Dispatcher-Export).
+
+| Image | Basis | Funktionen alt → neu | Strings mit XRef | XRefs auf Strings |
+|---|---|---|---|---|
+| cfs0_000_153 | 0x08003000 | 927 (Vergleichsimport @0x08000000; Doku nannte 942) → **1063** | 538 → **930** (von ~1180) | 812 → **1464** |
+| cfs6_222_000 | 0x08004000 | Doku 798 → **936** | → 601 (von 806) | → 1019 |
+| cfs0_000_150 | 0x08003000 | Dispatcher-Gegenprobe: identisch außer 0x12 | – | – |
+
+XRef-Vergleich (B): Was schon bei der alten Basis XRefs hatte, wird PC-relativ (`adr`)
+geladen und ist basisunabhängig; alle absoluten Literal-Pool-Zeiger (finsh-Tabellen,
+`__FUNCTION__`-Namen, Hilfetexte) lösen erst mit 0x08003000 auf (z.B. `preloading enable`,
+`STATE_CHECK_HUB`, `rfid_mgr_fila_*`: 0 → 1+ XRefs). Damit ist die alte Erklärung
+„RT-Thread-Tabellen ohne XRefs“ endgültig ersetzt.
+
+**cfs6_222 = andere Gerätevariante (B):** Strings `[D/HT] ptc_power`, `Chamber backside fan`,
+`dry aging wait ac connect` → Heizung/Lüfter (Trockner-Box); Bus „RS485“ oder „CAN“
+(`api_comm_cmd_parse` = `FUN_08005acc`). Eigene Implementierung (Message-Queue); 0x0d
+wirkt dort **pro Maske** (op 0/1 mit mask&0xF, 0 = alle), 0x10 nur Modi 0/4/5/6/7.
+Zusätzliche fun 0x16–0x19, 0x57 (Kandidaten Trockner, V, nicht dekompiliert).
+cfs0_000_153 hat **kein** Dryer-Kommando (B).
 String-Inventar (Beleg für Fähigkeiten/Zustände):
 
-- **RTOS:** RT-Thread (rt_thread_*, finsh-Shell, Log-Tags `[I/E/D/...]`), Threads u.a.
+- **MCU/RTOS:** GD32F303VET6, RT-Thread **5.0.2** (fake-name, stark) (rt_thread_*, finsh-Shell
+  – nur über SEGGER RTT/SWD `jlinkRtt`, NICHT über RS485 –, Log-Tags `[I/E/D/...]`), Threads u.a.
   `preload_mq`, `api_preload_thread_init`, RFID-Manager-Tasks
   (`rfid_mgr_fila_back/idle/print/save/task`)
-- **Treiber:** MS3791 (Stepper), at8236 ×4 (H-Brücken mit ADC-Strommessung + Timer),
+- **Treiber:** MS3791 ~~(Stepper)~~ = FW-Name des **BLDC-Hauptantriebs** (bestückt MS8828,
+  KORRIGIERT 15.10.2026, fake-name PCBs.md:22), at8236 ×4 (bestückt HTD8236, H-Brücken mit ADC-Strommessung + Timer),
   AHT30 Temp/Feuchte (SCL PC11, SDA PC12), 4 Feeder (feeder0-3) mit PID
   (`feeder_pid_output`, `feeder_target_speed`, `feeder_thrust_voltage`)
 - **Feed-Überwachung:** Odometer (`feeding 500ms timeout, odometer not change`,
@@ -387,7 +465,14 @@ String-Inventar (Beleg für Fähigkeiten/Zustände):
 2. ~~Auto-Addr-Handshake~~ → DEKOMPILIERT: 0xa1-Discovery (0xfd/0xfc/0xfb/0xfe) + 0xa0-Zuweisung mit UUID
 3. ~~mcu_util_485~~ → DEKOMPILIERT: Func 0xf0-Sub-Codes (version/sector/erase/request/len/data)
 4. `raw_send_wait_ack`-Body dekompilieren (mstate-Tabellen/Seeds)
-5. CFS-FW `cfs6_222_000.bin` → ERLEDIGT: Ghidra-Import-Rezept steht, 798 Funktionen analysiert; Detail-Analysen offen
+5. CFS-FW `cfs6_222_000.bin` → ERLEDIGT: Ghidra-Import-Rezept steht, ~~798~~ 936 Funktionen (Basis 0x08004000, 15.10.2026); offen: Handler 0x16–0x19/0x57 (Trockner?) im Detail
 6. AI-Waste (load_ai + YOLOv5-Bins) – nur falls Pi-Ersatz das braucht
 7. Langer RFID-Frame komplett (Log schneidet ~250 Zeichen ab → socat-Tee)
-8. RFID-Tag-Format vollständig (Felder nach dem vender-Hex)
+8. ~~RFID-Tag-Format vollständig (Felder nach dem vender-Hex)~~ → ERLEDIGT 15.10.2026:
+   keine Felder nach dem vender; Layout des 40-Zeichen-vender aus fake-name übernommen
+   (mittel-stark), `box.split_rfid_vendor()`; offen nur Datums-/len-Semantik
+9. ~~Ghidra-Neuanalyse cfs0/cfs6 mit korrigierter Basis (0x08003000/0x08004000) – läuft~~
+   → ERLEDIGT 15.10.2026 (`GHIDRA-CFS-BEFUND-2026-10-15.md`). Offen daraus: Quelle von
+   0x0a Byte 0/1 (live 0x13 0x34) und R[3]; Bedeutung Config #6 (0x0c/0x50); Inhalt 0x15;
+   Init der Auto-Addr-Tabelle (0xA0–0xA3); physische Zuordnung Sensor A/B (Pin-Tabelle
+   @0x20000218); weitere Fehlercodes 0x1a/0x20/0x22/0x51–0x53.

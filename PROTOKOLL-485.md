@@ -64,13 +64,15 @@ GCode: `BELT_MDL_INFO/MOVE(POS)/SET(MDL_N)/CALI(DIR,TEN)/TEST`, Fehler `key712-k
   = exakt die 12 Bytes im 0xa2-Frame nach `01 00`
 - Bus-Polling idle: alle ~2s `0xa2`-Frame an addr 0x01, 4 Retries, dann Timeout (CFS aus)
 - Box-Live-State: `disconnect` (CFS nicht angeschlossen), T1 hat aber gespeicherte
-  RFID-Daten (vender `AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA`, remain 32/0/100/0)
+  RFID-Daten (vender `101250000001010010FFFFFF0000000000000000`, remain 32/0/100/0)
 
 ## 2. CFS (Filament-Box) – RS485-Bus
 
 FW (live 1.1.7.0): `fw/cfs/cfs0_050_G30-cfs0_000_150.bin`,
 `fw/cfs/cfs0_050_G32-cfs0_000_153.bin`, `fw/cfs/cfs6_100_G31-cfs6_222_000.bin`
-(Cortex-M, Basis 0x08000000).
+(Cortex-M; ~~Basis 0x08000000~~ **KORRIGIERT 15.10.2026:** die `.bin` sind
+reine App-Images – cfs0-App @0x08003000, cfs6-App @0x08004000; Flash-Map s.
+„CFS-Firmware: Flash-Map, Bootloader, Shell“ unten).
 `fw/cfs/version.json`: boot `cfs0_050_G30/G32/cfs6_100_G31`,
 app `cfs0_000_150/153`, `cfs6_222_000`.
 
@@ -80,7 +82,7 @@ Bus-Logik aus `mcu_util_485` + FW-Strings:
 - Kommandos (FW-Shell + Log): `heartbeat`, `sn_information=%s`, `current mode = %d`,
   `485 uid = %d`, `slot%d insert/pullout/start preloading/read rfid`,
   `preloading enable/disable/aging/read [slot]`, `has filament`, `filament percent=%d%%`,
-  `feed: ch / pull_back_hub / motor block state=%02x`, Treiber `MS3791/at8236`,
+  `feed: ch / pull_back_hub / motor block state=%02x`, Treiber `MS3791/at8236` (FW-Namen; bestückt laut fake-name: BLDC-Treiber MS8828 + 4× HTD8236, s. „CFS-Hardware“ unten),
   `rfid init/read/write <card id>`, `detect rfid`, `different rfid uid, retry`,
   `AHT10 temp/humi`, `feed filament exceed max length`
 
@@ -108,9 +110,29 @@ Arm/Disarm-Belegung war durch keinen Frame gestützt und widerspricht beiden Ref
 Offen: ob das 1. Byte bei 0x00/0x01 die Maske
 ist (ref-hi: 0x0F) oder ignoriert wird (vanilla: 0). Nachbau:
 `box.build_preload(mask, action)` / `cfsseq.build_preload(mask, action)`,
-Konstanten `PRELOAD_DISABLE/ENABLE/FORCE_READ = 0x00/0x01/0x02`.
+Konstanten `PRELOAD_DISABLE/ENABLE/FORCE_READ = 0x00/0x01/0x02`
+(+ `PRELOAD_FORCE_TENSION_ONLY = 0x03` seit 15.10.2026, s. unten).
 Alle K2-Frames CRC-verifiziert; der Versuch blieb ohne Mechanik, weil kein
 neuer Insert-/Feed-Zustand vorlag.
+
+**BELEGT 15.10.2026 (Ghidra, CFS-App R153, `FUN_0800f0da`; Details
+`GHIDRA-CFS-BEFUND-2026-10-15.md` §3/§10):**
+- op **0x00 = disable** (`FUN_08005376`, = finsh `preloading disable`), op **0x01 = enable**
+  (`FUN_0800536e`) – **global**, das Masken-Byte wird bei op 0/1 **ignoriert** (damit ist
+  die Frage „ref-hi 0x0F vs. vanilla 0“ gegenstandslos: beide wirken gleich).
+- op **0x02 = Forced Preload MIT RFID** (`FUN_08004ec4(mask,1)`: pretension →
+  STATE_CHECK_HUB → „read rfid and margin estimation“ = enthält den Force-Read).
+- op **0x03 = Forced Preload OHNE RFID** (`FUN_08004ec4(mask,0)`: nur pretension) – NEU,
+  im Nachbau bisher nicht vorhanden (jetzt `PRELOAD_FORCE_TENSION_ONLY`).
+- op > 3 → Status 1. Status 3 = Box nicht IDLE/PRELOAD; 0x16 = kein Slot mit Filament
+  (setzt STATE_ERROR); sonst Fehlercode eines vorgeschalteten Pull-backs (in IDLE wird
+  vor dem Force `FUN_08004cd0(4,1)` = Rückzug aller Slots am Hub ausgeführt).
+- **Antwort bei op 2/3 erst NACH dem Vorgang:** je Slot der Maske nacheinander 5 s +
+  bis 180 s, ggf. vorher bis 179 s Warten auf laufendes Preload → **~3 min pro Slot**.
+  Ein Host-Timeout von 2 s + Retries würde den Befehl mehrfach senden (Nachbau:
+  langer Timeout, retries=0, s. `box.py`).
+- Abweichung cfs6_222 (`FUN_0800e674`): op 0/1 wirkt dort **pro Maske** (0 = alle),
+  op 2 braucht mask≠0, op 3 nur ein Slot, Antwort nur bei op 0/1 sofort.
 
 ### M8200-Sequenzen (13.10., belegt via helixscreen-Recherche + eigene Logs)
 
@@ -146,24 +168,40 @@ früheren Fehlschläge). Display-Flow bleibt zusätzlich belegt.
 
 ### RFID-Frame LIVE DEKODIERT (12.10.2026, 22:52:19)
 
-`f7 01 2e 00 02 41 3a 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 3b 78`
-(Vendor-Bytes anonymisiert, gleiche Länge; CRC 0x78 neu berechnet und verifiziert)
+`f7 01 2e 00 02 41 3a 31 30 31 32 35 30 30 30 30 30 30 31 30 31 30 30 31 30 46 46 46 46 46 46 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 3b d7`
+(Vendor-Bytes anonymisiert, gleiche Länge und Feldstruktur; CRC 0xd7 neu berechnet und verifiziert)
 
 - Func `0x02` = GET_RFID-Antwort, Daten als **ASCII**: `A:<hex>;...`
-- `A:` = Slot-Key, dann Vendor-Hex `AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA`, dann `;` –
-  VOLLSTÄNDIG (13.10. nachverifiziert: 49 Tokens, len=0x2e → 46+3=49 ✓, CRC=0x78 ✓
+- `A:` = Slot-Key, dann Vendor-Hex `101250000001010010FFFFFF0000000000000000`, dann `;` –
+  VOLLSTÄNDIG (13.10. nachverifiziert: 49 Tokens, len=0x2e → 46+3=49 ✓, CRC=0xd7 ✓
   über dem anonymisierten Frame;
   das `0x2` am Ende ist unpadded `%x`-Format, KEIN Abschneiden).
   Farbe/Material/Restmenge kommen aus separaten Abfragen.
 - **Kurzform:** `f7 01 0d 00 02 42 3a 75 6e 6b 6e 6f 77 6e 3b 8e` = `B:unknown;` (len 0x0d, Slot ohne erkannten Tag → ASCII "unknown")
 - **Weitere Zustände:** `f7 01 0a 00 02 43 3a 62 75 73 79 3b 54` = `C:busy;` (len 0x0a, Slot dreht/ließt gerade), später `C:unknown;` (Tag noch nicht gelesen)
-- Passt exakt zum Query: `vender=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA`, danach folgen vermutlich color / material_type / remain als weitere `;`-Felder
+- Passt exakt zum Query: `vender=101250000001010010FFFFFF0000000000000000`; ~~danach folgen vermutlich color / material_type / remain als weitere `;`-Felder~~
+  **KORRIGIERT 15.10.2026:** keine weiteren Felder – Farbe und Material stecken IM
+  40-Zeichen-vender (20 Byte als Hex/ASCII). Feldlayout (Quelle fake-name `firmware.md:340-352`
+  printf-Feldnamen, `firmware.md:521-523` Beispiel 11+13+16 = 40 Zeichen; Belegstärke
+  mittel-stark): `month(1) day(2) year(2) supplier(4) batch(2) · mat_id(6) col(7) ·
+  len(4) number(6) reserve(6)`. Unser Live-Vendor zerfällt sauber (Repo: Platzhalter mit gleicher Struktur; echte
+  day/year/supplier/batch/len/number entfernt):
+  `1|01|25|0000|00 · 101001|0FFFFFF · 0000|000000|000000` → mat_id `101001` (= Hyper PLA,
+  deckt sich mit Query `material_type`), col `0FFFFFF` (= Query `color_value`, weiß).
+  Offen: Datumskodierung (der echte day-Wert ist nicht dezimal), Einheit von `len`.
+  Nachbau: `nachbau/box.py` `split_rfid_vendor()` (Selbsttest feldweise).
 - **preloading_mask ist Bitmaske pro Slot:** `0x1`=Slot A, `0x2`=Slot B (live beobachtet beim Umstecken: `preloading_slots ['A']→['B']`)
 - Frame `f7 01 07 30 0a 03 00 00 00 51`: star kann `0x30` ('0') sein statt `0x00` – Statusfeld, CRC-8/ATM bestätigt (0x51)
 - GET_BOX_STATE/Eventkanal `0x0a`: `f7 01 09 00 0a X Y 00 00 00 00 crc`,
-  Status-/Datenbytes sind firmwareabhängige Zustandswerte; `0x30`/`0x16` sind
-  in der unabhängigen Referenz als Insert-/Busy-Events beschrieben.
-- REMAIN-Len-Frame bei Umstecken: `f7 01 07 00 03 1c ff 00 00 11` = A=28%, B=0xff (n/a, Spule raus), C/D=0
+  ~~Status-/Datenbytes sind firmwareabhängige Zustandswerte; `0x30`/`0x16` sind
+  in der unabhängigen Referenz als Insert-/Busy-Events beschrieben.~~
+  **BELEGT 15.10.2026 (Ghidra `FUN_0800ed26`):** Status 0x30 = Preload-Ereignis
+  anstehend (4 Byte je Slot 1/2/3), 0x16 ist KEIN 0x0a-Event, sondern Fehlercode
+  „Slot ohne Filament“ (0x0d/0x11). Layout s. Abschnitt „0x0a Box-State“ unten.
+- REMAIN-Len-Frame bei Umstecken: `f7 01 07 00 03 1c ff 00 00 11` = A=28%, B=0xff ~~(n/a, Spule raus)~~, C/D=0
+  **KORRIGIERT 15.10.2026 (Ghidra `FUN_0800ef66`):** 0xFF = nicht in Maske / Slot preloadet
+  gerade / **Filament da, aber keine RFID-Daten** (B war `unknown` → passt); 0x00 =
+  Sensor A meldet **kein Filament** (oder gespeicherter Prozentwert 0).
 
 ### Box-Func-Codes (LIVE, aus klippy.log extrahiert)
 
@@ -174,14 +212,30 @@ früheren Fehlschläge). Display-Flow bleibt zusätzlich belegt.
                          ~~0=ausgewählt+leer~~ KORRIGIERT 15.10.2026:
                          0 = kein RFID-Restwert (Slot B ist mit remain 0
                          gefahren, 160 mm, s. T1B) – nicht „leer“)
+                         KORRIGIERT/BELEGT 15.10.2026 (Ghidra): Wire-0 = kein
+                         Filament (Sensor A) oder 0 %; 0xff auch = Filament
+                         ohne RFID-Daten; „remain 0“ bei T1B war Host-Zustand
 0x04 = SET_BOX_MODE (Request [00 01] = Feed-Modus; [Slotmaske 00] = Print-Modus)
+       BELEGT 15.10.2026: [mask, mode]; mode 0 = Slot → STATE_PRINT (mask≠0),
+       mode 1 = Print verlassen → STATE_IDLE („Feed-Modus“ = IDLE); Status 3 in
+       PRELOAD/RELOAD
 0x05 = GET_BUFFER_STATE (Box-Adresse 0x01, Request leer; 1 Byte Buffer-State;
                          die frühere Bezeichnung CUT_STATE war falsch)
 0x08 = GET_HARDWARE_STATUS (Request [Kanal], Toolhead-/Hardware-Sensorstatus)
 0x0a = Herzschlag/Poll (6 Datenbytes, Zustand; alle ~4s)
+       ~~Kandidaten für das Zustandsbyte (SCHWACH, nur FW-Strings ohne Zahlenwerte,
+       fake-name firmware.md:322/562-567): STATE_IDLE/PRELOAD/PRINT/RELOAD/ERROR/
+       TEST/CHECK_HUB – Zuordnung zu b0/b1 unbelegt.~~
+       BELEGT 15.10.2026 (Ghidra): Zustand steht in **b3**: IDLE=0 PRELOAD=1
+       PRINT=2 RELOAD=3 ERROR=4 TEST=5; CHECK_HUB ist KEIN Box-Zustand (Preload-
+       Statemachine). Details Abschnitt „0x0a Box-State“ unten.
 0x0d = ~~?~~ SET_PRE_LOADING / RFID-Control (KORRIGIERT 15.10.2026; Request
        [Maske][00 disable|01 enable|02 Force-Read], s. Preload-Ablauf oben;
-       live nur leeres ACK len 3 nach GET_RFID; Form wie ref-hi `f7 01 03 00 0d 9e`)
+       BELEGT 15.10.2026 (Ghidra): op 2 = Forced Preload mit RFID, op 3 = ohne
+       RFID (nur Pretension), Maske nur bei op 2/3;
+       live nur leeres ACK len 3 nach GET_RFID; Form wie ref-hi `f7 01 03 00 0d 9e`;
+       FW-Strings `forced_preloading %d` / ` forced_preloading!` (fake-name
+       firmware.md:276-277) stützen SCHWACH Aktion 0x02 = Force-Preload)
 0x0e = MEASURING_WHEEL (Request [01], Antwort 4 Bytes Big-Endian IEEE-754 Float,
        NEGATIV – kein Zähler!
        KORREKTUR 13.10.: c4e6fe0b→-1847,94, ~~c5019149→-2073,08~~ (Tippfehler,
@@ -191,13 +245,25 @@ früheren Fehlschläge). Display-Flow bleibt zusätzlich belegt.
 0x14 = GET_VERSION_SN (Hi- wie K2-BELEGT: Hi-Request `f7 01 03 ff 14 06`;
        K2-Response 13.10.: `f7 01 19 00 14 ... d4`, Daten ASCII "153"+
        "SN-DEMO-1234567890X" = CFS-App-Version + SN, CRC ok)
-0x0f = CTRL_CONNECTION_MOTOR_ACTION (Request [01] Engage / [00] Release)
+0x0f = ~~CTRL_CONNECTION_MOTOR_ACTION (Request [01] Engage / [00] Release)~~
+       WIDERLEGT 15.10.2026 (Ghidra, inline im Dispatcher): **Auto-Preload-Sperr-
+       Flag** S[8] (0x200037d8): [01] = automatisches Preload gesperrt, [00] =
+       freigegeben; KEINE Motor-Aktion. Bytes/Live-Flanke unverändert gültig
+       (Host sperrt Auto-Preload während Load). Motor-Kommandos: 0x06/0x07/0x09
 0x10 = EXTRUDE_PROCESS (Request [Slotmaske, Stufe, Parameter]:
        [slot 00 00] init, [slot 04 00] engage, [slot 05 00] push,
        [slot 06 00] settle, [slot 07 03] finalize; 0x05-Push wiederholt
        sich sensor-/Messrad-gesteuert)
+       KORRIGIERT/BELEGT 15.10.2026 (Ghidra `FUN_080045c6`, 8 Modi 0..7):
+       00 = Stage1 (Pretension → feed_top_to_hub → fördern), 04 = Dauerfördern
+       starten (sofortige Antwort), 05 = **Odometer-Abfrage** (keine Push-
+       Aktion; Antwort 4 B Float BE = die `c4 …`-Replies), 06 = Fördern beenden
+       + Buffer-Check, 07 03 = **Extruder-Check mit p = 3 mm**. Tabelle unten.
 0x11 = RETRUDE_PROCESS (Request START [Slotmaske 00], FINISH [Slotmaske 01];
        K2-Logs zeigen die dazugehörigen kurzen ACKs `f7 01 03 00 11 ca`)
+       BELEGT 15.10.2026 (Ghidra `FUN_08004d90`): p=0 = Feeder+Hauptmotor
+       rückwärts bis Buffer-Sensor (≤5 s, sonst 0x13); p=1 = rfid_mgr_fila_back
+       + pull_back_hub (0x17/0x19/0x14); sonst Status 1; mask 0 = alle Slots
 0xa2 = Auto-Addr/SN-Query (f7 01 11 00 a2 01 00 <12B uuid> <crc>, Poll alle ~2s)
 ```
 
@@ -207,10 +273,17 @@ K2 nutzt zusätzlich `0x00` bei Belt-/Motor-Requests (`belt_mdl.py`), während
 die CFS-Box-Kommandos über den live introspektierten `send_data`-Pfad ebenfalls
 den Operational-Kontext verwenden. Frühere `params`-Logs wurden teils als
 Requests fehlinterpretiert, obwohl sie Antworten waren.
+~~`0x30` = Insert-Push, `0x16` = busy~~ → **KORRIGIERT/BELEGT 15.10.2026 (Ghidra):**
+Das Status-Byte im **Request wird von der CFS-App ignoriert** (Dispatcher liest
+`frame[2]` nie) – 0xFF/0x00 sind für die Box gleichwertig. Status-Werte in
+**Antworten** s. Tabelle „Status-Byte (Antworten)“ unten (0x16 = Slot ohne Filament,
+0x30 nur bei 0x0a).
 VORSICHT K2: Hi-Warnung, dass K1/K2-Firmware Func-Codes remappen könnte (CAN-Build) –
 auf unserem K2 Plus (1.1.7.0, UART+RS485, kein CAN) passen 0x02/0x03/0x0a/0x0e/0x10/0x11
 exakt zum Hi-Map. Zouordnung 0x04/0x05/0x08/0x0f/0x14 auf K2 daher plausibel,
-aber noch nicht einzeln verifiziert.
+aber noch nicht einzeln verifiziert. **NACHTRAG 15.10.2026:** In der Box-FW R153
+(= Firmware der Box des Users, App 153 live per 0x14) sind alle diese Codes per Ghidra
+belegt; 0x0f hat dort aber eine andere Semantik (Auto-Preload-Sperre).
 
 Alle Frames bestätigen CRC-8/ATM über `[len..data]`. Box-Operational-Requests
 verwenden eine 1-hot-Slotmaske (A=0x01, B=0x02, C=0x04, D=0x08);
@@ -219,6 +292,138 @@ GCode: `BOX_GET_RFID ADDR=<1..4> NUM=<0..3>`,
 `BOX_GET_REMAIN_LEN ADDR=<1..4> NUM=<0..3>`, `BOX_SET_PRE_LOADING ADDR=.. NUM=.. ACTION=RUN`.
 ACHTUNG: `NUM=A/B/C/D` ist FALSCH → `key60 Internal error` + Klippy-Shutdown (beobachtet
 12.10.2026); `NUM=0..3` numerisch verwenden.
+
+### Func-Tabelle CFS-App R153 (BELEGT 15.10.2026, Ghidra)
+
+Quelle: Ghidra-Neuanalyse `fw/cfs/cfs0_050_G32-cfs0_000_153.bin` @0x08003000 (= Firmware
+in der Box des Users, App-Version 153 live per 0x14 bestätigt); Bericht
+`GHIDRA-CFS-BEFUND-2026-10-15.md` (B = im Code belegt, B+L = zusätzlich Live-Frame,
+V = Deutung). Gegenprobe R150: identisch außer 0x12.
+
+**Rahmen (App):**
+- Empfang `FUN_0800f880`: wartet auf `0xF7`, akzeptiert `addr ∈ {eigene, 0xEA, 0xEB}`
+  (Bootloader dagegen 0xFF/0xFE/eigene/0xF0 – getrennter Parser, s. „Flash-Map“ oben),
+  `len > 2`, dann status, fun, `len-3` Daten, CRC; Byte-Timeout 0x78 Ticks.
+- **CRC-Scope `len..data` BESTÄTIGT** (`FUN_0800e9ec`, CRC-8 poly 0x07 init 0, Bitschleife;
+  B+L, 6 Live-Frames nachgerechnet).
+- **Status-Byte im Request wird ignoriert** (B): Dispatcher `FUN_0800f27c` liest `frame[2]` nie.
+- CRC-Fehler → Antwort `fun`, Status 2, ohne Daten (nicht bei addr 0xEA).
+- 0xEA = Broadcast ohne Antwort; 0xEB = Antwort mit Absender 0xEB (nur 0x50/0x51 relevant).
+- Antwort-Builder `FUN_0800eaf2`: `F7, own_addr, n+3, status, fun, data, crc`.
+- Längenprüfung `FUN_0800ebc2`: falsches len → Status 1. Maskenprüfung `FUN_0800eb88`:
+  nur 1-hot 0x01/0x02/0x04/0x08; 0x00 = „alle“ nur wo erlaubt; sonst Status 1.
+
+| fun | Daten (Request) | Handler | Semantik (belegt) |
+|---|---|---|---|
+| 0x01 | – | inline + `FUN_08010c60` | Status 0, dann LED-Status aus Slot-Sensoren neu (NEU) |
+| 0x02 | mask | `FUN_0800ef00` | RFID `"X:<40 Hex>;"` / `busy` (Preload läuft) / `unknown` (Filament, kein Tag) (B+L) |
+| 0x03 | mask | `FUN_0800ef66` | 4 B Restmenge %; 0xFF = nicht in Maske/preloadet/Filament ohne RFID; 0 = kein Filament (B+L) |
+| 0x04 | mask, mode | `FUN_0800f014` | mode 0 = STATE_PRINT (mask≠0), mode 1 = IDLE; Status 3 in PRELOAD/RELOAD (B) |
+| 0x05 | – | `FUN_0800f0c2` | 1 B: 2 Bit Buffer-Sensoren (invertiert) (B; „Buffer“ V) |
+| 0x06 | mask, op | `FUN_0800ebda` | Feeder: 0 stop, 1 out (P[1]), 2 back (P[6]); Status 3 ≠ IDLE. **FW-BUG** s. unten (NEU) |
+| 0x07 | op | `FUN_0800ec26` | Hauptmotor: 0 stop, 1 vor (P[2]), 2 zurück (P[7]); Status 3 ≠ IDLE (NEU; Motorzuordnung V) |
+| 0x08 | sel | `FUN_0800ec70` | 1 B Bitmaske: sel 0 = Sensor A, sel 1 = Sensor B (1 = aktiv) (B; A=Einlauf/B=Hub V) |
+| 0x09 | a, b, wert | `FUN_0800ecd2` | Speed-Parameter: (0,0)→P[1] (0,1)→P[6] (1,0)→P[2] (1,1)→P[7] (NEU) |
+| 0x0a | – | `FUN_0800ed26` | Box-State, s. unten (B+L) |
+| 0x0b | mask, x | `FUN_0800eee8` | LED-Code x für Slot (NEU; LED V). Achtung: Bootloader-0x0B [01] = Sprung in App |
+| 0x0c | – | `FUN_0800f124` | 1 B Config-Wert #6 (NEU; Bedeutung offen) |
+| 0x0d | mask, op | `FUN_0800f0da` | Preload-Steuerung op 0–3, s. „Preload-Ablauf“ (B) |
+| 0x0e | op | `FUN_0800efc6` | op 0 = Odometer nullen, op 1 = 4 B Float BE (mm) (B+L) |
+| 0x0f | x∈{0,1} | inline | **Auto-Preload-Sperr-Flag** S[8], Status 0; sonst 1. KEINE Motor-Aktion (B) |
+| 0x10 | mask, mode, p | `FUN_080045c6` | Extrude-Prozess, 8 Modi, s. unten (B) |
+| 0x11 | mask, p | `FUN_08004d90` | Retract p 0/1, s. unten (B) |
+| 0x12 | mask, mode, s, dist_hi, dist_lo | `FUN_080047f6` | mode 0 feed_top_to_hub (+1 B Zustand), mode 1 fördern bis dist (u16 BE, ≤3000 mm) (NEU; nur R153) |
+| 0x13 | mask | `FUN_08004dc2` | Pretension → feed_top_to_hub → fördern bis Stillstand; Status = Fehlercode (NEU) |
+| 0x14 | – | inline | 22 B: `"153"` + 19 B SN (B+L) |
+| 0x15 | – | `FUN_0800f16e` | 16 B: 6 Einträge `((i+1)<<4)|X[i]` (NEU; Bedeutung offen) |
+| 0x30 | x | `FUN_0800f19c` | GPIO 0x10 = (x==1), Status 0 (NEU) |
+| 0x50 | wert | inline | Config #6 schreiben+speichern, dann vermutl. Reset; gleicher Wert → Status 3 (NEU) |
+| 0x51 | x | inline | nur addr 0xEB: G[3]=x, keine Antwort (NEU) |
+| 0x52 | – | inline | Antwort mit **fun 0x53**: `[S[1], S[0]]` (= 0x0a Byte 0/1) (NEU) |
+| 0x53 | a, b | inline | schreibt S-Bytes, keine Antwort (Längenfehler meldet fun 0x52 – FW-Copy-Paste) (NEU) |
+| 0x55 | x | `FUN_0800f14a` | Echo-Test: Antwort x+1 (NEU) |
+| 0x56 | – | inline | Status 0, dann Reset (V) (NEU) |
+| 0x5b | – | `FUN_0800f1ba` | 8 B GD32-Unique-ID (NEU) |
+| 0x5c | 16 B | `FUN_0800f1e8` | Block an I2C-Gerät 0x60, 16 B Ergebnis (Auth/Krypto V) (NEU) |
+| 0x5d | – | `FUN_08007c0e` | `main_pcb_test_mode` (NEU) |
+| 0xA0–0xA3 | – | Modul `RS485_AUTO_ADDR` | nicht im Dispatcher; Antworten auf Box-eigene Anfragen |
+| sonst | – | `LAB_0800f7f8` | Status 1 ohne Daten |
+
+**FW-Bug 0x06 (B, auch R150):** Die Maske für `eb88` kommt aus Register `r7`
+(= `rt_tick_get()`, 0x0800f8a6), nicht aus dem Datenbyte (Disassembly 0x0800f470
+`mov r0,r7`) → praktisch **immer Status 1**. 0x06 ist damit am Bus faktisch unbenutzbar.
+
+**0x10 Extrude-Modi** (`FUN_080045c6`, mask 1-hot Pflicht, Speed-Param P[i]):
+
+| mode | Ablauf | Antwort |
+|---|---|---|
+| 0 | Stage1: Pretension → feed_top_to_hub → Hauptmotor P[3] bis Bedingung | Status + 1 B Box-Zustand |
+| 1 | RELOAD, Hauptmotor P[3] bis Odometer-Stillstand oder >3000 mm (0x0b) | Status |
+| 2 | RELOAD, P[2], ≥5 mm in 3 s nötig (sonst 0x0a), dann wie 1 | Status |
+| 3 | **Fehler löschen**: Zustand IDLE, S[3]=0, LED neu | Status 0 |
+| 4 | RELOAD, **sofort Status 0**, dann Dauerfördern P[3]; FW liest den Bus selbst (mode 5/6); Timeouts 25 s → 0x0a, >3000 mm → 0x0b, Stillstand 500 ms → 0x0c | Status 0 (sofort) |
+| 5 | Abfrage: Status = gespeicherter Fehler aus mode 4 (danach gelöscht) + 4 B Odometer Float BE | Status + 4 B |
+| 6 | Fördern beenden / Buffer füllen bis voll (≤3 s, sonst 0x0d) | Status |
+| 7 | Extruder-Check: P[4], 300 ms, Odometer muss > p mm laufen; < p·0,5 → 0x0e | Status |
+| >7 | `illegal data`, **keine Antwort** | – |
+
+Live `[mask 07 03]` = **mode 7 mit p = 3 mm** (Extruder-Greif-Check; Mechanik B, Deutung V) –
+Hypothese aus fake-name/CHECKLISTE **bestätigt**. Live-Ablauf 00/04/05…/06/07 03 passt
+damit: Stage1, Dauerfördern, Odometer-Polls, Stopp + Buffer, Extruder-Check.
+
+**0x11 Retract** (`FUN_08004d90`, mask 0 = alle Slots mit Sensor B aktiv):
+p=1 zuerst `rfid_mgr_fila_back`; Zustand muss IDLE/PRELOAD sein (sonst 3), Slot ohne
+Filament → 0x16 + ERROR. p=0: Feeder + Hauptmotor rückwärts P[7] bis Buffer-Sensor
+(≤5 s, sonst 0x13). p=1: pull_back_hub (Sensor A muss 0 sein, sonst 0x17; Motorblock 0x19;
+„pull back hub PE“-Timeout 0x14). Anderes p → 1. Danach IDLE bzw. ERROR mit Code.
+
+**Status-Byte (Antworten):**
+
+| Wert | Bedeutung |
+|---|---|
+| 0x00 | OK |
+| 0x01 | ungültig: len falsch, Maske ungültig, Subcode ungültig, fun unbekannt |
+| 0x02 | CRC-Fehler im Request |
+| 0x03 | busy / falscher Zustand (z.B. 0x04 in PRELOAD/RELOAD, 0x06/0x07 ≠ IDLE); bei 0x50 „Wert unverändert“ |
+| 0x05 | Feeder-Out-Fehler (`cmd_parse_out`) |
+| 0x06 | `buffer_fill_timeout` |
+| 0x08 | Pretension-Warten erfolglos |
+| 0x09 | feed_top_to_hub: Odometer bewegt sich nicht |
+| 0x0a | 25-s-Timeout bzw. < 5 mm in 3 s |
+| 0x0b | Fördern > 3000 mm |
+| 0x0c | Odometer-Stillstand 500 ms |
+| 0x0d | Buffer nicht voll |
+| 0x0e | feed extruder timeout (0x10 mode 7) |
+| 0x13 | Rückzug: Buffer-Sensor-Timeout 5 s |
+| 0x14 | pull back hub PE timeout |
+| 0x16 | Slot ohne Filament (setzt STATE_ERROR) |
+| 0x17 | pull_back_hub: Sensor A nicht aktiv |
+| 0x18 | intern „kein Slot belegt“ → auf 0x16 abgebildet |
+| 0x19 | pull_back_hub motor block |
+| 0x30 | **nur 0x0a**: Preload-Ereignis anstehend (4 B je Slot 1/2/3) (B+L) |
+| 0x50 | **nur 0x0a** in STATE_PRINT: Sensorprüfung ≠ 0 (V: Runout) |
+| S[3] | nur 0x0a in STATE_ERROR: gespeicherter Fehlercode |
+
+Fehler ∉ {1,3} setzen STATE_ERROR mit S[3]=Code (`FUN_08003e3a`); löschen per 0x10 mode 3.
+Weitere Codes nur im LED-Mapping (0x1a, 0x20, 0x22, 0x51–0x53), Quellen offen.
+
+**0x0a Box-State** (`FUN_0800ed26`, Antwort 6 Datenbytes, B+L):
+
+| Byte | Inhalt |
+|---|---|
+| 0 | S[1] (live 0x13; Quelle offen, = 0x52-Antwort Byte 0) |
+| 1 | S[0] (live 0x34) |
+| 2 | Flags: `R[3] | 0x80` einmalig wenn R[3]≠0 (V: Motorblock), sonst R[5] (wird zurückgesetzt) |
+| 3 | **Box-Zustand** S[2]: IDLE=0, PRELOAD=1, PRINT=2, RELOAD=3, ERROR=4, TEST=5 (≥6 „unknown“) |
+| 4 | Bitmaske Sensor B (aktiv = 1) |
+| 5 | Bitmaske „Slot hat gültige RFID-Daten“ (V) |
+
+**STATE_CHECK_HUB ist KEIN Box-Zustand**, sondern Zustand 2 der Preload-Statemachine
+`FUN_080064b8` (0 forced-Start, 1 idle/Queue, 2 CHECK_HUB, 3 pretension, 4 read rfid +
+margin estimation) – taucht in 0x0a nicht auf. Status der 0x0a-Antwort: ERROR → S[3];
+PRINT → 0x50 oder 0; Preload-Ereignis → 0x30 mit 4 Byte (dann anderes Layout!); sonst 0.
+Live `09 00 0a 13 34 00 00 00 00` = Zustand IDLE, keine Sensoren/RFID-Bits ✓;
+`07 30 0a 03 00 00 00` = Ereignis Slot A Wert 3 ✓.
 
 ### CRC-Quelle: auto_addr_wrapper.py im Klartext (13.10.2026)
 
@@ -268,7 +473,8 @@ als Quelle und ist an 10+ Live-Frames verifiziert.
 1. `EXTRUDE_PROCESS` (0x10): echte Requests tragen `[Slotmaske, Stufe, Parameter]`;
    Stufen 00/04/05/06/07, 0x05-Push wiederholt sich sensor-/Messrad-gesteuert.
    Die früher als „Poll“ bezeichneten `f7 01 03 00 10 cd` sind ACK/Antwortframes.
-2. High-Level-Load flankiert 0x10 mit Feed-Mode (0x04), Motor-Engage/Release (0x0f),
+2. High-Level-Load flankiert 0x10 mit Feed-Mode (0x04), ~~Motor-Engage/Release~~
+   Auto-Preload-Sperre an/aus (0x0f, KORRIGIERT 15.10.2026 Ghidra),
    Hardware-Ping (0x08), Buffer-Read (0x05) und Print-Mode (0x04).
 3. `MEASURING_WHEEL` (0x0e) alle ~3 s während/nach dem Extrudieren.
 4. Resultat: `change_color_num` T1A → 1, `extrude = 229.17 mm`
@@ -278,6 +484,9 @@ als Quelle und ist an 10+ Live-Frames verifiziert.
 - Gleicher Ablauf, `tnn: T1B`, `extrude_process_stage7_ret: OK`
 - 0x10-Frames: `f7 01 07 00 10 c4 xx xx xx xx` – Byte1 konstant `0xc4`, 4 variable Bytes
   (Encoder/Position); der Slot steckt NICHT im Frame – die Box kennt ihn kontextuell
+  **BELEGT 15.10.2026 (Ghidra):** das sind Antworten auf 0x10 **mode 5** = Status 0 +
+  4 Byte Odometer-Float BE (`c4 8d ad 5a` ≈ −1133 mm); `0xc4` = Vorzeichen/Exponent,
+  kein Konstantbyte. Slot im Antwortframe ist im Format nicht vorgesehen.
 - `change_color_num`: A=1, B=1 nach beiden Extrudes; remain B bleibt 0, vender B "unknown"
   (RFID-Tag von Slot 2 wurde bislang nicht eingelesen) → Beleg: remain 0 = kein
   RFID-Restwert, NICHT „leer“ (Nachbau: `has_filament` → None statt False, 15.10.2026)
@@ -296,6 +505,96 @@ als Quelle und ist an 10+ Live-Frames verifiziert.
   (T1C: 160 mm @ 360 mm/min, 220 °C, stage7 OK – 23:44)
 - WICHTIG live gelernt: CFS blockiert alle Einzüge, wenn ein Slot nicht zurückgezogen ist
   (`T1.filament = B` → `hub has filament`; Fix: Slot B „Zurückziehen" → `filament: None`)
+
+### CFS-Firmware: Flash-Map, Bootloader, Shell (fake-name + eigene Prüfung, 15.10.2026)
+
+Quelle: fake-name/cfs-reverse-engineering (Connor Wolf, Stand 2025-04, ältere FW
+App 108/113; keine Lizenz für Texte/Dumps → nur Fakten übernommen) + eigene Prüfung.
+
+- **MCU:** GD32F303VET6 (512 KiB Flash), RTOS **RT-Thread 5.0.2** (fake-name readme.md:17,
+  firmware.md:13-28). Stark.
+- **Flash-Map (stark, selbst verifiziert per String-Zeiger-Test: zählt Wörter im Image,
+  die bei angenommener Basis auf String-Anfänge zeigen):**
+  - Bootloader `cfs0_050_G32` 12 KiB @`0x08000000`
+  - cfs0-App @`0x08003000` (Versionsstring bei App+0x200) – `cfs0_000_153`: Basis
+    0x08003000 = **179 Treffer** vs. 1 bei 0x08000000
+  - cfs6-App @`0x08004000` – `cfs6_222_000`: 0x08004000 = **55** vs. 0 (passt zum
+    Reset-Vektor 0x08004144 aus dem alten Import)
+  - DB-/Parameter-Page 2 KiB @`0x0807F800` (letzte Flash-Page)
+  - Folge: unsere Ghidra-Importe @0x08000000 waren um 0x3000/0x4000 verschoben –
+    erklärt die „keinen direkten Code-XRefs“ (PROTOKOLL-GESAMT.md §5).
+    ~~Neuanalyse 15.10.2026 ausstehend~~ **ERLEDIGT 15.10.2026 (Ghidra):** cfs0_000_153
+    @0x08003000 → 1063 Funktionen (alte Basis 927), Strings mit XRef 538 → 930, XRefs
+    812 → 1464; cfs6_222 @0x08004000 → 936 Funktionen. Dispatcher, Handler und Semantik:
+    `GHIDRA-CFS-BEFUND-2026-10-15.md` und Abschnitt „Func-Tabelle CFS-App R153“ unten.
+- **Bootloader-Protokoll (stark, Disassembly des Bootloader-Dumps durch unseren Agent):**
+  - spricht selbst F7-Frames mit CRC-8 (poly 0x07, init 0, über [len..data]) – wie die App
+  - akzeptiert Zieladressen `0xFF`, `0xFE`, eigene Adresse und `0xF0` (Bedeutung von
+    0xF0 unklar); Längengrenze **len ≤ 0xFC** (serial485 prüft bis 255 – nur notiert)
+  - **UNTERSCHIED Bootloader ↔ App (BELEGT 15.10.2026, Ghidra):** die App-Empfangs-
+    Statemachine `FUN_0800f880` akzeptiert NUR `eigene`, `0xEA`, `0xEB` (kein 0xFF/0xFE/0xF0);
+    0xFF/0xFE kommen in der App nur im Modul `RS485_AUTO_ADDR` vor (`FUN_0800a92c`:
+    0xFF/0xFE/eigene für 0xA0–0xA3). Kein Widerspruch, sondern zwei getrennte Parser –
+    aber: ein App-Kommando an 0xFF wird von der App (außer Auto-Addr) NICHT bearbeitet.
+  - `0xA1` (Discovery): Antwort nur wenn `data[0] ≤ eigene Gruppe ≤ data[1]`, dann
+    Zufalls-Backoff (LCG `x*0x41C64E6D+12345`, `% 1000`, ≠ 0 – vermutlich ms) → erklärt
+    den Host-Timeout von 1 s (Antworten streuen über bis zu ~1 s)
+  - `0xA0` (Zuweisung): data = `[addr][12 B UID]`, UID-Vergleich, `addr ≠ 0` wird
+    übernommen; unadressiert gilt uid/Adresse `0xFE`
+  - Broadcast `0x0B [01]` → Sprung in die App (bestätigt unseren Loader-Check in
+    `auto_addr.py`)
+  - RS485 = USART1 auf PA2/PA3, 8N1, ≈230400 Bd (mittel; fake-name PCBs.md:64-68
+    nennt PA2 als TX-Enable-Pfad, PA3 RX)
+- **finsh-Shell (stark):** nur über **SEGGER RTT/SWD** erreichbar (Konsole `jlinkRtt`,
+  fake-name firmware.md:985; String auch in unserer R153), **NICHT über RS485**. Die
+  Shell-Kommandos (`preloading …`, `rfid …`, `MS3791_test` …) sind also kein Buspfad.
+
+### CFS-Hardware (fake-name PCBs.md + Mitschnitte `probing/*.dsl`, 15.10.2026)
+
+- **Hauptantrieb = BLDC**, bestückt ist **MS8828** (Relmon/Ruimeng); die FW nennt ihn
+  `MS3791` (PCBs.md:22). Pins: SS (Bremse) PE4, FG (Tacho) PE11, F/R PE3, PWM PE13
+  (PCBs.md:207-216). ~~„MS3791 (Stepper)“~~ korrigiert. Stark.
+- **4× H-Brücke HTD8236** (AT8236-kompatibel, FW-Name `at8236`) + LM358 + 0,5-Ω-Shunts
+  zur Strommessung (PCBs.md:10-11, 128-144). Slot A = M1: IN PD3/PD2, Strom PC5. Stark.
+- **2× RFID-Leser FM17622** (MFRC522-kompatibel), I2C-Adresse 0x28, J8 = PB10/PB11,
+  J19 = PB8/PB9 (PCBs.md:171-182, 219-227); Mitschnitt zeigt nur Init (SoftReset,
+  Reg 0x01 → 0x20). Stark.
+- **AHT30** (Temp/Feuchte) I2C 0x38: Trigger `AC 33 00`, 6 Byte nach 200 ms, Periode
+  ~1,2 s (Mitschnitt; Pins PC11/PC12, firmware.md:404-405). Stark.
+- **Magnet-Encoder MT6826S** (Board `MF003_ENCODER_V12`, Feeder-Baugruppe, PCBs.md:252-256),
+  SPI PB12-PB15, Mode 3, liest Reg 0x003 mit 50 Hz. Stark. **Offen:** misst er das
+  Messrad oder den BLDC? → mit 0x0e MEASURING_WHEEL korrelieren.
+- EEPROM 24C16, LCD-Treiber TM1621B – für den Bus irrelevant.
+
+### CFS-Bus physisch (15.10.2026, Quellen fake-name + eigene Deutung)
+
+- **Interner Stecker J4, 8-polig** (2 mm, vermutlich Yeonho SMW200-08; PCBs.md:52-78;
+  Belegstärke mittel-hoch):
+
+  | Pin | Signal |
+  |---|---|
+  | 1, 2 | +24 V |
+  | 3, 4 | GND |
+  | 5 | RS485-B |
+  | 6 | RS485-A |
+  | 7 | Buffer-SW1 (PD8) |
+  | 8 | Buffer-SW2 (PD9) |
+
+- **Rückwand-Board `MF003_INTERFACE_V20`** mit zwei 2×3-Buchsen → Daisy-Chain zur
+  nächsten Box (Deutung). Externer Bus 6-polig laut Netzliste des fake-name-Adapters:
+  1 B, 2 GND, 3 24 V, 4/5 Buffer, 6 A – **schwach**: Steckertyp ist dort ausdrücklich
+  „guesswork“ (readme.md:37), vermutet Molex Micro-Fit 3.0; Kabelfarben PCBs.md:238-245.
+- **A/B-Benennung ist in den Quellen widersprüchlich** → am Gerät messen: in Ruhe
+  liegt **A hoch, B tief** (Bias).
+- **Transceiver TPT75176H** (3Peak), Bias je 300 Ω A→5 V / B→GND, 120-Ω-Terminierung
+  vorgesehen, aber **NICHT bestückt** (PCBs.md:7, 72-74). Laut fake-name
+  Pseudo-Open-Collector-Betrieb (DI fest auf GND, DE wird per TX geschaltet) –
+  unsicher, begrenzt aber in jedem Fall Flankensteilheit/Baudrate.
+- **Buffer-Signale laufen NICHT über RS485:** der 4-in-1-Buffer hat zwei
+  Open-Collector-Ausgänge (Lichtschranken je Endlage), die direkt an jede Box gehen
+  (J4 Pin 7/8 → PD8/PD9); die fördernde Box regelt den Buffer selbst
+  (PCBs.md:263-271). `0x05 GET_BUFFER_STATE` ist nur die Abfrage dieses Zustands.
+  Passt zu `box-live.cfg` ohne Buffer-Pin.
 
 ## 3. Motor/Toolhead-Boards
 
