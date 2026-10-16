@@ -454,3 +454,10 @@ box 179 · boxmini 17 · cfsseq 28 · motor 134 · motor_mini 43 · auto_addr 33
   auto_addr-Selbsttest 13 (A0 3×, adressierte Box ignoriert A0)
 - [ ] Offen aus BEFUND2: Config #6, Fehlercodes 0x20/0x22, Zweck Typ-7-Tag-Sperrbit (0x5c-Auth?),
   Host-Burst-Timing im `.so`, Treiber-RX-Puffergröße der Box
+
+### GPIO-Phase / MCU-Schnittstelle (16.10.2026, GPIO-PHASE-BEFUND-2026-10-16.md)
+- [x] MCU-Data-Dictionaries (Main + Düse) extrahiert; Creality-Befehle `query_gpio_status`/`gpio_status`,
+  `transparent_*`, `prtouch_*`, `fancheck` identifiziert; Strapping mit Upstream-`set_digital_out` möglich
+- [x] Strapping-Mechanismus: `[duplicate_pin_override]` + Zeitmultiplex, kein Spezialbefehl
+- [ ] Pi-Host-Modul: Strapping über digital_out vor Broadcast + Extruder über transparent_send nachbauen
+- [ ] `mcu0_130`-Dictionary ohne `transparent_*` prüfen (vermutl. Extraktionslücke)

@@ -792,6 +792,12 @@ selbst gegengeprüft; bei der Einarbeitung zusätzlich nachgeprüft (Abschnitt �
 - **Selbsttests:** alle 9 grün (serial485, box, boxmini, cfsseq, motor, motor_mini, auto_addr, cfswatch,
   motor_init). Bestehende Module unverändert.
 
+## 16.10.2026 – GPIO-Phase / MCU-Schnittstelle
+
+- Zwei Zweitanalysen (weiterer KI-Agent, statisch) zu Host-Seite und MCU-Dictionaries; Kernaussagen von uns
+  am extrahierten Dictionary (Befehlsformate) und an `printer-live.cfg:231` (`[duplicate_pin_override]`)
+  nachgeprüft. Neu: `GPIO-PHASE-BEFUND-2026-10-16.md`; CHECKLISTE ergänzt.
+
 ## Anonymisierung (Repo-Fassung)
 
 Gegenüber der lokalen Forschungsablage sind im Repo folgende Werte durch syntaktisch
