@@ -48,12 +48,12 @@ Audit und Änderungsbegründungen: `<projekt>/AUDIT-UND-AENDERUNGEN.md`.
   Farbe/Material/Restmenge kommen aus SEPARATEN Abfragen, nicht aus diesem Frame.
 
 ## Offen – Pi-Ersatz (VOLL – Belt + PrTouch + CFS müssen laufen)
-- [ ] 32-bit Pi OS (armhf) + Python-3.9-Venv aufsetzen (nur so laden die Creality-`.so`)
-- [ ] Original-Klippy (`klippy/`-Tree + `.so` aus `rootfs-live/`, venv auf Pi neu
+- [~] 32-bit Pi OS (armhf) + Python-3.9-Venv aufsetzen (nur so laden die Creality-`.so`)  **ÜBERHOLT 16.10.2026: Weg = Upstream-Klipper + eigene Module, s. PI-ERSATZ-PLAN.md**
+- [~] Original-Klippy (`klippy/`-Tree + `.so` aus `rootfs-live/`, venv auf Pi neu  **ÜBERHOLT 16.10.2026: Weg = Upstream-Klipper + eigene Module, s. PI-ERSATZ-PLAN.md**
   aufsetzen) auf den Pi kopieren
-- [ ] `printer.cfg` voll übernehmen, nur Serials auf `/dev/ttyUSB*` umbiegen (live: ttyS2/ttyS3/ttyS5 (Dump-F008: ttyS7/ttyS1/ttyS6))
-- [ ] Pi mit 2x USB-Serial (Mainboard/Toolhead) + 1x USB-RS485 (CFS/Belt), 24V→5V-Buck
-- [ ] Testreihe: Belt-CALI/TEST, PrTouch `BED_MESH_CALIBRATE`, CFS Load/Unload mit RFID
+- [~] `printer.cfg` voll übernehmen, nur Serials auf `/dev/ttyUSB*` umbiegen (live: ttyS2/ttyS3/ttyS5 (Dump-F008: ttyS7/ttyS1/ttyS6))  **ÜBERHOLT 16.10.2026: Weg = Upstream-Klipper + eigene Module, s. PI-ERSATZ-PLAN.md**
+- [~] Pi mit 2x USB-Serial (Mainboard/Toolhead) + 1x USB-RS485 (CFS/Belt), 24V→5V-Buck  **ÜBERHOLT 16.10.2026: Weg = Upstream-Klipper + eigene Module, s. PI-ERSATZ-PLAN.md**
+- [~] Testreihe: Belt-CALI/TEST, PrTouch `BED_MESH_CALIBRATE`, CFS Load/Unload mit RFID  **ÜBERHOLT 16.10.2026: Weg = Upstream-Klipper + eigene Module, s. PI-ERSATZ-PLAN.md**
 - [ ] CFS-Bus-Anschluss (Elektrik, Quelle fake-name + Deutung, s. PROTOKOLL-485.md
   „CFS-Bus physisch“): A/B-Polarität am Gerät MESSEN (Ruhe: A hoch, B tief – Benennung in
   den Quellen widersprüchlich); USB-RS485 mit kräftigem Treiber + Auto-DE (z.B. FTDI +
@@ -102,7 +102,7 @@ Audit und Änderungsbegründungen: `<projekt>/AUDIT-UND-AENDERUNGEN.md`.
   (`FUN_08004d90`); Tabelle PROTOKOLL-485.md „Func-Tabelle CFS-App R153“, Konstanten
   `box.EXTRUDE_MODE_*`/`RETRUDE_P_*`. Live-Mitschnitt weiterer Extrudes bleibt als
   Gegenprobe sinnvoll (insb. Antwort mode 0 = Status + 1 B Zustand, bisher nicht im Log)
-- [ ] Kanal-A-Diagnose (13.10. spät): Slot A zieht seit Klemm-Episode (key865) nicht mehr ein,
+- [x] Kanal-A-Diagnose (13.10. spät): Slot A zieht seit Klemm-Episode (key865) nicht mehr ein,  **ERLEDIGT 16.10.2026: Filamentrest im Hub entfernt, live geprüft (Abschnitt „Kanal A – GELÖST“)**
   kein Insert-Event im Log; Gegenbeweis RFID-Theorie: Insert ist mechanisch, B lief ohne Tag.
   PRÄZISIERT 15.10.2026 (fake-name PCBs.md): Insert-Erkennung ist eine **optische
   Gabellichtschranke** (Filament-Sensor-PCB, U1-U4), evtl. mit Fahne. Reihenfolge:
@@ -186,7 +186,7 @@ motor 98 · motor_mini 30 · auto_addr 31 – alle grün.
 - [x] Motor 0x0F (version) live prüfen – **ERLEDIGT 16.10.2026:** `[00]` → 12 B
   (fireware_ver 1.9.7.81, cmd_system 1.3, protection 1.3, flash_param 2.75, logger 1.0;
   `motor.query_motor_version`, ersetzt Stub `motor_version_normal`)
-- [ ] **NEU 16.10.2026:** Bedeutung der 0x08-Indizes 1..12 klären – **TEILWEISE ERLEDIGT
+- [x] **NEU 16.10.2026:** Bedeutung der 0x08-Indizes 1..12 klären – **TEILWEISE ERLEDIGT  **ERLEDIGT 16.10.2026: idx 1–12 per Motor-FW + Live (MOTOR-FW-BEFUND, LIVE-ABFRAGEN)**
   16.10.2026 (REA, `REA-MOTOR-BEFUND-2026-10-16.md`):** idx 5 `pos_fdb`, 6 `spd_fdb`, 7 `id_fdb`,
   8 `iq_fdb` BELEGT (Host-Dict `NO_ERR_CODE_TO_GET`), Typkette fest (1–10/17/18 `<f`, 11–16 `<I`);
   `DATA=7/8 EXTRUDER=1` = Stats-Hook Extruder-Überstrom, `DATA=1` nur Hilfetext. Nachbau:
@@ -340,7 +340,7 @@ Quelle: `live-logs-2026-10-15/` (lokal, nicht fürs Repo), Auswertung PROTOKOLL-
 ### Pi-Ersatz (Folgerungen aus der Live-Bootsequenz)
 - [ ] **Ein** RS485-Port (Stock ttyS5, 230400) reicht für X/Y/Z/Z1 + CFS + Belt – eine
   gemeinsame Queue, kein paralleler Zugriff (Motor-, CFS- und Auto-Addr-Frames verschränkt)
-- [ ] Pi muss die **Motor-Init** übernehmen (Broadcast `FF 0E 01`, `0E 02`~~/`12 02`~~, Stall-Mode,
+- [x] Pi muss die **Motor-Init** übernehmen (Broadcast `FF 0E 01`, `0E 02`~~/`12 02`~~, Stall-Mode,  **ANALYSIERT 16.10.2026 (GPIO-PHASE-/MOTOR-INIT-BEFUND), im Entwurf pi-host/ umgesetzt – Gerätetest offen**
   Protection `0C [0b]`, flash_param-Lesen) und die **Sys-Params nach jedem Kaltstart neu
   schreiben** (0x06 Sub 01/03 flüchtig, sonst Board-Defaults Kp 300 / err_time 0,01 / …)
   – **KORREKTUR 16.10.2026:** `12 02` (UUID) ist kein Init-Schritt, sondern Webhook-Poll
@@ -356,12 +356,12 @@ Quelle: `live-logs-2026-10-15/` (lokal, nicht fürs Repo), Auswertung PROTOKOLL-
   Boot-Log-Abgleich (alle 10 Live-Boots: 0 Abweichungen, 0 fehlend, Konsistenz `isclose` ↔ Write 48/48),
   geschützter `run()` (confirm / allow_write / strapping_ok), Selbsttest mit FakeBus und anonymisiertem
   Log-Auszug. Kein Senden ohne Freigabe.
-- [ ] **GPIO-Phase über die Klipper-MCU** (P1/P7 von `motor_init.py`: Dir/Step-Pegel setzen + `query_gpio_status`
+- [x] **GPIO-Phase über die Klipper-MCU** (P1/P7 von `motor_init.py`: Dir/Step-Pegel setzen + `query_gpio_status`  **ANALYSIERT 16.10.2026 (GPIO-PHASE-/MOTOR-INIT-BEFUND), im Entwurf pi-host/ umgesetzt – Gerätetest offen**
   zurücklesen, Resend/key799/key800) – fehlt; ohne sie darf der Broadcast `FF 0E 01` nicht gesendet werden
   (`run(strapping_ok=…)`)
 - [ ] **Echter Lauf `motor_init.py`** am Drucker (erst nach GPIO-Phase und mit Freigabe; zuerst lesend
   `run(confirm=True)` ohne `allow_write`)
-- [ ] **Extruder-Transparent-Pfad** für den Param-Abgleich nachbauen (E über nozzle_mcu `transparent_send`,
+- [x] **Extruder-Transparent-Pfad** für den Param-Abgleich nachbauen (E über nozzle_mcu `transparent_send`,  **ENTWURF 16.10.2026 in pi-host/ (TransparentTransport, [k2_motor]) – Gerätetest offen**
   Adresse 0x81 – Stock-Bug 0x85 auf ttyS5 nicht übernehmen; Vorbild ungenutzter `motor_extruder_sys_param_init`)
   – in `motor_init.py` als transparent-Schritte markiert („transparent – Nachbau fehlt“: Adresse, Stall-Mode,
   `0C [0b]/[05]`, Param-Abgleich E)
@@ -369,7 +369,7 @@ Quelle: `live-logs-2026-10-15/` (lokal, nicht fürs Repo), Auswertung PROTOKOLL-
   (`MOTOR-INIT-BEFUND-2026-10-16.md` §7); `REA-MOTOR-BEFUND`/`MOTOR-FW-BEFUND` geprüft – keine Aussage beruht
   darauf (Prüfvermerk in beiden Dateien). Offen nur, falls künftig weitere Float-Konstanten aus der alten
   Tabelle zitiert werden: dann die korrigierte Tabelle verwenden
-- [ ] GPIO-Phase („initial/restore set_pin_io“ der Motor-dir/step-Pins) vor/nach der
+- [x] GPIO-Phase („initial/restore set_pin_io“ der Motor-dir/step-Pins) vor/nach der  **ANALYSIERT 16.10.2026 (GPIO-PHASE-/MOTOR-INIT-BEFUND), im Entwurf pi-host/ umgesetzt – Gerätetest offen**
   Adressabfrage braucht die **Main-MCU** – **BESTÄTIGT 16.10.2026:** `MOTOR_READ_ALL_PIN_IO`
   ist eine Klipper-GPIO-Abfrage (`gpio_status`, oid 11) an der Main-MCU (PB9, PB10, !PB7,
   PB8, PB5, PB6, PA1, PB15), kein RS485
@@ -382,7 +382,7 @@ Quelle: `live-logs-2026-10-15/` (lokal, nicht fürs Repo), Auswertung PROTOKOLL-
   `ParseData.parse_num_to_byte` → `TypeError: 'NoneType' object cannot be interpreted as an
   integer`. Creality-`gcode.py` lehnt den Bereich (minval=1/maxval=12) nur mit Warnung ab
   (`get_int` → None), `motor_get` rechnet weiter → Absturz vor dem Senden, **kein Frame**
-- [ ] Extruder-Motor nur über `transparent_send` (nozzle_mcu, Adresse 0x81) – Creality-
+- [x] Extruder-Motor nur über `transparent_send` (nozzle_mcu, Adresse 0x81) – Creality-  **ENTWURF 16.10.2026 in pi-host/ (TransparentTransport, [k2_motor]) – Gerätetest offen**
   Klipper-MCU-FW mit `config_transparent` oder eigene Lösung nötig
 
 ### Kanal-A-Diagnose (Slot A zieht nicht ein) – Live-Befund 13.–16.10.
@@ -402,7 +402,7 @@ Quelle: `live-logs-2026-10-15/` (lokal, nicht fürs Repo), Auswertung PROTOKOLL-
   (0x19, Flags 0x90/0x91) → STATE_ERROR, Abbruch, kein Preload der anderen Slots. Der Einzug-
   Abbruch nach ≈ 240 mm (0x0c) ist reine Odometer-Logik (mode 4 prüft keinen Sensor; gemeinsames
   Odometer → B/C/D können bei mechanisch blockiertem Pfad ebenfalls 0x09/0x0c/0x52 bekommen).
-- [ ] Hub/Pfad A mechanisch prüfen (Filamentrest entfernen), danach 0x0a Byte 4 = 00 kontrollieren.
+- [x] Hub/Pfad A mechanisch prüfen (Filamentrest entfernen), danach 0x0a Byte 4 = 00 kontrollieren.  **ERLEDIGT 16.10.2026: Filamentrest im Hub entfernt, live geprüft (Abschnitt „Kanal A – GELÖST“)**
   Konkrete Schritte:
   1. Drucker aus, Hub öffnen, **Filamentrest von Slot A** aus Hub/Pfad entfernen (auch
      abgebrochene Stücke an der Förderrolle).
@@ -459,7 +459,7 @@ box 179 · boxmini 17 · cfsseq 28 · motor 134 · motor_mini 43 · auto_addr 33
 - [x] MCU-Data-Dictionaries (Main + Düse) extrahiert; Creality-Befehle `query_gpio_status`/`gpio_status`,
   `transparent_*`, `prtouch_*`, `fancheck` identifiziert; Strapping mit Upstream-`set_digital_out` möglich
 - [x] Strapping-Mechanismus: `[duplicate_pin_override]` + Zeitmultiplex, kein Spezialbefehl
-- [ ] Pi-Host-Modul: Strapping über digital_out vor Broadcast + Extruder über transparent_send nachbauen
+- [x] Pi-Host-Modul: Strapping über digital_out vor Broadcast + Extruder über transparent_send nachbauen  **ENTWURF 16.10.2026 in pi-host/ (TransparentTransport, [k2_motor]) – Gerätetest offen**
 - [ ] `mcu0_130`-Dictionary ohne `transparent_*` prüfen (vermutl. Extraktionslücke)
 - [x] Pi-Host-Modul ENTWURF `pi-host/` (16.10.2026): k2_transport.py (RS485 + transparent_send), k2_motor_init.py
   ([k2_motor] für Upstream-Klipper: Strapping, Init P0–P9, Param-Abgleich, Extruder via transparent 0x81),
@@ -479,5 +479,5 @@ box 179 · boxmini 17 · cfsseq 28 · motor 134 · motor_mini 43 · auto_addr 33
 - [x] Architektur: MCU zeichnet nur auf (pres Düse, step Main), kein Hardwarestopp; Host berechnet Kontakt
 - [x] Live-Mitschnitt Auto-Nivellierung ausgewertet (99 Tastungen, Mesh 9×9, Rechenweg zoft belegt)
 - [x] Cut-Kalibrierung live (Stall-Mode 3 für Suche, Kp 300/100) – LIVE-ABFRAGEN-2026-10-16.md
-- [ ] Entscheidung Pi-Weg: PrTouch-Ersatz (eigenes Probe-Modul) oder Eddy-Sensor
+- [x] Entscheidung Pi-Weg: PrTouch-Ersatz (eigenes Probe-Modul) oder Eddy-Sensor  **ENTSCHIEDEN 16.10.2026: eigenes Modul für den eingebauten Kraftsensor (Weg A); Eddy optional später**
 - [ ] (für A) MCU-Bit-Ebene der prtouch-Frames: Schwellen/Filter/Register
