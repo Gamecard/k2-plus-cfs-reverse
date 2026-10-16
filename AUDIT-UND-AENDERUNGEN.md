@@ -798,6 +798,12 @@ selbst gegengeprüft; bei der Einarbeitung zusätzlich nachgeprüft (Abschnitt �
   am extrahierten Dictionary (Befehlsformate) und an `printer-live.cfg:231` (`[duplicate_pin_override]`)
   nachgeprüft. Neu: `GPIO-PHASE-BEFUND-2026-10-16.md`; CHECKLISTE ergänzt.
 
+## 16.10.2026 – Kanal A gelöst, Pi-Ersatz-Plan
+
+- Kanal-A-Defekt mechanisch: Filamentrest im Hub; nach Entfernen live mit `cfswatch` geprüft (Einstecken, Preload,
+  Extrude 1313 mm, Extruder-Check ok). Drucker-Zugriff dabei nur lesend (Log-Mitschnitt).
+- `PI-ERSATZ-PLAN.md` neu (Zweitanalyse durch weiteren KI-Agenten, von uns durchgesehen).
+
 ## Anonymisierung (Repo-Fassung)
 
 Gegenüber der lokalen Forschungsablage sind im Repo folgende Werte durch syntaktisch

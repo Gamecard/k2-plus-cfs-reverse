@@ -465,3 +465,12 @@ box 179 · boxmini 17 · cfsseq 28 · motor 134 · motor_mini 43 · auto_addr 33
   ([k2_motor] für Upstream-Klipper: Strapping, Init P0–P9, Param-Abgleich, Extruder via transparent 0x81),
   test_k2_motor.py 9/9 offline. Review-Fixes: Pins vor Connect, gültige print_time, query_gpio_status
 - [ ] pi-host: Test mit echtem Upstream-Klipper (Pi) + Creality-MCU-FW; Rs485Transport an Klipper-Reactor anbinden
+
+### Kanal A – GELÖST 16.10.2026
+- [x] Ursache: gebrochener Filamentrest von Slot A im Hub bis zum Extruder → Hub-Sensor A dauerhaft aktiv
+  (blockierte laut CFS-FW auch B/C/D; Einzug stoppte bei ~245 mm, Status 0x0c). Rest entfernt (User).
+- [x] Live-Gegenprobe (cfswatch): Ereignis „Herausziehen A“, Hub-Maske leer → Einstecken A → Auto-Preload fertig
+  → Force-Preload 0x0d 31 s ok → Extrude: Modus 0 (4,4 s ok), Modus 4/5 Odometer 1313 mm ohne Stillstand,
+  Modus 6 ok, Modus 7 Extruder-Check ok, Box-Modus PRINT. Kein Fehlercode.
+- [x] PI-ERSATZ-PLAN.md erstellt (Bestandsaufnahme, Hardware, Verkabelung, Inbetriebnahme, offene Punkte;
+  größter Blocker: PrTouch-Ersatz)
