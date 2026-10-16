@@ -126,6 +126,11 @@ Audit und Änderungsbegründungen: `<projekt>/AUDIT-UND-AENDERUNGEN.md`.
 - [x] Pi-Lücken aus dem Vanilla-Abgleich umgesetzt (16.10.2026, alles gesperrt, am Gerät ungetestet):
   A4 `_PI_NOZZLE_CLEAN` vor Z-Antasten/START_PRINT/G29, A5 RESUME mit Vorextrusion + Reinigung + sicherer Rückfahrt,
   A6 `CALIBRATE_CUT_POS` → `KTWO_MOTOR_CUT_CAL` (Live-Folge belegt), A7 `KTWO_BOX_RUNOUT` (Default aus)
+- [x] **Pi vorbereitet (16.10.2026):** CM5, MainsailOS (Debian 13, aarch64, Python 3.13), Klipper per Update-Manager
+  auf Upstream 9cb9975 (= geprüfter Stand); auf dem Pi: Batch-Prüfung config-pi EXIT 0, alle 6 Test-Suiten grün
+  (Testordner ~/k2-test, NICHT installiert; Klipper-Checkout unverändert)
+- [ ] Pi am Drucker: Lower-Board-Verbindung (UART Main/Düse + USB-RS485), by-id-Namen ermitteln, Module nach
+  config-pi/README §3 installieren, Inbetriebnahme §4 (erst ohne Bewegung)
 - [ ] A10 z_align-Vergleich am Gerät (Dual-Z ohne Lichtschranken stabil?)
 - [ ] RESUME nach abgebrochenem CFS-Wechsel im Schneidbereich: Upstream-RESUME_BASE fährt gerade zur Fehlerposition
   zurück und könnte den Schneidhebel erneut betätigen (bisher nur Meldung) – am Pi prüfen/absichern
