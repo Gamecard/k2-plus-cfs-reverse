@@ -689,6 +689,42 @@ selbst gegengeprüft; bei der Einarbeitung zusätzlich nachgeprüft (Abschnitt �
 - Selbsttests danach alle grün: serial485 93/93 · box 179 · boxmini 17 · cfsseq 28 ·
   motor 202 · motor_mini 64 · auto_addr 33 · cfswatch `--selftest` OK.
 
+## 16.10.2026 Live-Abfrage 0x13–0x16 (Motor X, Klipper-Webhooks)
+
+- **Anlass:** 0x13–0x16 waren nur FW-statisch belegt (Motor-FW-Befund), Request-Payload und
+  Feldreihenfolge der Proben „vermutet“, 0x14-Zusatzfloat ohne Host-Namen (`extra_f`).
+- **Beleg:** klippy.log-Auszug 16.10. 17:26:57–58 Log-Uhr (lokal `arbeitsdateien-lokal/`, enthält echte
+  UUID → nicht im Repo), Motor X `0x81`, Stillstand nach `M84`, Klipper durchgehend `ready`. Aufruf
+  über die Klipper-Webhook-Endpunkte `motor_err_detail_data` (Bus 0x13 → 0x15 → 0x16) und
+  `motor_cut_detail_data` (0x14 → MOTOR_GET idx 5–8), Parameter `{"num": 1}`; `motor_dev_uuid` nicht
+  benutzt, `motor_param_modifi_data` (vermutlich schreibend) NICHT angefasst.
+- **Befund:** Requests `81 04 00 1x 02` (Host-Payload `[02]`, FW ignoriert sie); Antworten STATUS 00,
+  0x13/0x14 len 0x4d → 74 B, 0x15/0x16 len 0xa4 → 161 B (Zählbyte 0x0A + 10 × `<ffff`). Host-JSON =
+  Nachbau-Dekodierung für alle Felder (0x13: err_code 0, elec_offset 123,58, err_deg 3,867, Rest 0;
+  0x14: encoder_fdb 4421 … 24,365 V, 50,32 °C, param_peak_overcurrent_A 0,012; 0x15: 10 × 2,15985 /
+  2,15985 / 2,159847 / 0; 0x16: 10 × ≈ 0).
+- **Korrekturen `nachbau/motor.py`:**
+  - `_read_detail()` sendet jetzt `DETAIL_REQUEST_PAYLOAD = (0x02,)` wie der Host (vorher leere
+    Payload `81 03 00 1x`; funktional gleich, jetzt byte-gleich zum Stock-Verkehr).
+  - `CUT_DETAIL_EXTRA_FIELD` `"extra_f"` → `"param_peak_overcurrent_A"` (Host-Name). Übrige 0x13/0x14-
+    Feldnamen entsprachen bereits den Host-Namen (`board_detect_power_supply_V` usw.) – unverändert.
+  - Docstrings `read_err_detail`/`read_stall_detail`/`read_pos_samples`/`read_spd_samples`,
+    `decode_err_detail`/`decode_samples`, Modulkopf und Konstanten-Kommentare: „LIVE bestätigt 16.10.“;
+    Reihenfolge der Probenfelder = Host (pos Feld 3/4 eindeutig, Feld 1/2 und spd im Stillstand nicht
+    unterscheidbar – so dokumentiert). `TIMEOUT_DETAIL` bleibt 1 s (Host-Timeout unbelegt; live
+    0,014–0,174 s laut Log-Stempeln).
+  - Selbsttest 7e: Live-Frames 0x13–0x16 (UUID-Bytes 3–8 → `00` als Platzhalter, CRC-8/ATM neu: 0x13
+    `a2`, 0x14 `c0`; 0x15/0x16 mit Original-Geräte-CRC `6f`/`1e`) gegen alle Host-JSON-Werte, Requests
+    `81 04 00 1x 02` (FakeBus prüft die TX-Bytes), Reihenfolge wie die Webhooks; synthetische Frames
+    bleiben für die Union-Dekodierung (live nur err_code 0) und die Guards.
+- **Doku:** PROTOKOLL-485.md §3.1 NACHTRAG (5) (Endpunkt-Weg, Feldtabelle mit Host-Namen),
+  CHECKLISTE.md, LIVE-ABFRAGEN-2026-10-16.md (Abschnitt „0x13–0x16 live“, ohne UUID),
+  MOTOR-FW-BEFUND-2026-10-16.md (Live-Nachtrag), lokale Übergabenotiz (nicht im Repo).
+- **Offen:** Union-Inhalte bei err_code ≠ 0; Bedeutung/Einheit von `param_peak_overcurrent_A` (0,012
+  bei err_code 0); Host-Timeout.
+- Selbsttests danach alle grün: serial485 93/93 · box 179 · boxmini 17 · cfsseq 28 ·
+  motor 208 · motor_mini 64 · auto_addr 33 · cfswatch `--selftest` OK.
+
 ## Anonymisierung (Repo-Fassung)
 
 Gegenüber der lokalen Forschungsablage sind im Repo folgende Werte durch syntaktisch

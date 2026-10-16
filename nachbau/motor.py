@@ -38,8 +38,18 @@ CH32V30x-Klasse, Basis 0x3000 hinter 12-KB-Bootloader, Befehlsregistrierung
   protection(); Sub-Codes 00..0B als Konstanten (SUB_PROT_*).
 - STATUS-Byte der Motorantwort = Bitfeld (bit0 Stall, bit1 Fehler latched,
   bit2 Warnung latched) -> decode_motor_status().
-- 0x13..0x16 lesend ohne Request-Payload (FW-statisch, live NICHT geprüft):
+- 0x13..0x16 lesend (FW-statisch; LIVE bestätigt 16.10., s. unten):
   read_err_detail, read_stall_detail, read_pos_samples, read_spd_samples.
+NACHTRAG 16.10.2026 17:26 Log-Uhr (LIVE-ABFRAGEN-2026-10-16.md, Abschnitt
+„0x13–0x16 live“, Motor X 0x81, Stillstand nach M84, Klipper durchgehend
+ready): über die Klipper-Webhook-Endpunkte motor_err_detail_data (Host
+sendet 0x13, danach 0x15 und 0x16) und motor_cut_detail_data (0x14, danach
+MOTOR_GET idx 5-8), Parameter {"num": 1}. Requests `81 04 00 13 02` /
+`14 02` / `15 02` / `16 02` (Host hängt [02] an, FW ignoriert die Payload),
+Antworten STATUS 00: 0x13/0x14 len 0x4d -> 74 B, 0x15/0x16 len 0xa4 ->
+161 B (Zählbyte 0x0A + 10 x '<ffff'). Dekodierung = Host-JSON (Feld-
+reihenfolge ERR_DETAIL_FORMAT bestätigt; 0x14-Zusatzfloat heißt im Host
+param_peak_overcurrent_A).
 - 0x11 heißt in der FW emergency_pin_mode (Host: stall_mode).
 
 Umfang:
@@ -71,9 +81,10 @@ Umfang:
   live für 0/13..18 NICHT geprüft)
 - check_protection (0x0C [0b]) -> dekodiert (decode_protection),
   check_protection_raw -> 8 B; decode_motor_status (STATUS-Bitfeld)
-- Detail-/Sample-Kommandos 0x13..0x16 LESEND (FW-statisch belegt, live
-  NICHT geprüft, retries 0, Timeout 1 s unbelegt): read_err_detail,
-  read_stall_detail, read_pos_samples, read_spd_samples (+ Decoder)
+- Detail-/Sample-Kommandos 0x13..0x16 LESEND (FW-statisch belegt, LIVE
+  bestätigt 16.10., Request [02] wie Host, retries 0, Timeout 1 s; Host-
+  Timeout unbelegt): read_err_detail, read_stall_detail, read_pos_samples,
+  read_spd_samples (+ Decoder)
 - 0x01/0x03/0x04/0x07/0x0B/0x0D: nur Konstanten + NotImplementedError-
   Stubs (senden NICHTS); 0x0C-Subs 01..05/07/09 nur Konstanten
 - WARNUNG Host-Bug (live 16.10., zweimal reproduziert, Ursache BELEGT):
@@ -119,8 +130,8 @@ Stock wiederholt nur beim E-Motor (0x85) auf Anwendungsebene (IDs 9/10/25
 je 3x) – nicht nachgebaut (0x85 gesperrt).
 
 Nie beobachtet (bleiben Stubs bzw. unverändert): 0x01, 0x03, 0x04, 0x07,
-0x0B, 0x0D, 0xF0; 0x13-0x16 seit 16.10. FW-statisch belegt und lesend
-gebaut, live aber nie gesehen (0x08/0x0F seit 16.10. live belegt, s. oben;
+0x0B, 0x0D, 0xF0 (0x13-0x16 seit 16.10. FW-statisch belegt UND live
+bestätigt, 0x08/0x0F seit 16.10. live belegt, s. oben;
 Bedeutung der Cmd-Bytes seit 16.10. aus der Host-Tabelle Motor_cmd belegt). 0x05 ([01]/[02] an X/Y bei BELT_TENSION)
 wurde nie beantwortet (klippy.log.2026-10-12:28621-28636) -> nicht gebaut.
 
@@ -210,14 +221,24 @@ MOTOR_ADDR_BY_NUM = dict([(str(n), 0x80 + n) for n in range(9)] + [("9", 0xFF)])
 MOTOR_NUM_TO_NAME = {1: "x", 2: "y", 3: "z", 4: "z1", 5: "e"}
 
 # 0x13 err_detail_data: Host-Unpack-Format @0x3a3f0 (BELEGT als Host-
-# Format). MOTOR-FW 16.10. (statisch, live NICHT geprüft): Request OHNE
-# Payload (FW liest 0x6cc nicht), Antwort 74 B = 66 B Grundformat + 8 B
-# Union (Inhalt je Fehlertyp, ERR_CODE_TO_UNION). Snapshot des LETZTEN
-# Fehlerereignisses (erfasst @0xc172 bei jedem in Maske 0x400 freigegebenen
-# Fehlerbit), bleibt bis zum nächsten Ereignis, auch über protection [05].
+# Format). MOTOR-FW 16.10. (statisch) + LIVE bestätigt 16.10. (Motor X,
+# Webhook motor_err_detail_data): Request `81 04 00 13 02` (der Host hängt
+# [02] an; die FW liest 0x6cc nicht -> Payload egal, Nachbau sendet wie
+# der Host DETAIL_REQUEST_PAYLOAD), Antwort len 0x4d -> 74 B = 66 B
+# Grundformat + 8 B Union (Inhalt je Fehlertyp, ERR_CODE_TO_UNION).
+# Snapshot des LETZTEN Fehlerereignisses (erfasst @0xc172 bei jedem in
+# Maske 0x400 freigegebenen Fehlerbit), bleibt bis zum nächsten Ereignis,
+# auch über protection [05]. Live (kein Fehler seit Boot): err_code 0,
+# Messfelder 0, nur statische Felder gefüllt (dev_uuid, elec_offset 123,58,
+# phase_order_invert 0, elec_offset_err_deg 3,867) – deckt sich mit „Handler
+# kopiert nur statische Felder nach“.
 # 0x14 cut_detail_data: gleiche 74 B, Snapshot beim STALL-Ereignis (Stall-
-# Callback @0xbf44); der Host entpackt 70 B (= Grundformat + 1 float, Name
-# im Host unbelegt -> hier "extra_f" = erste 4 B der Union).
+# Callback @0xbf44); der Host entpackt 70 B (= Grundformat + 1 float). Name
+# des Zusatzfloats LIVE aus dem Host-JSON (Webhook motor_cut_detail_data):
+# param_peak_overcurrent_A (= erste 4 B der Union; live 0,012 trotz
+# err_code 0 -> Bedeutung/Einheit nur Host-Name, Wert unplausibel klein für
+# einen Spitzenstrom-Grenzwert). Feldreihenfolge/Format live gegen alle
+# Host-JSON-Werte bestätigt (Selbsttest 7e).
 ERR_DETAIL_FORMAT = "<I8BfHfiiffffffffi"
 CUT_DETAIL_FORMAT = ERR_DETAIL_FORMAT + "f"
 ERR_DETAIL_BASE_LEN = 66
@@ -229,20 +250,27 @@ ERR_DETAIL_FIELDS = (
     "pos_fdb_encoder", "spd_fdb_encoder", "spd_fdb_ctrl", "id", "iq",
     "board_detect_power_supply_V", "board_detect_temperature_C",
     "pos_loop_pid_err", "step_increment")  # dev_uuid = 8 B
-CUT_DETAIL_EXTRA_FIELD = "extra_f"   # eigener Name, Host-Name unbelegt
+CUT_DETAIL_EXTRA_FIELD = "param_peak_overcurrent_A"   # Host-Name (live 16.10.)
+# Request-Payload 0x13..0x16: wie der Host [02] (live 16.10.); die FW wertet
+# sie nicht aus (MOTOR-FW-BEFUND: kein Lesezugriff auf 0x6cc).
+DETAIL_REQUEST_PAYLOAD = (0x02,)
 
-# 0x15 pos_data / 0x16 spd_data (MOTOR-FW 16.10., statisch, live NICHT
-# geprüft): Request OHNE Payload; Antwort = Zählbyte 0x0A + 10 Proben je
-# '<ffff' (16 B) = 161 B, älteste zuerst (Ringkopf obj+0x88c gemeinsam).
-# Geschrieben nur bei ctrl+4 == 1 (@0xb91c); kein Start, kein Löschen.
-# Feldnamen = Host-Strings (belegt); Zuordnung Name-Reihenfolge = FW-Byte-
-# Reihenfolge VERMUTET (zip/unpack-Reihenfolge des Hosts).
+# 0x15 pos_data / 0x16 spd_data (MOTOR-FW 16.10., statisch; LIVE bestätigt
+# 16.10., Webhook motor_err_detail_data sendet nach 0x13 auch 0x15/0x16):
+# Request [02] (s. DETAIL_REQUEST_PAYLOAD), Antwort len 0xa4 = Zählbyte
+# 0x0A + 10 Proben je '<ffff' (16 B) = 161 B, älteste zuerst (Ringkopf
+# obj+0x88c gemeinsam). Geschrieben nur bei ctrl+4 == 1 (@0xb91c); kein
+# Start, kein Löschen. Feldnamen = Host-Strings; Zuordnung Name-Reihenfolge
+# live = Host-JSON (pos: target_pos 2,159847 an Position 3, leso_err 0 an
+# Position 4; fdb/leso im Stillstand gleich -> nicht unterscheidbar; spd:
+# alle ~0, Reihenfolge nur konsistent, nicht unterscheidbar).
 SAMPLE_COUNT = 10
 SAMPLE_FORMAT = "<ffff"
 SAMPLE_LEN = 1 + SAMPLE_COUNT * 16   # 161 B
 POS_SAMPLE_FIELDS = ("fdb_pos", "leso_pos", "target_pos", "leso_err")
 SPD_SAMPLE_FIELDS = ("fdb_spd", "leso_spd", "target_spd", "leso_in_u")
-TIMEOUT_DETAIL = 1.0       # 0x13..0x16: unbelegt (nie live gesendet)
+TIMEOUT_DETAIL = 1.0       # 0x13..0x16: Host-Timeout unbelegt; live Antwort
+                           # nach 0,014..0,174 s (Log-Zeitstempel inkl. Logging)
 
 # Fehler-/Warnbits (Host-Dicts motor_error_dict / motor_warning_dict,
 # Modul-Init, BELEGT als Bit -> key-Zuordnung; Kurztexte = Übersetzung der
@@ -938,12 +966,14 @@ def decode_detail_union(err_code, union):
 
 def decode_err_detail(data, cut=False):
     """74 B Antwort von 0x13 (cut=False) bzw. 0x14 (cut=True) -> dict.
-    KEIN Bus-Zugriff. Format FW-statisch belegt, live NICHT geprüft.
+    KEIN Bus-Zugriff. Format FW-statisch belegt, LIVE bestätigt 16.10.
+    (alle Felder = Host-JSON der Webhooks motor_err/cut_detail_data).
 
     Felder ERR_DETAIL_FIELDS aus ERR_DETAIL_FORMAT (66 B; dev_uuid = 8 B
     als bytes), 'union_raw' = Byte 66..73, 'union' = decode_detail_union,
-    bei cut=True zusätzlich CUT_DETAIL_EXTRA_FIELD ('<f' aus Byte 66..69,
-    wie der Host mit CUT_DETAIL_FORMAT), 'errors' = decode_error_bits."""
+    bei cut=True zusätzlich CUT_DETAIL_EXTRA_FIELD = Host-Name
+    param_peak_overcurrent_A ('<f' aus Byte 66..69, wie der Host mit
+    CUT_DETAIL_FORMAT), 'errors' = decode_error_bits."""
     raw = bytes(data)
     if len(raw) != DETAIL_LEN:
         raise ValueError("0x%02x: %d statt %d Bytes: %r"
@@ -966,8 +996,8 @@ def decode_err_detail(data, cut=False):
 def decode_samples(data, fields):
     """161 B Antwort von 0x15/0x16 -> Liste von 10 dicts (älteste zuerst).
     KEIN Bus-Zugriff. Byte 0 = Anzahl (FW fest 0x0A), dann je Probe '<ffff'
-    mit den Feldnamen fields (POS_/SPD_SAMPLE_FIELDS; Zuordnung Reihenfolge
-    VERMUTET). Länge/Zählbyte falsch -> ValueError."""
+    mit den Feldnamen fields (POS_/SPD_SAMPLE_FIELDS; Reihenfolge = Host,
+    LIVE bestätigt 16.10.). Länge/Zählbyte falsch -> ValueError."""
     raw = bytes(data)
     if len(raw) != SAMPLE_LEN or raw[0] != SAMPLE_COUNT:
         raise ValueError("Sample-Antwort: %d B / Zählbyte %r statt %d B / %d"
@@ -1486,11 +1516,14 @@ class Motor:
             "read_position_feedback(with_counts=True) (0x08 idx 5 pos_fdb rad / "
             "idx 11 Counts, single-turn 3200/Umdrehung)")
 
-    # --- 0x13..0x16 Detail-/Sample-Daten (MOTOR-FW 16.10.: LESEND, ohne
-    # Request-Payload; FW-statisch belegt, live NICHT geprüft) ---
+    # --- 0x13..0x16 Detail-/Sample-Daten (MOTOR-FW 16.10.: LESEND;
+    # LIVE bestätigt 16.10. über die Klipper-Webhooks motor_err_detail_data /
+    # motor_cut_detail_data) ---
 
     def _read_detail(self, fun, length):
-        st, ans = self._tx_status(fun, [], TIMEOUT_DETAIL)
+        # Payload [02] wie der Host (live `81 04 00 1x 02`); die FW ignoriert
+        # sie (kein Lesezugriff auf 0x6cc) – byte-gleich zum Stock-Verkehr.
+        st, ans = self._tx_status(fun, list(DETAIL_REQUEST_PAYLOAD), TIMEOUT_DETAIL)
         if len(ans) != length:
             raise ValueError("0x%02x: %d statt %d Bytes: %r"
                              % (fun, len(ans), length, ans))
@@ -1498,11 +1531,14 @@ class Motor:
 
     def read_err_detail(self):
         """0x13 err_detail_data -> dict (decode_err_detail) + 'status'.
-        FW-statisch belegt, live NICHT geprüft. Request ohne Payload
-        (`81 03 00 13`), Antwort 74 B = Snapshot des LETZTEN Fehlerereignisses
-        (bleibt bis zum nächsten, auch über protection [05]); der Handler
-        kopiert nur statische Felder nach (idempotent). 'status' =
-        decode_motor_status oder None. retries=0, Timeout 1 s (unbelegt)."""
+        LIVE bestätigt 16.10. (Motor X, STATUS 00, Werte = Host-JSON).
+        Request `81 04 00 13 02` wie der Host (FW ignoriert die [02]),
+        Antwort 74 B = Snapshot des LETZTEN Fehlerereignisses (bleibt bis zum
+        nächsten, auch über protection [05]); der Handler kopiert nur
+        statische Felder nach (idempotent; live ohne Fehler seit Boot: nur
+        dev_uuid/elec_offset/phase_order_invert/elec_offset_err_deg gefüllt).
+        'status' = decode_motor_status oder None. retries=0, Timeout 1 s
+        (Host-Timeout unbelegt)."""
         st, ans = self._read_detail(FUNC_ERR_DETAIL_DATA, DETAIL_LEN)
         out = decode_err_detail(ans)
         out["status"] = None if st is None else decode_motor_status(st)
@@ -1510,9 +1546,11 @@ class Motor:
 
     def read_stall_detail(self):
         """0x14 cut_detail_data -> dict (decode_err_detail(cut=True)) +
-        'status'. FW-statisch belegt, live NICHT geprüft. Request ohne
-        Payload, Antwort 74 B = Snapshot beim STALL-Ereignis (Messpunkt von
-        MOTOR_CHECK_CUT_POS). retries=0, Timeout 1 s (unbelegt)."""
+        'status'. LIVE bestätigt 16.10. (Motor X, STATUS 00, Werte = Host-
+        JSON inkl. param_peak_overcurrent_A). Request `81 04 00 14 02` wie
+        der Host, Antwort 74 B = Snapshot beim letzten STALL-Ereignis
+        (Messpunkt von MOTOR_CHECK_CUT_POS; live z. B. encoder_fdb 4421,
+        24,365 V, 50,32 °C). retries=0, Timeout 1 s (Host-Timeout unbelegt)."""
         st, ans = self._read_detail(FUNC_CUT_DETAIL_DATA, DETAIL_LEN)
         out = decode_err_detail(ans, cut=True)
         out["status"] = None if st is None else decode_motor_status(st)
@@ -1520,18 +1558,20 @@ class Motor:
 
     def read_pos_samples(self):
         """0x15 pos_data -> {'samples': 10 x {fdb_pos, leso_pos, target_pos,
-        leso_err}, 'status'}. FW-statisch belegt, live NICHT geprüft.
-        Request ohne Payload, Antwort 161 B (Zählbyte 0x0A + 10 x '<ffff',
-        älteste zuerst); Ring wird nur bei ctrl+4 == 1 geschrieben, kein
-        Start/Löschen. retries=0, Timeout 1 s (unbelegt)."""
+        leso_err}, 'status'}. LIVE bestätigt 16.10. (Motor X Stillstand:
+        10 x fdb/leso_pos 2,15985, target_pos 2,159847, leso_err 0 = Host-
+        JSON). Request `81 04 00 15 02` wie der Host, Antwort 161 B
+        (Zählbyte 0x0A + 10 x '<ffff', älteste zuerst); Ring wird nur bei
+        ctrl+4 == 1 geschrieben, kein Start/Löschen. retries=0, Timeout 1 s."""
         st, ans = self._read_detail(FUNC_POS_DATA_SAMPLE, SAMPLE_LEN)
         return {"samples": decode_samples(ans, POS_SAMPLE_FIELDS),
                 "status": None if st is None else decode_motor_status(st)}
 
     def read_spd_samples(self):
         """0x16 spd_data -> {'samples': 10 x {fdb_spd, leso_spd, target_spd,
-        leso_in_u}, 'status'}. FW-statisch belegt, live NICHT geprüft.
-        Wie read_pos_samples (eigener Ring). retries=0, Timeout 1 s."""
+        leso_in_u}, 'status'}. LIVE bestätigt 16.10. (Motor X Stillstand:
+        10 x ~0 = Host-JSON). Request `81 04 00 16 02`, sonst wie
+        read_pos_samples (eigener Ring). retries=0, Timeout 1 s."""
         st, ans = self._read_detail(FUNC_SPD_DATA_SAMPLE, SAMPLE_LEN)
         return {"samples": decode_samples(ans, SPD_SAMPLE_FIELDS),
                 "status": None if st is None else decode_motor_status(st)}
@@ -2202,11 +2242,80 @@ def selftest():
           pc["err_code"] == 0x100 and pc["errors"][0][:2] == (8, "key789")
           and pc["warnings"][0][:2] == (1, "key796") and not bus.script)
 
-    # 7e. 0x13..0x16 (FW-statisch, Frames SYNTHETISCH; UUID = Platzhalter)
+    # 7e. 0x13..0x16 LIVE (16.10.2026 17:26 Log-Uhr, Motor X 0x81, Stillstand
+    # nach M84, Klipper-Webhooks motor_err_detail_data / motor_cut_detail_data,
+    # {"num": 1}). Rohframes aus klippy.log; die 6 echten UUID-Bytes nach
+    # "cd ab" sind durch 00 ersetzt (PLATZHALTER) und die CRC dafür NEU
+    # berechnet (CRC-8/ATM über len..data). 0x15/0x16 enthalten keine UUID ->
+    # Original-CRC 6f / 1e (Geräte-CRC, von parse_frame geprüft).
     def _drx(addr, fun, status, data):
         body = bytes([len(data) + 3, status, fun]) + bytes(data)
         return "f7 %02x %s %02x" % (addr, body.hex(" "), crc8_cal(body))
     uuid0 = bytes.fromhex("cd ab 00 00 00 00 00 00")   # PLATZHALTER
+    live13 = ("f7 81 4d 00 13 00 00 00 00 cd ab 00 00 00 00 00 00 20 29 f7 42"
+              " 00 00 dc 7a 77 40" + " 00" * 52 + " a2")
+    live14 = ("f7 81 4d 00 14 00 00 00 00 cd ab 00 00 00 00 00 00 20 29 f7 42"
+              " 00 00 dc 7a 77 40 45 11 00 00 45 11 00 00 ed 03 59 3f eb 3f 8c 3f"
+              " c4 11 c4 3f 4a 68 11 3c bd 04 04 3f 2f eb c2 41 d6 48 49 42"
+              " c0 62 46 3c 00 00 00 00 a6 9b 44 3c 00 00 00 00 c0")
+    live15 = ("f7 81 a4 00 15 0a" + " e7 3a 0a 40 e7 3a 0a 40 ef 3a 0a 40 00 00 00 00"
+              * 10 + " 6f")
+    live16 = ("f7 81 a4 00 16 0a" + " 00 00 00 00 65 97 99 ba 4d 92 b2 ba cf 84 d5 ba"
+              * 10 + " 1e")
+    check("Live-Frames 0x13..0x16: Länge/CRC (0x13/0x14 CRC neu, 0x15/0x16 Gerät)",
+          [len(bytes.fromhex(f)) for f in (live13, live14, live15, live16)]
+          == [80, 80, 167, 167]
+          and all(parse_frame(bytes.fromhex(f))[0] == fn for f, fn in
+                  ((live13, 0x13), (live14, 0x14), (live15, 0x15), (live16, 0x16)))
+          and _drx(0x81, 0x14, 0x00, bytes.fromhex(live14)[5:-1]) == live14)
+    bus = _FakeBus([("81 04 00 13 02", live13), ("81 04 00 15 02", live15),
+                    ("81 04 00 16 02", live16), ("81 04 00 14 02", live14)])
+    md = Motor(bus, 0x81)
+
+    def _near(a, b, tol):
+        return abs(a - b) <= tol
+    e = md.read_err_detail()
+    check("LIVE 0x13 = Host-JSON (err_code 0, elec_offset 123.58, err_deg 3.867)",
+          e["err_code"] == 0 and e["dev_uuid"] == uuid0 and e["errors"] == []
+          and _near(e["elec_offset"], 123.58, 5e-3) and e["phase_order_invert"] == 0
+          and _near(e["elec_offset_err_deg"], 3.867, 5e-4)
+          and all(e[k] == 0 for k in ERR_DETAIL_FIELDS[5:])
+          and e["union"] == {} and e["union_raw"] == bytes(8)
+          and CUT_DETAIL_EXTRA_FIELD not in e and e["status"]["ok"]
+          and bus.calls[0][2] == [0x02]
+          and bus.calls[0][3] == {"timeout": TIMEOUT_DETAIL, "retries": 0})
+    ps = md.read_pos_samples()
+    check("LIVE 0x15 = Host-JSON (10 x fdb/leso 2.15985, target 2.159847, err 0)",
+          len(ps["samples"]) == SAMPLE_COUNT and ps["status"]["ok"]
+          and all(_near(s_["fdb_pos"], 2.15985, 5e-6) and _near(s_["leso_pos"], 2.15985, 5e-6)
+                  and _near(s_["target_pos"], 2.159847, 5e-7) and s_["leso_err"] == 0
+                  for s_ in ps["samples"]))
+    ss = md.read_spd_samples()
+    check("LIVE 0x16 = Host-JSON (10 x ~0, |v| < 2e-3)",
+          len(ss["samples"]) == SAMPLE_COUNT and ss["status"]["ok"]
+          and all(s_["fdb_spd"] == 0 and all(abs(v) < 2e-3 for v in s_.values())
+                  for s_ in ss["samples"])
+          and _near(ss["samples"][0]["leso_in_u"], -0.001629, 1e-6))
+    c = md.read_stall_detail()
+    want14 = {"encoder_fdb": (4421, 0), "encoder_fdb_last": (4421, 0),
+              "pos_fdb_encoder": (0.8477, 5e-5), "spd_fdb_encoder": (1.0957, 5e-5),
+              "spd_fdb_ctrl": (1.5318, 5e-5), "id": (0.00887, 5e-6),
+              "iq": (0.5157, 5e-5), "board_detect_power_supply_V": (24.365, 5e-4),
+              "board_detect_temperature_C": (50.32, 5e-3),
+              "pos_loop_pid_err": (0.01211, 5e-6), "step_increment": (0, 0),
+              "param_peak_overcurrent_A": (0.012, 1e-7)}
+    check("LIVE 0x14 = Host-JSON (12 Felder inkl. param_peak_overcurrent_A)",
+          all(_near(c[k], v, t) for k, (v, t) in want14.items())
+          and CUT_DETAIL_EXTRA_FIELD == "param_peak_overcurrent_A"
+          and c["err_code"] == 0 and c["dev_uuid"] == uuid0
+          and _near(c["elec_offset"], 123.58, 5e-3) and c["status"]["ok"]
+          and struct.unpack(CUT_DETAIL_FORMAT, bytes.fromhex(live14)[5:75])[-1]
+          == c[CUT_DETAIL_EXTRA_FIELD])
+    check("LIVE Reihenfolge 0x13/0x15/0x16/0x14, alle Payload [02], retries 0",
+          [c_[1] for c_ in bus.calls] == [0x13, 0x15, 0x16, 0x14]
+          and all(c_[2] == [0x02] and c_[3]["retries"] == 0 for c_ in bus.calls)
+          and not bus.script and list(DETAIL_REQUEST_PAYLOAD) == [0x02])
+    # SYNTHETISCH (live nur err_code 0): Union-Dekodierung je Fehlerbit
     base = struct.pack(ERR_DETAIL_FORMAT, 0x100, *(list(uuid0) + [
         123.5, 0, 1.25, 1000, 999, 1.0, 2.0, 3.0, 0.1, 0.2, 24.0, 30.0, 0.5, 7]))
     det = base + struct.pack("<ff", 0.75, 0.0)
@@ -2217,13 +2326,13 @@ def selftest():
                                  for k in range(10))
     spd = bytes([10]) + b"".join(struct.pack("<ffff", k, k, 2 * k, 0.25)
                                  for k in range(10))
-    bus = _FakeBus([("81 03 00 13", _drx(0x81, 0x13, 0x02, det)),
-                    ("81 03 00 14", _drx(0x81, 0x14, 0x01, cut)),
-                    ("81 03 00 15", _drx(0x81, 0x15, 0x00, pos)),
-                    ("81 03 00 16", _drx(0x81, 0x16, 0x00, spd))])
+    bus = _FakeBus([("81 04 00 13 02", _drx(0x81, 0x13, 0x02, det)),
+                    ("81 04 00 14 02", _drx(0x81, 0x14, 0x01, cut)),
+                    ("81 04 00 15 02", _drx(0x81, 0x15, 0x00, pos)),
+                    ("81 04 00 16 02", _drx(0x81, 0x16, 0x00, spd))])
     md = Motor(bus, 0x81)
     e = md.read_err_detail()
-    check("read_err_detail 74 B (Request ohne Payload, retries 0, 1 s)",
+    check("read_err_detail SYNTHETISCH: Schleppfehler 0x100 + Status latched",
           len(det) == DETAIL_LEN == 74 and e["err_code"] == 0x100
           and e["dev_uuid"] == uuid0 and e["phase_order_invert"] == 0
           and abs(e["elec_offset"] - 123.5) < 1e-6 and e["encoder_fdb"] == 1000
@@ -2231,34 +2340,32 @@ def selftest():
           and e["board_detect_temperature_C"] == 30.0 and e["step_increment"] == 7
           and e["errors"][0][1] == "key789" and e["union"] == {"tracking_error": None}
           and e["union_raw"] == struct.pack("<ff", 0.75, 0.0)
-          and e["status"]["err_latched"] and not e["status"]["stall"]
-          and bus.calls[0][2] == [] and bus.calls[0][3] == {"timeout": TIMEOUT_DETAIL,
-                                                            "retries": 0})
+          and e["status"]["err_latched"] and not e["status"]["stall"])
     c = md.read_stall_detail()
-    check("read_stall_detail 0x14: Union Spitzenstrom + extra_f (Host 70 B)",
+    check("read_stall_detail SYNTHETISCH: Union Spitzenstrom + Zusatzfloat (Host 70 B)",
           c["err_code"] == 4 and c["union"] == {"peak_overcurrent_A": 2.5}
           and c[CUT_DETAIL_EXTRA_FIELD] == 2.5 and c["errors"][0][1] == "key783"
           and c["status"]["stall"]
           and struct.unpack(CUT_DETAIL_FORMAT, cut[:70])[-1] == c[CUT_DETAIL_EXTRA_FIELD])
     ps = md.read_pos_samples()
-    check("read_pos_samples 0x15: 161 B, 10 x fdb/leso/target/leso_err",
+    check("read_pos_samples SYNTHETISCH: 161 B, Feldzuordnung je Probe",
           len(pos) == SAMPLE_LEN == 161 and len(ps["samples"]) == 10
           and ps["samples"][3] == {"fdb_pos": 3.0, "leso_pos": 3.5,
                                    "target_pos": 4.0, "leso_err": -3.0}
           and ps["status"]["ok"])
     ss = md.read_spd_samples()
-    check("read_spd_samples 0x16: Felder fdb/leso/target_spd, leso_in_u",
+    check("read_spd_samples SYNTHETISCH: Felder fdb/leso/target_spd, leso_in_u",
           ss["samples"][9] == {"fdb_spd": 9.0, "leso_spd": 9.0, "target_spd": 18.0,
                                "leso_in_u": 0.25}
           and [c_[1] for c_ in bus.calls] == [0x13, 0x14, 0x15, 0x16]
-          and all(c_[2] == [] for c_ in bus.calls) and not bus.script)
+          and all(c_[2] == [0x02] for c_ in bus.calls) and not bus.script)
     check("Host-Aliase 0x13..0x16 = lesende Methoden",
           Motor.err_detail_data is Motor.read_err_detail
           and Motor.cut_detail_data is Motor.read_stall_detail
           and Motor.pos_data_sample is Motor.read_pos_samples
           and Motor.spd_data_sample is Motor.read_spd_samples)
-    bus = _FakeBus([("81 03 00 13", _drx(0x81, 0x13, 0x00, det[:66])),
-                    ("81 03 00 15", _drx(0x81, 0x15, 0x00, bytes([9]) + pos[1:]))])
+    bus = _FakeBus([("81 04 00 13 02", _drx(0x81, 0x13, 0x00, det[:66])),
+                    ("81 04 00 15 02", _drx(0x81, 0x15, 0x00, bytes([9]) + pos[1:]))])
     check("0x13/0x15 Längen-/Zählbyte-Guard",
           raises(ValueError, Motor(bus, 0x81).read_err_detail)
           and raises(ValueError, Motor(bus, 0x81).read_pos_samples) and not bus.script
@@ -2271,7 +2378,7 @@ def selftest():
             return pos
     nf = _NoFull()
     check("ohne transact_full: status None, Daten trotzdem",
-          Motor(nf, 0x83).read_pos_samples()["status"] is None and nf.calls[0][2] == [])
+          Motor(nf, 0x83).read_pos_samples()["status"] is None and nf.calls[0][2] == [0x02])
 
     # 8. Update-Pfad (Doku 1.7 + Disassembly, live nie beobachtet)
     bus = _FakeBus([

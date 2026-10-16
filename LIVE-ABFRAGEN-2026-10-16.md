@@ -127,3 +127,47 @@ Ergebnis: **idx 12 = DIR-Eingangspegel – BESTÄTIGT.** Der Wert folgt der Fahr
 im Stillstand auf der zuletzt gefahrenen Richtung stehen; „1 in Fahrt / 0 im Stillstand“ aus dem
 Abschnitt davor war nur die Richtung +X bzw. der Einschaltzustand. Damit ist die Hypothese
 „Bewegungs-/Regler-aktiv-Flag“ widerlegt. Nachbau: `motor.read_dir_input()`, Name `dir_input`.
+
+## 0x13–0x16 live (16.10.2026 17:26:57–58 Log-Uhr, Motor X 0x81, Klipper-Webhooks)
+
+Zustand: Stillstand nach `M84`, kein Druck, Klipper durchgehend `ready`. Rohframes (klippy.log-Auszug)
+liegen nur lokal in `arbeitsdateien-lokal/` – sie enthalten die echte Motor-UUID; hier ist die UUID
+durch `<UUID 8 B>` ersetzt.
+
+**Weg:** 0x13–0x16 haben keinen G-Code; der Host stellt sie als Klipper-Webhook-Endpunkte bereit
+(Klipper-API-Socket, `list_endpoints`). Aufgerufen wurden nur die zwei lesenden Endpunkte, Parameter
+`{"num": 1}` (= Motor X):
+
+| Endpunkt | Frames auf dem Bus | Ergebnis |
+|---|---|---|
+| `motor_err_detail_data` | `81 04 00 13 02`, dann `81 04 00 15 02`, `81 04 00 16 02` | JSON err_detail + pos_data_sample + spd_data_sample |
+| `motor_cut_detail_data` | `81 04 00 14 02`, dann MOTOR_GET idx 5–8 | JSON cut_detail |
+
+Weitere Endpunkte laut `list_endpoints`: `motor_dev_uuid` (nicht benutzt), `motor_param_modifi_data`
+(vermutlich schreibend – **nicht angefasst**).
+
+**Antworten** (STATUS 00, Geräte-CRC ok):
+
+| Cmd | len | Daten | Rohdaten (UUID ersetzt) |
+|---|---|---|---|
+| 0x13 | `4d` | 74 B | `00 00 00 00` `<UUID 8 B>` `20 29 f7 42` `00 00` `dc 7a 77 40` + 52 × `00` |
+| 0x14 | `4d` | 74 B | `00 00 00 00` `<UUID 8 B>` `20 29 f7 42` `00 00` `dc 7a 77 40` `45 11 00 00` `45 11 00 00` `ed 03 59 3f` `eb 3f 8c 3f` `c4 11 c4 3f` `4a 68 11 3c` `bd 04 04 3f` `2f eb c2 41` `d6 48 49 42` `c0 62 46 3c` `00 00 00 00` `a6 9b 44 3c` `00 00 00 00` |
+| 0x15 | `a4` | 161 B | `0a` + 10 × `e7 3a 0a 40 e7 3a 0a 40 ef 3a 0a 40 00 00 00 00` (CRC `6f`) |
+| 0x16 | `a4` | 161 B | `0a` + 10 × `00 00 00 00 65 97 99 ba 4d 92 b2 ba cf 84 d5 ba` (CRC `1e`) |
+
+**Host-Dekodierung (JSON) = Nachbau-Dekodierung (`motor.decode_err_detail` / `decode_samples`):**
+
+- 0x13 (letztes Fehlerereignis – keins seit Boot): `err_code` 0, `elec_offset` 123,58,
+  `phase_order_invert` 0, `elec_offset_err_deg` 3,867, alle Encoder-/pos-/spd-/id-/iq-Felder 0.
+- 0x15: 10 × {`fdb_pos` ≈ 2,15985, `leso_pos` ≈ 2,15985, `target_pos` ≈ 2,159847, `leso_err` 0}.
+- 0x16: 10 × ≈ 0 (`fdb_spd` 0, `leso_spd` −0,00117, `target_spd` −0,00136, `leso_in_u` −0,00163).
+- 0x14 (letztes Stall-Ereignis): `encoder_fdb` 4421, `encoder_fdb_last` 4421, `pos_fdb_encoder` 0,8477,
+  `spd_fdb_encoder` 1,0957, `spd_fdb_ctrl` 1,5318, `id` 0,00887, `iq` 0,5157,
+  `board_detect_power_supply_V` 24,365, `board_detect_temperature_C` 50,32, `pos_loop_pid_err` 0,01211,
+  `step_increment` 0, `param_peak_overcurrent_A` 0,012 (Byte 66–69, der Host entpackt für 0x14 70 B).
+
+**Ergebnis:** Längen (74/161 B), Zählbyte 0x0A, Format `<I8BfHfiiffffffffi` und Feldreihenfolge
+bestätigt; Payload `[02]` des Hosts wird von der FW ignoriert (FW-Befund), der Nachbau sendet sie
+trotzdem byte-gleich. Feldname des 0x14-Zusatzfloats = `param_peak_overcurrent_A` (vorher `extra_f`).
+Offen: Union-Inhalte bei err_code ≠ 0, Bedeutung von `param_peak_overcurrent_A` (0,012 trotz err_code 0).
+Einarbeitung: PROTOKOLL-485.md §3.1 NACHTRAG (5), `nachbau/motor.py` (Selbsttest 7e mit Live-Frames).

@@ -46,9 +46,9 @@ ssh root@<drucker> 'tail -F /mnt/UDISK/printer_data/logs/klippy.log' | python3 n
 Echte Hardware braucht `pyserial`; der Import erfolgt erst bei Benutzung
 (`Serial485(port, baud)`), die Tests laufen ohne.
 
-Stand der Selbsttests (16.10.2026 nach dem Motor-FW-Befund, `ok`-Zeilen, 0 FAIL):
+Stand der Selbsttests (16.10.2026 nach der Live-Prüfung 0x13–0x16, `ok`-Zeilen, 0 FAIL):
 `serial485` 93/93 (inkl. ref-hi: 16 CRC-Vektoren + 12 Nachrichten), `box` 179,
-`boxmini` 17, `cfsseq` 28, `motor` 202, `motor_mini` 64, `auto_addr` 33,
+`boxmini` 17, `cfsseq` 28, `motor` 208, `motor_mini` 64, `auto_addr` 33,
 `cfswatch --selftest` OK.
 
 > **WARNUNG – Creality-Host-Bug:** `MOTOR_GET … DATA=0` und `MOTOR_GET … DATA=13` lassen
@@ -91,9 +91,11 @@ Motor-FW-Befund 16.10.2026 (statische Analyse der Motor-Firmware selbst, Details
 - **0x0C [0b]:** Byte 0–3 Fehler, Byte 4–7 Warnung, je u32 Little-Endian → `check_protection()`
   liefert jetzt Fehler-/Warnbits im Klartext. Sub-Codes 01–05/07/09 (zustandsändernd bzw.
   Seiteneffekt Notfall-Pin) nur als Konstanten.
-- **0x13–0x16** lesend ohne Request-Payload: Fehler-/Stall-Snapshot (74 B) und Probenringe
-  (`0A` + 10 × 4 float) → `read_err_detail()`, `read_stall_detail()`, `read_pos_samples()`,
-  `read_spd_samples()` – FW-statisch belegt, **live noch nicht geprüft**.
+- **0x13–0x16** lesend: Fehler-/Stall-Snapshot (74 B) und Probenringe (`0A` + 10 × 4 float) →
+  `read_err_detail()`, `read_stall_detail()`, `read_pos_samples()`, `read_spd_samples()` –
+  FW-statisch belegt und **live bestätigt 16.10.2026** (Motor X, über die Klipper-Webhook-Endpunkte
+  `motor_err_detail_data`/`motor_cut_detail_data`; Request `81 04 00 1x 02`, Host-Dekodierung =
+  Nachbau; 0x14-Zusatzfloat `param_peak_overcurrent_A`; Details `PROTOKOLL-485.md` §3.1 „NACHTRAG (5)“).
 
 REA-Motor-Befund 16.10.2026 (statische Analyse `motor_control_wrapper.so`, Details:
 `REA-MOTOR-BEFUND-2026-10-16.md`, `PROTOKOLL-485.md` §3.1 „NACHTRAG (2)“):
@@ -182,7 +184,7 @@ RS485 protocol between the Creality K2 Plus host board and its lower boards
 by live captures and Ghidra analysis. License: GPL-3.0-or-later.
 
 Status 16.10.2026: all self-tests green (serial485 93/93 incl. Hi reference
-vectors, box 179, boxmini 17, cfsseq 28, motor 202, motor_mini 64, auto_addr 33,
+vectors, box 179, boxmini 17, cfsseq 28, motor 208, motor_mini 64, auto_addr 33,
 `cfswatch.py --selftest` OK).
 
 Motor firmware found and analysed statically (16.10.2026, `MOTOR-FW-BEFUND-2026-10-16.md`,
@@ -198,7 +200,9 @@ Ia/−Ib [A], 11 step-pulse counter, 12 DIR input level, 13 EN (assumed), 14 sta
 (bytes 0–3) and warning code (bytes 4–7), each u32 little-endian; `check_protection()` now
 decodes them. `0x13`–`0x16` are read-only without request payload (74-byte error/stall
 snapshots, 10-sample position/speed rings) → `read_err_detail()`, `read_stall_detail()`,
-`read_pos_samples()`, `read_spd_samples()` – statically derived, **not yet verified live**.
+`read_pos_samples()`, `read_spd_samples()` – statically derived and **verified live on
+16.10.2026** (motor X via the Klipper webhook endpoints `motor_err_detail_data` /
+`motor_cut_detail_data`; request `81 04 00 1x 02`, host JSON matches the decoder).
 `read_variable()` stays limited to 1..12 (host crash); idx 0/13..18 only via
 `read_variable_raw_fw(idx, confirm=True)`.
 

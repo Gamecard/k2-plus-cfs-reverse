@@ -127,9 +127,27 @@ Parameter `num`(2), `code`(0), `dev_uuid`(0)).
 | 0x15 pos_data | Ringpuffer mit **10 Proben à 16 B**, älteste zuerst. Kopf `obj+0x88c` (gemeinsam mit 0x16). Geschrieben von @0xb91c (registriert @0xf22e) nur bei `ctrl+4 == 1`. **Kein Start, kein Löschen.** | `0A` + 10 × `<ffff` = 161 B | Felder (Host): **fdb_pos, leso_pos, target_pos, leso_err** = FW obj+0xf0, ctrl+0xbc, ctrl+0x50, ctrl+0x4a0 |
 | 0x16 spd_data | wie 0x15, eigener Ring 0x92e | `0A` + 10 × `<ffff` | **fdb_spd, leso_spd, target_spd, leso_in_u** = obj+0x100, ctrl+0xc0, ctrl+0x54, ctrl+0x4bc |
 
-Die Zuordnung „Hostname-Reihenfolge = FW-Byte-Reihenfolge“ ist vermutet; sie setzt eine zip/unpack-Reihenfolge voraus.
+~~Die Zuordnung „Hostname-Reihenfolge = FW-Byte-Reihenfolge“ ist vermutet; sie setzt eine zip/unpack-Reihenfolge voraus.~~
+(live bestätigt, s. Nachtrag unten.)
 Die Namen selbst sind belegt (Strings @0x38290-Block).
 Snapshot-Inhalte bleiben bis zum nächsten Ereignis erhalten. `protection [05]` setzt sie nicht zurück.
+
+### Live-Nachtrag 16.10.2026 (17:26 Log-Uhr): 0x13–0x16 LIVE BESTÄTIGT
+Motor X `0x81`, Stillstand nach `M84`, Klipper durchgehend `ready`; aufgerufen über die Webhook-Endpunkte
+`motor_err_detail_data` (Bus: 0x13 → 0x15 → 0x16) und `motor_cut_detail_data` (0x14 → MOTOR_GET idx 5–8) mit
+`{"num": 1}` – genau die oben statisch gefundene Host-Kette. `motor_param_modifi_data` (vermutlich schreibend) wurde
+nicht angefasst. Details/Rohdaten ohne UUID: `LIVE-ABFRAGEN-2026-10-16.md` „0x13–0x16 live“, PROTOKOLL-485.md §3.1
+NACHTRAG (5).
+- **Payload:** Der Host sendet `81 04 00 1x 02` (Payload `[02]`); die Antworten passen zur Aussage „FW liest keine Payload“.
+- **Längen:** 0x13/0x14 len `0x4d` → 74 B, 0x15/0x16 len `0xa4` → 161 B (Zählbyte `0x0A`), STATUS 00 – wie statisch.
+- **Format/Reihenfolge:** Host-JSON = Dekodierung mit `<I8BfHfiiffffffffi` (+`f` für 0x14) in der Host-Feldreihenfolge.
+  0x14 live z. B. `encoder_fdb` 4421, `board_detect_power_supply_V` 24,365, `board_detect_temperature_C` 50,32,
+  `pos_loop_pid_err` 0,01211; das 70-B-Zusatzfloat heißt im Host **`param_peak_overcurrent_A`** (live 0,012).
+- **0x13 ohne Fehler seit Boot:** err_code 0, Messfelder 0, nur uuid/elec_offset (123,58)/phase_order (0)/
+  elec_offset_err (3,867°) gefüllt → bestätigt „Handler kopiert nur statische Felder nach“.
+- **0x15:** Feld 3 `target_pos` (2,159847) und Feld 4 `leso_err` (0) eindeutig; Feld 1/2 im Stillstand identisch.
+  **0x16:** alle ≈ 0, Reihenfolge nur konsistent.
+- Offen bleibt: Union-Inhalte bei err_code ≠ 0; Bedeutung von `param_peak_overcurrent_A` (0,012 bei err_code 0).
 
 ## 3. MOTOR_GET (Cmd 0x08): FW-Tabelle — BELEGT (Sprungtabelle @0x1bce4, 19 Einträge, idx 0..18)
 `ctrl = obj->[4]` (Regler), `drv = obj->[8]` (Treiberplatine). Die Regler-Update-Routine @0x82b6–0x83fe schreibt

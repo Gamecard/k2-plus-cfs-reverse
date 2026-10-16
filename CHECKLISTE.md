@@ -212,7 +212,8 @@ motor 98 · motor_mini 30 · auto_addr 31 – alle grün.
 - [x] **NEU 16.10.2026 (REA):** Detail-/Sample-Kommandos 0x13–0x16 und 0x0C-Byte-Layout –
   **ERLEDIGT (statisch) 16.10.2026, Motor-FW-Befund:** 0x13–0x16 lesend **ohne** Request-Payload
   (0x13/0x14 je 74 B Snapshot Fehler/Stall, 0x15/0x16 `0A` + 10 × `<ffff`); Nachbau
-  `read_err_detail`/`read_stall_detail`/`read_pos_samples`/`read_spd_samples` (live NICHT geprüft).
+  `read_err_detail`/`read_stall_detail`/`read_pos_samples`/`read_spd_samples` ~~(live NICHT geprüft)~~
+  – **LIVE ERLEDIGT 16.10.2026** (s. Punkt „0x13–0x16 live“ unten).
   0x0C [0b]: Byte 0–3 Fehler u32 LE (key781+n), Byte 4–7 Warnung u32 LE (key795+n) →
   `decode_protection`, `check_protection()` dekodiert
 - [x] **Motor-FW-Befund 16.10.2026** (`MOTOR-FW-BEFUND-2026-10-16.md`, PROTOKOLL-485.md §3.1
@@ -223,8 +224,17 @@ motor 98 · motor_mini 30 · auto_addr 31 – alle grün.
   0x13–0x16 statisch; Nachbau `VARIABLE_TABLE` (idx 0..18, Einheiten, Belegstatus),
   `read_reference_values`, `read_phase_currents`, `read_dir_input`, `read_variable_raw_fw`
   (idx 0..18, nur `confirm=True`), cfswatch zeigt Namen/Einheiten, 0x0C-Bits und Motor-STATUS
-- [ ] **Offen aus dem Motor-FW-Befund:** idx 15/16 (obj->[0xc]+0x24/+0x2c); 0x13–0x16 live
-  gegenprüfen (Längen 74/161 B, Feldreihenfolge der Proben vermutet); Setzer von Fehlerbit 4
+- [x] **0x13–0x16 live (16.10.2026 17:26 Log-Uhr, Motor X 0x81, Stillstand nach M84,
+  `LIVE-ABFRAGEN-2026-10-16.md` „0x13–0x16 live“, PROTOKOLL-485.md §3.1 NACHTRAG (5)):** über die
+  Klipper-Webhooks `motor_err_detail_data` (0x13 → 0x15 → 0x16) und `motor_cut_detail_data` (0x14 →
+  MOTOR_GET idx 5–8), `{"num": 1}`. Requests `81 04 00 1x 02` (Host-Payload `[02]`, FW ignoriert),
+  Antworten STATUS 00, 74 B bzw. 161 B (Zählbyte 0x0A); Feldreihenfolge/Format = Host-JSON bestätigt,
+  0x14-Zusatzfloat = `param_peak_overcurrent_A`. Nachbau: Payload `[02]`, Feldname angeglichen,
+  Selbsttest 7e mit Live-Frames (UUID-Platzhalter, CRC neu). `motor_param_modifi_data` (vermutl.
+  schreibend) NICHT angefasst. Rest offen: Union-Inhalte bei err_code ≠ 0, Bedeutung
+  `param_peak_overcurrent_A` (live 0,012), Host-Timeout.
+- [ ] **Offen aus dem Motor-FW-Befund:** idx 15/16 (obj->[0xc]+0x24/+0x2c); ~~0x13–0x16 live
+  gegenprüfen (Längen 74/161 B, Feldreihenfolge der Proben vermutet)~~ (erledigt 16.10., s. oben); Setzer von Fehlerbit 4
   (HW-Überstrom) und Warnbit 0 (Kommunikation) nicht lokalisiert (Fehlerbit 11 ohne Beleg);
   Gain·R der Strommessung (1 Ω vermutet → Flash-Parameter `driver_board_amp_gain` /
   `driver_board_R_of_current_sample_ohm` lesen); idx 13 (EN) live gegenprüfen

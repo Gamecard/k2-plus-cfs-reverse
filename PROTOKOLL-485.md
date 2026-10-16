@@ -1068,28 +1068,99 @@ die FW nach der Antwort den Notfall-/Stall-Pin frei (quittiert die Leitung, Code
 `err_code`, `warning_code`, `errors`, `warnings`, `ok`, `raw`), `check_protection_raw()` → 8 B;
 `check_protection_code` = Alias (Host-Parser @0xd6cbc identisch).
 
-**0x13–0x16 – LESEND, ohne Request-Payload** (FW liest Payload-Byte 0 nicht; Host stellt sie als
-Webhook-Endpoints bereit, kein G-Code). **FW-statisch belegt, live NICHT geprüft.**
+**0x13–0x16 – LESEND, ~~ohne Request-Payload~~ Payload egal** (FW liest Payload-Byte 0 nicht; der Host
+sendet `[02]`, live 16.10.; Host stellt sie als Webhook-Endpoints bereit, kein G-Code). ~~FW-statisch
+belegt, live NICHT geprüft.~~ **FW-statisch belegt UND LIVE bestätigt 16.10.2026** (→ NACHTRAG (5)).
 
 | Cmd | FW-Name | Antwort | Inhalt | Nachbau |
 |---|---|---|---|---|
 | 0x13 | err_detail_data | 74 B = `<I8BfHfiiffffffffi` (66 B) + 8 B Union | Snapshot zum **letzten Fehlerereignis**: err_code (= 1<<n), dev_uuid, elec_offset, phase_order_invert, elec_offset_err_deg, encoder_fdb, encoder_fdb_last, pos_fdb_encoder, spd_fdb_encoder, spd_fdb_ctrl, id, iq, V, °C, pos_loop_pid_err, step_increment; Union je Fehlertyp (`ERR_CODE_TO_UNION`) | `read_err_detail()` |
-| 0x14 | cut_detail_data | 74 B, gleiches Layout | Snapshot beim **Stall-Ereignis** (Messpunkt von MOTOR_CHECK_CUT_POS); Host entpackt 70 B (+1 `f`, Name unbelegt → `extra_f`) | `read_stall_detail()` |
+| 0x14 | cut_detail_data | 74 B, gleiches Layout | Snapshot beim **Stall-Ereignis** (Messpunkt von MOTOR_CHECK_CUT_POS); Host entpackt 70 B (+1 `f`, ~~Name unbelegt → `extra_f`~~ Host-Name live: `param_peak_overcurrent_A`) | `read_stall_detail()` |
 | 0x15 | pos_data | `0A` + 10 × `<ffff` = 161 B | Ring, älteste zuerst: fdb_pos, leso_pos, target_pos, leso_err | `read_pos_samples()` |
 | 0x16 | spd_data | `0A` + 10 × `<ffff` = 161 B | eigener Ring: fdb_spd, leso_spd, target_spd, leso_in_u | `read_spd_samples()` |
 
 Snapshots bleiben bis zum nächsten Ereignis (auch über `protection [05]`); die Ringe werden nur bei
 ctrl+4 == 1 geschrieben, kein Start/Löschen. Feldnamen = Host-Strings; „Namensreihenfolge =
-Byte-Reihenfolge“ ist **vermutet**. Nachbau: Längen- und Zählbyte-Prüfung (`ValueError`), `retries=0`,
-Timeout 1 s (**unbelegt**), Rückgabe inkl. `status` (decode_motor_status, über `transact_full`);
-Host-Namen `err_detail_data`/`cut_detail_data`/`pos_data_sample`/`spd_data_sample` sind Aliase.
-Selbsttests nur mit synthetischen Frames (Platzhalter-UUID).
+Byte-Reihenfolge“ ist ~~**vermutet**~~ live = Host-Dekodierung (NACHTRAG (5)). Nachbau: Längen- und
+Zählbyte-Prüfung (`ValueError`), `retries=0`, Timeout 1 s (Host-Timeout **unbelegt**), Rückgabe inkl.
+`status` (decode_motor_status, über `transact_full`); Host-Namen `err_detail_data`/`cut_detail_data`/
+`pos_data_sample`/`spd_data_sample` sind Aliase. ~~Selbsttests nur mit synthetischen Frames
+(Platzhalter-UUID).~~ Selbsttests seit 16.10. mit den Live-Frames (UUID-Platzhalter, CRC neu) +
+synthetischen Frames für die Union-Dekodierung (live nur err_code 0).
 
 **Einstufung:** lesend/sicher = 0x08 (alle idx), 0x13–0x16, 0x0C 06/08/0A; 0x0C 07/09/0B lesend mit
 Seiteneffekt (nur stall_mode 2); zustandsändernd = 0x0C 01–05 und 0x11.
 
-**Noch offen:** idx 15/16; 0x13–0x16 live gegenprüfen; Setzer von Fehlerbit 4 (HW-Überstrom) und
-Warnbit 0 (Kommunikation); Gain·R (Stromskala); Fehlerbit 11 ohne FW-Beleg.
+**Noch offen:** idx 15/16; ~~0x13–0x16 live gegenprüfen~~ (erledigt 16.10., NACHTRAG (5)); Setzer von
+Fehlerbit 4 (HW-Überstrom) und Warnbit 0 (Kommunikation); Gain·R (Stromskala); Fehlerbit 11 ohne
+FW-Beleg; Union-Inhalte bei err_code ≠ 0 (live nur 0); Bedeutung `param_peak_overcurrent_A` (live 0,012).
+
+#### NACHTRAG 16.10.2026 (5): 0x13–0x16 LIVE BESTÄTIGT (Motor X, Klipper-Webhooks)
+
+Quelle: `LIVE-ABFRAGEN-2026-10-16.md` Abschnitt „0x13–0x16 live“ (klippy.log-Auszug 16.10. 17:26:57–58
+Log-Uhr = UTC+8; Rohframes nur lokal, da mit echter Motor-UUID). Motor X `0x81`, Stillstand nach `M84`,
+Klipper durchgehend `ready`, kein Druck.
+
+**Weg (kein G-Code):** Die Kommandos sind nur als **Klipper-Webhook-Endpunkte** erreichbar (Unix-Socket
+von Klipper, z. B. `/tmp/klippy_uds`, JSON-Request `{"id": …, "method": "<endpunkt>", "params": {"num": 1}}`;
+Liste per `list_endpoints`):
+
+| Endpunkt | gesendete Frames (in dieser Reihenfolge) | Rückgabe |
+|---|---|---|
+| `motor_err_detail_data` | `0x13`, danach `0x15` und `0x16` | JSON: err_detail + pos_data_sample + spd_data_sample |
+| `motor_cut_detail_data` | `0x14`, danach `MOTOR_GET` idx 5–8 (0x08 = pos/spd/id/iq_fdb) | JSON: cut_detail-Felder (s. Tabelle) |
+| `motor_dev_uuid` | (0x12, hier nicht benutzt) | – |
+| `motor_param_modifi_data` | **vermutlich schreibend – NICHT angefasst** | – |
+
+`num` = Motor-NUM (1 = X → `0x81`, Host-Tabelle `MOTOR_ADDR_BY_NUM`).
+
+**Requests:** `81 04 00 13 02`, `81 04 00 14 02`, `81 04 00 15 02`, `81 04 00 16 02` – der Host hängt
+`[02]` an (die FW ignoriert die Payload; Nachbau sendet trotzdem byte-gleich `DETAIL_REQUEST_PAYLOAD`).
+Je Request genau eine Antwort (kein Retry im Auszug); Antwortzeit laut Log-Stempeln 0,014–0,174 s
+(inkl. Logging; Host-Timeout unbelegt).
+
+**Antworten:** STATUS `00` (kein Stall/Fehler/Warnung latched). 0x13/0x14: len `0x4d` → **74 B** Daten;
+0x15/0x16: len `0xa4` → **161 B** (Zählbyte `0x0A` + 10 × 16 B `<ffff`). Geräte-CRC (CRC-8/ATM) stimmt.
+
+**Feldtabelle 0x13/0x14** (74 B, `ERR_DETAIL_FORMAT = "<I8BfHfiiffffffffi"` + 8 B Union; Feldnamen = Host-
+JSON-Schlüssel, Werte live, Dekodierung des Nachbaus = Host-JSON):
+
+| Byte | Format | Host-Name | 0x13 live | 0x14 live |
+|---|---|---|---|---|
+| 0–3 | `<I` | `err_code` | 0 | 0 |
+| 4–11 | 8 × `B` | `dev_uuid` | `cd ab …` (UUID, nicht dokumentiert) | gleich |
+| 12–15 | `<f` | `elec_offset` | 123,58 | 123,58 |
+| 16–17 | `<H` | `phase_order_invert` | 0 | 0 |
+| 18–21 | `<f` | `elec_offset_err_deg` | 3,867 | 3,867 |
+| 22–25 | `<i` | `encoder_fdb` | 0 | 4421 |
+| 26–29 | `<i` | `encoder_fdb_last` | 0 | 4421 |
+| 30–33 | `<f` | `pos_fdb_encoder` | 0 | 0,8477 |
+| 34–37 | `<f` | `spd_fdb_encoder` | 0 | 1,0957 |
+| 38–41 | `<f` | `spd_fdb_ctrl` | 0 | 1,5318 |
+| 42–45 | `<f` | `id` | 0 | 0,00887 |
+| 46–49 | `<f` | `iq` | 0 | 0,5157 |
+| 50–53 | `<f` | `board_detect_power_supply_V` | 0 | 24,365 |
+| 54–57 | `<f` | `board_detect_temperature_C` | 0 | 50,32 |
+| 58–61 | `<f` | `pos_loop_pid_err` | 0 | 0,01211 |
+| 62–65 | `<i` | `step_increment` | 0 | 0 |
+| 66–69 | `<f` (nur 0x14, Host 70 B) | `param_peak_overcurrent_A` | – (Host entpackt 66 B) | 0,012 |
+| 66–73 | Union (je err_code) | – | 8 × 00 | `a6 9b 44 3c` + 4 × 00 |
+
+Lesart: 0x13 = kein Fehlerereignis seit Boot → nur die statischen Felder (UUID, elec_offset,
+phase_order_invert, elec_offset_err_deg) sind gefüllt (deckt sich mit „Handler kopiert statische Felder
+nach“, NACHTRAG (4)). 0x14 = Snapshot des letzten Stall-Ereignisses (vermutlich Homing davor) mit
+plausiblen Bordwerten (24,4 V, 50 °C). `param_peak_overcurrent_A` = 0,012 trotz err_code 0 – Host-Name
+übernommen, Bedeutung/Einheit offen (für einen Spitzenstrom-Grenzwert unplausibel klein).
+
+**0x15/0x16** (10 Proben, Stillstand → alle 10 gleich): pos `fdb_pos` 2,15985 / `leso_pos` 2,15985 /
+`target_pos` 2,159847 / `leso_err` 0 (Feld 3 und 4 damit eindeutig zugeordnet, Feld 1/2 identisch);
+spd `fdb_spd` 0 / `leso_spd` −0,00117 / `target_spd` −0,00136 / `leso_in_u` −0,00163 (Host: „≈ 0“; Reihen-
+folge konsistent, aber nicht unterscheidbar).
+
+**Nachbau:** `motor.py` sendet `[02]` (`DETAIL_REQUEST_PAYLOAD`), `CUT_DETAIL_EXTRA_FIELD =
+"param_peak_overcurrent_A"` (vorher `extra_f`), Docstrings „LIVE bestätigt 16.10.“, Selbsttest 7e mit den
+Live-Frames (UUID-Bytes 3–8 → `00`, CRC neu berechnet: 0x13 `a2`, 0x14 `c0`; 0x15/0x16 Original-CRC `6f`/`1e`)
+gegen alle Host-JSON-Werte. motor 208 ok.
 
 ## 4. Update-Werkzeuge
 
