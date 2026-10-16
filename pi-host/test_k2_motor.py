@@ -84,6 +84,9 @@ class FakeRs485Bus:
         self.calls = []  # [(addr, fun, tuple(data), kwargs)]
         self.broadcast_seen = 0
         self.round = 0
+        self.modes = {}  # addr -> Stall-Mode (0x11), Default 2 wie nach Boot
+        self.prot = {}  # addr -> 8 B Antwort auf 0C [0b] (Default 8x00)
+        self.bad_echo = set()  # addr -> 0x11 antwortet mit falschem Echo
         self.types = {10: "int16_t", 12: "uint16_t", 66: "uint16_t",
                       67: "uint16_t", 94: "uint16_t", 110: "uint16_t",
                       122: "uint16_t", 128: "uint16_t", 141: "uint16_t",
@@ -114,10 +117,19 @@ class FakeRs485Bus:
             import k2_transport as _T
             raw = _T.build_frame(addr, fun, [addr])
             return addr, 0x00, fun, bytes([addr]), raw
+        if fun == K.FUNC_SET_MODE and payload == [K.SUB_STALL_GET]:
+            # live: 81 04 00 11 04 -> f7 81 05 00 11 02 00 0e ([mode, 00])
+            raw = bytes([self.modes.get(addr, 2), 0])
+            return addr, 0x00, fun, raw, T.build_frame(addr, fun, raw)
         if fun == K.FUNC_SET_MODE:
+            if len(payload) == 1:
+                self.modes[addr] = payload[0]
+            if addr in self.bad_echo:
+                return addr, 0x00, fun, b"\x07", T.build_frame(addr, fun, [7])
             return addr, 0x00, fun, bytes(payload), T.build_frame(addr, fun, payload)
         if fun == K.FUNC_PROTECTION and payload == [K.SUB_PROT_CHECK]:
-            return addr, 0x00, fun, bytes(8), T.build_frame(addr, fun, bytes(8))
+            raw = self.prot.get(addr, bytes(8))
+            return addr, 0x00, fun, raw, T.build_frame(addr, fun, raw)
         if fun == K.FUNC_PROTECTION and payload == [K.SUB_PROT_CLEAR]:
             raise TimeoutError("0C 05 nie beantwortet (live ebenso)")
         if fun == K.FUNC_SYS_PARAM and payload[0] == K.SUB_SYS_READ:
@@ -522,6 +534,7 @@ class FakePrinter:
         if bus is not None:
             self.objects["k2_485"] = bus
         self._connect_handlers = []
+        self.events = {}
         self.loaded = []
 
     def lookup_object(self, name, default=RuntimeError):
@@ -542,6 +555,11 @@ class FakePrinter:
     def register_event_handler(self, ev, cb):
         if ev == "klippy:connect":
             self._connect_handlers.append(cb)
+        self.events.setdefault(ev, []).append(cb)
+
+    def send_event(self, ev, *args):
+        for cb in list(self.events.get(ev, [])):
+            cb(*args)
 
     def fire_connect(self):
         # Config-Callbacks laufen NOCH vor connect (add_config_cmd erlaubt).
@@ -920,7 +938,18 @@ class FakeKGcmd:
         self.infos = []
 
     def get_int(self, name, default=None, **kw):
-        return int(self.params.get(name, default))
+        v = self.params.get(name, default)
+        return None if v is None else int(v)
+
+    def get_float(self, name, default=None, **kw):
+        v = self.params.get(name, default)
+        return None if v is None else float(v)
+
+    def get(self, name, default=None):
+        v = self.params.get(name, default)
+        if v is None:
+            raise FakeCmdError("Error on '%s': missing %s" % ("CMD", name))
+        return str(v)
 
     def respond_info(self, msg):
         self.infos.append(str(msg))
@@ -966,8 +995,10 @@ def test_huelle_upstream():
     bus = FakeRs485Bus(gpio=FakeGpio())
     printer = FakePrinter(bus=bus)
     obj = K.load_config(FakeKConfig(printer, _huelle_opts(), sections=("k2_485",)))
-    assert sorted(printer.gcode.commands) == ["KTWO_MOTOR_INIT", "KTWO_MOTOR_STATUS"], \
-        printer.gcode.commands
+    assert sorted(printer.gcode.commands) == [
+        "KTWO_MOTOR_HOMING", "KTWO_MOTOR_INIT", "KTWO_MOTOR_PROTECTION",
+        "KTWO_MOTOR_STALL_MODE", "KTWO_MOTOR_STATUS", "KTWO_MOTOR_SYS_PARAM"], \
+        sorted(printer.gcode.commands)
     assert all(upstream_gcode_name_ok(c) for c in printer.gcode.commands)
     assert not upstream_gcode_name_ok("K2_MOTOR_INIT"), "Regel-Nachbau defekt"
     assert obj.nozzle_mcu is printer.nozzle_mcu, "nozzle_mcu -> 'mcu nozzle_mcu'"
@@ -1019,6 +1050,258 @@ def test_huelle_ohne_bus():
 
 
 # =====================================================================
+# Sensorless-Homing X/Y (KTWO_MOTOR_HOMING / _STALL_MODE / _SYS_PARAM)
+# =====================================================================
+
+# Live-Belege live-logs-2026-10-16/klippy.log, G28 X Y 14:06:21–14:06:31
+# (Requests ohne Kopf/CRC wie "retries = 0, cmd = …", Antworten als Vollframe)
+LIVE_HOMING_BEGIN = [            # Zeilen 369155 / 369163 / 369172
+    "81 04 00 11 01", "82 04 00 11 01", "81 09 00 06 01 46 00 00 96 43"]
+LIVE_HOMING_END_RS485 = [        # Zeilen 369268 / 369281 / 369289–369310 / 369319
+    "81 04 00 11 02", "82 04 00 11 02",
+    "81 04 00 0c 0b", "82 04 00 0c 0b", "83 04 00 0c 0b", "84 04 00 0c 0b",
+    "81 09 00 06 01 46 00 00 c8 42"]
+LIVE_HOMING_END_E = "f7 81 04 00 0c 0b 95"   # transparent an E (Zeile 369316)
+LIVE_ECHOS = [  # (addr, fun, payload, Live-Vollframe)
+    (0x81, 0x11, [0x01], "f7 81 04 00 11 01 1d"),       # 369157
+    (0x82, 0x11, [0x01], "f7 82 04 00 11 01 1d"),       # 369165
+    (0x81, 0x06, [0x00, 0x00, 0x96, 0x43], "f7 81 07 00 06 00 00 96 43 09"),  # 369174
+    (0x81, 0x11, [0x02], "f7 81 04 00 11 02 14"),       # 369270
+    (0x81, 0x0C, [0] * 8, "f7 81 0b 00 0c 00 00 00 00 00 00 00 00 fb"),  # 369291
+    (0x81, 0x06, [0x00, 0x00, 0xc8, 0x42], "f7 81 07 00 06 00 00 c8 42 d4"),  # 369321
+    (0x81, 0x11, [0x02, 0x00], "f7 81 05 00 11 02 00 0e"),  # 0x11 [04]-Antwort (klippy.log.2026-10-12:31419)
+]
+
+
+def _wire(addr, fun, data):
+    """Request wie im Stock-Log (addr len 00 fun data, ohne F7/CRC)."""
+    d = list(data)
+    return " ".join("%02x" % b for b in [addr, len(d) + 3, 0x00, fun] + d)
+
+
+def _homing_opts(allow=True):
+    opts = test_options()
+    opts["allow_write"] = "True" if allow else "False"
+    return opts
+
+
+def test_homing_frames_live():
+    """PHASE=BEGIN/END senden exakt die Stock-Frames (Reihenfolge + Bytes)."""
+    for addr, fun, payload, live in LIVE_ECHOS:
+        assert T.build_frame(addr, fun, payload).hex(" ") == live, (live, T.build_frame(addr, fun, payload).hex(" "))
+    cfg, gpio, bus, mcu, rs485, transp, ctl, events = build_system(opts=_homing_opts())
+    log = ctl.homing_begin()
+    got = [_wire(a, f, d) for a, f, d, _k in bus.calls]
+    assert got == LIVE_HOMING_BEGIN, got
+    assert ctl.homing_active and ctl.stall_mode["x"] == 1 and ctl.stall_mode["y"] == 1
+    assert log[0] == "stall mode change motor81: send:01 recv:01", log
+    assert all(k["retries"] == 0 for _a, _f, _d, k in bus.calls), "Stock: retries=0"
+    assert bus.values[(0x81, 70)] == 300.0
+    n0 = len(bus.calls)
+    log2, errors = ctl.homing_end()
+    assert errors == [], errors
+    got = [_wire(a, f, d) for a, f, d, _k in bus.calls[n0:]]
+    assert got == LIVE_HOMING_END_RS485, got
+    assert [w.hex(" ") for w in mcu.writes] == [LIVE_HOMING_END_E], mcu.writes
+    assert not ctl.homing_active and ctl.stall_mode["x"] == 2 and ctl.stall_mode["y"] == 2
+    assert bus.values[(0x81, 70)] == 100.0
+    # kein 06 [03], kein Frame an 0x85, nichts an Z/Z1 außer 0C [0b]
+    allf = [(a, f, tuple(d)) for a, f, d, _k in bus.calls]
+    assert (0x81, 0x06, (3,)) not in allf and all(a != 0x85 for a, _f, _d in allf)
+    assert not any(a in (0x83, 0x84) and f == 0x11 for a, f, _d in allf)
+    return "BEGIN 3 + END 7 RS485 + 1 transparent Frame = Live 14:06:21/31 (Echo-CRCs ok)"
+
+
+def test_homing_kp_config():
+    """Restore-Kp aus x_controller_pos_loop_pid_param_kp, homing_pos_kp-Option."""
+    opts = _homing_opts()
+    opts["x_controller_pos_loop_pid_param_kp"] = "120"
+    opts["homing_pos_kp"] = "250"
+    cfg, gpio, bus, mcu, rs485, transp, ctl, events = build_system(opts=opts)
+    ctl.homing_begin()
+    assert bus.values[(0x81, 70)] == 250.0
+    ctl.homing_end()
+    assert bus.values[(0x81, 70)] == 120.0
+    assert K.parse_options(test_options())["homing_pos_kp"] == 300.0
+    for bad in ("0", "-5", "abc", "1e9", "nan"):
+        o = test_options()
+        o["homing_pos_kp"] = bad
+        try:
+            K.parse_options(o)
+        except ValueError:
+            continue
+        raise AssertionError("homing_pos_kp=%s akzeptiert" % bad)
+    return "Kp 250 beim Homing, 120 (Config) danach; Default 300; 5 ungültige Werte abgelehnt"
+
+
+def test_homing_sperren():
+    """allow_write=False / unzulässige Werte: K2MotorError OHNE Bus-Zugriff."""
+    cfg, gpio, bus, mcu, rs485, transp, ctl, events = build_system(opts=_homing_opts(False))
+    for fn in (ctl.homing_begin, ctl.homing_end,
+               lambda: ctl.set_stall_mode(["x", "y"], 1),
+               lambda: ctl.write_sys_param("x", 70, 300.0)):
+        try:
+            fn()
+        except K.K2MotorError as exc:
+            assert "allow_write=False" in str(exc), exc
+        else:
+            raise AssertionError("ohne allow_write kein Fehler")
+    assert bus.calls == [] and mcu.writes == [], "Bus-Zugriff trotz Sperre"
+    cfg, gpio, bus, mcu, rs485, transp, ctl, events = build_system(opts=_homing_opts())
+    bad = [lambda: ctl.set_stall_mode(["z"], 1),       # Z/Z1 nur Init
+           lambda: ctl.set_stall_mode(["e"], 2),
+           lambda: ctl.set_stall_mode(["x"], 3),       # 03 = Cut-Check, nicht freigegeben
+           lambda: ctl.set_stall_mode(["x"], 4),
+           lambda: ctl.set_stall_mode(["x"], True),
+           lambda: ctl.write_sys_param("x", 9, 1.0),   # Kalibrierwert
+           lambda: ctl.write_sys_param("x", 226, 1.0),  # Host-ID
+           lambda: ctl.write_sys_param("x", 70, float("inf")),
+           lambda: ctl.write_sys_param("x", 70, 1e39),
+           lambda: ctl.write_sys_param("x", 70, 1e-50),
+           lambda: ctl.write_sys_param("e", 70, 100.0),
+           lambda: ctl.read_sys_param("x", 226),
+           lambda: ctl.get_stall_mode("e")]
+    for fn in bad:
+        try:
+            fn()
+        except K.K2MotorError:
+            continue
+        raise AssertionError("ungültiger Aufruf akzeptiert")
+    assert bus.calls == [] and mcu.writes == [], bus.calls
+    return "4 Schreibwege gesperrt ohne allow_write, %d ungültige Aufrufe ohne Frame" % len(bad)
+
+
+def test_homing_rueckbau():
+    """BEGIN-Fehler (Y tot) -> Rückbau X/Y auf 2, kein Kp-Write, homing_active False."""
+    cfg, gpio, bus, mcu, rs485, transp, ctl, events = build_system(opts=_homing_opts(), dead={0x82})
+    try:
+        ctl.homing_begin()
+    except K.K2MotorError as exc:
+        msg = str(exc)
+    else:
+        raise AssertionError("BEGIN ohne Fehler trotz totem Y")
+    got = [_wire(a, f, d) for a, f, d, _k in bus.calls]
+    assert got == ["81 04 00 11 01", "82 04 00 11 01", "81 04 00 11 02", "82 04 00 11 02"], got
+    assert "keine Bewegung" in msg and "Rückbau" in msg, msg
+    assert not ctl.homing_active and ctl.stall_mode["x"] == 2 and ctl.stall_mode["y"] is None
+    # Echo falsch bei X -> Fehler, Rückbau
+    cfg, gpio, bus, mcu, rs485, transp, ctl, events = build_system(opts=_homing_opts())
+    bus.bad_echo.add(0x81)
+    try:
+        ctl.homing_begin()
+    except K.K2MotorError as exc:
+        assert "Echo 07 statt 01" in str(exc), exc
+    else:
+        raise AssertionError("falsches Echo akzeptiert")
+    return "Y tot: %d Frames (01,01,02,02), Meldung '%s…'" % (len(got), msg[:60])
+
+
+def test_homing_end_fehler():
+    """END läuft komplett durch: Schutzbit an Z -> Fehler, Kp trotzdem zurück."""
+    cfg, gpio, bus, mcu, rs485, transp, ctl, events = build_system(opts=_homing_opts())
+    ctl.homing_begin()
+    bus.prot[0x83] = struct.pack("<II", 1 << 8, 0)  # key789 Schleppfehler
+    log, errors = ctl.homing_end()
+    assert len(errors) == 1 and "Schutz z" in errors[0] and "key789" in errors[0], errors
+    assert bus.values[(0x81, 70)] == 100.0
+    assert ctl.last_error == errors[0]
+    # Schutz-Timeout (E) nur Hinweis:
+    cfg, gpio, bus, mcu, rs485, transp, ctl, events = build_system(opts=_homing_opts())
+    ctl.homing_begin()
+    mcu_exchange = mcu.exchange
+    mcu.exchange = lambda w, t: b""
+    log, errors = ctl.homing_end()
+    mcu.exchange = mcu_exchange
+    assert errors == [] and any("Schutz e 0C [0b]: keine Antwort" in l for l in log), (log, errors)
+    return "Schutzbit key789 -> Fehler, Kp 100 trotzdem; E-Timeout nur Hinweis"
+
+
+class FakeBatchBus:
+    """Wie [k2_485] im Batch-Modus: jeder Zugriff RuntimeError."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def transact_full(self, *a, **kw):
+        self.calls += 1
+        raise RuntimeError("[k2_485] Batch-Modus: RS485-Port /dev/serial/by-id/x wird nicht geöffnet")
+
+
+def _huelle(allow=True, bus=None):
+    bus = bus if bus is not None else FakeRs485Bus(gpio=FakeGpio())
+    printer = FakePrinter(bus=bus)
+    opts = _huelle_opts()
+    opts["allow_write"] = "True" if allow else "False"
+    obj = K.load_config(FakeKConfig(printer, opts, sections=("k2_485",)))
+    printer.fire_connect()
+    return printer, obj, bus
+
+
+def _expect_cmd_error(fn, params, *needles):
+    g = FakeKGcmd(params)
+    try:
+        fn(g)
+    except FakeCmdError as exc:
+        for n in needles:
+            assert n in str(exc), (n, str(exc))
+        return str(exc), g
+    raise AssertionError("kein G-Code-Fehler: %s %r" % (fn.__name__, params))
+
+
+def test_huelle_homing():
+    """G-Codes: Sperre ohne allow_write, BEGIN/END, Lesen, Auto-Rückbau, Batch."""
+    # 1. allow_write=False: alle Schreib-G-Codes -> G-Code-Fehler, KEIN Frame
+    printer, obj, bus = _huelle(allow=False)
+    for fn, params in ((obj.cmd_homing, {"PHASE": "BEGIN"}), (obj.cmd_homing, {"PHASE": "END"}),
+                       (obj.cmd_stall_mode, {"DATA": 1}),
+                       (obj.cmd_sys_param, {"MOTOR": "x", "ID": 70, "VALUE": 300})):
+        _expect_cmd_error(fn, params, "allow_write=False", "nichts gesendet")
+    assert bus.calls == [], bus.calls
+    assert obj.get_status()["allow_write"] is False
+    # Lesen geht ohne allow_write:
+    g = FakeKGcmd({})
+    obj.cmd_stall_mode(g)
+    assert g.infos == ["[k2_motor] x: stall_mode=2", "[k2_motor] y: stall_mode=2"], g.infos
+    g = FakeKGcmd({"MOTOR": "x", "ID": 70})
+    obj.cmd_sys_param(g)
+    assert g.infos and "controller_pos_loop_pid_param_kp" in g.infos[0], g.infos
+    assert [_wire(a, f, d) for a, f, d, _k in bus.calls] == [
+        "81 04 00 11 04", "82 04 00 11 04", "81 05 00 06 02 46"]
+    # 2. allow_write=True: BEGIN/END über die Hülle
+    printer, obj, bus = _huelle(allow=True)
+    th = printer.toolhead
+    g = FakeKGcmd({"PHASE": "BEGIN"})
+    obj.cmd_homing(g)
+    assert th.wait_moves_calls == 1, "vor dem Moduswechsel Bewegungen abwarten"
+    st = obj.get_status()
+    assert st["homing_active"] and st["stall_mode"]["x"] == 1 and st["homing_pos_kp"] == 300.0, st
+    obj.cmd_homing(FakeKGcmd({"PHASE": "END"}))
+    assert not obj.get_status()["homing_active"]
+    _expect_cmd_error(obj.cmd_homing, {"PHASE": "MITTE"}, "BEGIN oder END")
+    _expect_cmd_error(obj.cmd_stall_mode, {"DATA": 3}, "DATA=3")
+    _expect_cmd_error(obj.cmd_stall_mode, {"DATA": 1, "MOTOR": "z"}, "MOTOR=z")
+    _expect_cmd_error(obj.cmd_sys_param, {"MOTOR": "x", "ID": 9, "VALUE": 1}, "nicht freigegeben")
+    # 3. Auto-Rückbau: BEGIN, dann G-Code-Fehler (z.B. G28 Y ohne Trigger)
+    n0 = len(bus.calls)
+    obj.cmd_homing(FakeKGcmd({"PHASE": "BEGIN"}))
+    n1 = len(bus.calls)
+    printer.send_event("gcode:command_error")
+    got = [_wire(a, f, d) for a, f, d, _k in bus.calls[n1:]]
+    assert got == ["81 04 00 11 02", "82 04 00 11 02", "81 09 00 06 01 46 00 00 c8 42"], got
+    assert any("Homing abgebrochen" in i for i in printer.gcode.infos), printer.gcode.infos
+    assert not obj.get_status()["homing_active"]
+    printer.send_event("gcode:command_error")  # zweiter Fehler: nichts mehr senden
+    assert len(bus.calls) == n1 + 3 and n1 - n0 == 3
+    # 4. Batch-Modus ohne Port: klare Meldung, kein Absturz, nichts aktiv
+    printer, obj, bus = _huelle(allow=True, bus=FakeBatchBus())
+    msg, _g = _expect_cmd_error(obj.cmd_homing, {"PHASE": "BEGIN"}, "Batch-Modus",
+                                "keine Bewegung", "Homing-Vorbereitung fehlgeschlagen")
+    assert not obj.get_status()["homing_active"] and bus.calls == 3, bus.calls  # 01 x + Rückbau x,y
+    _expect_cmd_error(obj.cmd_stall_mode, {}, "Batch-Modus")
+    return "Sperre/Lesen/BEGIN-END/Auto-Rückbau/Batch ok (%s…)" % msg[:50]
+
+
+# =====================================================================
 # Runner
 # =====================================================================
 
@@ -1034,6 +1317,12 @@ TESTS = [
     ("REVIEW 3: query + Fallback", test_review_query),
     ("Hülle Upstream (Namen/pins/MCU/cb/max_duration/k2_485)", test_huelle_upstream),
     ("Hülle ohne [k2_485] -> klare Meldung", test_huelle_ohne_bus),
+    ("Homing: Frames = Live-Log (BEGIN/END)", test_homing_frames_live),
+    ("Homing: Kp aus Config / homing_pos_kp", test_homing_kp_config),
+    ("Homing: Sperren ohne Bus-Zugriff", test_homing_sperren),
+    ("Homing: Rückbau bei BEGIN-Fehler", test_homing_rueckbau),
+    ("Homing: END best effort", test_homing_end_fehler),
+    ("Hülle: KTWO_MOTOR_HOMING/_STALL_MODE/_SYS_PARAM", test_huelle_homing),
 ]
 
 

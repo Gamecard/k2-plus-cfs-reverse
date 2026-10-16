@@ -1,5 +1,8 @@
 # PrTouch v3 (Düse als Kraftsensor) – Befund 16.10.2026
 
+> **KORREKTUR 16.10.2026:** Handler-Adressen aus der alten Befehlstabelle sind um einen Eintrag verschoben (HANDLER-TABELLE-BEFUND-2026-10-16.md); „kein MCU-Hardwarestopp“ ist überholt – der Z-Stopp läuft über einen normalen Klipper-Endstop auf der Swap-Leitung (PRTOUCH-LESETEST-BEFUND-2026-10-16.md §3/§6).
+
+
 Grundlage: zwei statische Analysen (Host-Modul `prtouch_v3_wrapper.so`, MCU-Firmware Main/Düse) und eine
 Gegenprüfung gegen einen echten Mitschnitt der „Auto-Nivellierung“ am Display (klippy.log, 16.10.2026).
 Analysen durch einen weiteren KI-Agenten, Kernaussagen von uns am Mitschnitt nachgeprüft (Mesh-Werte, Zeiten,

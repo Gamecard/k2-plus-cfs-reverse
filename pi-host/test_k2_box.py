@@ -15,6 +15,18 @@ in pi-host/k2_transport.py). Prüft:
 8. Preload OPs + Auto-Addr nach k2_motor:ready + Guards (nie 0x50/0x06,
    keine Bursts, Cut-Platzhalter).
 9. G-Codes KTWO_BOX_STATUS/LOAD/UNLOAD/PRELOAD via FakePrinter.
+Filamentwechsel (Ergänzung 16.10.2026, Belege README-k2_box.md §8):
+10. Bausteine (Schnitt/Schacht/Abstreifen/Spülen/Rückzug) == box.cfg + Live,
+    TNN-Mapping, Optionsgrenzen, Upstream-Namensregel.
+11. Einzug bis Kopfsensor + Stage 7 (0x0e ohne Extruder, Timeout -> IDLE).
+12. Rückzug mit Extruder-Haken je p0 (Frames == cfsseq).
+13. Box-Zustand abwarten (PRELOAD/ERROR/Timeout).
+14. Volle Kette T1B über die Klipper-Hülle (Reihenfolge Bus + G-Code).
+15. Sperren (allow_write/allow_move/Druck ohne Freigabe -> Pause).
+16. Fehler im Druck -> Pause, Quittung, RESUME_FIX.
+17. Fehler ohne Druck -> G-Code-Fehler; Box 2/Hub belegt/kein Bus.
+18. ReactorBusProxy.  19. Makros T0-T15/M8200/RESUME (Jinja2).
+20. Python-3.9-Syntax.
 
 Fakes:
 - FakeBoxBus: simuliert Box-Zustände (IDLE/PRELOAD/PRINT/ERROR), Hub-Maske,
@@ -25,6 +37,7 @@ Fakes:
 - FakeMotorBus: minimaler Motor-Transport mit gleichem Lock (für Test 6).
 """
 
+import math
 import os
 import struct
 import sys
@@ -41,6 +54,8 @@ if os.path.isdir(_NACHBAU) and _NACHBAU not in sys.path:
     sys.path.insert(0, _NACHBAU)
 
 import k2_box as K
+import logging
+logging.getLogger().setLevel(logging.CRITICAL)  # Fehlerpfad-Tests ohne Log-Rauschen
 
 try:
     import box as BOX
@@ -102,6 +117,15 @@ class FakeBoxBus:
                                   "remain": [28, 29, 30, 31][i]}
         self.calls = []  # [(addr, fun, tuple(data), kwargs)]
         self.intervals = []  # [(t0, t1)] für Lock-Test
+        # Wechsel-Simulation (Tests 10+): gemeinsamer Ereignis-Trace mit dem
+        # FakeGcode, Kopfsensor (Filament am Kopf ab head_at_mm Odometer),
+        # mode 7 nur ok, wenn der Extruder seit mode 6 gefördert hat.
+        self.trace = None
+        self.head = False
+        self.head_at_mm = None
+        self.need_extruder_for_mode7 = False
+        self.extruder_mm = 0.0
+        self.preload_polls = 0  # so viele 0x0a-Polls noch PRELOAD melden
 
     # -- Bus-API (BoxAction-kompatibel) ---------------------------------
     def transact_full(self, addr, fun, data=(), timeout=None, retries=0,
@@ -115,6 +139,8 @@ class FakeBoxBus:
             self.calls.append((addr, fun, tuple(payload),
                                dict(timeout=timeout, retries=retries,
                                     status=status)))
+            if self.trace is not None:
+                self.trace.append(("bus", fun, tuple(payload)))
             raddr, rstatus, rfun, rdata = self._handle(addr, fun, payload)
             t1 = time.monotonic()
             self.intervals.append((t0, t1))
@@ -148,6 +174,11 @@ class FakeBoxBus:
             raise TimeoutError("FakeBox: falsche Adresse 0x%02x" % addr)
         if fun == 0x0A:  # Status-Poll (6 B, Beleg GHIDRA §5 / BEFUND2 §1)
             t = self.temp_c & 0xFF
+            if self.preload_polls > 0:
+                self.preload_polls -= 1
+                data = bytes([t, self.rh & 0xFF, 0x00, 1,
+                              self.hub_mask & 0xFF, 0x00])
+                return A, 0x00, 0x0A, data
             data = bytes([t, self.rh & 0xFF, 0x00, self.state,
                           self.hub_mask & 0xFF, 0x00])
             st = self.stored_error if self.state == 4 else 0x00
@@ -232,11 +263,17 @@ class FakeBoxBus:
                         self.feeding = False
                         return A, 0x0C, 0x10, struct.pack(">f", -self.odo)
                 self.odo += self.odo_step
+                if self.head_at_mm is not None and self.odo >= self.head_at_mm:
+                    self.head = True
                 return A, 0x00, 0x10, struct.pack(">f", -self.odo)
             if mode == 6:  # Stopp/Buffer
                 self.feeding = False
+                self.extruder_mm = 0.0
                 return A, 0x00, 0x10, b""
-            if mode == 7:  # Extruder-Check p mm
+            if mode == 7:  # Extruder-Check p mm (Odometer > p in 300 ms)
+                if self.need_extruder_for_mode7 and self.extruder_mm <= 0:
+                    self.state, self.stored_error = 4, 0x0E
+                    return A, 0x0E, 0x10, b""
                 return A, 0x00, 0x10, b""
             if mode == 3:  # Fehler löschen
                 self.state, self.stored_error = 0, 0x00
@@ -250,6 +287,8 @@ class FakeBoxBus:
                 self.hub_mask = 0x00
             else:
                 self.hub_mask &= (~mask) & 0xFF
+            if p == 1:
+                self.head = False
             self.state = 0
             return A, 0x00, 0x11, b""
         if fun == 0x05:  # Buffer
@@ -301,14 +340,23 @@ class FakeMotorBus:
 # =====================================================================
 
 class FakeReactor:
+    """Reactor mit virtueller Uhr: pause(waketime) springt dorthin (+1 ms
+    echte Wartezeit, damit Hilfs-Threads des ReactorBusProxy laufen)."""
     NOW = 0
 
     def __init__(self):
         self.timers = []
         self.pauses = []
+        self.now = 1000.0
 
-    def pause(self, s):
-        self.pauses.append(float(s))
+    def monotonic(self):
+        return self.now
+
+    def pause(self, waketime):
+        self.pauses.append(float(waketime))
+        time.sleep(0.001)
+        self.now = max(self.now + 0.001, float(waketime))
+        return self.now
 
     def register_timer(self, cb, when=0):
         self.timers.append(cb)
@@ -319,9 +367,24 @@ class FakeGcode:
     def __init__(self):
         self.infos = []
         self.commands = {}
+        self.scripts = []   # ausgeführte Zeilen (run_script_from_command)
+        self.raw = []
+        self.printer = None  # FakePrinter (für Zustands-Simulation)
 
     def respond_info(self, msg):
         self.infos.append(str(msg))
+
+    def respond_raw(self, msg):
+        self.raw.append(str(msg))
+
+    def run_script_from_command(self, script):
+        for line in script.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            self.scripts.append(line)
+            if self.printer is not None:
+                self.printer.sim(line)
 
     def register_command(self, name, func, desc=None):
         if not upstream_gcode_name_ok(name):
@@ -350,14 +413,108 @@ def upstream_gcode_name_ok(cmd):
     return ''.join(parts[:3]).strip() == cmd
 
 
+class _Obj:
+    def __init__(self, status):
+        self.status = status
+
+    def get_status(self, eventtime=None):
+        return dict(self.status)
+
+
+class _SensorObj:
+    def __init__(self, printer):
+        self.printer = printer
+        self.enabled = True
+
+    def get_status(self, eventtime=None):
+        bus = self.printer.bus
+        return {"filament_detected": bool(getattr(bus, "head", False)),
+                "enabled": self.enabled}
+
+
 class FakePrinter:
-    def __init__(self, bus):
+    def __init__(self, bus, with_motion=False):
         self.reactor = FakeReactor()
         self.gcode = FakeGcode()
+        self.gcode.printer = self
         self.bus = bus
         self.objects = {"gcode": self.gcode, "k2_485": bus}
         self.handlers = {}
         self.events = []
+        # Drucker-Simulation für die Wechsel-Tests (Positionen in mm)
+        self.pos = [200.0, 200.0, 20.0, 0.0]
+        self.relative = False
+        self.accel = 20000.0
+        self.saved = {}
+        self.fail_on = None  # Zeilenanfang -> gcode-Fehler simulieren
+        if with_motion:
+            self.print_state = "standby"
+            self.paused = False
+            self.target = 0.0
+            self.sensor = _SensorObj(self)
+            self.objects.update({
+                "print_stats": _Obj({}), "pause_resume": _Obj({}),
+                "toolhead": _Obj({}), "gcode_move": _Obj({}),
+                "extruder": _Obj({}),
+                "filament_switch_sensor filament_sensor": self.sensor})
+            self._refresh()
+
+    def _refresh(self):
+        if "toolhead" not in self.objects:
+            return
+        self.objects["print_stats"].status = {"state": self.print_state}
+        self.objects["pause_resume"].status = {"is_paused": self.paused}
+        self.objects["toolhead"].status = {
+            "homed_axes": "xyz", "max_accel": self.accel,
+            "axis_maximum": [352.5, 400.0, 360.0, 0.0]}
+        self.objects["gcode_move"].status = {"gcode_position": list(self.pos)}
+        self.objects["extruder"].status = {"target": self.target}
+
+    def sim(self, line):
+        """Minimale G-Code-Simulation (nur was die Wechsel-Tests brauchen)."""
+        if self.fail_on and line.startswith(self.fail_on):
+            raise ValueError("Simulierter G-Code-Fehler bei %r" % line)
+        if self.bus is not None and getattr(self.bus, "trace", None) is not None:
+            self.bus.trace.append(("gcode", line))
+        w = line.split()
+        cmd = w[0]
+        args = {}
+        for tok in w[1:]:
+            if "=" in tok:
+                k, v = tok.split("=", 1)
+                args[k] = v
+            else:
+                args[tok[0]] = tok[1:]
+        if cmd == "G90":
+            self.relative = False
+        elif cmd == "G91":
+            self.relative = True
+        elif cmd in ("G0", "G1"):
+            for i, ax in enumerate("XYZE"):
+                if ax in args:
+                    v = float(args[ax])
+                    self.pos[i] = self.pos[i] + v if (self.relative or ax == "E") \
+                        else v
+                    if ax == "E" and v > 0 and self.bus is not None:
+                        self.bus.extruder_mm += v
+        elif cmd == "SET_VELOCITY_LIMIT" and "ACCEL" in args:
+            self.accel = float(args["ACCEL"])
+        elif cmd in ("M104", "M109"):
+            self.target = float(args.get("S", 0))
+        elif cmd == "SAVE_GCODE_STATE":
+            self.saved[args["NAME"]] = self.relative
+        elif cmd == "RESTORE_GCODE_STATE":
+            self.relative = self.saved.get(args["NAME"], self.relative)
+        elif cmd == "SET_FILAMENT_SENSOR":
+            self.sensor.enabled = bool(int(args["ENABLE"]))
+        elif cmd == "PAUSE":
+            self.paused = True
+            self.print_state = "paused"
+        self._refresh()
+
+    def set_printing(self, on=True):
+        self.print_state = "printing" if on else "standby"
+        self._refresh()
 
     def lookup_object(self, name):
         try:
@@ -407,11 +564,24 @@ class FakeGcmd:
     def get(self, name, default=None):
         return self.params.get(name, self.params.get(name.lower(), default))
 
-    def get_int(self, name, default=None):
+    def get_int(self, name, default=None, **kw):
         v = self.get(name, default)
         if v is None:
             return default
         return int(v)
+
+    def get_float(self, name, default=None, **kw):
+        v = self.get(name, default)
+        if v is None:
+            return default
+        v = float(v)
+        if "minval" in kw and v < kw["minval"]:
+            raise ValueError("%s < minval" % name)
+        if "maxval" in kw and v > kw["maxval"]:
+            raise ValueError("%s > maxval" % name)
+        if "above" in kw and v <= kw["above"]:
+            raise ValueError("%s <= above" % name)
+        return v
 
     def respond_info(self, msg):
         self.infos.append(str(msg))
@@ -514,14 +684,14 @@ def test_allow_write_false():
     assert ctl.get_rfid("B") is not None
     assert isinstance(ctl.get_remain(), dict)
     assert ctl.get_version_sn()[0] == "153"
-    try:
-        ctl.do_cut("B")
-    except NotImplementedError:
-        pass
-    else:
-        raise AssertionError("Cut-Platzhalter müsste NotImplementedError werfen")
+    # Cut = reine Kopfbewegung (16.10.2026): do_cut liefert nur den G-Code-
+    # Plan und sendet KEIN Box-Frame (Beleg Live-Cut ohne Box-/Motor-Frame).
+    n_cut = len(bus.calls)
+    plan = ctl.do_cut("B")
+    assert plan["status"] == "plan" and any("X-7.8" in l for l in plan["gcode"]), plan
+    assert len(bus.calls) == n_cut, "do_cut hat gesendet!"
     assert all(c[1] != 0x50 and c[1] != 0x06 for c in bus.calls), "verbotenes fun!"
-    return "keine mechanischen Frames (%d nur-lesend), Cut-Platzhalter ok" % (
+    return "keine mechanischen Frames (%d nur-lesend), Cut = Plan ohne Frame" % (
         len(bus.calls),)
 
 
@@ -704,6 +874,606 @@ def test_gcodes():
 
 
 # =====================================================================
+# Filamentwechsel (Ergänzung 16.10.2026) – Belege s. README-k2_box.md §8
+# =====================================================================
+
+class VClock:
+    """Virtuelle Uhr für Controller-Tests (pause springt vor)."""
+
+    def __init__(self):
+        self.t = 0.0
+        self.pauses = []
+
+    def clock(self):
+        return self.t
+
+    def pause(self, s):
+        self.pauses.append(float(s))
+        self.t += float(s)
+
+
+def build_vsystem(opts=None, **bus_kw):
+    cfg, bus, ctl = build_system(opts, **bus_kw)
+    vc = VClock()
+    ctl.pause = vc.pause
+    ctl.clock = vc.clock
+    return cfg, bus, ctl, vc
+
+
+def _frames(trace):
+    return [(e[1], e[2]) for e in trace if e[0] == "bus"]
+
+
+def test_wechsel_bausteine():
+    c = K.parse_options(test_options())
+    # Defaults = box.cfg + SAVE_CONFIG (cut_pos_x -7.80), Sperren aus
+    assert c["cut_pos_x"] == -7.8 and c["pre_cut_pos_x"] == 10.0 \
+        and c["pre_cut_pos_y"] == 200.0 and c["cut_pos_y"] == 200.0, c
+    assert c["allow_move"] is False and c["pause_on_failure"] is True, c
+    assert c["filament_sensor"] == "filament_sensor" and c["cut_sensor"] == ""
+    # Stock-Schreibweise (Klipper schreibt Optionsnamen klein)
+    c2 = K.parse_options(test_options(Tn_retrude="-12", cut_pos_x="-7.6"))
+    assert c2["tn_retrude"] == -12.0 and c2["cut_pos_x"] == -7.6, c2
+    for bad in ({"cut_pos_x": "-4.0"}, {"cut_pos_x": "-10"},
+                {"tn_retrude": "10"}, {"cut_velocity": "0"},
+                {"change_z_hop": "8"}, {"allow_move": "vielleicht"}):
+        try:
+            K.parse_options(test_options(**bad))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("Option hätte abgelehnt werden müssen: %r" % bad)
+    # Schneidfahrt = T0-Beispiel Schritt 3-5 + CR_BOX_CUT (cut_pos_x -7.80)
+    assert K.gcode_cut(c, 20000) == [
+        "G90", "G0 X10 Y200 F12000", "SET_VELOCITY_LIMIT ACCEL=5000",
+        "G0 X-7.8 Y200 F30000", "G4 P100", "G0 X10 F12000",
+        "SET_VELOCITY_LIMIT ACCEL=20000", "M400"], K.gcode_cut(c, 20000)
+    # Schacht (T0-Beispiel Schritt 6-6.3) / Verlassen (Schritt 11)
+    assert K.gcode_go_extrude_pos(c) == [
+        "G90", "G0 Y345 F12000", "G0 X139 F12000", "G0 Y378 F12000",
+        "G0 X133 F12000"]
+    assert K.gcode_safe_pos(c) == ["G90", "G0 X160 F12000", "G0 Y345 F12000"]
+    # Abstreifen (10.1-10.3): Blech-Schnitt, 2 Kreise r=4, 3x Schütteln
+    w = K.gcode_wipe(c, 20000)
+    assert w[:5] == ["G90", "SET_VELOCITY_LIMIT ACCEL=5000", "G0 X160 F12000",
+                     "G0 X135 F12000", "G0 X160 Y374 F12000"], w[:5]
+    circ1, circ2 = w[5:21], w[22:38]
+    assert w[21] == "G0 X170 Y374 F12000", w[21]
+
+    def _pts(lines):
+        out = []
+        for l in lines:
+            parts = dict((t[0], float(t[1:])) for t in l.split()[1:])
+            out.append((parts["X"], parts["Y"], parts["F"]))
+        return out
+    for pts, cx, end in ((_pts(circ1), 164.0, (160.0, 374.0)),
+                         (_pts(circ2), 166.0, (170.0, 374.0))):
+        for x, y, f in pts:
+            assert abs(math.hypot(x - cx, y - 374.0) - 4.0) < 0.01 and f == 10000
+        assert abs(pts[-1][0] - end[0]) < 0.01 and abs(pts[-1][1] - end[1]) < 0.01
+    # G2 = im Uhrzeigersinn: vom Startpunkt (160|374) zuerst nach oben (y+)
+    assert _pts(circ1)[0][1] > 374.0 and _pts(circ2)[0][1] > 374.0
+    assert w[38:44] == ["G0 X160 Y378 F12000", "G0 X133 Y378 F12000"] * 3, w[38:44]
+    assert w[-1] == "SET_VELOCITY_LIMIT ACCEL=20000"
+    # Spülen live: length [90, 70], check_and_extrude 18/72 und 14/56 mm
+    assert K.flush_segments(c) == [90.0, 70.0]
+    assert K.gcode_flush_segment(90, 360) == ["G91", "G1 E18 F360",
+                                              "G1 E72 F360", "G90"]
+    assert K.gcode_flush_segment(70, 360)[1:3] == ["G1 E14 F360", "G1 E56 F360"]
+    assert K.flush_segments(c, 200) == [90.0, 90.0, 20.0]
+    # Rückzug live 3x "extrude = -10.0" (= buffer_empty_len 30)
+    assert K.retrude_extruder_steps(c) == [-10.0, -10.0, -10.0]
+    assert K.retrude_extruder_steps(c, 25) == [-10.0, -10.0, -5.0]
+    assert K.gcode_extruder_move(-10, 600) == ["G91", "G1 E-10 F600", "G90"]
+    # TNN wie box.cfg M8200 L: addr = I/4+1, Slot = I%4
+    for i, tnn in ((0, "T1A"), (1, "T1B"), (3, "T1D"), (4, "T2A"),
+                   (9, "T3B"), (15, "T4D"), ("=2", "T1C")):
+        assert K.tnn_from_index(i) == tnn, (i, K.tnn_from_index(i))
+    assert K.parse_tnn("t1b") == (1, 1, "B", "T1B")
+    for bad in (16, -1, "x", True):
+        try:
+            K.tnn_from_index(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("tnn_from_index(%r) hätte werfen müssen" % (bad,))
+    for bad in ("T5A", "T1E", "1A", "T12"):
+        try:
+            K.parse_tnn(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("parse_tnn(%r) hätte werfen müssen" % (bad,))
+    # Upstream-Namensregel für alle neuen G-Codes
+    for name in ("KTWO_BOX_PRE_OPT", "KTWO_BOX_CUT", "KTWO_BOX_GO_EXTRUDE_POS",
+                 "KTWO_BOX_SAFE_POS", "KTWO_BOX_RETRUDE", "KTWO_BOX_EXTRUDE",
+                 "KTWO_BOX_FLUSH", "KTWO_BOX_WIPE", "KTWO_BOX_WASTE",
+                 "KTWO_BOX_END_OPT", "KTWO_BOX_WAIT", "KTWO_BOX_ERROR_CLEAR",
+                 "KTWO_BOX_RESUME_FIX"):
+        assert upstream_gcode_name_ok(name), name
+    return "Cut/Schacht/Abstreifen/Spülen/Rückzug == box.cfg + Live, TNN-Mapping ok"
+
+
+def test_extrude_sensor_stage7():
+    cfg, bus, ctl, vc = build_vsystem()
+    bus.trace = []
+    bus.head_at_mm = 200.0           # Kopfsensor nach 4 Polls (4 x 50 mm)
+    bus.need_extruder_for_mode7 = True
+    stage7 = []
+
+    def _stage7():
+        stage7.append(vc.t)
+        bus.trace.append(("stage7",))
+        bus.extruder_mm += 30.0      # Extruder greift (G1 E30 F360)
+
+    res = ctl.do_extrude("B", sensor_fn=lambda: bus.head, sensor_timeout=90,
+                         poll_interval=2.0, stage7_fn=_stage7, stage7_delay=2.0)
+    assert res["status"] == "ok" and len(res["odo_mm"]) == 4, res
+    assert ctl.loaded_slot == "B"
+    seq = [e for e in bus.trace]
+    names = []
+    for e in seq:
+        if e[0] == "stage7":
+            names.append("S7")
+        else:
+            names.append("%02x:%s" % (e[1], ",".join("%02x" % b for b in e[2])))
+    exp = (["04:00,01", "0f:01", "08:00", "10:02,00,00", "10:02,04,00"]
+           + ["10:02,05,00"] * 4
+           + ["10:02,06,00", "S7", "10:02,07,03", "05:", "04:02,00", "0f:00"])
+    assert names == exp, names
+    assert 2.0 in vc.pauses, vc.pauses  # stage7_delay vor mode 7
+    # Ohne Stage 7 greift kein Extruder -> Box meldet 0x0e (mode 7)
+    cfg2, bus2, ctl2, vc2 = build_vsystem()
+    bus2.need_extruder_for_mode7 = True
+    try:
+        ctl2.do_extrude("C")
+    except BOX.CfsStatusError as exc:
+        assert exc.status == 0x0E, exc.status
+    else:
+        raise AssertionError("mode 7 ohne Extruder hätte 0x0e liefern müssen")
+    # Kopfsensor nie erreicht -> Timeout, Box per 0x04 [00 01] gestoppt
+    cfg3, bus3, ctl3, vc3 = build_vsystem()
+    try:
+        ctl3.do_extrude("D", sensor_fn=lambda: False, sensor_timeout=10,
+                        poll_interval=2.0)
+    except K.BoxChangeError as exc:
+        assert "Kopf-Filamentsensor" in str(exc), exc
+    else:
+        raise AssertionError("Sensor-Timeout hätte BoxChangeError werfen müssen")
+    last = bus3.calls[-1]
+    assert last[1] == 0x04 and tuple(last[2]) == (0x00, 0x01), last
+    polls = [c for c in bus3.calls if c[1] == 0x10 and c[2][1] == 0x05]
+    assert 5 <= len(polls) <= 7, len(polls)  # ~alle 2 s in 10 s
+    assert ctl3.loaded_slot is None
+    return ("Einzug bis Kopfsensor (4 Polls), Stage 7 zwischen mode 6/7, "
+            "0x0e ohne Extruder, Timeout -> IDLE")
+
+
+def test_retrude_after_p0():
+    cfg, bus, ctl, vc = build_vsystem()
+    ctl.do_load("A")
+    bus.trace = []
+    marks = []
+
+    def _after(i):
+        marks.append(i)
+        bus.trace.append(("E", i))
+
+    ctl.do_retrude("A", after_p0=_after)
+    names = [("E%d" % e[1]) if e[0] == "E" else
+             "%02x:%s" % (e[1], ",".join("%02x" % b for b in e[2]))
+             for e in bus.trace]
+    assert names == ["04:00,01", "08:00", "11:01,00", "E0", "11:01,00", "E1",
+                     "11:01,00", "E2", "11:01,00", "E3", "11:01,01"], names
+    assert ctl.loaded_slot is None and bus.hub_mask & 0x01 == 0
+    # Frames selbst unverändert == cfsseq-Live-Sequenz
+    if _HAVE_SEQ and _HAVE_S485:
+        got = [bytes(REF_BUILD(0x01, f, list(d), status=0xFF))
+               for f, d in _frames(bus.trace)]
+        assert got == SEQ.build_retrude_sequence(0x01), "Retrude-Frames weichen ab"
+    return "Rückzug: p0 -> Extruder-Haken x4 -> p1, Frames live-identisch"
+
+
+def test_wait_box_ready():
+    cfg, bus, ctl, vc = build_vsystem()
+    bus.preload_polls = 3
+    st = ctl.wait_box_ready(timeout=60, interval=1.0)
+    assert st["state_name"] == "STATE_IDLE", st
+    assert len([c for c in bus.calls if c[1] == 0x0A]) == 4 and \
+        vc.pauses == [1.0, 1.0, 1.0], vc.pauses
+    bus.state, bus.stored_error = 4, 0x0C
+    try:
+        ctl.wait_box_ready(timeout=60)
+    except BOX.CfsStatusError as exc:
+        assert exc.status == 0x0C, exc.status
+    else:
+        raise AssertionError("ERROR-Zustand hätte CfsStatusError werfen müssen")
+    bus.state, bus.stored_error = 0, 0
+    bus.preload_polls = 10000
+    try:
+        ctl.wait_box_ready(timeout=5, interval=1.0)
+    except K.BoxChangeError as exc:
+        assert "nicht bereit" in str(exc), exc
+    else:
+        raise AssertionError("Timeout hätte BoxChangeError werfen müssen")
+    return "PRELOAD -> warten -> IDLE, ERROR -> 0x0c, Timeout"
+
+
+def build_hull(**opt_over):
+    bus = FakeBoxBus()
+    printer = FakePrinter(bus, with_motion=True)
+    opts = test_options(allow_move="True")
+    opts.update(opt_over)
+    mod = K.PrinterK2Box(FakeConfig(printer, opts))
+    printer.fire("klippy:connect")
+    mod._bus = bus
+    return bus, printer, mod
+
+
+def run_chain(mod, tnn, ret=1):
+    """Kette wie macros.cfg _KTWO_TOOL_CHANGE (T-Befehl) -> alle Antworten."""
+    infos = []
+    for fn, params in ((mod.cmd_pre_opt, {"TNN": tnn}), (mod.cmd_cut, {}),
+                       (mod.cmd_retrude, {}), (mod.cmd_extrude, {"TNN": tnn}),
+                       (mod.cmd_waste, {}), (mod.cmd_flush, {"TNN": tnn}),
+                       (mod.cmd_end_opt, {"RETURN": str(ret)})):
+        g = FakeGcmd(params)
+        fn(g)
+        infos.extend(g.infos)
+    return infos
+
+
+def _idx(trace, pred, start=0):
+    for i in range(start, len(trace)):
+        if pred(trace[i]):
+            return i
+    raise AssertionError("Eintrag fehlt ab %d" % start)
+
+
+def _g(line):
+    return lambda e: e[0] == "gcode" and e[1] == line
+
+
+def _b(fun, data):
+    return lambda e: e[0] == "bus" and e[1] == fun and tuple(e[2]) == tuple(data)
+
+
+def test_wechsel_kette_voll():
+    bus, printer, mod = build_hull(allow_write="True")
+    bus.hub_mask, bus.head = 0x01, True   # A ist geladen
+    bus.head_at_mm = 300.0
+    bus.need_extruder_for_mode7 = True
+    bus.trace = []
+    run_chain(mod, "T1B")
+    t = bus.trace
+    i0 = _idx(t, _g("SET_FILAMENT_SENSOR SENSOR=filament_sensor ENABLE=0"))
+    i1 = _idx(t, _g("SAVE_GCODE_STATE NAME=_ktwo_box_chain"), i0)
+    i2 = _idx(t, _g("G1 Z0.4 F600"), i1)
+    i3 = _idx(t, _g("G0 X-7.8 Y200 F30000"), i2)          # Schnitt
+    i4 = _idx(t, _g("G0 X133 F12000"), i3)                # Schacht
+    i5 = _idx(t, _g("M109 S220"), i4)
+    i6 = _idx(t, _b(0x08, (0x01,)), i5)                   # Hub lesen
+    p0 = i6
+    for k in range(3):                                    # p0 + E-10 x3
+        p0 = _idx(t, _b(0x11, (0x01, 0x00)), p0 + 1)
+        _idx(t, _g("G1 E-10 F600"), p0)
+        assert _idx(t, _g("G1 E-10 F600"), p0) < _idx(t, _b(0x11, (0x01, 0x00)), p0 + 1)
+    i7 = _idx(t, _b(0x11, (0x01, 0x01)), p0)              # p1
+    i8 = _idx(t, _b(0x10, (0x02, 0x06, 0x00)), i7)        # mode 6
+    i9 = _idx(t, _g("G1 E30 F360"), i8)                   # Stage 7
+    i10 = _idx(t, _b(0x10, (0x02, 0x07, 0x03)), i9)       # mode 7
+    i11 = _idx(t, _b(0x04, (0x02, 0x00)), i10)            # PRINT
+    i12 = _idx(t, _g("G1 E18 F360"), i11)
+    i13 = _idx(t, _g("G1 E72 F360"), i12)
+    i14 = _idx(t, _g("G0 X135 F12000"), i13)              # Abstreifen 1
+    i15 = _idx(t, _g("G1 E14 F360"), i14)
+    i16 = _idx(t, _g("G1 E56 F360"), i15)
+    i17 = _idx(t, _g("G0 X135 F12000"), i16)              # Abstreifen 2
+    i18 = _idx(t, _g("G0 Y345 F12000"), i17)              # Schacht verlassen
+    i19 = _idx(t, _g("G0 X200 Y200 F12000"), i18)         # Rückfahrt
+    i20 = _idx(t, _g("G0 Z20 F600"), i19)
+    i21 = _idx(t, _g("M104 S0"), i20)
+    _idx(t, _g("RESTORE_GCODE_STATE NAME=_ktwo_box_chain"), i21)
+    _idx(t, _g("SET_FILAMENT_SENSOR SENSOR=filament_sensor ENABLE=1"), i21)
+    assert [round(v, 3) for v in printer.pos[:3]] == [200.0, 200.0, 20.0], printer.pos
+    st = mod.get_status()
+    assert st["loaded_tnn"] == "T1B" and not st["chain_active"] \
+        and st["chain_error"] == "" and st["change_enabled"], st
+    assert printer.accel == 20000.0, printer.accel
+    assert not [m for m in printer.gcode.raw if m.startswith("!!")], printer.gcode.raw
+    # Gleicher Slot nochmal: kein Wechsel (Hub B + Kopfsensor)
+    n_bus = len([e for e in t if e[0] == "bus" and e[1] in (0x10, 0x11, 0x04)])
+    n_g = len([e for e in t if e[0] == "gcode" and e[1].startswith(("G0", "G1"))])
+    infos = run_chain(mod, "T1B")
+    assert len([e for e in t if e[0] == "bus" and e[1] in (0x10, 0x11, 0x04)]) == n_bus
+    assert len([e for e in t if e[0] == "gcode" and e[1].startswith(("G0", "G1"))]) == n_g
+    assert any("bereits geladen" in m for m in infos), infos
+    return "T1B: Hop→Schnitt→Schacht→E-10x3/p0→p1→Einzug→E30→mode7→Spülen 90+70→Rückfahrt; T1B erneut = nichts"
+
+
+def test_wechsel_sperren():
+    # 1) beide gesperrt, kein Druck: nur Plan, keine Bewegung, keine Mechanik
+    bus, printer, mod = build_hull(allow_write="False", allow_move="False")
+    infos = run_chain(mod, "T1C")
+    moves = [l for l in printer.gcode.scripts
+             if l.split()[0] in ("G0", "G1", "M109", "M104", "PAUSE")]
+    assert moves == [], moves
+    mech = [c for c in bus.calls if c[1] in (0x04, 0x0D, 0x0F, 0x10, 0x11, 0xA0)]
+    assert mech == [], mech
+    plans = [m for m in infos if "PLAN" in m]
+    assert any("X-7.8" in m for m in plans) and any("PLAN Box EXTRUDE" in m
+                                                     for m in plans), plans
+    assert mod.get_status()["change_enabled"] is False
+    # 2) Trockenlauf mit Bewegung (allow_move, ohne Box): Kopf + Extruder ja, Box nein
+    bus, printer, mod = build_hull(allow_write="False", allow_move="True")
+    run_chain(mod, "T1C")
+    sc = printer.gcode.scripts
+    assert "G0 X-7.8 Y200 F30000" in sc and sc.count("G1 E-10 F600") == 3 \
+        and "G1 E30 F360" in sc and "G1 E18 F360" in sc, sc
+    mech = [c for c in bus.calls if c[1] in (0x04, 0x0D, 0x0F, 0x10, 0x11, 0xA0)]
+    assert mech == [], mech
+    # 3) Im Druck ohne Freigabe: PAUSE, Rest übersprungen, keine Bewegung
+    bus, printer, mod = build_hull(allow_write="False", allow_move="True")
+    printer.set_printing(True)
+    infos = run_chain(mod, "T1B")
+    sc = printer.gcode.scripts
+    assert "PAUSE" in sc and not [l for l in sc if l.startswith(("G0", "G1"))], sc
+    st = mod.get_status()
+    assert "nicht freigegeben" in st["chain_error"] and not st["chain_active"], st
+    assert any("übersprungen" in m for m in infos), infos
+    assert printer.sensor.enabled, "Kopfsensor muss wieder aktiv sein"
+    mod.cmd_error_clear(FakeGcmd({}))
+    assert mod.get_status()["chain_error"] == ""
+    return "gesperrt = nur Plan; allow_move ohne Box = Trockenlauf; Druck ohne Freigabe = PAUSE"
+
+
+def test_wechsel_fehler_im_druck():
+    bus, printer, mod = build_hull(allow_write="True")
+    bus.fail_after_mm = 245.0          # Slot A: 0x0c wie Kanal-A-Defekt
+    bus.head_at_mm = 1000.0
+    printer.set_printing(True)
+    bus.trace = []
+    run_chain(mod, "T1A")
+    sc = printer.gcode.scripts
+    assert "PAUSE" in sc, sc
+    st = mod.get_status()
+    assert "0x0c" in st["chain_error"] and not st["chain_active"], st
+    assert st["pending_resume_z"] == 20.0, st
+    assert any(m.startswith("!!") and "PAUSIERT" in m for m in printer.gcode.raw)
+    i_pause = sc.index("PAUSE")
+    assert not [l for l in sc[i_pause:] if l.startswith(("G0", "G1"))], sc[i_pause:]
+    assert printer.sensor.enabled and "RESTORE_GCODE_STATE NAME=_ktwo_box_chain" \
+        in sc[i_pause:]
+    # PRE_OPT mit offenem Fehler: nichts, keine zweite Pause-Bewegung
+    n = len(sc)
+    mod.cmd_pre_opt(FakeGcmd({"TNN": "T1A"}))
+    mod.cmd_cut(FakeGcmd({}))
+    assert not [l for l in sc[n:] if l.startswith(("G0", "G1"))], sc[n:]
+    mod.cmd_end_opt(FakeGcmd({}))
+    # Quittieren: Box 0x04 [00 01] (löscht ERROR) + RESUME_FIX senkt Z
+    mod.cmd_error_clear(FakeGcmd({}))
+    assert bus.calls[-1][1] == 0x04 and tuple(bus.calls[-1][2]) == (0, 1)
+    mod.cmd_resume_fix(FakeGcmd({}))
+    assert "G1 Z20 F600" in printer.gcode.scripts
+    assert mod.get_status()["pending_resume_z"] is None
+    return "0x0c im Druck -> PAUSE (kein Abbruch), Folgeschritte übersprungen, Quittung + Z-Fix"
+
+
+def test_wechsel_fehler_ohne_druck():
+    # Box-Fehler außerhalb des Drucks -> G-Code-Fehler, Kette aufgeräumt
+    bus, printer, mod = build_hull(allow_write="True")
+    bus.fail_after_mm = 245.0
+    mod.cmd_pre_opt(FakeGcmd({"TNN": "T1A"}))
+    try:
+        mod.cmd_extrude(FakeGcmd({"TNN": "T1A"}))
+    except ValueError as exc:
+        assert "0x0c" in str(exc), exc
+    else:
+        raise AssertionError("Box-Fehler ohne Druck hätte G-Code-Fehler werfen müssen")
+    assert not mod.get_status()["chain_active"] and printer.sensor.enabled
+    assert "PAUSE" not in printer.gcode.scripts
+    # Bewegungsfehler im Schnitt -> Beschleunigung zurück + Fehler
+    bus, printer, mod = build_hull(allow_write="True")
+    printer.fail_on = "G0 X-7.8"
+    try:
+        mod.cmd_cut(FakeGcmd({}))
+    except ValueError as exc:
+        assert "CUT fehlgeschlagen" in str(exc), exc
+    else:
+        raise AssertionError("Bewegungsfehler hätte G-Code-Fehler werfen müssen")
+    assert printer.accel == 20000.0, printer.accel
+    # Box 2 nicht konfiguriert / Hub durch anderen Slot belegt
+    bus, printer, mod = build_hull(allow_write="True")
+    for params, text in (({"TNN": "T2A"}, "Box 2"), ({"TNN": "T1B"}, "Hub belegt")):
+        bus.hub_mask = 0x01 if params["TNN"] == "T1B" else 0
+        try:
+            mod.cmd_extrude(FakeGcmd(params))
+        except ValueError as exc:
+            assert text in str(exc), exc
+        else:
+            raise AssertionError("%s hätte abgelehnt werden müssen" % params)
+    mech = [c for c in bus.calls if c[1] in (0x10, 0x11)]
+    assert mech == [], mech
+    # Ohne Bus (RS485 fehlt): klare Meldung, kein Absturz
+    bus2 = FakeBoxBus()
+    printer2 = FakePrinter(bus2, with_motion=True)
+    del printer2.objects["k2_485"]
+    mod2 = K.PrinterK2Box(FakeConfig(printer2, test_options(allow_move="True")))
+    try:
+        mod2.cmd_retrude(FakeGcmd({}))
+    except ValueError as exc:
+        assert "k2_485" in str(exc), exc
+    else:
+        raise AssertionError("ohne Bus hätte G-Code-Fehler kommen müssen")
+    return "ohne Druck: G-Code-Fehler + Aufräumen; Box 2/Hub belegt/kein Bus abgelehnt"
+
+
+def test_reactor_bus_proxy():
+    bus = FakeBoxBus()
+    seen = []
+    real = bus.transact_full
+
+    def _tf(*a, **k):
+        seen.append(threading.current_thread() is threading.main_thread())
+        return real(*a, **k)
+
+    bus.transact_full = _tf
+    r = FakeReactor()
+    proxy = K.ReactorBusProxy(bus, r)
+    out = proxy.transact_full(0x01, 0x0A, [], timeout=0.5, retries=0)
+    assert out[2] == 0x0A and seen == [False] and r.pauses, (out, seen)
+
+    class Boom:
+        def transact_full(self, *a, **k):
+            raise RuntimeError("Port weg")
+    try:
+        K.ReactorBusProxy(Boom(), r).transact_full(1, 0x0A, [])
+    except RuntimeError as exc:
+        assert "Port weg" in str(exc)
+    else:
+        raise AssertionError("Fehler im Hilfs-Thread muss durchgereicht werden")
+    # Hülle nutzt den Proxy, wenn der Reactor pause+monotonic hat
+    b2, p2, m2 = build_hull()
+    ctl = m2._ensure_controller()
+    assert isinstance(ctl.bus, K.ReactorBusProxy), type(ctl.bus)
+    return "Bus-Aufruf im Hilfs-Thread, Reactor pausiert, Fehler durchgereicht"
+
+
+def test_python39():
+    import ast
+    for fn in ("k2_box.py", "test_k2_box.py"):
+        with open(os.path.join(_HERE, fn), encoding="utf-8") as fh:
+            ast.parse(fh.read(), filename=fn, feature_version=(3, 9))
+    return "k2_box.py + test_k2_box.py Python-3.9-Syntax ok"
+
+
+def _macro_sources(path):
+    """[gcode_macro NAME] -> (gcode-Text, variablen) aus einer cfg-Datei."""
+    macros, cur, in_gcode, var = {}, None, False, {}
+    with open(path, encoding="utf-8") as fh:
+        for raw in fh:
+            line = raw.rstrip("\n")
+            if line.startswith("["):
+                cur, in_gcode = None, False
+                if line.startswith("[gcode_macro "):
+                    cur = line[len("[gcode_macro "):-1].strip()
+                    macros[cur] = {"gcode": [], "vars": {}}
+                continue
+            if cur is None:
+                continue
+            if in_gcode and (line.startswith((" ", "\t")) or not line.strip()):
+                macros[cur]["gcode"].append(line.strip())
+                continue
+            in_gcode = False
+            if line.startswith("gcode:"):
+                in_gcode = True
+            elif line.startswith("variable_"):
+                k, v = line[len("variable_"):].split(":", 1)
+                macros[cur]["vars"][k.strip()] = v.strip()
+    return {k: ("\n".join(v["gcode"]), v["vars"]) for k, v in macros.items()}
+
+
+def test_makros_cfg():
+    try:
+        import jinja2
+    except Exception:
+        return "SKIP (jinja2 fehlt)"
+    path = os.path.join(_HERE, "config-pi", "macros.cfg")
+    macros = _macro_sources(path)
+    for n in ["T%d" % i for i in range(16)] + ["M8200", "_KTWO_TOOL_CHANGE",
+                                               "RESUME"]:
+        assert n in macros, "Makro %s fehlt" % n
+    env = jinja2.Environment("{%", "%}", "{", "}")
+
+    class _Raise(Exception):
+        pass
+
+    def render(name, params=None, k2=None, m8200_tnn=""):
+        src, _vars = macros[name]
+        printer = {"k2_box": dict({"change_enabled": True, "chain_error": ""},
+                                  **(k2 or {})),
+                   "gcode_macro M8200": {"tnn": m8200_tnn},
+                   "gcode_macro _PI_PARAM": {"hotend_temp": 0, "fan0_speed": 0,
+                                             "fan2_speed": 0},
+                   "gcode_macro _KTWO_FAN_SAVE": {"fan2_value": 0.0},
+                   "output_pin fan2": {"value": 0.0},
+                   "pause_resume": {"is_paused": False}}
+        msgs = []
+
+        def _info(m):
+            msgs.append(m)
+            return ""
+
+        def _err(m):
+            raise _Raise(m)
+
+        out = env.from_string(src).render(
+            params=dict(params or {}), rawparams="", printer=printer,
+            action_respond_info=_info, action_raise_error=_err)
+        lines = [l.strip() for l in out.split("\n")
+                 if l.strip() and not l.strip().startswith("#")]
+        return lines, msgs
+
+    # T-Befehle: T1..T15 -> Kette, T0 nur mit Freigabe (sonst Einfarbbetrieb)
+    for i in range(1, 16):
+        assert render("T%d" % i)[0] == ["_KTWO_TOOL_CHANGE T=%d" % i]
+    assert render("T0")[0] == ["_KTWO_TOOL_CHANGE T=0"]
+    lines, msgs = render("T0", k2={"change_enabled": False})
+    assert lines == [] and "Einfarbbetrieb" in msgs[0], (lines, msgs)
+    exp = {0: "T1A", 1: "T1B", 3: "T1D", 4: "T2A", 5: "T2B", 15: "T4D"}
+    for i, tnn in exp.items():
+        lines, _m = render("_KTWO_TOOL_CHANGE", {"T": str(i)})
+        assert lines == ["_KTWO_FAN_SAVE", "KTWO_BOX_PRE_OPT TNN=%s" % tnn,
+                         "KTWO_BOX_CUT", "KTWO_BOX_RETRUDE",
+                         "KTWO_BOX_EXTRUDE TNN=%s" % tnn, "KTWO_BOX_WASTE",
+                         "KTWO_BOX_FLUSH TNN=%s" % tnn,
+                         "KTWO_BOX_END_OPT RETURN=1", "_KTWO_FAN_RESTORE"], lines
+    # M8200-Kette (Stock box.cfg-Semantik)
+    cases = [({"P": ""}, ["KTWO_BOX_PRE_OPT Z_HOP=0"]),
+             ({"P": "", "S": "5"}, ["KTWO_BOX_PRE_OPT Z_HOP=0 TNN=T2B"]),
+             ({"C": "", "S": "0"}, ["KTWO_BOX_CUT"]),
+             ({"R": ""}, ["KTWO_BOX_RETRUDE"]),
+             ({"R": "", "E": "20"}, ["KTWO_BOX_RETRUDE LENGTH=20.0"]),
+             ({"L": "", "I": "0"}, ["KTWO_BOX_EXTRUDE TNN=T1A",
+                                    "SET_GCODE_VARIABLE MACRO=M8200 VARIABLE=tnn VALUE='\"T1A\"'",
+                                    "KTWO_BOX_WASTE"]),
+             ({"L": "", "I": "=7"}, None),
+             ({"W": ""}, ["KTWO_BOX_WASTE"]),
+             ({"F": "", "S": "600", "L": "100"}, ["KTWO_BOX_FLUSH",
+                                                 "SET_GCODE_VARIABLE MACRO=M8200 VARIABLE=tnn VALUE='\"\"'"]),
+             ({"O": ""}, ["KTWO_BOX_END_OPT RETURN=0"])]
+    for params, want in cases:
+        lines, msgs = render("M8200", params)
+        if want is None:
+            assert lines[0] == "KTWO_BOX_EXTRUDE TNN=T2D" and msgs == ["tnn: T2D"], lines
+        else:
+            assert lines == want, (params, lines)
+    lines, _m = render("M8200", {"F": ""}, m8200_tnn="T1C")
+    assert lines[0] == "KTWO_BOX_FLUSH TNN=T1C", lines
+    # RESUME gesperrt bei offenem Wechsel-Fehler, sonst mit RESUME_FIX
+    try:
+        render("RESUME", k2={"chain_error": "EXTRUDE fehlgeschlagen"})
+    except _Raise as exc:
+        assert "RESUME gesperrt" in str(exc)
+    else:
+        raise AssertionError("RESUME hätte gesperrt sein müssen")
+    lines, _m = render("RESUME")
+    assert lines[-2:] == ["RESUME_BASE", "KTWO_BOX_RESUME_FIX"], lines
+    # Jeder KTWO_BOX_*-Befehl der Makros ist im Modul registriert
+    bus = FakeBoxBus()
+    printer = FakePrinter(bus, with_motion=True)
+    K.PrinterK2Box(FakeConfig(printer, test_options()))
+    import re as _re
+    used = set()
+    for src, _v in macros.values():
+        used.update(_re.findall(r"KTWO_BOX_[A-Z_]*[A-Z]", src))
+    missing = sorted(u for u in used if u not in printer.gcode.commands)
+    assert not missing, missing
+    assert "_PI_KEIN_CFS" not in open(path, encoding="utf-8").read()
+    return "T0..T15/M8200/RESUME gerendert (Jinja2), TNN == box.cfg, %d KTWO_BOX_* registriert" % len(used)
+
+
+# =====================================================================
 # Runner
 # =====================================================================
 
@@ -719,6 +1489,17 @@ TESTS = [
     ("Preload/Addr/Guards (nie 0x50/0x06, keine Bursts)",
      test_preload_addr_guards),
     ("G-Codes via FakePrinter", test_gcodes),
+    ("Wechsel-Bausteine == box.cfg/Live", test_wechsel_bausteine),
+    ("Einzug mit Kopfsensor + Stage 7", test_extrude_sensor_stage7),
+    ("Rückzug mit Extruder-Haken je p0", test_retrude_after_p0),
+    ("Box-Zustand abwarten (BOX_MODE_WAIT)", test_wait_box_ready),
+    ("Wechsel-Kette T1B komplett (Freigaben an)", test_wechsel_kette_voll),
+    ("Wechsel-Sperren (allow_write/allow_move/Druck)", test_wechsel_sperren),
+    ("Wechsel-Fehler im Druck -> Pause", test_wechsel_fehler_im_druck),
+    ("Wechsel-Fehler ohne Druck -> G-Code-Fehler", test_wechsel_fehler_ohne_druck),
+    ("ReactorBusProxy (kein Reactor-Blockieren)", test_reactor_bus_proxy),
+    ("Makros T0-T15/M8200/RESUME (macros.cfg)", test_makros_cfg),
+    ("Python-3.9-Syntax", test_python39),
 ]
 
 

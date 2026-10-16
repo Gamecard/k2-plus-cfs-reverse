@@ -319,7 +319,7 @@ Details: `GHIDRA-CFS-BEFUND-2026-10-15.md` §9/§10.
 - [x] RFID-vender-Feldlayout (40 Zeichen) → `box.split_rfid_vendor()` (Selbsttest)
 
 ## Offen – Tiefenanalyse (mit Ghidra + REA)
-- [x] Ghidra 12.1.4 + JDK installiert (/opt/ghidra), REA 6.4.0 global, MCP für OpenCode registriert
+- [x] Ghidra 12.1.4 + JDK installiert (/opt/ghidra), REA 6.4.0 global, MCP registriert
 - [x] `rea analyze mcu_util` läuft (116 Prozeduren, ARM-ELF)
 - [x] Update-Protokoll dekompiliert: State-Machine + Commands `0x04FB/0x05FA/0x00FF/0x03FC/0x01FE/0x02FD`
 - [x] Checksumme geknackt: 1er-Komplement-Summe über Datenbytes (`FUN_00010e54`;
@@ -501,8 +501,11 @@ box 179 · boxmini 17 · cfsseq 28 · motor 134 · motor_mini 43 · auto_addr 33
 - [x] **Belt-Modul `[k2_belt]` portiert (16.10.2026):** pi-host/k2_belt.py, ohne numpy, gemeinsamer Bus `k2_485`, Schreiben/Bewegen gesperrt (allow_write/allow_move), Tests 12/12 (266 Prüfungen, identisch zum Original am Simulator); 2 Original-Fehler abgesichert (CALI DIR=0 ohne INFO, Default-POS 0). Am Gerät ungetestet
 - [x] **Pi-Config `pi-host/config-pi/` (16.10.2026):** Upstream-printer.cfg aus der aktuellen Stock-Config, Creality-Abschnitte ersetzt/entfernt (Zuordnung im README), alles gesperrt; **Batch-Validierung mit Upstream-Klipper 9cb9975 + Live-MCU-Dictionaries: EXIT 0 ohne Testpatches**
 - [x] **Upstream-Modulfehler behoben (16.10.2026):** G-Codes K2_* → KTWO_* (Upstream-Namensregel), ppins→pins, Config-Callback-Signatur, Düsen-MCU-Name, Import-Falle (sys.path/statistics), reactor.pause absolut, Strapping max_duration=0 (wie Stock), query_gpio_status ohne OID (liest Ausgangs-Latch OCTL); neues Modul `[k2_485]` (ein gemeinsamer RS485-Bus)
-- [ ] Nachprüfen: HANDLER-TABELLE.txt der prtouch-Analyse ordnet Handler um einen Eintrag verschoben zu (Befund Modulfix 16.10.2026) – darauf beruhende Aussagen gegenprüfen
-- [ ] Pi: Stall-Mode-G-Codes in k2_motor für sensorless X/Y-Homing (config-pi `xy_stall_ok`), Beschleunigungssensor (Creality-lis2dw-Protokoll), CFS-Wechsel-Makros
+- [x] Handler-Tabelle nachgeprüft (16.10.2026, HANDLER-TABELLE-BEFUND-2026-10-16.md): Layout `info|param_types|func`, 75/75 IDs am Image belegt; STOPP-BEWEIS §2/§3 und PRTOUCH-BEFUND korrigiert markiert
+- [x] Pi: **Sensorless X/Y-Homing** (16.10.2026): `KTWO_MOTOR_HOMING PHASE=BEGIN/END` mit Stock-Frame-Folge (Stall-Mode 1/2 X/Y, Kp ID 70 300↔100, Schutzabfrage; Live-Log belegt), homing.cfg wie Stock inkl. `FORCE_MOVE stepper_y -3`; motor 17/17
+- [x] Pi: **Beschleunigungssensor `[k2_lis2dw]`** (16.10.2026): altes Creality-Protokoll (aus Düsen-FW rekonstruiert) → Upstream-Bulk-Sensor; 64/64 gegen echte Upstream-Module, Batch ohne „format mismatch“
+- [x] Pi: **CFS-Farbwechsel** (16.10.2026): T0–T15 + M8200 als `KTWO_BOX_*`-Kette (nur Box 1), Ablauf aus Live-Log eines echten Wechsels, Fehler im Druck → PAUSE, lange Box-Antworten im Hilfs-Thread; box 20/20, Batch-Bahn 89/89 Ecken
+- [ ] Am Gerät (Pi): Polarität PB11/PB12 in Stall-Mode 1 (`QUERY_ENDSTOPS`), Stage-7-Extruderweg beim CFS-Einzug, lis2dw-Erstlauf (Chip-ID 0x44, ~1600 Hz)
 - [ ] Bustest Teil 2 (schreibend/MCU): Motor-Init mit Strapping, Extruder transparent, Box-Preload – braucht Klipper bzw. Pi
 - [x] KORREKTUR: Klipper-MCU-Basis 0x08003000 (Main + Düse); PrTouch „stoppt nicht selbst“ mit korrekter Basis bestätigt
 - [x] PrTouch-Stopp-Weg BEWIESEN (statisch): Host bricht ab, Swap-Leitung nur Synchronisation, kein trsync/Endstop – PRTOUCH-STOPP-BEWEIS-2026-10-16.md

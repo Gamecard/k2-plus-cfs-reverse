@@ -1,5 +1,8 @@
 # BEWEIS: Z-Stopp beim Düsenkontakt (Creality K2 Plus, PrTouch v3) — statischer Nachweis
 
+> **KORREKTUR 2 (16.10.2026, HANDLER-TABELLE-BEFUND-2026-10-16.md): Die Handler-Adressen in §2/§3 sind um einen Eintrag verschoben** (Tabellen-Layout `info|param_types|func`). Insbesondere ist „`stop_prtouch_pres` treibt nicht“ falsch – der echte Handler setzt den Swap-Pin auf 0/1.
+
+
 > **KORREKTUR 16.10.2026 (PRTOUCH-LESETEST-BEFUND-2026-10-16.md §3): §1 ist WIDERLEGT.** Die Emulation des Stock-Moduls zeigt `config_endstop oid=1 pin=PC7` + `config_trsync` + `stepper_stop_on_trigger` und Homing-Event-Handler – der Z-Stopp läuft über einen normalen Klipper-Endstop auf der Swap-Leitung (Düse PA15 → Main PC7). Die Aussagen zu den prtouch-MCU-Befehlen selbst (§2/§3: sie stoppen nichts) bleiben gültig.
 
 

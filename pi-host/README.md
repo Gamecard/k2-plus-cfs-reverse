@@ -1,4 +1,4 @@
-> **ENTWURF – am echten Gerät UNGETESTET (Stand 16.10.2026).** Klipper-Zusatzmodul für Upstream-Klipper auf einem Pi-Host; nur offline mit simulierter MCU/Motoren getestet (`python3 test_k2_motor.py`, 11/11) und im Batch-Modus gegen Upstream-Klipper 9cb9975 ohne Testpatches (config-pi/README.md §5, Lauf F–I). Upstream-Fix 16.10.2026 abends: §8. Entwurf durch einen weiteren KI-Agenten, Review und drei Korrekturen (Pins vor Connect, gültige print_time, query_gpio_status) durch uns.
+> **ENTWURF – am echten Gerät UNGETESTET (Stand 16.10.2026).** Klipper-Zusatzmodul für Upstream-Klipper auf einem Pi-Host; nur offline mit simulierter MCU/Motoren getestet (`python3 test_k2_motor.py`, 17/17 seit Sensorless-Homing §9) und im Batch-Modus gegen Upstream-Klipper 9cb9975 ohne Testpatches (config-pi/README.md §5, Lauf F–I). Upstream-Fix 16.10.2026 abends: §8. Entwurf durch einen weiteren KI-Agenten, Review und drei Korrekturen (Pins vor Connect, gültige print_time, query_gpio_status) durch uns.
 
 # BERICHT – Klipper-Zusatzmodul [k2_motor] (Entwurf, 16.10.2026)
 
@@ -385,9 +385,66 @@ config-vor-connect/lookup-danach), `test_k2_motor.py` (Fakes + 3 Tests).
   `mcu nozzle_mcu`, `cb()`, `try_lookup_command(fmt)`, `max_duration`,
   Namensregel; neu: Hülle mit/ohne `k2_485`), `test_k2_485.py` 32/32.
 
+## 9. Sensorless-Homing X/Y (16.10.2026 spät)
+
+Ziel: `G28 X`/`G28 Y` auf dem Pi wie Stock – die Closed-loop-Motoren X/Y
+liefern ihr Stall-Signal auf PB11 (Motor x, 0x81 → `[stepper_x] endstop_pin`)
+und PB12 (Motor y, 0x82 → `[stepper_y]`), aber nur in **Stall-Mode 1**.
+Ausführlich (Belege, Ablauf, Annahmen): `config-pi/NOTIZ-stall.md`.
+
+**Stock-Folge (live, `live-logs-2026-10-16/klippy.log`, G28 X Y 14:06:21–31,
+Zeilen 369155–369321; G28 14:08–14:09 und 14:21–14:22 identisch):**
+
+| Schritt | Stock-G-Code (sensorless.cfg) | Frame (Request → Echo) |
+|---|---|---|
+| vor | `MOTOR_STALL_MODE DATA=1` | `81 04 00 11 01` → `f7 81 04 00 11 01 1d`, dann `82 …` |
+| vor | `MOTOR_SYS_PARAM NUM=1 DATA=1 ID=70 PARAMS=300` | `81 09 00 06 01 46 00 00 96 43` → `f7 81 07 00 06 00 00 96 43 09` |
+| nach | `MOTOR_STALL_MODE DATA=2` | `81 04 00 11 02` → `f7 81 04 00 11 02 14`, dann `82 …` |
+| nach | `MOTOR_CHECK_PROTECTION_AFTER_HOME DATA=11` | `0C [0b]` an 81/82/83/84 (→ 8×00), E transparent `f7 81 04 00 0c 0b 95` |
+| nach | `MOTOR_SYS_PARAM … PARAMS=100` | `81 09 00 06 01 46 00 00 c8 42` → `… c8 42 d4` |
+
+ID 70 = `controller_pos_loop_pid_param_kp` (Positionsregler-Kp), NUM=1 =
+nur Motor x; Motor y hat laut `motor_control.cfg` ohnehin 300. Kein `06 [03]`,
+keine Pausen, retries 0, 0x11/0x06 an Z/Z1 nie beim Homing.
+
+**Neue G-Codes** (alle schreibenden NUR mit `allow_write: True` in der
+Config – kein G-Code-Override –, vorher `toolhead.wait_moves()`, Fehler =
+G-Code-Fehler, nie Shutdown):
+
+| G-Code | Wirkung |
+|---|---|
+| `KTWO_MOTOR_HOMING PHASE=BEGIN` | 0x11 [01] an x, y; ID 70 = `homing_pos_kp` (Default 300) an x. Fehler → Rückbau (Mode 2, Kp) + Fehler „… – keine Bewegung“ |
+| `KTWO_MOTOR_HOMING PHASE=END` | 0x11 [02] an x, y; 0C [0b] an alle; ID 70 = `x_controller_pos_loop_pid_param_kp` (100). Läuft immer komplett; Schutzbits/Schreibfehler → Fehler danach, Schutz-Timeout nur Hinweis |
+| `KTWO_MOTOR_STALL_MODE [MOTOR=x\|y\|xy\|z\|z1] [DATA=1\|2]` | ohne DATA lesen (0x11 [04] → `[mode,00]`), mit DATA setzen (nur x/y; 3/4 abgelehnt) |
+| `KTWO_MOTOR_SYS_PARAM MOTOR=x ID=<n> [VALUE=<f>]` | ohne VALUE lesen (0x06 [02,id]), mit VALUE flüchtig schreiben – nur IDs 70, 86, 87, 102, 103, 116, 118–121, 187, 188 (Stock-Config-IDs), Echo-Prüfung |
+| `KTWO_MOTOR_PROTECTION [STRICT=1]` | 0C [0b] an alle (lesend; bei Mode 2 quittiert die FW damit die Notfall-Leitung, wie Stock) |
+
+**Sicherheitsnetz:** Bricht ein G-Code zwischen BEGIN und END ab (z. B.
+`G28 Y` „No trigger“), setzt das Modul X/Y über das Upstream-Ereignis
+`gcode:command_error` selbst zurück (Mode 2, Kp 100; einmalig). Status für
+Makros: `printer.k2_motor.{allow_write, homing_active, stall_mode,
+homing_pos_kp, last_error}`. Neue Option `homing_pos_kp` (Default 300).
+
+**homing.cfg:** `G28`/`G28 X Y`: Sperren prüfen (`_PI_FREIGABE allow_move`,
+`printer.k2_motor.allow_write`, Not-Sperre `xy_stall_ok`) → `M204 S500` →
+`KTWO_MOTOR_HOMING PHASE=BEGIN` → Y (M204 S100, ggf. Freifahren, `G28 Y`,
+`G1 Y10`) → X (`G28 X`, `G1 X-10`) → `FORCE_MOVE STEPPER=stepper_y
+DISTANCE=-3 VELOCITY=10` (Stock-Bedingungen, übernommen: Stock-Koordinaten) →
+`PHASE=END` → ggf. Z wie bisher. Ohne Freigabe: Abbruch beim Rendern, KEIN
+Frame, KEINE Bewegung.
+
+**Tests:** `test_k2_motor.py` 17/17 (neu 6: Frames = Live-Log inkl. Echo-CRCs,
+Kp aus Config, Sperren ohne Bus-Zugriff, Rückbau, END best effort, Hülle mit
+Auto-Rückbau + Batch-Meldung). **Batch:** `arbeitsdateien-lokal/upstream-test-stall/`
+(`lauf-stall.sh`, LIESMICH.txt): Auslieferung EXIT 0; Sperre ohne
+allow_write und Lauf ohne Port brechen ohne Schritt-Befehle ab (EXIT 255,
+klare Meldung); mit Test-Fake-Bus läuft `G28 X Y` komplett (10 RS485-Frames in
+Stock-Reihenfolge, FORCE_MOVE, EXIT 0).
+
 ## 7. Quellen (alle nur gelesen)
 
 - `MOTOR-INIT-BEFUND-2026-10-16.md`, `GPIO-PHASE-BEFUND-2026-10-16.md`
 - `nachbau/motor_init.py`, `nachbau/motor.py`, `nachbau/serial485.py`
 - `live-logs-2026-10-15/klippy.log` (Boot ab Zeile 2259)
+- `live-logs-2026-10-16/klippy.log` (Homing 14:06/14:09/14:21), `live-logs-2026-10-16/config-aktuell/sensorless.cfg`
 - `config/F008_CR0CN240319C13/motor_control.cfg` (Pins + F008-Params)

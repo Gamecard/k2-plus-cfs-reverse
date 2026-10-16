@@ -87,8 +87,41 @@ G-Codes:
 - ``KTWO_BOX_UNLOAD SLOT=A..D [DRY_RUN=1]`` – Box-Unload (Retrude-Ablauf A5).
 - ``KTWO_BOX_PRELOAD SLOT=A..D OP=0..3 [DRY_RUN=1]`` – 0x0d op (0 disable,
   1 enable, 2 Force mit RFID, 3 Force ohne RFID).
+
+Filamentwechsel (Ergänzung 16.10.2026, Ersatz für CR_BOX_* / M8200-Kette /
+Stock-Tn aus box_wrapper.so – Belege s. README-k2_box.md §8 und
+config-pi/NOTIZ-cfs.md). Jeder Schritt ist einzeln aufrufbar und ein
+Glied der Makrokette (config-pi/macros.cfg: T0–T15, M8200):
+
+- ``KTWO_BOX_PRE_OPT [TNN=T1A] [Z_HOP=mm]`` (= M8200 P / CR_BOX_PRE_OPT):
+  Kette beginnen, Kopfsensor sperren, Zustand sichern, Z-Hop.
+- ``KTWO_BOX_CUT`` (= M8200 C / CR_BOX_CUT): Schneidfahrt
+  pre_cut_pos → cut_pos_x (SAVE_CONFIG-Wert) → zurück.
+- ``KTWO_BOX_GO_EXTRUDE_POS`` / ``KTWO_BOX_SAFE_POS``: in den / aus dem
+  Abfallschacht (Stock BOX_GO_TO_EXTRUDE_POS / BOX_MOVE_TO_SAFE_POS).
+- ``KTWO_BOX_RETRUDE [SLOT=] [LENGTH=]`` (= M8200 R): Box 0x11 p0×4 + p1,
+  dazwischen Extruder-Rückzug Tn_retrude (live 3× −10 mm).
+- ``KTWO_BOX_EXTRUDE TNN=T1A|SLOT=A`` (= M8200 L I0): Box-Einzug bis zum
+  Kopfsensor, Stage 7 (Extruder greift), Box PRINT.
+- ``KTWO_BOX_FLUSH [TNN=] [LENGTH=] [VELOCITY=] [TEMP=]`` (= M8200 F):
+  Spülen in Abschnitten (live 90 + 70 mm) mit Abstreifen.
+- ``KTWO_BOX_WIPE`` (Abstreifen, Stock-T0-Beispiel 10.1–10.3),
+  ``KTWO_BOX_WASTE`` (= M8200 W, hier nur Hinweis),
+  ``KTWO_BOX_END_OPT [RETURN=0|1]`` (= M8200 O), ``KTWO_BOX_WAIT``
+  (Box-Zustand abwarten, Stock BOX_MODE_WAIT), ``KTWO_BOX_ERROR_CLEAR``,
+  ``KTWO_BOX_RESUME_FIX`` (aus RESUME, Z nach Abbruch im Wechsel).
+
+Freigaben: Box-Frames nur mit ``allow_write``, Kopf-/Extruder-Bewegung und
+Heizen nur mit ``allow_move`` (beide Default False → nur Plan). Im Druck
+(print_stats printing/paused) braucht ein Wechsel BEIDE Freigaben, sonst
+Pause. Fehler im Druck → PAUSE (kein Shutdown, kein Druckabbruch),
+Folgeschritte der Kette werden übersprungen; außerhalb eines Drucks →
+G-Code-Fehler. Lange Box-Antworten (mode 0 ~4,5 s, 0x11 p1 bis 23 s) laufen
+in einem Hilfs-Thread, der Reactor pausiert derweil (ReactorBusProxy).
 """
 
+import logging
+import math
 import struct
 import threading
 import time
@@ -181,6 +214,243 @@ PRELOAD_OP_NAMES = {
 }
 
 
+# ---------------------------------------------------------------------
+# Filamentwechsel: Stock-Werte (Optionen im Stock-Stil, Namen wie [box])
+# ---------------------------------------------------------------------
+# Belege: live-logs-2026-10-16/config-aktuell/box.cfg ([box]-Abschnitt +
+# kommentiertes T0-Beispiel), printer.cfg SAVE_CONFIG ``[box] cut_pos_x =
+# -7.80`` (Cut-Kalibrierung 16.10.2026, LIVE-ABFRAGEN-2026-10-16.md),
+# Live-Wechsel klippy.log.2026-10-12 00:24:49–00:26:35 (Unload+Load T1A:
+# 3x "extrude = -10.0, velocity (600,)", "length: [90, 70]", "extrude =
+# 160, velocity 360, temp 220"), klippy.log.2026-10-13 02:31 ("timeout =
+# 90" beim Einzug, stage7). Kleinbuchstaben, weil Klipper Optionsnamen
+# klein schreibt (Stock "Tn_retrude" -> "tn_retrude").
+CHANGE_DEFAULTS = {
+    # Schneiden (box.cfg + SAVE_CONFIG; T0-Beispiel Schritt 3-5)
+    "pre_cut_pos_x": 10.0,
+    "pre_cut_pos_y": 200.0,
+    "cut_pos_x": -7.80,          # SAVE_CONFIG-Wert (kalibriert 16.10.2026)
+    "cut_pos_y": 200.0,
+    "cut_velocity": 30000.0,     # mm/min
+    "cut_accel": 5000.0,         # T0-Beispiel SET_VELOCITY_LIMIT ACCEL=5000
+    # ANNAHME: kurz am Anschlag verweilen. Batch-Lauf 16.10.2026: mit
+    # Input-Shaper (mzv 42 Hz) kehrt der Kopf ohne Halt schon bei X -7,69
+    # statt -7,80 um (dekodierte MCU-Schritte, upstream-test-cfs).
+    "cut_dwell": 0.1,            # s
+    "check_cut_pos_x_min": -9.5,
+    "check_cut_pos_x_max": -5.5,
+    # Extruder (box.cfg)
+    "tn_retrude": -10.0,         # mm je Schritt (live 3x)
+    "tn_retrude_velocity": 600.0,
+    "tn_extrude_temp": 220.0,
+    "tn_extrude": 140.0,         # Stock: Vorheiz-/Einzugswert, hier nur Doku
+    "tn_extrude_velocity": 360.0,
+    "buffer_empty_len": 30.0,    # Schneide -> Extruderzahnrad
+    # Schacht / Abstreifer (box.cfg + T0-Beispiel Schritt 6, 10, 11)
+    "extrude_pos_x": 133.0,
+    "extrude_pos_y": 378.0,
+    "extrude_entry_pos_x": 139.0,  # T0-Beispiel 6.1 "G0 X139"
+    "safe_pos_x": 225.0,
+    "safe_pos_y": 345.0,
+    "clean_left_pos_x": 135.0,
+    "clean_left_pos_y": 378.0,
+    "clean_right_pos_x": 160.0,
+    "clean_right_pos_y": 378.0,
+    "clean_velocity": 12000.0,
+    "clean_pos_left_x": 160.0,
+    "clean_pos_right_x": 170.0,
+    "clean_pos_middle_y": 374.0,
+    "wipe_circle_radius": 4.0,   # T0-Beispiel G2 I4 / G3 I-4
+    "wipe_circle_velocity": 10000.0,
+    "wipe_accel": 5000.0,
+    "wipe_shakes": 3,            # T0-Beispiel 10.3 (3x 160 <-> 133)
+    "box_first_clean_length": 90.0,  # live "length: [90, 70]" (mockconfig 90)
+    "box_need_clean_length": 70.0,
+    "travel_velocity": 12000.0,  # T0-Beispiel F12000
+    "z_velocity": 600.0,         # T0-Beispiel G0 Z.. F600
+    "change_z_hop": 0.4,         # T0-Beispiel "G0 Z50.4" bei Z50
+    # Wartezeiten (live belegt bzw. ANNAHME, s. NOTIZ-cfs.md)
+    "extrude_sensor_timeout": 90.0,  # live "timeout = 90"
+    "extrude_poll_interval": 2.0,    # live 0x10 mode 5 alle ~2 s
+    "stage7_delay": 2.0,             # ANNAHME (live 3,7-3,8 s bis mode 7)
+    "box_wait_timeout": 200.0,       # ANNAHME (Preload <= ~3 min/Slot)
+    "box_wait_interval": 1.0,
+}
+CHANGE_INT_KEYS = ("wipe_shakes",)
+
+CHAIN_STATE_NAME = "_ktwo_box_chain"
+STEP_STATE_NAME = "_ktwo_box_step"
+
+
+class BoxChangeError(RuntimeError):
+    """Wechsel-Fehler ohne Box-Statuscode (Timeout, Sensor, Zustand)."""
+
+
+def tnn_from_index(index):
+    """Werkzeug-Index 0..15 -> TNN wie Stock-M8200 L (box.cfg):
+    addr = I/4 + 1, Slot = 'ABCD'[I % 4] -> 0 = T1A, 1 = T1B, 4 = T2A,
+    15 = T4D (Beleg box.cfg + PROTOKOLL-485.md „M8200-Sequenzen“)."""
+    if isinstance(index, bool):
+        raise ValueError("Werkzeug-Index muss 0..15 sein: %r" % (index,))
+    try:
+        i = int(str(index).strip().lstrip("="))
+    except ValueError:
+        raise ValueError("Werkzeug-Index muss 0..15 sein: %r" % (index,))
+    if not 0 <= i <= 15:
+        raise ValueError("Werkzeug-Index muss 0..15 sein: %r" % (index,))
+    return "T%d%s" % (i // 4 + 1, SLOT_LETTERS[i % 4])
+
+
+def parse_tnn(tnn):
+    """'T1A'..'T4D' -> (box_addr 1..4, slot_index 0..3, letter, 'T1A')."""
+    s = str(tnn).strip().upper().strip('"').strip("'")
+    if (len(s) == 3 and s[0] == "T" and s[1] in "1234"
+            and s[2] in SLOT_LETTERS):
+        idx = SLOT_LETTERS.index(s[2])
+        return int(s[1]), idx, s[2], s
+    raise ValueError("TNN muss T1A..T4D sein (Box 1-4, Slot A-D): %r" % (tnn,))
+
+
+def _n(value):
+    """Zahl für G-Code (max. 3 Nachkommastellen, ohne Nullen)."""
+    txt = ("%.3f" % float(value)).rstrip("0").rstrip(".")
+    return "0" if txt in ("-0", "") else txt
+
+
+def gcode_extruder_move(length, velocity):
+    """Relativer Extruder-Schritt (G91/G90 wie Stock-QUIT_MATERIAL)."""
+    return ["G91", "G1 E%s F%s" % (_n(length), _n(velocity)), "G90"]
+
+
+def gcode_go_extrude_pos(c):
+    """BOX_GO_TO_EXTRUDE_POS (Stock-T0-Beispiel Schritt 6–6.3):
+    G0 Y345 F12000 / G0 X139 / G0 Y378 / G0 X133."""
+    f = _n(c["travel_velocity"])
+    return ["G90",
+            "G0 Y%s F%s" % (_n(c["safe_pos_y"]), f),
+            "G0 X%s F%s" % (_n(c["extrude_entry_pos_x"]), f),
+            "G0 Y%s F%s" % (_n(c["extrude_pos_y"]), f),
+            "G0 X%s F%s" % (_n(c["extrude_pos_x"]), f)]
+
+
+def gcode_safe_pos(c):
+    """Schacht verlassen (Stock-T0-Beispiel Schritt 11): G0 X160 / G0 Y345."""
+    f = _n(c["travel_velocity"])
+    return ["G90",
+            "G0 X%s F%s" % (_n(c["clean_right_pos_x"]), f),
+            "G0 Y%s F%s" % (_n(c["safe_pos_y"]), f)]
+
+
+def gcode_cut(c, restore_accel=None):
+    """Schneidfahrt (T0-Beispiel Schritt 3–5 + CR_BOX_CUT):
+    Vor-Schneidposition X10 Y200 (F12000) → ACCEL 5000 → Hebel gegen den
+    Anschlag fahren bis cut_pos_x (SAVE_CONFIG -7.80) mit cut_velocity →
+    G4 cut_dwell (ANNAHME, s. CHANGE_DEFAULTS) → zurück auf pre_cut_pos_x →
+    Beschleunigung zurück → M400.
+    ANNAHME: Rückweg mit travel_velocity (Stock-Geschwindigkeit unbelegt)."""
+    f = _n(c["travel_velocity"])
+    lines = ["G90",
+             "G0 X%s Y%s F%s" % (_n(c["pre_cut_pos_x"]),
+                                 _n(c["pre_cut_pos_y"]), f),
+             "SET_VELOCITY_LIMIT ACCEL=%s" % _n(c["cut_accel"]),
+             "G0 X%s Y%s F%s" % (_n(c["cut_pos_x"]), _n(c["cut_pos_y"]),
+                                 _n(c["cut_velocity"]))]
+    if c.get("cut_dwell", 0) > 0:
+        lines.append("G4 P%s" % _n(float(c["cut_dwell"]) * 1000.0))
+    lines.append("G0 X%s F%s" % (_n(c["pre_cut_pos_x"]), f))
+    if restore_accel is not None:
+        lines.append("SET_VELOCITY_LIMIT ACCEL=%s" % _n(restore_accel))
+    lines.append("M400")
+    return lines
+
+
+def gcode_circle(start_x, start_y, center_dx, radius, clockwise, feed,
+                 segments=16):
+    """Vollkreis als G1-Polygon (Ersatz für Stock "G2/G3 I±4 J0 P1"; Upstream-
+    gcode_arcs kennt P nicht und Start == Ziel ist dort mehrdeutig)."""
+    cx = start_x + center_dx
+    a0 = math.atan2(0.0, start_x - cx)
+    out = []
+    for i in range(1, segments + 1):
+        step = 2.0 * math.pi * i / segments
+        a = a0 - step if clockwise else a0 + step
+        out.append("G1 X%s Y%s F%s" % (_n(cx + radius * math.cos(a)),
+                                       _n(start_y + radius * math.sin(a)),
+                                       _n(feed)))
+    return out
+
+
+def gcode_wipe(c, restore_accel=None):
+    """Abstreifen am Schacht (Stock-T0-Beispiel 10.1–10.3):
+    Blech-Schnitt X160→X135 (Y378), Kreis am Silikon um (164|374) und
+    (166|374), dann 3x Schütteln X160↔X133 auf Y378 (endet an extrude_pos)."""
+    cv = _n(c["clean_velocity"])
+    r = float(c["wipe_circle_radius"])
+    my = c["clean_pos_middle_y"]
+    lines = ["G90", "SET_VELOCITY_LIMIT ACCEL=%s" % _n(c["wipe_accel"]),
+             "G0 X%s F%s" % (_n(c["clean_right_pos_x"]), cv),
+             "G0 X%s F%s" % (_n(c["clean_left_pos_x"]), cv),
+             "G0 X%s Y%s F%s" % (_n(c["clean_pos_left_x"]), _n(my), cv)]
+    lines += gcode_circle(c["clean_pos_left_x"], my, r, r, True,
+                          c["wipe_circle_velocity"])
+    lines.append("G0 X%s Y%s F%s" % (_n(c["clean_pos_right_x"]), _n(my), cv))
+    lines += gcode_circle(c["clean_pos_right_x"], my, -r, r, False,
+                          c["wipe_circle_velocity"])
+    for _ in range(int(c["wipe_shakes"])):
+        lines.append("G0 X%s Y%s F%s" % (_n(c["clean_right_pos_x"]),
+                                         _n(c["clean_right_pos_y"]), cv))
+        lines.append("G0 X%s Y%s F%s" % (_n(c["extrude_pos_x"]),
+                                         _n(c["extrude_pos_y"]), cv))
+    if restore_accel is not None:
+        lines.append("SET_VELOCITY_LIMIT ACCEL=%s" % _n(restore_accel))
+    return lines
+
+
+def flush_segments(c, length=None):
+    """Spül-Abschnitte: live [box_first_clean_length, box_need_clean_length]
+    = [90, 70] (Summe 160 = "extrude = 160"). LENGTH > 0 ersetzt das durch
+    Abschnitte von höchstens box_first_clean_length (ANNAHME)."""
+    if length is None:
+        segs = [float(c["box_first_clean_length"]),
+                float(c["box_need_clean_length"])]
+        return [s for s in segs if s > 0]
+    total = float(length)
+    if total <= 0:
+        return []
+    size = max(float(c["box_first_clean_length"]), 1.0)
+    out = []
+    while total > 1e-9:
+        part = min(size, total)
+        out.append(part)
+        total -= part
+    return out
+
+
+def gcode_flush_segment(length, velocity):
+    """Ein Spül-Abschnitt, live 20 %/80 % geteilt (18+72 bzw. 14+56 mm)."""
+    first = round(float(length) * 0.2, 3)
+    return ["G91",
+            "G1 E%s F%s" % (_n(first), _n(velocity)),
+            "G1 E%s F%s" % (_n(float(length) - first), _n(velocity)),
+            "G90"]
+
+
+def retrude_extruder_steps(c, length=None):
+    """Extruder-Rückzug je 0x11-p0 (live 3x -10 mm = buffer_empty_len 30).
+    LENGTH (Stock "M8200 R E…"/CR_BOX_RETRUDE LENGTH) = Gesamtlänge,
+    aufgeteilt in |tn_retrude|-Schritte (ANNAHME)."""
+    step = abs(float(c["tn_retrude"]))
+    total = abs(float(c["buffer_empty_len"] if length is None else length))
+    if step <= 0 or total <= 0:
+        return []
+    out = []
+    while total > 1e-9:
+        part = min(step, total)
+        out.append(-part)
+        total -= part
+    return out
+
+
 def check_not_forbidden(fun):
     """Guard: 0x50/0x06 dürfen nie gesendet werden (Beleg s. FORBIDDEN_FUNS)."""
     if fun in FORBIDDEN_FUNS:
@@ -241,6 +511,11 @@ def parse_options(opts):
     - box_addr (Default 1), allow_write (Default False),
       shutdown_on_failure (Default False), auto_init (Default True),
       poll_interval (Default 4.0 s).
+    - Filamentwechsel: allow_move (Default False – Bewegung/Heizen),
+      pause_on_failure (Default True), filament_sensor (Default
+      "filament_sensor"), cut_sensor (Default leer) und alle Stock-[box]-
+      Werte aus CHANGE_DEFAULTS (Positionen, Längen, Temperaturen,
+      Geschwindigkeiten; cut_pos_x Default = SAVE_CONFIG -7.80).
     """
     o = {str(k).strip().lower(): v for k, v in dict(opts).items()}
 
@@ -264,18 +539,61 @@ def parse_options(opts):
             return False
         raise ValueError("%s muss bool sein: %r" % (key, o.get(key)))
 
+    def _str(key, default=""):
+        return str(o.get(key, default) or "").strip()
+
     cfg = {
         "box_addr": _int("box_addr", BOX_ADDR_DEFAULT),
         "allow_write": _bool("allow_write", False),
         "shutdown_on_failure": _bool("shutdown_on_failure", False),
         "auto_init": _bool("auto_init", True),
         "poll_interval": _float("poll_interval", POLL_INTERVAL_DEFAULT),
+        # Filamentwechsel (Ergänzung 16.10.2026)
+        "allow_move": _bool("allow_move", False),
+        "pause_on_failure": _bool("pause_on_failure", True),
+        # Stock [box] filament_sensor: filament_sensor (Kopfsensor PA11)
+        "filament_sensor": _str("filament_sensor", "filament_sensor"),
+        # Stock [box] switch_pin: !nozzle_mcu:PB9 (Schneidhebel) – hier nur
+        # als Name eines [filament_switch_sensor …] (leer = keine Prüfung)
+        "cut_sensor": _str("cut_sensor", ""),
     }
+    for key, default in CHANGE_DEFAULTS.items():
+        if key in CHANGE_INT_KEYS:
+            cfg[key] = _int(key, default)
+        else:
+            cfg[key] = _float(key, default)
     if not 0x01 <= cfg["box_addr"] <= 0x04:
         raise ValueError("box_addr muss 1..4 sein (Auto-Addr-Tabelle MB): %r"
                          % (cfg["box_addr"],))
     if not cfg["poll_interval"] > 0:
         raise ValueError("poll_interval muss > 0 sein: %r" % (cfg["poll_interval"],))
+    # Stock-Kalibriergrenzen (box.cfg check_cut_pos_x_min/max)
+    if not (cfg["check_cut_pos_x_min"] <= cfg["cut_pos_x"]
+            <= cfg["check_cut_pos_x_max"]):
+        raise ValueError("cut_pos_x %.2f außerhalb check_cut_pos_x_min/max "
+                         "[%.2f, %.2f] (Stock-Kalibriergrenzen)" % (
+                             cfg["cut_pos_x"], cfg["check_cut_pos_x_min"],
+                             cfg["check_cut_pos_x_max"]))
+    for key in ("cut_velocity", "cut_accel", "tn_retrude_velocity",
+                "tn_extrude_velocity", "clean_velocity", "travel_velocity",
+                "z_velocity", "wipe_circle_velocity", "wipe_accel",
+                "extrude_sensor_timeout", "extrude_poll_interval",
+                "box_wait_timeout", "box_wait_interval"):
+        if not cfg[key] > 0:
+            raise ValueError("%s muss > 0 sein: %r" % (key, cfg[key]))
+    if cfg["cut_dwell"] > 2.0:
+        raise ValueError("cut_dwell > 2 s unplausibel: %r" % (cfg["cut_dwell"],))
+    for key in ("buffer_empty_len", "tn_extrude_temp", "change_z_hop", "cut_dwell",
+                "stage7_delay", "box_first_clean_length",
+                "box_need_clean_length", "wipe_circle_radius", "wipe_shakes"):
+        if cfg[key] < 0:
+            raise ValueError("%s darf nicht negativ sein: %r" % (key, cfg[key]))
+    if cfg["tn_retrude"] > 0:
+        raise ValueError("tn_retrude muss <= 0 sein (Rückzug, Stock -10): %r"
+                         % (cfg["tn_retrude"],))
+    if cfg["change_z_hop"] > 5.0:
+        raise ValueError("change_z_hop > 5 mm unplausibel (Stock 0.4): %r"
+                         % (cfg["change_z_hop"],))
     return cfg
 
 
@@ -288,6 +606,10 @@ def parse_klipper_config(config):
     try:
         if hasattr(config, "get_options"):
             keys = list(config.get_options())
+        elif hasattr(config, "get_prefix_options"):
+            # Upstream-ConfigWrapper (configfile.py): alle Optionen des
+            # Abschnitts; jede gelesene Option gilt als benutzt.
+            keys = list(config.get_prefix_options(""))
         elif hasattr(config, "_options"):
             keys = list(dict(config._options).keys())
         elif isinstance(config, dict):
@@ -310,8 +632,9 @@ def parse_klipper_config(config):
         return parse_options(config)
     for k in keys:
         opts[k.lower()] = _g(k, "")
-    for k in ("box_addr", "allow_write", "shutdown_on_failure", "auto_init",
-              "poll_interval"):
+    for k in (("box_addr", "allow_write", "shutdown_on_failure", "auto_init",
+               "poll_interval", "allow_move", "pause_on_failure",
+               "filament_sensor", "cut_sensor") + tuple(CHANGE_DEFAULTS)):
         if k not in opts:
             v = _g(k, None)
             if v is not None:
@@ -327,9 +650,58 @@ def parse_klipper_config(config):
 def reactor_sleep(reactor):
     """Relative Pause für Klipper: reactor.pause() erwartet eine ABSOLUTE
     Weckzeit (upstream reactor.py: pause(waketime)). Ohne Reactor -> time.sleep."""
-    if reactor is None or not hasattr(reactor, "pause"):
+    if reactor is None or not hasattr(reactor, "pause") \
+            or not hasattr(reactor, "monotonic"):
         return time.sleep
     return lambda s: reactor.pause(reactor.monotonic() + float(s))
+
+
+class ReactorBusProxy:
+    """Bus-Aufrufe in einem Hilfs-Thread; der Klipper-Reactor pausiert
+    derweil in kleinen Schritten (andere Timer laufen weiter).
+
+    Grund: Box-Antworten kommen erst NACH dem Vorgang (0x10 mode 0 live
+    4,3–5,4 s, 0x11 p1 0,8–22,4 s, 0x0d op 2 31–37 s; Beleg livelog-cfs/
+    BEFUND-LIVE.md §3). Ein blockierender Aufruf im Reactor würde Heizungs-
+    PWM-Updates (max_duration) und die MCU-Uhr-Synchronisation aufhalten –
+    bei heißer Düse droht ein MCU-Shutdown. Der Bus-Lock (serial485,
+    threading.Lock) serialisiert weiterhin alle Teilnehmer.
+    Callbacks des Controllers (Sensor, Extruder-Bewegung) laufen NICHT im
+    Thread, sondern im Reactor (nur transact/transact_full sind verlagert).
+    """
+
+    def __init__(self, bus, reactor, step=0.02):
+        self.bus = bus
+        self.reactor = reactor
+        self.step = float(step)
+
+    def _run(self, name, *args, **kwargs):
+        res = {}
+
+        def _work():
+            try:
+                res["v"] = getattr(self.bus, name)(*args, **kwargs)
+            except BaseException as exc:  # an den Aufrufer weiterreichen
+                res["e"] = exc
+
+        t = threading.Thread(target=_work, name="k2_box-bus")
+        t.daemon = True
+        t.start()
+        while t.is_alive():
+            self.reactor.pause(self.reactor.monotonic() + self.step)
+        t.join()
+        if "e" in res:
+            raise res["e"]
+        return res.get("v")
+
+    def transact_full(self, *args, **kwargs):
+        return self._run("transact_full", *args, **kwargs)
+
+    def transact(self, *args, **kwargs):
+        return self._run("transact", *args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self.bus, name)
 
 class BoxAutoAddrSerial:
     """Adapter: auto_addr-Serial-API um einen Box-Bus (serial485-artig).
@@ -409,6 +781,11 @@ class K2BoxController:
         self.slot_cache = {}  # letter -> {rfid, remain}
         self._stop = threading.Event()
         self._thread = None
+        # Filamentwechsel: zuletzt geladener Slot (None = leer/unbekannt),
+        # busy = langer Box-Vorgang läuft (Poll-Timer pausiert dann).
+        self.loaded_slot = None
+        self.busy = False
+        self.clock = time.monotonic
 
     class _print_log:
         def info(self, msg):
@@ -452,7 +829,9 @@ class K2BoxController:
                    "10/05 x%d → 10/06 → 10/07 p=3 → 05 → 04 PRINT → 0f aus" % ODO_POLLS_DEFAULT)
         out.append("A5 Retrude (Unload): 04 IDLE → 08 Sensor → 11 p0 x%d → 11 p1" % (
             RETRUDE_REPEATS_DEFAULT,))
-        out.append("A6 Cut: Platzhalter (braucht Motor/Toolhead – sendet NICHTS)")
+        out.append("A6 Cut: Kopfbewegung pre_cut_pos -> cut_pos_x %s -> zurück "
+                   "(KTWO_BOX_CUT, allow_move; sendet KEIN Box-Frame)" % (
+                       _n(self.cfg.get("cut_pos_x", CHANGE_DEFAULTS["cut_pos_x"])),))
         out.append("Verboten: nie 0x50 (Reset) / nie 0x06-Feeder (FW-Bug); "
                    "Bus-Lock mit [k2_motor] teilen (eine ttyS5-Instanz).")
         if not self.cfg.get("allow_write"):
@@ -617,12 +996,28 @@ class K2BoxController:
         return {"status": "ok", "slot": letter, "op": op, "raw": bytes(raw)}
 
     # --- A4 Extrude (Load, Box-Seite) --------------------------------------
-    def do_extrude(self, slot, odo_polls=ODO_POLLS_DEFAULT, dry_run=False):
+    def do_extrude(self, slot, odo_polls=ODO_POLLS_DEFAULT, dry_run=False,
+                   sensor_fn=None, sensor_timeout=90.0, poll_interval=2.0,
+                   sensor_check=0.1, stage7_fn=None, stage7_delay=0.0):
         """Box-Extrude A4 (Byte-folge == cfsseq.build_extrude_sequence).
 
         Abbruch bei Status != 0: BoxAction wirft CfsStatusError (mit
         Status-Name, z.B. 0x0c Odometer-Stillstand) – hier mit Slot-Kontext
         angereichert und propagiert (Auftrag: „Abbruch mit CfsStatusError-Text“).
+
+        Wechsel-Erweiterung (16.10.2026, Beleg Live-Wechsel 12./13.10.):
+        - ``sensor_fn`` (callable -> bool, Kopf-Filamentsensor): statt fester
+          ``odo_polls`` wird mode 5 alle ``poll_interval`` s abgefragt, bis
+          der Kopfsensor Filament meldet (live: mode 6 kommt aus dem
+          Sensor-Ereignis, „timeout = 90“). Kein Sensor nach
+          ``sensor_timeout`` s -> Box per 0x04 [00 01] auf IDLE (Fördern
+          stoppen, ANNAHME) + BoxChangeError.
+        - ``stage7_fn`` (callable): zwischen mode 6 und mode 7 (live Ereignis
+          ``extrude_process_stage7``) – Drucker lässt den Extruder greifen;
+          danach ``stage7_delay`` s warten, dann mode 7 p=3 (Box prüft, dass
+          das Odometer > p mm in 300 ms läuft, sonst 0x0e).
+        Ohne beide Callbacks bleibt die Frame-Folge byte-identisch zu
+        EXTRUDE_LIVE_CMDS_B.
         """
         idx, letter, mask = parse_slot(slot)
         if isinstance(odo_polls, bool) or not isinstance(odo_polls, int) \
@@ -652,36 +1047,73 @@ class K2BoxController:
                     pass
             return raw
 
+        def _stop_feed():
+            # Best effort: IDLE stoppt/löscht (live 0x04 [00 01] aus ERROR).
+            try:
+                self.action.communication_set_box_mode_feed()
+            except Exception:
+                pass
+
+        self.busy = True
         try:
             self.action.communication_set_box_mode_feed()
             self.action.communication_set_preload_inhibit(True)
             self.action.communication_get_filament_sensor_state(0x00)
             _run(_SEQ.EXTRUDE_MODE_STAGE1, 0x00, "Stage1 (mode 0)")
             _run(_SEQ.EXTRUDE_MODE_FEED_START, 0x00, "Feed-Start (mode 4)")
-            for _ in range(odo_polls):
+            if sensor_fn is None:
+                for _ in range(odo_polls):
+                    _run(_SEQ.EXTRUDE_MODE_QUERY, 0x00, "Odometer-Poll (mode 5)")
+            else:
+                t0 = self.clock()
                 _run(_SEQ.EXTRUDE_MODE_QUERY, 0x00, "Odometer-Poll (mode 5)")
+                last = self.clock()
+                while not sensor_fn():
+                    now = self.clock()
+                    if now - t0 > float(sensor_timeout):
+                        _stop_feed()
+                        raise BoxChangeError(
+                            "Einzug SLOT=%s: Kopf-Filamentsensor nach %.0f s "
+                            "nicht erreicht (Odometer %s mm) – Box auf IDLE" % (
+                                letter, float(sensor_timeout),
+                                round(odo_trace[-1], 1) if odo_trace else "?"))
+                    if now - last >= float(poll_interval):
+                        _run(_SEQ.EXTRUDE_MODE_QUERY, 0x00,
+                             "Odometer-Poll (mode 5)")
+                        last = self.clock()
+                    self.pause(float(sensor_check))
             _run(_SEQ.EXTRUDE_MODE_STOP_BUFFER, 0x00, "Stopp/Buffer (mode 6)")
+            if stage7_fn is not None:
+                stage7_fn()
+                if stage7_delay:
+                    self.pause(float(stage7_delay))
             _run(_SEQ.EXTRUDE_MODE_EXTRUDER_CHECK, EXTRUDER_CHECK_MM,
                  "Extruder-Check (mode 7 p=3)")
             self.action.communication_get_buffer_state()
             self.action.communication_set_box_mode_print(mask)
             self.action.communication_set_preload_inhibit(False)
-        except CfsStatusError:
-            raise
+        finally:
+            self.busy = False
+        self.loaded_slot = letter
         return {"status": "ok", "slot": letter, "odo_mm": list(odo_trace)}
 
-    def do_load(self, slot, dry_run=False, odo_polls=ODO_POLLS_DEFAULT):
+    def do_load(self, slot, dry_run=False, odo_polls=ODO_POLLS_DEFAULT,
+                **extrude_kw):
         """Box-Load = Extrude-Ablauf A4 (Toolhead-Heizen/Fahren macht der
-        Aufrufer per Makro – hier nur Box-Förderung, ANNAHME s. BERICHT)."""
+        Aufrufer per Makro bzw. KTWO_BOX_EXTRUDE – hier nur Box-Förderung)."""
         if dry_run:
             idx, letter, _m = parse_slot(slot)
             return {"status": "dry_run", "slot": letter,
                     "plan": self.describe_plan()}
-        return self.do_extrude(slot, odo_polls=odo_polls)
+        return self.do_extrude(slot, odo_polls=odo_polls, **extrude_kw)
 
     # --- A5 Retrude (Unload, Box-Seite) ------------------------------------
     def do_retrude(self, slot,
-                   to_buffer_repeats=RETRUDE_REPEATS_DEFAULT, dry_run=False):
+                   to_buffer_repeats=RETRUDE_REPEATS_DEFAULT, dry_run=False,
+                   after_p0=None):
+        """Box-Retrude A5. ``after_p0(i)`` (optional) läuft nach der i-ten
+        0x11-p0-Antwort (0-basiert) – Wechsel: Extruder-Rückzug tn_retrude
+        (live 3x "extrude = -10.0" je nach p0 1–3, dann p0 4 + p1)."""
         idx, letter, mask = parse_slot(slot)
         if isinstance(to_buffer_repeats, bool) or not isinstance(
                 to_buffer_repeats, int) or to_buffer_repeats < 0:
@@ -694,18 +1126,25 @@ class K2BoxController:
             self._require_write("Retrude SLOT=%s" % letter)
         for fun in (FUNC_SET_BOX_MODE, FUNC_RETRUDE):
             check_not_forbidden(fun)
+        self.busy = True
         try:
             self.action.communication_set_box_mode_feed()
             if to_buffer_repeats:
                 self.action.communication_get_filament_sensor_state(0x00)
-                for _ in range(to_buffer_repeats):
+                for i in range(to_buffer_repeats):
                     self.action.communication_retrude(
                         mask, RETRUDE_P_TO_BUFFER)
+                    if after_p0 is not None:
+                        after_p0(i)
             self.action.communication_retrude(mask, RETRUDE_P_PULL_HUB)
         except CfsStatusError as exc:
             raise CfsStatusError(
                 exc.status, "Retrude SLOT=%s: %s" % (letter, exc.name),
                 exc.data, exc.fun)
+        finally:
+            self.busy = False
+        if self.loaded_slot in (None, letter):
+            self.loaded_slot = None
         return {"status": "ok", "slot": letter}
 
     def do_unload(self, slot, dry_run=False,
@@ -717,17 +1156,52 @@ class K2BoxController:
         return self.do_retrude(slot, to_buffer_repeats=to_buffer_repeats,
                                dry_run=False)
 
-    # --- A6 Cut (Platzhalter) ------------------------------------------------
-    def do_cut(self, slot=None):
-        """Cut-Ablauf als Platzhalter (braucht Motor/Toolhead).
+    # --- A6 Cut (reine Kopfbewegung, kein Box-Frame) -------------------------
+    def do_cut(self, slot=None, restore_accel=None):
+        """Schneidfahrt als G-Code-Plan (sendet NICHTS an die Box).
 
-        ANNAHME (Beleg CHECKLISTE/Box-Makros: BOX_CUT_MATERIAL fährt Kopf an
-        Cutter-Pos und nutzt Motor-Boards): sendet bewusst NICHTS – hier nur
-        Box-Seite verfügbar. Aufrufer nutzt Original-Makro M8200 C / CR_BOX_CUT.
+        Beleg: Live-Cut 12.10. 00:24:50–00:24:53 und 16.10. 22:02:35–22:02:39
+        – zwischen „[box] cut sensor detected“ und „cut to return OK“ nur
+        0x0a-Polls/0x0e, KEIN Box- oder Motor-Frame → Cut = Kopfbewegung
+        gegen den Schneidhebel (+ Schaltersensor switch_pin PB9). Positionen
+        aus box.cfg/SAVE_CONFIG (s. gcode_cut). Ausführen macht die
+        Klipper-Hülle (KTWO_BOX_CUT, nur mit allow_move).
         """
-        raise NotImplementedError(
-            "Cut braucht Motor/Toolhead (Fahrt an Cutter-Pos + Stall) – "
-            "Box-Modul sendet nichts (Platzhalter)")
+        if slot is not None:
+            parse_slot(slot)  # nur Plausibilität (Cut ist slot-unabhängig)
+        return {"status": "plan", "gcode": gcode_cut(self.cfg, restore_accel)}
+
+    # --- Wechsel: Wartebedingungen (lesend) ----------------------------------
+    def hub_mask(self):
+        """Hub-Sensor (0x08 [01] = Sensor B, live auch 0x0a b4) – lesend."""
+        return int(self.get_sensor(0x01)) & MASK_ALL
+
+    def wait_box_ready(self, timeout=200.0, interval=1.0):
+        """Box-Zustand abwarten (Stock BOX_MODE_WAIT): 0x0a pollen, bis
+        IDLE oder PRINT. PRELOAD/RELOAD/0x30-Ereignis -> weiter warten
+        (Preload live 31–37 s je Slot); ERROR -> CfsStatusError mit
+        gespeichertem Fehlercode; Timeout -> BoxChangeError. Lesend."""
+        t0 = self.clock()
+        last = None
+        while True:
+            st = self.poll_status()
+            last = st
+            kind = st.get("kind")
+            state = st.get("state")
+            if kind in ("state", "state_v113"):
+                if state == _BOX.BOX_STATE_ERROR:
+                    code = st.get("error_code") or st.get("frame_status") or 0
+                    raise CfsStatusError(
+                        int(code), "Box im Zustand ERROR (Fehler 0x%02x %s) – "
+                        "KTWO_BOX_ERROR_CLEAR" % (int(code), status_name(int(code))),
+                        b"", FUNC_GET_BOX_STATE)
+                if state in (BOX_STATE_IDLE, _BOX.BOX_STATE_PRINT):
+                    return st
+            if self.clock() - t0 > float(timeout):
+                raise BoxChangeError(
+                    "Box nach %.0f s nicht bereit (Zustand %s)" % (
+                        float(timeout), (last or {}).get("state_name", "?")))
+            self.pause(float(interval))
 
     # --- Status-Objekt für Moonraker (kein Bus) ------------------------------
     def get_status(self, eventtime=None):
@@ -741,6 +1215,8 @@ class K2BoxController:
         base = {"ready": bool(self.is_ready),
                 "box_addr": self.cfg.get("box_addr", BOX_ADDR_DEFAULT),
                 "box_fw": self.box_fw,
+                "loaded_slot": self.loaded_slot,
+                "busy": bool(self.busy),
                 "state": None, "state_name": "unknown",
                 "hub_mask": None, "temp_c": None, "rh": None,
                 "slots": {k: dict(v) for k, v in self.slot_cache.items()}}
@@ -791,6 +1267,39 @@ class PrinterK2Box:
                                     desc="K2-Box-Unload SLOT=A..D [DRY_RUN=1]")
         self.gcode.register_command("KTWO_BOX_PRELOAD", self.cmd_preload,
                                     desc="K2-Box-Preload SLOT=A..D OP=0..3")
+        # Filamentwechsel (T0–T15 / M8200-Kette, s. Modul-Docstring)
+        self.chain = self._new_chain()
+        self.chain_error = ""
+        self.pending_resume_z = None
+        self._keep_start_pos = None  # Startposition eines abgebrochenen Wechsels
+        for name, func, desc in (
+                ("KTWO_BOX_PRE_OPT", self.cmd_pre_opt,
+                 "Wechsel beginnen (= M8200 P) [TNN=T1A] [Z_HOP=mm]"),
+                ("KTWO_BOX_CUT", self.cmd_cut,
+                 "Filament schneiden (= M8200 C), Kopfbewegung"),
+                ("KTWO_BOX_GO_EXTRUDE_POS", self.cmd_go_extrude_pos,
+                 "Kopf in den Abfallschacht (Stock BOX_GO_TO_EXTRUDE_POS)"),
+                ("KTWO_BOX_SAFE_POS", self.cmd_safe_pos,
+                 "Abfallschacht verlassen (Stock BOX_MOVE_TO_SAFE_POS)"),
+                ("KTWO_BOX_RETRUDE", self.cmd_retrude,
+                 "Filament in die Box zurück (= M8200 R) [SLOT=] [LENGTH=]"),
+                ("KTWO_BOX_EXTRUDE", self.cmd_extrude,
+                 "Filament einziehen (= M8200 L I..) TNN=T1A|SLOT=A"),
+                ("KTWO_BOX_FLUSH", self.cmd_flush,
+                 "Spülen + Abstreifen (= M8200 F) [LENGTH=] [VELOCITY=] [TEMP=]"),
+                ("KTWO_BOX_WIPE", self.cmd_wipe,
+                 "Düse am Schacht abstreifen (Stock-T0-Beispiel 10.1-10.3)"),
+                ("KTWO_BOX_WASTE", self.cmd_waste,
+                 "Abfallschacht-Prüfung (= M8200 W, hier nur Hinweis)"),
+                ("KTWO_BOX_END_OPT", self.cmd_end_opt,
+                 "Wechsel abschließen (= M8200 O) [RETURN=0|1]"),
+                ("KTWO_BOX_WAIT", self.cmd_wait,
+                 "Box-Zustand abwarten (IDLE/PRINT) [TIMEOUT=s]"),
+                ("KTWO_BOX_ERROR_CLEAR", self.cmd_error_clear,
+                 "Wechsel-Fehler quittieren (+ Box 0x04 IDLE mit allow_write)"),
+                ("KTWO_BOX_RESUME_FIX", self.cmd_resume_fix,
+                 "Nach RESUME: Z auf Höhe vor dem abgebrochenen Wechsel")):
+            self.gcode.register_command(name, func, desc=desc)
 
     def _ensure_bus(self):
         # ANNAHME: EIN geteilter RS485-Bus (dieselbe Instanz wie [k2_motor],
@@ -813,10 +1322,15 @@ class PrinterK2Box:
         if self.controller is not None:
             return self.controller
         bus = self._ensure_bus()
+        if hasattr(self.reactor, "pause") and hasattr(self.reactor, "monotonic"):
+            # Lange Box-Antworten nicht im Reactor blockieren (s. Proxy).
+            bus = ReactorBusProxy(bus, self.reactor)
         self.controller = K2BoxController(
             self.cfg, bus, pause=reactor_sleep(self.reactor),
             logger=self.gcode,
             send_event=getattr(self.printer, "send_event", None))
+        if hasattr(self.reactor, "monotonic"):
+            self.controller.clock = self.reactor.monotonic
         return self.controller
 
     def handle_connect(self):
@@ -859,10 +1373,11 @@ class PrinterK2Box:
                                               POLL_INTERVAL_DEFAULT))
 
                 def _poll(eventtime):
-                    try:
-                        ctl.poll_status()
-                    except Exception:
-                        pass
+                    if not ctl.busy:  # kein Poll während langer Box-Vorgänge
+                        try:
+                            ctl.poll_status()
+                        except Exception:
+                            pass
                     return eventtime + interval
 
                 self.reactor.register_timer(
@@ -872,8 +1387,26 @@ class PrinterK2Box:
 
     def get_status(self, eventtime=None):
         if self.controller is None:
-            return {"ready": False, "state_name": "unknown"}
-        return self.controller.get_status(eventtime)
+            st = {"ready": False, "state_name": "unknown",
+                  "loaded_slot": None, "busy": False}
+        else:
+            st = self.controller.get_status(eventtime)
+        loaded = st.get("loaded_slot")
+        st.update({
+            "allow_write": bool(self.cfg.get("allow_write")),
+            "allow_move": bool(self.cfg.get("allow_move")),
+            # Wechsel vollständig freigegeben (macros.cfg T0: sonst Einfarb)
+            "change_enabled": bool(self.cfg.get("allow_write")
+                                   and self.cfg.get("allow_move")),
+            "loaded_tnn": ("T%d%s" % (self.cfg.get("box_addr", 1), loaded)
+                           if loaded else ""),
+            "chain_active": bool(self.chain.get("active")),
+            "chain_tnn": self.chain.get("tnn") or "",
+            "chain_skip": bool(self.chain.get("skip")),
+            "chain_error": self.chain_error or "",
+            "pending_resume_z": self.pending_resume_z,
+        })
+        return st
 
     # -- G-Code-Helfer ---------------------------------------------------
     @staticmethod
@@ -1039,6 +1572,594 @@ class PrinterK2Box:
             raise gcmd.error(msg) if hasattr(gcmd, "error") else RuntimeError(msg)
         gcmd.respond_info("[k2_box] Preload SLOT=%s OP=%s ok" % (
             res.get("slot"), res.get("op")))
+
+    # =================================================================
+    # Filamentwechsel – Klipper-Seite (T0–T15 / M8200-Kette)
+    # =================================================================
+    # Aufteilung (Beleg Live-Wechsel 12.10. 00:24–00:26, box.cfg T0-Beispiel):
+    #   Box (RS485, allow_write): 0x04/0x0f/0x08/0x10/0x11/0x05 – Retrude,
+    #     Einzug, Box-Zustand.
+    #   Drucker (allow_move): Z-Hop, Schneidfahrt, Schacht, Heizen (M109),
+    #     Extruder-Rückzug je p0, Stage-7-Greifen, Spülen, Abstreifen,
+    #     Rückfahrt. Lüfter sichern/zurück machen die Makros (macros.cfg).
+    @staticmethod
+    def _new_chain():
+        return {"active": False, "skip": False, "skip_reason": "",
+                "tnn": "", "start_pos": None, "hop": 0.0,
+                "state_saved": False, "sensor_was_enabled": None,
+                "orig_target": None, "temp_changed": False}
+
+    def _now(self):
+        try:
+            return self.reactor.monotonic()
+        except Exception:
+            return time.monotonic()
+
+    def _lookup(self, name):
+        try:
+            return self.printer.lookup_object(name)
+        except Exception:
+            return None
+
+    def _obj_status(self, name):
+        obj = self._lookup(name)
+        if obj is None or not hasattr(obj, "get_status"):
+            return {}
+        try:
+            return dict(obj.get_status(self._now()))
+        except Exception:
+            return {}
+
+    def _print_active(self):
+        return self._obj_status("print_stats").get("state") in (
+            "printing", "paused")
+
+    def _is_paused(self):
+        return bool(self._obj_status("pause_resume").get("is_paused"))
+
+    def _released(self):
+        return bool(self.cfg.get("allow_write") and self.cfg.get("allow_move"))
+
+    def _sensor_state(self, name):
+        """[filament_switch_sensor <name>] -> True/False, None = fehlt."""
+        if not name:
+            return None
+        st = self._obj_status("filament_switch_sensor %s" % (name,))
+        if "filament_detected" not in st:
+            return None
+        return bool(st["filament_detected"])
+
+    def _head_filament(self):
+        return self._sensor_state(self.cfg.get("filament_sensor"))
+
+    def _respond_error(self, msg):
+        try:
+            if hasattr(self.gcode, "respond_raw"):
+                self.gcode.respond_raw("!! %s" % (msg,))
+            else:
+                self.gcode.respond_info(msg)
+        except Exception:
+            pass
+        try:
+            logging.error(msg)
+        except Exception:
+            pass
+
+    def _script(self, lines):
+        self.gcode.run_script_from_command("\n".join(lines))
+
+    def _move(self, gcmd, title, lines, wrap=True):
+        """Bewegungs-/Heiz-Zeilen ausführen (nur allow_move) – sonst Plan.
+
+        wrap: in SAVE/RESTORE_GCODE_STATE einpacken (G90/G91 des Aufrufers
+        bleiben erhalten; RESTORE ohne MOVE korrigiert die E-Basis)."""
+        if not lines:
+            return False
+        if not self.cfg.get("allow_move"):
+            gcmd.respond_info("[k2_box] PLAN %s (allow_move: False – nichts "
+                              "bewegt/geheizt):\n  %s" % (title,
+                                                          "\n  ".join(lines)))
+            return False
+        body = list(lines)
+        if wrap:
+            body = (["SAVE_GCODE_STATE NAME=%s" % STEP_STATE_NAME] + body
+                    + ["RESTORE_GCODE_STATE NAME=%s" % STEP_STATE_NAME])
+        try:
+            self._script(body)
+        except Exception:
+            if wrap:
+                try:
+                    self._script(["RESTORE_GCODE_STATE NAME=%s"
+                                  % STEP_STATE_NAME])
+                except Exception:
+                    pass
+            raise
+        return True
+
+    def _plan_note(self):
+        if self.cfg.get("allow_move") and self.cfg.get("allow_write"):
+            return ""
+        return " (Teil-Plan: allow_write=%s, allow_move=%s)" % (
+            self.cfg.get("allow_write"), self.cfg.get("allow_move"))
+
+    def _box_plan(self, gcmd, title, text):
+        gcmd.respond_info("[k2_box] PLAN Box %s (allow_write: False – nichts "
+                          "gesendet): %s" % (title, text))
+
+    def _homed_ok(self):
+        homed = str(self._obj_status("toolhead").get("homed_axes", ""))
+        return all(a in homed for a in "xyz")
+
+    def _gcode_pos(self):
+        pos = self._obj_status("gcode_move").get("gcode_position")
+        if pos is None:
+            return None
+        try:
+            return [float(pos[0]), float(pos[1]), float(pos[2])]
+        except Exception:
+            return None
+
+    def _max_accel(self):
+        try:
+            return float(self._obj_status("toolhead").get("max_accel"))
+        except Exception:
+            return None
+
+    def _change_temp(self, gcmd):
+        """Wechsel-Temperatur: TEMP= oder max(Ziel, Tn_extrude_temp 220).
+        ANNAHME: Stock nimmt Material-Temperaturen aus dem RFID-Tag
+        (live "get next material temp: 220", max 240) – hier nicht verfügbar."""
+        t = gcmd.get_float("TEMP", None)
+        if t is None:
+            try:
+                target = float(self._obj_status("extruder").get("target") or 0.0)
+            except Exception:
+                target = 0.0
+            t = max(target, float(self.cfg["tn_extrude_temp"]))
+        return float(t)
+
+    def _heat(self, gcmd, temp):
+        ch = self.chain
+        if ch.get("active") and ch.get("orig_target") is None:
+            try:
+                ch["orig_target"] = float(
+                    self._obj_status("extruder").get("target") or 0.0)
+            except Exception:
+                ch["orig_target"] = 0.0
+        if self._move(gcmd, "Heizen", ["M109 S%s" % _n(temp)], wrap=False):
+            if ch.get("active"):
+                ch["temp_changed"] = True
+
+    def _set_head_sensor(self, enable):
+        name = self.cfg.get("filament_sensor")
+        if not name or self._lookup("filament_switch_sensor %s" % name) is None:
+            return
+        try:
+            self._script(["SET_FILAMENT_SENSOR SENSOR=%s ENABLE=%d"
+                          % (name, 1 if enable else 0)])
+        except Exception:
+            pass
+
+    def _check_tnn(self, raw):
+        box, idx, letter, tnn = parse_tnn(raw)
+        if box != int(self.cfg.get("box_addr", BOX_ADDR_DEFAULT)):
+            raise BoxChangeError(
+                "%s liegt in Box %d, konfiguriert ist nur Box %d ([k2_box] "
+                "box_addr) – weitere Boxen ANNAHME/ungetestet" % (
+                    tnn, box, int(self.cfg.get("box_addr", 1))))
+        return box, idx, letter, tnn
+
+    def _already_loaded(self, idx, letter):
+        """Slot schon geladen? Hub-Sensor (0x08 [01], lesend) + Kopfsensor."""
+        try:
+            ctl = self._ensure_controller()
+        except Exception:
+            return False
+        try:
+            hub = ctl.hub_mask()
+        except Exception:
+            hub = None
+        head = self._head_filament()
+        if hub is None:
+            return ctl.loaded_slot == letter and head is not False
+        if hub == SLOT_MASKS[idx] and head is not False:
+            ctl.loaded_slot = letter
+            return True
+        if hub == 0:
+            ctl.loaded_slot = None
+        return False
+
+    def _go_extrude_pos(self, gcmd):
+        c = self.cfg
+        pos = self._gcode_pos()
+        if pos is not None and abs(pos[0] - c["extrude_pos_x"]) < 0.5 \
+                and abs(pos[1] - c["extrude_pos_y"]) < 0.5:
+            return False
+        return self._move(gcmd, "Abfallschacht (BOX_GO_TO_EXTRUDE_POS)",
+                          gcode_go_extrude_pos(c))
+
+    @staticmethod
+    def _exc_text(exc):
+        if isinstance(exc, CfsStatusError):
+            return "Box-Status 0x%02x (%s)" % (exc.status, exc.name)
+        txt = str(exc)
+        return txt if txt else type(exc).__name__
+
+    def _chain_cleanup(self, gcmd=None):
+        """Nicht-mechanisches Aufräumen: Kopfsensor, G-Code-Zustand."""
+        ch = self.chain
+        if ch.get("sensor_was_enabled") is not None:
+            self._set_head_sensor(ch["sensor_was_enabled"])
+        if ch.get("state_saved"):
+            try:
+                self._script(["RESTORE_GCODE_STATE NAME=%s" % CHAIN_STATE_NAME])
+            except Exception:
+                pass
+        self.chain = self._new_chain()
+
+    def _fail(self, gcmd, name, text):
+        """Fehler im Wechsel: im Druck PAUSE (kein Shutdown, kein Abbruch),
+        Folgeschritte überspringen; sonst Aufräumen + G-Code-Fehler."""
+        msg = "[k2_box] %s fehlgeschlagen: %s" % (name, text)
+        if self._print_active() and self.cfg.get("pause_on_failure"):
+            if not self.chain_error:
+                self.chain_error = msg
+            ch = self.chain
+            if ch.get("start_pos") is not None:
+                self._keep_start_pos = list(ch["start_pos"])
+                if ch.get("hop"):
+                    self.pending_resume_z = float(ch["start_pos"][2])
+            self._respond_error(
+                "%s – Druck wird PAUSIERT (kein Abbruch). Ursache beheben, "
+                "Schritt bzw. Wechsel (T<n>) von Hand wiederholen, dann "
+                "KTWO_BOX_ERROR_CLEAR und RESUME." % (msg,))
+            if not self._is_paused():
+                try:
+                    self._script(["PAUSE"])
+                except Exception as exc:
+                    self._respond_error("[k2_box] PAUSE fehlgeschlagen: %s"
+                                        % (exc,))
+            return None
+        self._chain_cleanup(gcmd)
+        if hasattr(gcmd, "error"):
+            raise gcmd.error(msg)
+        raise RuntimeError(msg)
+
+    def _run_step(self, gcmd, name, body, chain_step=True, need_release=True):
+        ch = self.chain
+        if chain_step and ch.get("active") and (ch.get("skip")
+                                                or self.chain_error):
+            why = (ch.get("skip_reason") if ch.get("skip")
+                   else "Wechsel-Fehler offen")
+            gcmd.respond_info("[k2_box] %s übersprungen (%s)" % (name, why))
+            return None
+        if need_release and self._print_active() and not self._released():
+            return self._fail(gcmd, name, (
+                "Filamentwechsel im Druck nicht freigegeben ([k2_box] "
+                "allow_write=%s, allow_move=%s) – nichts ausgeführt" % (
+                    self.cfg.get("allow_write"), self.cfg.get("allow_move"))))
+        try:
+            return body(gcmd)
+        except Exception as exc:
+            return self._fail(gcmd, name, self._exc_text(exc))
+
+    # -- G-Codes ---------------------------------------------------------
+    def cmd_pre_opt(self, gcmd):
+        if self.chain.get("active"):  # alte Kette ohne END_OPT
+            self._chain_cleanup(gcmd)
+        ch = self._new_chain()
+        ch["active"] = True
+        self.chain = ch
+        if self.chain_error:
+            return self._fail(gcmd, "PRE_OPT", (
+                "Wechsel-Fehler offen (%s) – erst beheben und "
+                "KTWO_BOX_ERROR_CLEAR" % (self.chain_error,)))
+
+        def body(gcmd):
+            c = self.cfg
+            hop = gcmd.get_float("Z_HOP", c["change_z_hop"], minval=0.,
+                                 maxval=5.)
+            tnn_raw = gcmd.get("TNN", None)
+            if tnn_raw:
+                _b, idx, letter, tnn = self._check_tnn(tnn_raw)
+                ch["tnn"] = tnn
+                if self._already_loaded(idx, letter):
+                    ch["skip"] = True
+                    ch["skip_reason"] = "%s ist bereits geladen" % (tnn,)
+                    gcmd.respond_info("[k2_box] PRE_OPT: %s bereits geladen – "
+                                      "kein Wechsel" % (tnn,))
+                    return
+            if c.get("allow_move") and not self._homed_ok():
+                raise BoxChangeError("Achsen nicht referenziert (homed_axes=%r)"
+                                     " – erst G28" % (self._obj_status(
+                                         "toolhead").get("homed_axes", ""),))
+            # Kopfsensor sperren (Stock disable_filament_sensor): beim
+            # Rückzug fällt er ab -> Upstream würde sonst pausieren.
+            sens = self._obj_status("filament_switch_sensor %s"
+                                    % (c.get("filament_sensor"),))
+            if "enabled" in sens:
+                ch["sensor_was_enabled"] = bool(sens["enabled"])
+                self._set_head_sensor(False)
+            ch["start_pos"] = (list(self._keep_start_pos)
+                               if self._keep_start_pos else self._gcode_pos())
+            self._script(["SAVE_GCODE_STATE NAME=%s" % CHAIN_STATE_NAME])
+            ch["state_saved"] = True
+            if hop > 0:
+                zmax = None
+                try:
+                    zmax = float(self._obj_status("toolhead")
+                                 .get("axis_maximum")[2])
+                except Exception:
+                    zmax = None
+                pos = self._gcode_pos()
+                if zmax is not None and pos is not None:
+                    hop = max(0.0, min(hop, zmax - pos[2]))
+                if hop > 0 and self._move(gcmd, "Z-Hop", [
+                        "G91", "G1 Z%s F%s" % (_n(hop), _n(c["z_velocity"])),
+                        "G90"]):
+                    ch["hop"] = hop
+            gcmd.respond_info("[k2_box] Wechsel %s begonnen (allow_write=%s, "
+                              "allow_move=%s)" % (ch.get("tnn") or "(ohne TNN)",
+                                                  c.get("allow_write"),
+                                                  c.get("allow_move")))
+        return self._run_step(gcmd, "PRE_OPT", body, chain_step=False)
+
+    def cmd_cut(self, gcmd):
+        def body(gcmd):
+            c = self.cfg
+            old = self._max_accel()
+            cs = c.get("cut_sensor")
+            if c.get("allow_move") and cs and self._sensor_state(cs) is False:
+                raise BoxChangeError("Schneidhebel-Sensor %s meldet vor dem "
+                                     "Schnitt nicht bereit" % (cs,))
+            try:
+                self._move(gcmd, "Schneiden (CR_BOX_CUT)", gcode_cut(c, old))
+            except Exception:
+                if c.get("allow_move") and old is not None:
+                    try:
+                        self._script(["SET_VELOCITY_LIMIT ACCEL=%s" % _n(old)])
+                    except Exception:
+                        pass
+                raise
+            if c.get("allow_move") and cs and self._sensor_state(cs) is False:
+                raise BoxChangeError("Schneidhebel-Sensor %s nach dem Schnitt "
+                                     "nicht zurück (Stock „cut to return“)"
+                                     % (cs,))
+            gcmd.respond_info("[k2_box] CUT: Schneidfahrt X%s -> X%s -> X%s%s"
+                              % (_n(c["pre_cut_pos_x"]), _n(c["cut_pos_x"]),
+                                 _n(c["pre_cut_pos_x"]), self._plan_note()))
+        return self._run_step(gcmd, "CUT", body)
+
+    def cmd_go_extrude_pos(self, gcmd):
+        def body(gcmd):
+            self._go_extrude_pos(gcmd)
+        return self._run_step(gcmd, "GO_EXTRUDE_POS", body)
+
+    def cmd_safe_pos(self, gcmd):
+        def body(gcmd):
+            self._move(gcmd, "Schacht verlassen (BOX_MOVE_TO_SAFE_POS)",
+                       gcode_safe_pos(self.cfg))
+        return self._run_step(gcmd, "SAFE_POS", body)
+
+    def cmd_retrude(self, gcmd):
+        def body(gcmd):
+            c = self.cfg
+            slot = gcmd.get("SLOT", None)
+            length = gcmd.get_float("LENGTH", None, minval=0.)
+            steps = retrude_extruder_steps(c, length)
+            vel = c["tn_retrude_velocity"]
+            self._go_extrude_pos(gcmd)
+            if self._head_filament() is not False:  # Stock: nur mit Filament
+                self._heat(gcmd, self._change_temp(gcmd))
+
+            def _extr(i):
+                if i < len(steps):
+                    self._move(gcmd, "Extruder-Rückzug %d/%d" % (i + 1, len(steps)),
+                               gcode_extruder_move(steps[i], vel) + ["M400"])
+
+            if not c.get("allow_write"):
+                self._box_plan(gcmd, "RETRUDE", (
+                    "0x08 [01] Hub -> 0x04 [00 01] -> 0x08 [00] -> 0x11 [m 00] "
+                    "x%d (nach p0 1-%d je Extruder %s mm F%s) -> 0x11 [m 01]"
+                    % (RETRUDE_REPEATS_DEFAULT, len(steps), _n(c["tn_retrude"]),
+                       _n(vel))))
+                for i in range(len(steps)):
+                    _extr(i)
+                return
+            ctl = self._ensure_controller()
+            ctl.wait_box_ready(c["box_wait_timeout"], c["box_wait_interval"])
+            if slot is None:
+                hub = ctl.hub_mask()
+                if hub == 0:
+                    ctl.loaded_slot = None
+                    gcmd.respond_info("[k2_box] RETRUDE: Hub leer – kein "
+                                      "Box-Rückzug nötig")
+                    return
+                if hub not in SLOT_MASKS:
+                    raise BoxChangeError("Hub meldet mehrere Slots (0x%02x)"
+                                         % (hub,))
+                slot = SLOT_LETTERS[SLOT_MASKS.index(hub)]
+            res = ctl.do_retrude(slot, after_p0=_extr)
+            for i in range(RETRUDE_REPEATS_DEFAULT, len(steps)):
+                _extr(i)
+            if self._head_filament() is True:
+                gcmd.respond_info("[k2_box] WARNUNG: Kopfsensor meldet nach dem "
+                                  "Rückzug noch Filament")
+            gcmd.respond_info("[k2_box] RETRUDE Slot %s ok (Hub frei)"
+                              % (res.get("slot"),))
+        return self._run_step(gcmd, "RETRUDE", body)
+
+    def cmd_extrude(self, gcmd):
+        def body(gcmd):
+            c = self.cfg
+            tnn_raw = gcmd.get("TNN", None)
+            slot = gcmd.get("SLOT", None)
+            if tnn_raw:
+                _b, idx, letter, tnn = self._check_tnn(tnn_raw)
+            elif slot is not None:
+                idx, letter, _m = parse_slot(slot)
+                tnn = "T%d%s" % (int(c.get("box_addr", 1)), letter)
+            else:
+                raise ValueError("TNN=T1A..T1D oder SLOT=A..D fehlt")
+            mask = SLOT_MASKS[idx]
+            self._go_extrude_pos(gcmd)
+            self._heat(gcmd, self._change_temp(gcmd))
+            grab = gcode_extruder_move(c["buffer_empty_len"],
+                                       c["tn_extrude_velocity"])
+            if not c.get("allow_write"):
+                self._box_plan(gcmd, "EXTRUDE %s" % tnn, (
+                    "0x04 [00 01] -> 0x0f [01] -> 0x08 [00] -> 0x10 [%02x 00 00] "
+                    "-> [%02x 04 00] -> [%02x 05 00] alle %s s bis Kopfsensor "
+                    "(max %s s) -> [%02x 06 00] -> Stage 7 Extruder +%s mm -> "
+                    "[%02x 07 03] -> 0x05 -> 0x04 [%02x 00] -> 0x0f [00]" % (
+                        mask, mask, mask, _n(c["extrude_poll_interval"]),
+                        _n(c["extrude_sensor_timeout"]), mask,
+                        _n(c["buffer_empty_len"]), mask, mask)))
+                self._move(gcmd, "Stage 7: Extruder greift (Trockenlauf)",
+                           grab + ["M400"])
+                return
+            ctl = self._ensure_controller()
+            ctl.wait_box_ready(c["box_wait_timeout"], c["box_wait_interval"])
+            hub = ctl.hub_mask()
+            head = self._head_filament()
+            if hub and hub != mask:
+                other = (SLOT_LETTERS[SLOT_MASKS.index(hub)]
+                         if hub in SLOT_MASKS else "0x%02x" % hub)
+                raise BoxChangeError("Hub belegt durch Slot %s – erst "
+                                     "KTWO_BOX_RETRUDE (CFS blockiert sonst "
+                                     "alle Einzüge)" % (other,))
+            if head is True:
+                if hub == mask:
+                    ctl.loaded_slot = letter
+                    gcmd.respond_info("[k2_box] EXTRUDE: %s bereits geladen"
+                                      % (tnn,))
+                    return
+                raise BoxChangeError("Kopfsensor meldet noch Filament – erst "
+                                     "KTWO_BOX_CUT + KTWO_BOX_RETRUDE")
+            sensor_fn = None
+            if head is not None:
+                sensor_fn = lambda: self._head_filament() is True  # noqa: E731
+            else:
+                gcmd.respond_info("[k2_box] WARNUNG: kein Kopfsensor "
+                                  "(filament_sensor) – feste %d Odometer-Polls "
+                                  "(ANNAHME)" % (ODO_POLLS_DEFAULT,))
+
+            def _stage7():
+                # Ohne M400: die Bewegung läuft, während mode 7 prüft.
+                self._move(gcmd, "Stage 7: Extruder greift", grab)
+
+            res = ctl.do_extrude(
+                letter, sensor_fn=sensor_fn,
+                sensor_timeout=c["extrude_sensor_timeout"],
+                poll_interval=c["extrude_poll_interval"],
+                stage7_fn=_stage7, stage7_delay=c["stage7_delay"])
+            self._move(gcmd, "Bewegungen abwarten", ["M400"], wrap=False)
+            odo = res.get("odo_mm") or []
+            gcmd.respond_info("[k2_box] EXTRUDE %s ok (Odometer %s mm, %d Polls)"
+                              % (tnn, round(odo[-1], 1) if odo else "?",
+                                 len(odo)))
+        return self._run_step(gcmd, "EXTRUDE", body)
+
+    def cmd_flush(self, gcmd):
+        def body(gcmd):
+            c = self.cfg
+            length = gcmd.get_float("LENGTH", None, minval=0.)
+            vel = gcmd.get_float("VELOCITY", c["tn_extrude_velocity"], above=0.)
+            segs = flush_segments(c, length)
+            self._go_extrude_pos(gcmd)
+            self._heat(gcmd, self._change_temp(gcmd))
+            old = self._max_accel()
+            for i, seg in enumerate(segs):
+                self._move(gcmd, "Spülen %d/%d (%s mm)" % (i + 1, len(segs), _n(seg)),
+                           gcode_flush_segment(seg, vel) + ["M400"])
+                self._move(gcmd, "Abstreifen %d/%d" % (i + 1, len(segs)),
+                           gcode_wipe(c, old))
+            gcmd.respond_info("[k2_box] FLUSH %s mm (%s) mit F%s ok%s" % (
+                _n(sum(segs)), " + ".join(_n(x) for x in segs), _n(vel),
+                self._plan_note()))
+        return self._run_step(gcmd, "FLUSH", body)
+
+    def cmd_wipe(self, gcmd):
+        def body(gcmd):
+            self._go_extrude_pos(gcmd)
+            self._move(gcmd, "Abstreifen", gcode_wipe(self.cfg, self._max_accel()))
+        return self._run_step(gcmd, "WIPE", body)
+
+    def cmd_waste(self, gcmd):
+        def body(gcmd):
+            gcmd.respond_info("[k2_box] WASTE: Abfallschacht-Prüfung (Stock "
+                              "CR_BOX_WASTE, Kamera/[load_ai]) gibt es auf dem "
+                              "Pi nicht – übersprungen")
+        return self._run_step(gcmd, "WASTE", body, need_release=False)
+
+    def cmd_end_opt(self, gcmd):
+        ch = self.chain
+        if not ch.get("active"):
+            gcmd.respond_info("[k2_box] END_OPT: kein Wechsel aktiv")
+            return
+        ret = gcmd.get_int("RETURN", 1)
+        if ch.get("skip"):
+            gcmd.respond_info("[k2_box] END_OPT: %s – nichts zu tun"
+                              % (ch.get("skip_reason"),))
+        elif self.chain_error:
+            gcmd.respond_info("[k2_box] END_OPT: Wechsel nach Fehler beendet "
+                              "(keine Bewegung) – %s" % (self.chain_error,))
+        else:
+            try:
+                c = self.cfg
+                pos = self._gcode_pos()
+                if pos is not None and pos[1] > c["safe_pos_y"] + 0.5:
+                    self._move(gcmd, "Schacht verlassen", gcode_safe_pos(c))
+                sp = ch.get("start_pos")
+                if ret and sp is not None:
+                    self._move(gcmd, "Rückfahrt zur Startposition", [
+                        "G90",
+                        "G0 X%s Y%s F%s" % (_n(sp[0]), _n(sp[1]),
+                                            _n(c["travel_velocity"])),
+                        "G0 Z%s F%s" % (_n(sp[2]), _n(c["z_velocity"]))])
+                if ch.get("temp_changed") and ch.get("orig_target") is not None:
+                    self._move(gcmd, "Zieltemperatur zurück",
+                               ["M104 S%s" % _n(ch["orig_target"])], wrap=False)
+                self._keep_start_pos = None
+                gcmd.respond_info("[k2_box] Wechsel %s abgeschlossen%s"
+                                  % (ch.get("tnn") or "", self._plan_note()))
+            except Exception as exc:
+                self._fail(gcmd, "END_OPT", self._exc_text(exc))
+        if self.chain.get("active"):
+            self._chain_cleanup(gcmd)
+
+    def cmd_wait(self, gcmd):
+        def body(gcmd):
+            c = self.cfg
+            timeout = gcmd.get_float("TIMEOUT", c["box_wait_timeout"], above=0.)
+            ctl = self._ensure_controller()
+            st = ctl.wait_box_ready(timeout, c["box_wait_interval"])
+            gcmd.respond_info("[k2_box] Box bereit: %s" % (st.get("state_name"),))
+        return self._run_step(gcmd, "WAIT", body, need_release=False)
+
+    def cmd_error_clear(self, gcmd):
+        old = self.chain_error
+        self.chain_error = ""
+        msg = "[k2_box] Wechsel-Fehler quittiert" + (" (%s)" % old if old else "")
+        if self.cfg.get("allow_write"):
+            try:
+                ctl = self._ensure_controller()
+                ctl.action.communication_set_box_mode_feed()  # 0x04 [00 01]
+                msg += "; Box 0x04 [00 01] IDLE (löscht Box-ERROR, live belegt)"
+            except Exception as exc:
+                msg += "; Box nicht erreichbar: %s" % (exc,)
+        gcmd.respond_info(msg)
+
+    def cmd_resume_fix(self, gcmd):
+        z = self.pending_resume_z
+        if z is None:
+            return
+        self.pending_resume_z = None
+        try:
+            self._move(gcmd, "Z nach abgebrochenem Wechsel zurück",
+                       ["G90", "G1 Z%s F%s" % (_n(z), _n(self.cfg["z_velocity"]))])
+        except Exception as exc:
+            raise gcmd.error("[k2_box] RESUME_FIX: %s" % (exc,))
 
 
 def load_config(config):

@@ -78,6 +78,27 @@ G-Codes:
   Plan ausgeben, nichts senden)
 - ``KTWO_MOTOR_STATUS`` – liest je Motor Version (0x0F), Schutz (0x0C [0b]
   dekodiert) und Feedback idx 5/6 (0x08, pos_fdb/spd_fdb) – nur lesend.
+
+Sensorless-Homing X/Y (16.10.2026 spät, config-pi/NOTIZ-stall.md; Frames
+live belegt, s. Konstanten STALL_MODE_ENDSTOP ff.):
+- ``KTWO_MOTOR_HOMING PHASE=BEGIN|END`` – Stock-Folge vor/nach G28 X/Y:
+  BEGIN = 0x11 [01] an x, y + ID 70 (pos_kp) = ``homing_pos_kp`` (300) an x;
+  END = 0x11 [02] an x, y + 0C [0b] an alle + ID 70 = Config-Kp (100) an x.
+  BEGIN-Fehler -> Rückbau + G-Code-Fehler (G28 bricht ohne Bewegung ab);
+  END läuft immer komplett, Fehler danach als G-Code-Fehler. Bricht ein
+  G-Code zwischen BEGIN und END ab (Ereignis ``gcode:command_error``),
+  setzt das Modul X/Y selbst zurück.
+- ``KTWO_MOTOR_STALL_MODE [MOTOR=x|y|xy|z|z1] [DATA=1|2]`` – ohne DATA lesen
+  (0x11 [04]), mit DATA setzen (nur x/y).
+- ``KTWO_MOTOR_SYS_PARAM MOTOR=x ID=<n> [VALUE=<f>]`` – ohne VALUE lesen
+  (0x06 [02,id]), mit VALUE flüchtig schreiben (0x06 [01,id]+<f, nur
+  SYS_PARAM_WRITABLE_IDS, kein 06 [03]).
+- ``KTWO_MOTOR_PROTECTION [STRICT=1]`` – 0C [0b] an alle (lesend).
+Alle schreibenden Varianten NUR mit ``allow_write: True`` in der Config
+(kein G-Code-Override), vorher ``toolhead.wait_moves()``; Fehler = G-Code-
+Fehler, nie Shutdown. Status für Makros: ``printer.k2_motor`` mit
+``allow_write``, ``homing_active``, ``stall_mode``, ``homing_pos_kp``,
+``last_error``.
 """
 
 import math
@@ -142,6 +163,38 @@ SUB_ADDR_SET = 0x01
 SUB_ADDR_READ = 0x02
 SUB_VERSION_GET = 0x00
 STALL_MODE_EMERGENCY = 0x02
+
+# --- Sensorless-Homing X/Y (Stock sensorless.cfg [homing_override]) ----------
+# Belege (live-logs-2026-10-16/klippy.log, G28 X Y 14:06:21–14:06:31,
+# Zeilen 369155–369319; G28 14:08-14:09 / 14:21-14:22 identisch):
+#   vor dem Homing  MOTOR_STALL_MODE DATA=1   -> 81 04 00 11 01, 82 04 00 11 01
+#                   (Echo f7 8x 04 00 11 01 1d)
+#                   MOTOR_SYS_PARAM NUM=1 DATA=1 ID=70 PARAMS=300 PARAMS_TYPE=float
+#                   -> 81 09 00 06 01 46 00 00 96 43 (Echo f7 81 07 00 06 00 00 96 43 09)
+#   nach dem Homing MOTOR_STALL_MODE DATA=2   -> 81/82 04 00 11 02 (Echo ... 02 14)
+#                   MOTOR_CHECK_PROTECTION_AFTER_HOME DATA=11 -> 0C [0b] an
+#                   81, 82, 83, 84 + E transparent (f7 81 04 00 0c 0b 95)
+#                   MOTOR_SYS_PARAM NUM=1 ... PARAMS=100 -> 81 09 00 06 01 46 00 00 c8 42
+# KEIN 06 [03] (Übernahme) und KEINE Pause zwischen den Frames (Stock-Abstand
+# ~20 ms = Bus-Laufzeit). DATA=1/2 gehen NUR an X/Y (0x81/0x82), Z/Z1 bleiben
+# auf ihrem Boot-Modus 2 (alle Logs 05.–16.10.). ID 70 =
+# controller_pos_loop_pid_param_kp, NUM=1 -> nur Motor x (0x81); Motor y hat
+# laut motor_control.cfg ohnehin Kp 300 -> beim Homing beide CoreXY-Motoren 300.
+# Hilfetext Stock (REA-MOTOR-BEFUND §3): Stall-Mode 1 = Endschalter-/
+# Blockiersignal (PB11/PB12), 2 = Notfall-Schutzausgang.
+STALL_MODE_ENDSTOP = 0x01
+STALL_MODES_SETTABLE = (STALL_MODE_ENDSTOP, STALL_MODE_EMERGENCY)  # 03 nur Cut-Check
+SUB_STALL_GET = 0x04       # 0x11 [04] -> [mode, 00] (klippy.log.2026-10-12:31417)
+STALL_SET_MOTORS = ("x", "y")      # Stock MOTOR_STALL_MODE: nur 0x81/0x82
+STALL_READ_MOTORS = ("x", "y", "z", "z1")
+SYS_PARAM_MOTORS = ("x", "y", "z", "z1")  # RS485; E (transparent) hier nicht
+HOMING_PARAM_ID = 70       # controller_pos_loop_pid_param_kp
+HOMING_PARAM_MOTORS = ("x",)  # Stock NUM=1
+HOMING_POS_KP_DEFAULT = 300.0  # Stock PARAMS=300 (sensorless.cfg:145)
+HOMING_POS_KP_RESTORE_DEFAULT = 100.0  # Stock PARAMS=100, sonst Config-Wert
+# Schreibbar per KTWO_MOTOR_SYS_PARAM: nur die IDs, die Stock per
+# [motor_control] setzt (SYS_PARAM_STOCK_CONFIGURED ohne Host-ID 226).
+SYS_PARAM_WRITABLE_IDS = (70, 86, 87, 102, 103, 116, 118, 119, 120, 121, 187, 188)
 
 TIMEOUT_ADDR = 0.05
 TIMEOUT_STALL = 1.0
@@ -505,10 +558,19 @@ def parse_options(opts):
         "auto_init": _bool("auto_init", True),
         "nozzle_mcu": str(o.get("nozzle_mcu", "nozzle_mcu")).strip(),
         "main_mcu": str(o.get("main_mcu", "mcu")).strip(),
+        "homing_pos_kp": HOMING_POS_KP_DEFAULT,
         "pins": {}, "params": {},
     }
     if cfg["retries"] < 1:
         raise ValueError("retries muss >= 1 sein")
+    if o.get("homing_pos_kp") not in (None, ""):
+        try:
+            hk = float(str(o["homing_pos_kp"]).strip())
+        except ValueError:
+            raise ValueError("homing_pos_kp muss Zahl sein: %r" % (o["homing_pos_kp"],))
+        if not math.isfinite(hk) or not 0.0 < hk <= 10000.0:
+            raise ValueError("homing_pos_kp muss 0 < Wert <= 10000 sein: %r" % (hk,))
+        cfg["homing_pos_kp"] = hk
     for m in VERIFY_ORDER:
         cfg["pins"][m] = {
             "dir": parse_pin_level(o.get("motor_%s_dir" % m)),
@@ -519,7 +581,7 @@ def parse_options(opts):
         cfg["params"][m] = {}
     known = {"switch", "motor_closed_loop", "retries", "allow_write",
              "shutdown_on_failure", "auto_init", "nozzle_mcu", "main_mcu",
-             "overcurrent_switch", "cut_pos_offset"}
+             "overcurrent_switch", "cut_pos_offset", "homing_pos_kp"}
     import re as _re
     by_name = {p["name"]: p for p in default_param_table()}
     for key, val in o.items():
@@ -598,7 +660,7 @@ def parse_klipper_config(config):
     # Falls get_options leer war (manche Wrapper), Fix-Keys direkt holen:
     for k in ("switch", "motor_closed_loop", "retries", "allow_write",
               "shutdown_on_failure", "auto_init", "nozzle_mcu", "main_mcu",
-              "overcurrent_switch", "cut_pos_offset"):
+              "overcurrent_switch", "cut_pos_offset", "homing_pos_kp"):
         if k not in opts:
             v = _g(k, None)
             if v is not None:
@@ -966,6 +1028,11 @@ class K2MotorController:
         self.send_event = send_event
         self.is_ready = False
         self.pin_levels = {}  # pin_raw -> level (für Diagnose/Tests)
+        # Sensorless-Homing-Zustand (KTWO_MOTOR_HOMING / _STALL_MODE):
+        # zuletzt per Echo bestätigter Stall-Mode je Motor (None = unbekannt)
+        self.stall_mode = {m: None for m in STALL_READ_MOTORS}
+        self.homing_active = False  # BEGIN ok, END noch nicht gelaufen
+        self.last_error = None
         self._table = default_param_table()
         self._by_name = {p["name"]: p for p in self._table}
 
@@ -1491,6 +1558,222 @@ class K2MotorController:
             out[m] = entry
         return out
 
+    # --- Sensorless-Homing X/Y (Stock sensorless.cfg, Belege s. Konstanten) --
+    # Alle schreibenden Methoden prüfen allow_write ZUERST (K2MotorError ohne
+    # Bus-Zugriff). Bus-/Port-Fehler (RuntimeError aus [k2_485], TimeoutError,
+    # ValueError bei Absender/fun-Mismatch, OSError) werden als K2MotorError
+    # gemeldet – die Klipper-Hülle macht daraus G-Code-Fehler (kein Shutdown).
+
+    def _require_write(self, what):
+        if not self.cfg.get("allow_write"):
+            raise K2MotorError(
+                "%s gesperrt: [k2_motor] allow_write=False – nichts gesendet "
+                "(erst nach KTWO_MOTOR_INIT-Prüfung allow_write: True setzen)" % what)
+
+    def _bus_call(self, motor, fun, payload, timeout, what):
+        """Ein Frame, retries=0 wie Stock; Fehler -> K2MotorError."""
+        try:
+            return self._transact(motor, fun, payload, timeout, 0)
+        except K2MotorError:
+            raise
+        except (RuntimeError, TimeoutError, ValueError, OSError) as exc:
+            raise K2MotorError("%s: %s" % (what, exc))
+
+    def set_stall_mode(self, motors, mode):
+        """0x11 [mode] an ``motors`` (Reihenfolge wie übergeben, Stock x→y).
+
+        Nur Modus 1 (Endschalter, vor dem Homing) und 2 (Notfall-Schutz,
+        danach); nur x/y (Z/Z1 setzt der Init in P4). Antwort = Echo [mode]
+        (live ``f7 81 04 00 11 01 1d``), sonst K2MotorError. Bricht beim
+        ersten Fehler ab; ``self.stall_mode`` zeigt, was bestätigt ist.
+        Rückgabe: Logzeilen (Stock-Wortlaut "stall mode change motor81")."""
+        if isinstance(mode, bool) or mode not in STALL_MODES_SETTABLE:
+            raise K2MotorError("Stall-Mode muss 1 (Endschalter) oder 2 (Notfall-"
+                               "Schutz) sein: %r" % (mode,))
+        motors = list(motors)
+        for m in motors:
+            if m not in STALL_SET_MOTORS:
+                raise K2MotorError("Stall-Mode setzen nur für x/y (Stock); %r "
+                                   "abgelehnt" % (m,))
+        self._require_write("Stall-Mode setzen (0x11)")
+        out = []
+        for m in motors:
+            _tr, addr = self._transport_for(m)
+            try:
+                _st, _fn, data = self._bus_call(
+                    m, FUNC_SET_MODE, [mode], TIMEOUT_STALL,
+                    "Stall-Mode %s (0x%02X) 0x11 [%02x]" % (m, addr, mode))
+            except K2MotorError:
+                self.stall_mode[m] = None  # Frame evtl. angekommen -> unbekannt
+                raise
+            if bytes(data) != bytes([mode]):
+                self.stall_mode[m] = None
+                raise K2MotorError("Stall-Mode %s (0x%02X): Echo %s statt %02x"
+                                   % (m, addr, bytes(data).hex() or "leer", mode))
+            self.stall_mode[m] = mode
+            out.append("stall mode change motor%02x: send:%02x recv:%02x"
+                       % (addr, mode, mode))
+        return out
+
+    def get_stall_mode(self, motor):
+        """0x11 [04] -> int (Antwort [mode, 00], klippy.log.2026-10-12:31419). LESEND."""
+        if motor not in STALL_READ_MOTORS:
+            raise K2MotorError("Stall-Mode lesen nur für x/y/z/z1: %r" % (motor,))
+        _tr, addr = self._transport_for(motor)
+        _st, _fn, data = self._bus_call(motor, FUNC_SET_MODE, [SUB_STALL_GET],
+                                        TIMEOUT_STALL,
+                                        "Stall-Mode lesen %s (0x%02X)" % (motor, addr))
+        raw = bytes(data)
+        if len(raw) != 2:
+            raise K2MotorError("Stall-Mode lesen %s: %d statt 2 Bytes (%s)"
+                               % (motor, len(raw), raw.hex()))
+        self.stall_mode[motor] = raw[0]
+        return raw[0]
+
+    def read_sys_param(self, motor, pid):
+        """0x06 [02, id] -> Wert (float bzw. Typ laut Tabelle). LESEND."""
+        if motor not in SYS_PARAM_MOTORS:
+            raise K2MotorError("Sys-Param nur für x/y/z/z1: %r" % (motor,))
+        if isinstance(pid, bool) or not isinstance(pid, int) or not 0 <= pid < len(self._table):
+            raise K2MotorError("Param-ID muss 0..%d sein: %r" % (len(self._table) - 1, pid))
+        if pid in HOST_ONLY_IDS:
+            raise K2MotorError("ID %d ist ein reiner Host-Parameter (Motor antwortet 0 B)" % pid)
+        p = self._table[pid]
+        _st, _fn, data = self._bus_call(motor, FUNC_SYS_PARAM, [SUB_SYS_READ, pid],
+                                        TIMEOUT_SYS_PARAM,
+                                        "Sys-Param lesen %s ID %d" % (motor, pid))
+        return self._decode_param(bytes(data), p["value_type"] or "float")
+
+    def write_sys_param(self, motor, pid, value):
+        """0x06 [01, id] + <f – FLÜCHTIG (bis Kaltstart), KEIN 06 [03] (wie
+        Stock beim Homing). Nur IDs aus SYS_PARAM_WRITABLE_IDS, Echo = die 4
+        Float-Bytes (live ``f7 81 07 00 06 00 00 96 43 09``). -> float32-Wert."""
+        if motor not in SYS_PARAM_MOTORS:
+            raise K2MotorError("Sys-Param schreiben nur für x/y/z/z1: %r" % (motor,))
+        if isinstance(pid, bool) or pid not in SYS_PARAM_WRITABLE_IDS:
+            raise K2MotorError("ID %r nicht freigegeben (schreibbar nur %s)"
+                               % (pid, ",".join(str(i) for i in SYS_PARAM_WRITABLE_IDS)))
+        try:
+            raw = _float_to_bytes(value)
+        except ValueError as exc:
+            raise K2MotorError("Sys-Param ID %d: %s" % (pid, exc))
+        f32 = struct.unpack("<f", raw)[0]
+        if not math.isfinite(f32) or (value != 0 and f32 == 0.0):
+            raise K2MotorError("Sys-Param ID %d: %r nicht als float32 darstellbar" % (pid, value))
+        self._require_write("Sys-Param schreiben (0x06 [01])")
+        _st, _fn, data = self._bus_call(motor, FUNC_SYS_PARAM,
+                                        [SUB_SYS_WRITE, pid] + list(raw),
+                                        TIMEOUT_SYS_PARAM,
+                                        "Sys-Param schreiben %s ID %d" % (motor, pid))
+        if bytes(data) != raw:
+            raise K2MotorError("Sys-Param %s ID %d: Echo %s statt %s"
+                               % (motor, pid, bytes(data).hex() or "leer", raw.hex()))
+        return f32
+
+    def check_protection(self, motors=None):
+        """0C [0b] an alle (Stock MOTOR_CHECK_PROTECTION_AFTER_HOME DATA=11,
+        E transparent). -> {motor: dict|str}; dict = decode_protection_local,
+        str = Fehlertext (Timeout/Port). Seiteneffekt laut FW-Befund: bei
+        Stall-Mode 2 quittiert [0b] die Notfall-Leitung (Codes bleiben) – so
+        auch Stock direkt nach DATA=2."""
+        out = {}
+        for m in (motors if motors is not None else self.cfg["motor_closed_loop"]):
+            try:
+                _st, _fn, data = self._transact(
+                    m, FUNC_PROTECTION, [SUB_PROT_CHECK],
+                    TIMEOUT_TRANSPARENT if m == "e" else TIMEOUT_PROTECTION, 0)
+                out[m] = decode_protection_local(bytes(data))
+            except (RuntimeError, TimeoutError, ValueError, OSError) as exc:
+                out[m] = "%s" % exc
+        return out
+
+    def _restore_kp_value(self):
+        return float(self.cfg["params"].get("x", {}).get(
+            "controller_pos_loop_pid_param_kp", HOMING_POS_KP_RESTORE_DEFAULT))
+
+    def homing_begin(self):
+        """Stock-Folge VOR dem X/Y-Homing: 0x11 [01] an x, y; dann ID 70 an x
+        = homing_pos_kp (300). Fehler -> Rückbau (best effort: Stall-Mode 2,
+        Kp zurück) und K2MotorError, damit das Homing OHNE Bewegung abbricht."""
+        self._require_write("Homing-Vorbereitung (Stall-Mode 1 + Kp)")
+        log = []
+        self.homing_active = False
+        kp = float(self.cfg.get("homing_pos_kp", HOMING_POS_KP_DEFAULT))
+        stage = "stall"
+        try:
+            log.extend(self.set_stall_mode(STALL_SET_MOTORS, STALL_MODE_ENDSTOP))
+            stage = "kp"
+            for m in HOMING_PARAM_MOTORS:
+                v = self.write_sys_param(m, HOMING_PARAM_ID, kp)
+                log.append("sys param %s ID %d (pos_kp) = %g (Echo ok)"
+                           % (m, HOMING_PARAM_ID, v))
+        except K2MotorError as exc:
+            rb = self._rollback(stage)
+            self.last_error = "Homing-Vorbereitung: %s" % exc
+            raise K2MotorError("Homing-Vorbereitung fehlgeschlagen: %s | Rückbau: %s"
+                               " – keine Bewegung" % (exc, "; ".join(rb) or "nichts nötig"))
+        self.homing_active = True
+        self.last_error = None
+        return log
+
+    def _rollback(self, stage):
+        """Best effort nach Fehler in homing_begin (Fehler nur gemeldet)."""
+        out = []
+        for m in STALL_SET_MOTORS:  # beide, auch den fehlgeschlagenen (Zustand unbekannt)
+            try:
+                self.set_stall_mode([m], STALL_MODE_EMERGENCY)
+                out.append("%s Stall-Mode 2 ok" % m)
+            except K2MotorError as exc:
+                out.append("%s Stall-Mode 2: %s" % (m, exc))
+        if stage == "kp":
+            for m in HOMING_PARAM_MOTORS:
+                try:
+                    self.write_sys_param(m, HOMING_PARAM_ID, self._restore_kp_value())
+                    out.append("%s Kp zurück ok" % m)
+                except K2MotorError as exc:
+                    out.append("%s Kp zurück: %s" % (m, exc))
+        return out
+
+    def homing_end(self, protection=True):
+        """Stock-Folge NACH dem Homing: 0x11 [02] an x, y; 0C [0b] an alle
+        (inkl. E transparent); ID 70 an x = Config-Kp (100). Läuft IMMER
+        komplett durch (best effort), Rückgabe (log, errors). Schutzbits
+        gesetzt oder Stall/Kp fehlgeschlagen -> errors; Timeout der
+        Schutzabfrage nur als Hinweis im Log (lesend, Stock wertet es nicht)."""
+        self._require_write("Homing-Abschluss (Stall-Mode 2 + Kp)")
+        self.homing_active = False
+        log, errors = [], []
+        for m in STALL_SET_MOTORS:
+            try:
+                log.extend(self.set_stall_mode([m], STALL_MODE_EMERGENCY))
+            except K2MotorError as exc:
+                errors.append(str(exc))
+        if protection:
+            for m, res in self.check_protection().items():
+                if isinstance(res, dict):
+                    if res["ok"]:
+                        log.append("Schutz %s 0C [0b]: ok (8x00)" % m)
+                    else:
+                        errors.append("Schutz %s: err=%s warn=%s" % (
+                            m, [k for _b, k, _t in res["errors"]],
+                            [k for _b, k, _t in res["warnings"]]))
+                else:
+                    log.append("Schutz %s 0C [0b]: keine Antwort (%s)" % (m, res))
+        kp = self._restore_kp_value()
+        for m in HOMING_PARAM_MOTORS:
+            try:
+                v = self.write_sys_param(m, HOMING_PARAM_ID, kp)
+                log.append("sys param %s ID %d (pos_kp) = %g (Echo ok)"
+                           % (m, HOMING_PARAM_ID, v))
+            except K2MotorError as exc:
+                errors.append(str(exc))
+        self.last_error = "; ".join(errors) if errors else None
+        return log, errors
+
+
+class K2MotorError(RuntimeError):
+    """Fehler der Homing-/Stall-/Param-Befehle (-> G-Code-Fehler, kein Shutdown)."""
+
 
 # =====================================================================
 # Klipper-Hülle [k2_motor] (ANNAHMEN zur Upstream-API, s. BERICHT.md)
@@ -1550,6 +1833,21 @@ class PrinterK2Motor:
                                     desc="K2-Motor-Init (DRY_RUN=1 nur Plan)")
         self.gcode.register_command("KTWO_MOTOR_STATUS", self.cmd_status,
                                     desc="K2-Motor-Status (Version/Schutz/Feedback)")
+        # Sensorless-Homing X/Y (Stock MOTOR_STALL_MODE / MOTOR_SYS_PARAM /
+        # MOTOR_CHECK_PROTECTION_AFTER_HOME) – Namen ohne Ziffern (Upstream-
+        # Parser trennt an Ziffern).
+        self.gcode.register_command("KTWO_MOTOR_STALL_MODE", self.cmd_stall_mode,
+                                    desc="Stall-Mode X/Y lesen bzw. setzen (DATA=1|2)")
+        self.gcode.register_command("KTWO_MOTOR_SYS_PARAM", self.cmd_sys_param,
+                                    desc="Motor-Sys-Param lesen bzw. flüchtig schreiben")
+        self.gcode.register_command("KTWO_MOTOR_PROTECTION", self.cmd_protection,
+                                    desc="Schutzabfrage 0C [0b] an alle Motoren")
+        self.gcode.register_command("KTWO_MOTOR_HOMING", self.cmd_homing,
+                                    desc="Stock-Folge vor/nach X/Y-Homing (PHASE=BEGIN|END)")
+        # Auto-Rückbau: bricht ein G-Code (z.B. G28 Y "No trigger") nach
+        # PHASE=BEGIN ab, setzt das Modul X/Y zurück (Stall-Mode 2, Kp).
+        self.printer.register_event_handler("gcode:command_error",
+                                            self._handle_command_error)
 
     def _strapping_pin_specs(self):
         """Alle früh anzulegenden Pins: Dir/Step (x/y/z/z1) + Enable."""
@@ -1634,9 +1932,13 @@ class PrinterK2Motor:
             self._transparent = TransparentTransport(self._tadapter, oid=self._oid)
         pause = reactor_sleep(self.reactor)  # relative Sekunden -> absolute Weckzeit
         send_event = getattr(self.printer, "send_event", None)
+        old = self.controller
         self.controller = K2MotorController(
             self.cfg, self._rs485, self._transparent, self._gpio,
             pause=pause, logger=self.gcode, send_event=send_event)
+        if old is not None:  # Homing-/Stall-Zustand nicht verlieren
+            self.controller.stall_mode.update(old.stall_mode)
+            self.controller.homing_active = old.homing_active
         res = self.controller.run_init()
         for _lvl, msg in res.get("log", []):
             try:
@@ -1681,6 +1983,154 @@ class PrinterK2Motor:
             gcmd.respond_info("[k2_motor] %s: version=%s schutz=%s pos_fdb=%s spd_fdb=%s" % (
                 m, ver, pro, e.get("pos_fdb", e.get("pos_fdb_error")),
                 e.get("spd_fdb", e.get("spd_fdb_error"))))
+
+
+    # --- Sensorless-Homing X/Y ------------------------------------------
+    def _motors_arg(self, gcmd, default, allowed):
+        raw = str(gcmd.get("MOTOR", default)).strip().lower()
+        motors = ["x", "y"] if raw == "xy" else [s.strip() for s in raw.split(",") if s.strip()]
+        for m in motors:
+            if m not in allowed:
+                raise gcmd.error("[k2_motor] MOTOR=%s ungültig (erlaubt: %s)"
+                                 % (raw, ", ".join(allowed + (("xy",) if "y" in allowed else ()))))
+        return motors
+
+    def _wait_moves(self):
+        """Bewegungen abwarten, bevor der Motor-Modus wechselt (Sicherheit;
+        Stock-Wrapper wartet vermutlich nicht – ANNAHME, s. NOTIZ-stall.md)."""
+        try:
+            self.printer.lookup_object("toolhead").wait_moves()
+        except Exception:
+            pass
+
+    def _ctl_or_error(self, gcmd):
+        try:
+            return self._ensure_controller()
+        except RuntimeError as exc:
+            msg = str(exc)
+            raise gcmd.error(msg if msg.startswith("[") else "[k2_motor] " + msg)
+
+    def cmd_stall_mode(self, gcmd):
+        """KTWO_MOTOR_STALL_MODE [MOTOR=x|y|xy|z|z1] [DATA=1|2]
+        Ohne DATA: lesen (0x11 [04]). Mit DATA: setzen (nur x/y, allow_write)."""
+        data = gcmd.get_int("DATA", None)
+        if data is None:
+            ctl = self._ctl_or_error(gcmd)
+            for m in self._motors_arg(gcmd, "xy", STALL_READ_MOTORS):
+                try:
+                    gcmd.respond_info("[k2_motor] %s: stall_mode=%d" % (m, ctl.get_stall_mode(m)))
+                except K2MotorError as exc:
+                    raise gcmd.error("[k2_motor] %s" % exc)
+            return
+        motors = self._motors_arg(gcmd, "xy", STALL_SET_MOTORS)
+        if data not in STALL_MODES_SETTABLE:
+            raise gcmd.error("[k2_motor] DATA=%d ungültig (1 = Endschalter, 2 = Notfall-Schutz)" % data)
+        if not self.cfg.get("allow_write"):
+            raise gcmd.error("[k2_motor] Stall-Mode setzen gesperrt: allow_write=False – nichts gesendet")
+        ctl = self._ctl_or_error(gcmd)
+        self._wait_moves()
+        try:
+            for line in ctl.set_stall_mode(motors, data):
+                gcmd.respond_info("[k2_motor] %s" % line)
+        except K2MotorError as exc:
+            raise gcmd.error("[k2_motor] %s" % exc)
+
+    def cmd_sys_param(self, gcmd):
+        """KTWO_MOTOR_SYS_PARAM MOTOR=x ID=70 [VALUE=300]
+        Ohne VALUE: lesen (0x06 [02,id]). Mit VALUE: flüchtig schreiben
+        (0x06 [01,id]+<f, nur Stock-IDs, allow_write; kein 06 [03])."""
+        motors = self._motors_arg(gcmd, "x", SYS_PARAM_MOTORS)
+        pid = gcmd.get_int("ID", minval=0, maxval=len(_SYS_PARAM_NAMES) - 1)
+        value = gcmd.get_float("VALUE", None)
+        if value is not None and not self.cfg.get("allow_write"):
+            raise gcmd.error("[k2_motor] Sys-Param schreiben gesperrt: allow_write=False – nichts gesendet")
+        ctl = self._ctl_or_error(gcmd)
+        name = _SYS_PARAM_NAMES[pid]
+        try:
+            for m in motors:
+                if value is None:
+                    gcmd.respond_info("[k2_motor] %s ID %d %s = %r" % (
+                        m, pid, name, ctl.read_sys_param(m, pid)))
+                else:
+                    self._wait_moves()
+                    v = ctl.write_sys_param(m, pid, value)
+                    gcmd.respond_info("[k2_motor] %s ID %d %s = %g geschrieben (Echo ok, "
+                                      "flüchtig)" % (m, pid, name, v))
+        except K2MotorError as exc:
+            raise gcmd.error("[k2_motor] %s" % exc)
+
+    def cmd_protection(self, gcmd):
+        """KTWO_MOTOR_PROTECTION [STRICT=1] – 0C [0b] an alle (lesend; bei
+        Stall-Mode 2 quittiert die FW damit die Notfall-Leitung)."""
+        strict = bool(gcmd.get_int("STRICT", 0))
+        ctl = self._ctl_or_error(gcmd)
+        bad = []
+        for m, res in ctl.check_protection().items():
+            if isinstance(res, dict):
+                txt = "ok" if res["ok"] else "err=%s warn=%s" % (
+                    [k for _b, k, _t in res["errors"]], [k for _b, k, _t in res["warnings"]])
+                if not res["ok"]:
+                    bad.append(m)
+            else:
+                txt = "keine Antwort (%s)" % res
+                if strict:
+                    bad.append(m)
+            gcmd.respond_info("[k2_motor] Schutz %s: %s" % (m, txt))
+        if strict and bad:
+            raise gcmd.error("[k2_motor] Schutzabfrage: Problem bei %s" % ", ".join(bad))
+
+    def cmd_homing(self, gcmd):
+        """KTWO_MOTOR_HOMING PHASE=BEGIN|END – Stock-Folge rund um G28 X/Y."""
+        phase = str(gcmd.get("PHASE")).strip().upper()
+        if phase not in ("BEGIN", "END"):
+            raise gcmd.error("[k2_motor] PHASE muss BEGIN oder END sein: %r" % phase)
+        if not self.cfg.get("allow_write"):
+            raise gcmd.error("[k2_motor] Homing-%s gesperrt: allow_write=False – nichts "
+                             "gesendet, keine Bewegung" % phase)
+        ctl = self._ctl_or_error(gcmd)
+        self._wait_moves()
+        if phase == "BEGIN":
+            try:
+                log = ctl.homing_begin()
+            except K2MotorError as exc:
+                raise gcmd.error("[k2_motor] %s" % exc)
+            for line in log:
+                gcmd.respond_info("[k2_motor] %s" % line)
+            return
+        log, errors = ctl.homing_end()
+        for line in log:
+            gcmd.respond_info("[k2_motor] %s" % line)
+        if errors:
+            raise gcmd.error("[k2_motor] Homing-Abschluss mit Fehlern: %s" % " | ".join(errors))
+
+    def _handle_command_error(self):
+        """gcode:command_error – lief BEGIN, aber END nicht (Homing-Abbruch),
+        X/Y zurücksetzen (Stall-Mode 2, Kp). Fehler nur melden."""
+        ctl = self.controller
+        if ctl is None or not ctl.homing_active:
+            return
+        try:
+            log, errors = ctl.homing_end(protection=False)
+        except Exception as exc:  # nie aus dem Fehlerpfad heraus werfen
+            log, errors = [], [str(exc)]
+        try:
+            self.gcode.respond_info(
+                "[k2_motor] Homing abgebrochen – Rückbau X/Y: %s%s" % (
+                    "; ".join(log) or "-",
+                    (" | FEHLER: " + " | ".join(errors)) if errors else ""))
+        except Exception:
+            pass
+
+    def get_status(self, eventtime=None):
+        ctl = self.controller
+        return {
+            "allow_write": bool(self.cfg.get("allow_write")),
+            "homing_pos_kp": float(self.cfg.get("homing_pos_kp", HOMING_POS_KP_DEFAULT)),
+            "homing_active": bool(ctl.homing_active) if ctl is not None else False,
+            "stall_mode": dict(ctl.stall_mode) if ctl is not None
+            else {m: None for m in STALL_READ_MOTORS},
+            "last_error": ctl.last_error if ctl is not None else None,
+        }
 
 
 def load_config(config):

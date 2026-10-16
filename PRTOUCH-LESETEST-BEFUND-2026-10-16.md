@@ -85,8 +85,8 @@ Attributen `_home_cmd/_oid/_pin/_invert/_mcu`. `prtouch_v3.py` legt daraus das
 `probe`-Objekt an (`probe:z_virtual_endstop` für `stepper_z/z1`).
 
 Damit ist **PRTOUCH-STOPP-BEWEIS §1 („kein Standard-MCU_endstop auf
-step_swap_pin“) widerlegt.** Die prtouch-MCU-Befehle selbst stoppen weiterhin
-nichts (§2/§3 dort bleiben richtig) – der Stopp entsteht **zusätzlich** über die
+step_swap_pin“) widerlegt.** Die prtouch-MCU-Befehle selbst rufen kein endstop/trsync auf (Handler-Adressen
+korrigiert in HANDLER-TABELLE-BEFUND-2026-10-16.md) – der Stopp entsteht **zusätzlich** über die
 Swap-Leitung: Düsen-MCU (PA15) → Main-MCU (PC7) → Klipper-Endstop → trsync stoppt
 die Z-Stepper in der MCU.
 

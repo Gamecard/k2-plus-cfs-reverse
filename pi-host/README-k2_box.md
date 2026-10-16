@@ -1,4 +1,4 @@
-> **ENTWURF – am echten Gerät UNGETESTET (Stand 16.10.2026).** Klipper-Modul [k2_box] für Upstream-Klipper; offline getestet (`python3 test_k2_box.py`, 9/9). Entwurf durch einen weiteren KI-Agenten, von uns geprüft.
+> **ENTWURF – am echten Gerät UNGETESTET (Stand 16.10.2026).** Klipper-Modul [k2_box] für Upstream-Klipper; offline getestet (`python3 test_k2_box.py`, 20/20 inkl. Filamentwechsel §8). Entwurf durch einen weiteren KI-Agenten, von uns geprüft.
 
 # BERICHT – Klipper-Modul [k2_box] + serial485-Patch (Entwurf, 16.10.2026)
 
@@ -84,8 +84,8 @@ Test-Vergleiche). Der Test beweist Byte-Gleichheit (15 + 7 Frames).
   `CfsStatusError`-Text (Slot-Kontext). Byte-identisch zu Live (s. §5).
 - `do_retrude(slot, repeats=4)` / `do_unload(...)` – A5 Box-Unload:
   `04 IDLE → 08 Sensor → 11 p0 x4 → 11 p1` (Beleg §6.5 + cfsseq).
-- `do_cut(...)` – A6 Platzhalter: wirft `NotImplementedError`, sendet NICHTS
-  (braucht Motor/Toolhead – ANNAHME, s. §4).
+- `do_cut(...)` – A6 ~~Platzhalter~~ seit 16.10.2026: liefert den G-Code-Plan
+  der Schneidfahrt, sendet NICHTS an die Box (Ausführung `KTWO_BOX_CUT`, §8).
 - `get_status(eventtime)` – Moonraker-Objekt (nur Cache, kein Bus):
   Zustand, Hub-Maske, Temp/Feuchte, Slots, FW, ready.
 - `start_background()` / `stop_background()` – Threading-Poll (offline/Test;
@@ -177,14 +177,14 @@ Kapselung in Controller/Hülle, vor Hardware-Lauf gegen echten Quellbaum prüfen
 - **Auto-Addr-Persistenz:** Uniids nur in-memory (`_addr_store`); Stock speichert
   in `printer.cfg` (`mb_addr_table_uniids`) – Übernahme in `configfile` fehlt
   (Entwurf). `expect_addr=None` für 0xFE-Broadcasts (Beleg §6.8).
-- **Cut:** `BOX_CUT_MATERIAL`/`M8200 C`/`CR_BOX_CUT` fahren Kopf an Cutter-Pos
-  und nutzen Motor-Boards (Beleg box.cfg-Kette + LIVE-ABFRAGEN Cut-Kalibrierung
-  Kp 300/Stall 3) – Box-Modul sendet bewusst nichts (Platzhalter).
-- **Toolhead-Seite von Load/Unload:** Heizen (M104 220 °C), Fahren an
-  Extrude-Pos (X133 Y378), Purge/Flush (G1 E…), Wischen – machen Original-Makros
-  (`BOX_LOAD_MATERIAL_*`, M8200 P→L→F→O); hier nur Box-Förderung. `odo_polls=5`
-  Default aus Live B (Beleg `EXTRUDE_LIVE_CMDS_B`); echte Stufen-Steuerung ist
-  sensor-/messrad-gesteuert im `.so` (TODO dort), hier feste Poll-Zahl.
+- **Cut:** ~~Platzhalter~~ seit 16.10.2026 abends umgesetzt (§8): reine
+  Kopfbewegung `KTWO_BOX_CUT` (Beleg: im Live-Cut kein Box-/Motor-Frame);
+  Motor-Boards nur bei der Cut-KALIBRIERUNG (Kp 300/Stall 3, nicht auf dem Pi).
+- **Toolhead-Seite von Load/Unload:** ~~nur Original-Makros~~ seit 16.10.2026
+  abends als Wechsel-Schritte im Modul (§8: Heizen, Schacht X133 Y378,
+  Spülen, Abstreifen, Stage 7). `KTWO_BOX_LOAD/UNLOAD` bleiben reine
+  Box-Förderung mit fester Poll-Zahl (`odo_polls=5`, Beleg
+  `EXTRUDE_LIVE_CMDS_B`); `KTWO_BOX_EXTRUDE` pollt bis zum Kopfsensor.
 - **Neue Optionen** (`box_addr`, `allow_write`, `shutdown_on_failure`,
   `auto_init`, `poll_interval`) sind Entwurfs-Erweiterungen (Defaults sicher).
   `SLOT=A..D` (Auftrag) plus Komfort `0..3` (Original NUM numerisch, Beleg §2:
@@ -281,3 +281,100 @@ Fire-and-forget, z.B. `cmd_485_send_data`). Alles unter `_lock`, TTLs
   CR_BOX_*, BOX_CUT_MATERIAL), `config/F008_CR0CN240319C13/gcode_macro.cfg`
   (BOX_*-Makroverdrahtung), `live-1.1.7.0-configs/box-live.cfg`
   ([box]-Parameter als Doku)
+
+## 8. Filamentwechsel T0–T15 / M8200-Kette (Ergänzung 16.10.2026 abends)
+
+> **ENTWURF – am Gerät UNGETESTET.** Offline: `test_k2_box.py` 20/20,
+> Batch gegen Upstream 9cb9975: `arbeitsdateien-lokal/upstream-test-cfs/`
+> (`ERGEBNIS.txt`). Bedienung/Inbetriebnahme: `config-pi/NOTIZ-cfs.md`.
+
+### 8.1 Belegter Stock-Ablauf (Fundstellen)
+
+| Quelle | Beleg |
+|---|---|
+| `live-logs-2026-10-16/config-aktuell/box.cfg` | `[box]`-Werte (pre_cut 10/200, cut_pos_y 200, cut_velocity 30000, Tn_retrude -10 @600, Tn_extrude_temp 220, Tn_extrude 140 @360, buffer_empty_len 30, extrude_pos 133/378, clean_* 135/160/378, 160/170/374, clean_velocity 12000, box_need_clean_length 70, safe_pos 225/345, check_cut_pos_x -9.5…-5.5, switch_pin !nozzle_mcu:PB9); M8200 P/C/R/L/W/F/O → CR_BOX_PRE_OPT/CUT/RETRUDE/EXTRUDE/WASTE/FLUSH/END_OPT; TNN `T<I/4+1><ABCD[I%4]>`; kommentiertes T0-Beispiel (Z+0.4, `G0 X10 Y200 F12000`, ACCEL 5000, M8200 C, `G0 Y345 / X139 / Y378 / X133`, M8200 R, M104, M8200 L I0, `G0 E90 F600`, Blech X160/X135, Kreise `G2 I4`/`G3 I-4` bei Y374, 3× Schütteln 160↔133, `G0 X160 / Y345`, M8200 O, Z zurück) |
+| `…/printer.cfg` SAVE_CONFIG | `[box] cut_pos_x = -7.80` (Kalibrierung 16.10.2026, LIVE-ABFRAGEN §Schneidposition) – UUID-Zeilen dort bewusst NICHT übernommen |
+| `…/gcode_macro.cfg` | `LOAD_MATERIAL_CLOSE_FAN2`/`RESTORE_FAN2` (fan2 aus/zurück), `QUIT_MATERIAL_RETRUDE_MATERIAL` (`G91 / G0 E-10 F360 / G90`); T0…T15 sind KEINE Makros (kommen aus `box_wrapper.so`) |
+| `live-logs-2026-10-15/klippy.log.2026-10-12` 00:24:49–00:26:35 | vollständiger Wechsel T1A (Unload + Load): Heizen 220 → „[box] cut sensor detected“ → „cut to return OK“ (3 s, **kein** Box-/Motor-Frame) → 0x08 [01], 0x08 [00], 0x04 [00 01] → **4× 0x11 [01 00], nach p0 1–3 je „extrude = -10.0, velocity (600,)“** → 0x11 [01 01] (20 s) → Einzug 0x04/0x0f/0x08/0x10 m0/m4/m5×5 (alle 2 s)/m6 (aus Sensor-Ereignis) → `extrude_process_stage7 tnn: T1A` → m7 p3 → 0x05 → 0x04 [01 00] → 0x0f [00] → Spülen „length: [90, 70]“, `check_and_extrude` 18 + 72 mm (240 °C, ×1,2) und 14 + 56 mm (220 °C) |
+| `…/klippy.log.2026-10-13` 02:30–02:31 | zweiter Einzug: gleiche Folge, **„timeout = 90“** Countdown während m5 |
+| `arbeitsdateien-lokal/cutpos-live-20261016-1601.log` 22:02 | Cut + Retrude 16.10.: Reihenfolge 0x04 [00 01] → 0x08 [00] → p0 (+E-10, hier F350 aus Material) ×3 → p0 → p1, danach „filament_sensor false“ |
+| `arbeitsdateien-lokal/kanalA-live-20261016-1527.txt` | Preload/Einzug/Rückzug-Zeiten (m0 4,4 s, p1 22,4 s, op2 31 s) |
+| `PROTOKOLL-485.md` „M8200-Sequenzen“ | Load P→L→F→O, Unload P→C→R→O, `CR_BOX_PRE_OPT` Pflicht vor EXTRUDE (key60), I=n → TnX; Box blockiert Einzüge, solange ein Slot im Hub steckt |
+| `GHIDRA-CFS-BEFUND*.md`, `nachbau/cfsseq.py` | 0x10-Modi (m7 = Odometer > p mm in 300 ms, sonst 0x0e), 0x11 p0/p1, 0x04 [00 01] löscht ERROR |
+
+**Aufteilung:** Box (RS485) = Rückzug 0x11, Einzug 0x10 + 0x04/0x0f/0x08/0x05,
+Zustand 0x0a. Drucker = Z-Hop, Schneiden (Kopf drückt den Hebel gegen den
+Anschlag), Schacht, Heizen, Extruder-Rückzug zwischen den p0, Stage 7
+(Extruder greift, während die Box mit m7 prüft), Spülen, Abstreifen,
+Lüfter, Rückfahrt.
+
+### 8.2 Neue G-Codes (`k2_box.py`, Präfix `KTWO_`, Upstream-Namensregel geprüft)
+
+| G-Code | Stock | Inhalt |
+|---|---|---|
+| `KTWO_BOX_PRE_OPT [TNN=] [Z_HOP=]` | M8200 P | Kette starten; schon geladen (Hub-Sensor + Kopfsensor) → Rest überspringen; Kopfsensor sperren (`SET_FILAMENT_SENSOR … ENABLE=0`, sonst pausiert Upstream beim Rückzug); `SAVE_GCODE_STATE`; Z-Hop 0,4 |
+| `KTWO_BOX_CUT` | M8200 C | `G0 X10 Y200 F12000`, `ACCEL=5000`, `G0 X-7.8 Y200 F30000`, `G4 P100`, `G0 X10`, Accel zurück, `M400`; optional Schneidhebel-Sensor (`cut_sensor`) |
+| `KTWO_BOX_GO_EXTRUDE_POS` / `KTWO_BOX_SAFE_POS` | BOX_GO_TO_EXTRUDE_POS / BOX_MOVE_TO_SAFE_POS | T0-Beispiel Schritt 6 / 11 |
+| `KTWO_BOX_RETRUDE [SLOT=] [LENGTH=]` | M8200 R [E] | Schacht, M109 (nur mit Filament am Kopf), Box bereit abwarten, Slot aus Hub-Sensor, `do_retrude(after_p0=…)`: p0 → E-10 F600 → … → p1 |
+| `KTWO_BOX_EXTRUDE TNN=\|SLOT=` | M8200 L I | Hub frei/gleicher Slot prüfen, Kopf leer prüfen, M109, `do_extrude(sensor_fn, stage7_fn)`: m5 alle 2 s bis Kopfsensor (max 90 s), m6, Extruder `G1 E30 F360` (ohne M400), 2 s, m7 p3, PRINT |
+| `KTWO_BOX_FLUSH [TNN=] [LENGTH=] [VELOCITY=] [TEMP=]` | M8200 F | Abschnitte 90 + 70 mm, je 20 %/80 %, danach Abstreifen |
+| `KTWO_BOX_WIPE`, `KTWO_BOX_WASTE` | T0-Bsp. 10.1–10.3, M8200 W | Abstreifen; WASTE = nur Hinweis (Stock-Kamera fehlt) |
+| `KTWO_BOX_END_OPT [RETURN=0\|1]` | M8200 O | Schacht verlassen, ggf. Rückfahrt XY + Z, Zieltemperatur zurück, Zustand/Kopfsensor zurück |
+| `KTWO_BOX_WAIT [TIMEOUT=]` | BOX_MODE_WAIT | 0x0a bis IDLE/PRINT, ERROR → Fehler |
+| `KTWO_BOX_ERROR_CLEAR` / `KTWO_BOX_RESUME_FIX` | BOX_ERROR_CLEAR | Fehler quittieren (+ 0x04 [00 01]) / Z-Hop nach Pause zurücknehmen (aus RESUME) |
+
+Controller-Erweiterungen (wiederverwendet, Frame-Folgen unverändert):
+`do_extrude(sensor_fn, sensor_timeout, poll_interval, stage7_fn, stage7_delay)`,
+`do_retrude(after_p0)`, `do_cut()` (= G-Code-Plan, sendet nichts),
+`wait_box_ready()`, `hub_mask()`, `loaded_slot`; reine Bausteine
+`gcode_cut/go_extrude_pos/safe_pos/wipe/flush_segment/extruder_move`,
+`flush_segments`, `retrude_extruder_steps`, `tnn_from_index`, `parse_tnn`.
+Neue Optionen (Stock-Namen, Defaults = box.cfg): s. `CHANGE_DEFAULTS` und
+`config-pi/k2-module.cfg`.
+
+### 8.3 Sicherheitslogik
+
+- Box-Frames nur mit `allow_write`, Kopf/Extruder/Heizen nur mit
+  `allow_move` (beide Default False → Plan-Text). `allow_move` ohne
+  `allow_write` = Trockenlauf mit Bewegung (nur außerhalb eines Drucks).
+- Im Druck (print_stats printing/paused) braucht jeder Schritt BEIDE
+  Freigaben, sonst Pause. T0 ohne Freigaben = Einfarbbetrieb (Makro).
+- Fehler im Druck → `PAUSE`, Meldung `!! …`, Folgeschritte der Kette
+  übersprungen, END_OPT räumt nur nicht-mechanisch auf; `RESUME` gesperrt
+  bis `KTWO_BOX_ERROR_CLEAR`; danach senkt `KTWO_BOX_RESUME_FIX` den Z-Hop.
+  Außerhalb eines Drucks → G-Code-Fehler + Aufräumen. Nie „Internal
+  error“/Shutdown (alle Ausnahmen werden abgefangen).
+- Box 2–4 (T4–T15) abgelehnt, solange nicht konfiguriert; Hub durch anderen
+  Slot belegt → Ablehnung vor jedem Frame; Kopfsensor zeigt Filament vor
+  dem Einzug → Ablehnung.
+- `ReactorBusProxy`: lange Box-Antworten blockieren den Reactor nicht
+  (Heizungs-PWM/MCU-Takt laufen weiter); Poll-Timer pausiert bei `busy`.
+
+### 8.4 Tests und Batch
+
+`test_k2_box.py` +11 Prüfungen (20/20): Bausteine == box.cfg/Live (Schnitt,
+Schacht, Kreise, 18/72 + 14/56, 3× −10, TNN-Mapping, Optionsgrenzen),
+Einzug bis Kopfsensor + Stage 7 (0x0e ohne Extruder, Timeout → 0x04 IDLE),
+Rückzug mit Haken (Frames == `build_retrude_sequence`), Box-Wartebedingung,
+volle Kette T1B in Reihenfolge (Hop → Schnitt → Schacht → p0/E-10 ×3 → p1 →
+m6 → E30 → m7 → PRINT → Spülen/Abstreifen → Rückfahrt), Sperren, Fehler im
+Druck (0x0c → Pause) und ohne Druck, Proxy, Makros T0–T15/M8200/RESUME per
+Jinja2 gerendert, Python-3.9-Syntax.
+
+Batch (`arbeitsdateien-lokal/upstream-test-cfs/lauf-cfs.sh`): Auslieferung
+ohne Freigaben → 0 Schritte, nur Pläne, EXIT 0; `allow_move` → dekodierte
+MCU-Schritte bestätigen die Bahn (89/89 Ecken, Anschlag X −7,800, Z 20,4
+beim Schnitt, Extruder −30/+120/+70 mit 10/6 mm/s nur im Schacht); beide
+Freigaben ohne Port → `RETRUDE fehlgeschlagen: [k2_485] Batch-Modus …`,
+kein Shutdown; T5 → „Box 2 … nur Box 1“.
+
+### 8.5 ANNAHMEN (Wechsel)
+
+Stage-7-Extruderlänge (`buffer_empty_len` 30) + `stage7_delay` 2 s,
+Rückweg-Geschwindigkeit nach dem Schnitt, `cut_dwell` 0,1 s (Input-Shaper),
+Bedeutung des Schneidhebel-Sensors, Material-Temperaturen (Stock: RFID;
+hier `max(Ziel, 220)`), Spül-Erhöhung auf Max-Temperatur/×1,2 entfällt,
+`box_wait_timeout` 200 s, Verhalten bei Sensor-Timeout (0x04 IDLE),
+`safe_pos_x` 225 ungenutzt, Box 2–4, Lüfter fan0/„Blasen“ beim Spülen
+nicht nachgebaut, Z nach RESUME mitten im Wechsel. Details:
+`config-pi/NOTIZ-cfs.md`.

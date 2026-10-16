@@ -10,12 +10,12 @@
 | `k2-motor.cfg` | `[k2_motor]` mit allen Pins und aktiven Parametern aus `motor_control.cfg` |
 | `k2-module.cfg` | `[k2_485]` (gemeinsamer RS485-Bus, by-id-Platzhalter), `[k2_box]`, `[k2_belt mdlx]`/`[k2_belt mdly]` (gesperrt) |
 | `homing.cfg` | `[homing_override]` + Freigabe-Makro `_PI_FREIGABE` + Stall-Mode-Haken |
-| `macros.cfg` | Grundbetrieb: M106/M107, M141/M191, M900, M205, START/END_PRINT (+ PRINT_START/PRINT_END), PAUSE/RESUME/CANCEL_PRINT, T0–T15, M8200-Sperre, G29, BEDPID, NOZZLE_PID |
+| `macros.cfg` | Grundbetrieb: M106/M107, M141/M191, M900, M205, START/END_PRINT (+ PRINT_START/PRINT_END), PAUSE/RESUME/CANCEL_PRINT, T0–T15 + M8200-Kette (CFS-Wechsel über `[k2_box]`, NOTIZ-cfs.md), G29, BEDPID, NOZZLE_PID |
 | `README.md` | diese Datei |
 
 Reihenfolge in `printer.cfg`: `[mcu]`, `[mcu nozzle_mcu]`, `[k2_prtouch]`, dann die Includes, dann der Rest. Seit dem Modul-Fix (§5.3) ist die Reihenfolge der Abschnitte **egal** (Lauf I: `[k2_prtouch]` ans Ende verschoben, fehlerfrei, `statistics` aus der Standardbibliothek); `[k2_prtouch]` muss nur wegen SAVE_CONFIG (`z_offset`) in der Hauptdatei stehen.
 
-**Sicherheits-Defaults (alles gesperrt):** `[k2_prtouch] allow_move: False`, `[k2_motor] allow_write: False` + `auto_init: False`, `[k2_box] allow_write: False`, `[k2_belt mdlx/mdly] allow_write: False` + `allow_move: False`, `_PI_FREIGABE allow_move: False` + `xy_stall_ok: False` (G28 bricht ohne jede Bewegung ab – im Batch-Test nachgewiesen, §5).
+**Sicherheits-Defaults (alles gesperrt):** `[k2_prtouch] allow_move: False`, `[k2_motor] allow_write: False` + `auto_init: False`, `[k2_box] allow_write: False`, `[k2_belt mdlx/mdly] allow_write: False` + `allow_move: False`, `[k2_box] allow_move: False`, `_PI_FREIGABE allow_move: False` (`xy_stall_ok` ist nur noch Not-Sperre, Default True; X/Y-Homing braucht zusätzlich `[k2_motor] allow_write: True`, NOTIZ-stall.md) (G28 bricht ohne jede Bewegung ab – im Batch-Test nachgewiesen, §5).
 
 ## 2. Zuordnung Stock → Pi
 
@@ -43,7 +43,7 @@ Quelle: `live-logs-2026-10-16/config-aktuell/` (printer.cfg mit SAVE_CONFIG, sen
 | `[multi_pin LED_pin]`, `[output_pin LED/power/ptc_power]` | Ü | |
 | `[duplicate_pin_override]` | Ü + `nozzle_mcu:PB1` | Upstream unterscheidet Pins je MCU: hotend_fan-multi_pin und extruder_fan nutzen beide Düsen-PB1 → ohne Ergänzung „pin PB1 used multiple times“ (Batch-Lauf D). Das Stock-`PB1` (Main) bleibt drin |
 | `[motor_control]` (in printer.cfg auskommentiert, aktiv in motor_control.cfg) | M `[k2_motor]` | §2.2 |
-| `[lis2dw]`, `[resonance_tester]` | E/O | Creality-MCU-FW hat das alte lis2dw-Protokoll – Upstream-`[lis2dw]` scheitert mit „Command format mismatch: query_lis2dw oid=%c rest_ticks=%u vs query_lis2dw oid=%c clock=%u rest_ticks=%u“ (Batch-Lauf C). Kein `SHAPER_CALIBRATE` (Werte aus SAVE_CONFIG wirken) |
+| `[lis2dw]`, `[resonance_tester]` | M | Upstream-`[lis2dw]` scheitert an der Creality-FW (altes Protokoll, „Command format mismatch“, Batch-Lauf C) → ersetzt durch `[k2_lis2dw]` (pi-host/k2_lis2dw.py, NOTIZ-accel.md); `[resonance_tester] accel_chip: k2_lis2dw` |
 | `[prtouch_v3]` | M `[k2_prtouch]` | Übernommen: `z_offset 0`, `speed 5`, `samples 1`, `samples_result average`, `samples_tolerance 0.5`, `samples_tolerance_retries 5`, `step_swap_pin !PC7`, `pres_swap_pin nozzle_mcu:PA15`, `pres_cs0_pin PB13/PB14`, `pres_tri_hold 4000,10000,500`, `pres_cfg_regs 60`; ergänzt (Stock-Defaults, BELEGT per Emulation): `pres_acq_tkms 0.78125`, `pres_tri_fter 5,1,0.8`, `pres_ded_tkms 128`, `step_acq_tkms 0.390625`. **E/O:** `quick_lift_speed 100`, `prth_clr_probe_pos 150,355`, `prth_msg_show`, `enable_not_linear_comp`/`high_low_temp_leveling` (Temperaturkompensation), `prth_max_chps 8`, `prth_tri_zacc 1000`, `prth_min_fans 0.6`, `bed_mesh_fall_comp_diagonal/axis` (Mesh-Kompensation), `need_steady_regional 0.8` |
 | `[bed_mesh]` | Ü | `move_check_distance` 1 → **3** (Upstream-Minimum 3.0, sonst Config-Fehler) |
 | `[printer]` | Ü | `max_accel_to_decel: 30000` gibt es in Upstream nicht mehr → `minimum_cruise_ratio: 0.0` (gleichwertig, da = max_accel) |
@@ -73,13 +73,13 @@ Quelle: `live-logs-2026-10-16/config-aktuell/` (printer.cfg mit SAVE_CONFIG, sen
 
 **Übernommen/angepasst (macros.cfg):** `M106`/`M107` (Stock-Abbildung S→fanN_min…255, fan0 schaltet `fan0_en`; ohne Qmode), `M141`/`M191` (Stock-Logik ohne `SET_TEMPERATURE_FAN_SWITCH`; M191 wartet per `TEMPERATURE_WAIT`), `M900`, `M205`, `START_PRINT` (Gerüst: Bett + Düse 140 °C, G28, zweites G28 Z mit warmem Bett, Profil `default` laden falls vorhanden, Drucktemperatur) + `PRINT_START`, `END_PRINT` (Stock-Ablauf ohne BOX/Qmode, Z sicher wie `END_PRINT_POINT`) + `PRINT_END`, `wait_temp`/`WAIT_TEMP_START`/`WAIT_TEMP_END` (als `_wait_temp`/`_WAIT_TEMP_*`), `PAUSE` (Stock-z_safe-Logik, Düse 140 °C, Parken), `RESUME` (Temperatur/Lüfter zurück), `CANCEL_PRINT`, `G29` (vereinfacht: G28 → Z_TILT_ADJUST → G28 Z → BED_MESH_CALIBRATE), `BEDPID`, `NOZZLE_PID` (ohne automatisches SAVE_CONFIG), `T0` (kein Wechsel).
 
-**Neu (Sperren/Hilfen):** `T1`–`T15` und `M8200` → Fehler „CFS noch nicht verfügbar“ (Druck bricht ab statt falsch weiterzudrucken), `_PI_FREIGABE`, `_PI_VOR_HOMING`, `_PI_NACH_HOMING`, `_PI_MESH_LADEN`, `_PI_PARAM`.
+**Neu (Sperren/Hilfen):** `T0`–`T15` und `M8200` → CFS-Wechselkette über `KTWO_BOX_*` (nur Box 1, ohne Freigaben nur Plan; Fehler im Druck → PAUSE; NOTIZ-cfs.md), `_PI_FREIGABE`, `_PI_VOR_HOMING`, `_PI_NACH_HOMING`, `_PI_MESH_LADEN`, `_PI_PARAM`.
 
 **Weggelassen (Grund):**
 
 | Stock-Makro | Grund |
 |---|---|
-| `BOX_LOAD_MATERIAL*`, `BOX_QUIT_MATERIAL*`, `BOX_INFO_REFRESH`, `M8200`-Kette (`CR_BOX_*`) | Creality-Box-Befehle (`BOX_*`, `CR_BOX_*`); Ersatz erst mit k2_box-Wechselablauf |
+| `BOX_LOAD_MATERIAL*`, `BOX_QUIT_MATERIAL*`, `BOX_INFO_REFRESH`, `M8200`-Kette (`CR_BOX_*`) | Creality-Box-Befehle (`BOX_*`, `CR_BOX_*`); ersetzt durch die `KTWO_BOX_*`-Kette (NOTIZ-cfs.md) |
 | `LOAD_MATERIAL*`, `QUIT_MATERIAL*`, `LOAD_MATERIAL_CLOSE_FAN2/RESTORE_FAN2` | `FILAMENT_RACK_*`, `BOX_*`, `SET_COOL_TEMP` (Creality) |
 | `Qmode`, `Qmode_exit`, `M204`-Override | Leisemodus mit Creality-`SET_QMODE_FLAG`; M204 = Upstream |
 | `IF_NEED_HOME`, `PRINT_TEMP_SET`, `PRINT_PREPARED`, `PRINT_PREPARE_CLEAR`, `MAINTENANCE_ITEM(_PARAM)`, `MOTOR_CANCEL_PRINT` | Display-/App-Hilfen bzw. `BOX_SET_CURRENT_BOX_IDLE_MODE` |
@@ -88,7 +88,7 @@ Quelle: `live-logs-2026-10-16/config-aktuell/` (printer.cfg mit SAVE_CONFIG, sen
 | `ZDOWN_SWITCH_SET`, `BED_MANUAL_CAL(_START/_END)`, `Z_AXIS_CALIBRATION` | `ZDOWN_SWITCH`/`SET_G29_FLAG`/`NEXT_HOMEZ_NACCU` (`[z_align]`/prtouch_v3) |
 | `CALIBRATE_CUT_POS` | `MOTOR_SYS_PARAM`/`MOTOR_CHECK_CUT_POS` – braucht k2_motor-G-Codes (O) |
 | `BELT_TENSION` | `BELT_MDL_*`; Ersatz-Beispiel `KTWO_BELT_TENSION` (ruft `KTWO_BELT_*`) in README-k2_belt.md – seit dem Modul-Fix gültig, aber bewusst nicht aktiv (fährt G28 X Y + spannt; erst nach Freigabe README-k2_belt.md §6) |
-| `INPUTSHAPER`, `AUTOTUNE_SHAPERS` | kein Beschleunigungssensor (lis2dw inkompatibel); `CXSAVE_CONFIG` |
+| `INPUTSHAPER`, `AUTOTUNE_SHAPERS` | Creality-Makros; mit `[k2_lis2dw]` stattdessen Upstream-`SHAPER_CALIBRATE` nutzen; `CXSAVE_CONFIG` |
 | `NOZZLE_PID_HIGH` | zweiter PID-Satz (Creality) |
 | `TUNOFFINPUTSHAPER` | trivial (`SET_INPUT_SHAPER SHAPER_FREQ_X=0 SHAPER_FREQ_Y=0` direkt nutzbar) |
 | `SET_CHAMBER_FAN`, `CANCEL_CHAMBER_FAN_SWITCH` | Watermark-Hack bzw. `SET_TEMPERATURE_FAN_SWITCH` (Creality) |
@@ -127,7 +127,7 @@ Jeder Schritt nur, wenn der vorige bestanden ist; nach jedem Schritt `klippy.log
 3. **RS485-Bus + Motor-Init lesend:** `KTWO_BUS_STATUS` → `offen=True` (sonst Port/Adapter prüfen; Meldung `[k2_485] Port … nicht zu öffnen` beim Connect). Dann `KTWO_MOTOR_STATUS` (Version/Schutz/Feedback X/Y/Z/Z1 über `k2_485`, E über transparent) und `KTWO_MOTOR_INIT` mit `allow_write: False` – nur Plan, nichts gesendet. `KTWO_BOX_STATUS` (lesend) ebenso.
 4. **Motor-Init schreibend:** `allow_write: True`, danach `auto_init: True` → „All motors are normal“, Stall Z/Z1/E, `0C [0b]` 8×00, Param-Abgleich, Event `k2_motor:ready`. Abbruch bei key798–802, STATUS-Bits ≠ 0, `0C`-Fehlerbits → STOP, kein Homing.
 5. **PrTouch ohne Bewegung:** `KTWO_PRTOUCH_TEST_SWAP`, `KTWO_PRTOUCH_READ`, `QUERY_PROBE` (open), `KTWO_PRTOUCH_STATUS`; `PROBE` muss mit „allow_move“-Fehler abbrechen (k2_prtouch README A.6).
-6. **Homing X/Y:** erst wenn Stall-Mode 1 per Modul gesetzt werden kann (§6) und PB11/PB12 beim Blockieren nachweislich auslösen. Dann zur Laufzeit `SET_GCODE_VARIABLE MACRO=_PI_FREIGABE VARIABLE=allow_move VALUE=True` und `… VARIABLE=xy_stall_ok VALUE=True`, `G28 Y`, dann `G28 X` (einzeln, Hand am Not-Aus). Erwartet nach G28 X Y: X 342,5 / Y 3,8 (im Batch-Test so). Abbruch bei Schrittverlust/Blockade.
+6. **Homing X/Y:** `[k2_motor] allow_write: True`; vorher `KTWO_MOTOR_HOMING PHASE=BEGIN` im Stand + `QUERY_ENDSTOPS` (Polarität PB11/PB12 prüfen, NOTIZ-stall.md §5), dann `KTWO_MOTOR_HOMING PHASE=END`. Danach zur Laufzeit `SET_GCODE_VARIABLE MACRO=_PI_FREIGABE VARIABLE=allow_move VALUE=True`, `G28 Y`, dann `G28 X` (einzeln, Hand am Not-Aus). Erwartet nach G28 X Y: X 342,5 / Y 3,8 (im Batch-Test so). Abbruch bei Schrittverlust/Blockade.
 7. **Z mit Probe:** `[k2_prtouch] allow_move: True`; Düse ~3 mm über dem Bett, `SET_KINEMATIC_POSITION Z=10`, `PROBE` (Stopp beobachten), `PROBE_ACCURACY SAMPLES=5`, dann `G28` (Z in Bettmitte, ≤ 5 mm/s), `Z_TILT_ADJUST`, `G28 Z`, `BED_MESH_CALIBRATE PROFILE=default` (bzw. `G29`), Ergebnis gegen `stock_referenz_2026-10-16` (−0,067 … 0,226) plausibilisieren, `SAVE_CONFIG`.
 8. **Heizen/Kammer:** Düse/Bett aufheizen, ggf. `NOZZLE_PID`/`BEDPID`; `M141 S45` → PTC-Lüfter (!PB14/PB2) MUSS sofort laufen, sonst sofort `M141 S0` (§6).
 9. **Erstdruck einfarbig** (Slicer: CFS aus; `START_PRINT EXTRUDER_TEMP=… BED_TEMP=…`).
@@ -214,16 +214,28 @@ RS485-Port und alles darüber (`[k2_485]` öffnet im Batch-Modus bewusst nie; Mo
 
 1. **Modul-Fixes §5.3** – erledigt 16.10.2026 abends (Lauf F–I). Am Gerät ungetestet.
 2. **RS485-Bus `[k2_485]`** (`pi-host/k2_485.py`): öffnet GENAU EINE `nachbau/serial485.Serial485`-Instanz (`serial:` Pflicht, `baud:` Default 230400, `timeout:` 1,0 s). Klipper legt das Objekt beim Laden unter `k2_485` ab (`load_object` = Wirkung von `add_object`); `[k2_motor]` lädt es bei Bedarf selbst vor (`has_section` + `load_object`) und nutzt es für X/Y/Z/Z1 (`Rs485Transport`), `[k2_box]`/`[k2_belt]` holen es per `lookup_object('k2_485')` → Reihenfolge egal. Port: Öffnen erst bei `klippy:connect`, faul erneut bei jedem Zugriff, Schließen bei `klippy:disconnect`/Ausfall (`OSError`, nicht `TimeoutError`). **Ohne Port:** Batch-Modus → nie geöffnet, Meldung `Batch-Modus: RS485-Port … wird nicht geöffnet`; Normalbetrieb → Meldung `[k2_485] Port … nicht zu öffnen (…)` beim Connect, kein Absturz/Shutdown, `get_status`/`KTWO_BUS_STATUS` zeigen `offen=False` + Fehler, Zugriffe der Module → G-Code-Fehler. **Fehlt `[k2_485]`:** `[k2_motor] RS485-Bus fehlt: Abschnitt [k2_485] … anlegen` (nur `DRY_RUN=1` geht), Box/Belt analog. ANNAHME: USB-RS485-Adapter mit Auto-DE (Halbduplex ohne RTS-Steuerung, wie `serial485.py`). OFFEN: Bus-Zugriffe sind blockierend (Serial485-Lock + pyserial) und laufen im Klipper-Reaktor-Thread (bei Box-Poll/Init kurzzeitige Blockade, Stock-Wrapper ähnlich) – am Gerät auf „Timer too close“ achten.
-3. **Stall-Mode für X/Y-Homing:** Stock setzt vor dem Homing `MOTOR_STALL_MODE DATA=1` (Endschalter-Signal auf PB11/PB12) und danach `DATA=2` + Schutzprüfung + Kp ID 70 300→100. `[k2_motor]` hat dafür noch keine G-Codes → `_PI_VOR_HOMING`/`_PI_NACH_HOMING` leer, `xy_stall_ok: False` sperrt X/Y-Homing.
+3. **ERLEDIGT 16.10.2026 (NOTIZ-stall.md):** Alter Stand – Stall-Mode für X/Y-Homing: Stock setzt vor dem Homing `MOTOR_STALL_MODE DATA=1` (Endschalter-Signal auf PB11/PB12) und danach `DATA=2` + Schutzprüfung + Kp ID 70 300→100. `[k2_motor]` hat dafür noch keine G-Codes → `_PI_VOR_HOMING`/`_PI_NACH_HOMING` leer, `xy_stall_ok: False` sperrt X/Y-Homing.
 4. **Stock-`FORCE_MOVE STEPPER=stepper_y DISTANCE=-3` nach dem XY-Homing** nicht übernommen (CoreXY: Versatz je 1,5 mm in X/Y ohne Positionsupdate, Creality-force_move ggf. anders). Koordinaten am Gerät gegen Stock prüfen (Purge/Wischposition Y 374–378!), ggf. `position_endstop` anpassen.
 5. **Düsenreinigung vor dem Antasten** (Stock `BOX_NOZZLE_CLEAN` am Silikonstreifen X160–170/Y374, `NOZZLE_CLEAR`) fehlt – wichtig für die Kraftsensor-Genauigkeit; als reines G-Code-Makro nachbaubar (Koordinaten in k2-module.cfg-Kommentar).
 6. **prtouch_v3-Kompensationen** (Temperatur nichtlinear, `bed_mesh_fall_comp_*`, `need_steady_regional`, `prth_min_fans`) fehlen in k2_prtouch.
 7. **PTC-Lüfter:** ANNAHME, dass `is_ptc_fan` nur „läuft, solange die Kammerheizung ein Ziel hat“ bedeutet – am Gerät prüfen (Schritt 8), sonst Überhitzungsgefahr.
-8. **Beschleunigungssensor:** eigenes Modul für das alte Creality-lis2dw-Protokoll nötig (oder externer ADXL); bis dahin nur gespeicherte Shaper-Werte.
+8. **ERLEDIGT 16.10.2026 (`[k2_lis2dw]`, NOTIZ-accel.md):** Alter Stand – Beschleunigungssensor: eigenes Modul für das alte Creality-lis2dw-Protokoll nötig (oder externer ADXL); bis dahin nur gespeicherte Shaper-Werte.
 9. **MCU-Temperatur** (gd32f303xe/xb) nicht in Upstream; optional eigenes Mini-Modul.
 10. **Hochtemperatur-PID** (Stock ab 280 °C eigener Satz) fehlt.
 11. **`[idle_timeout]` 99999999** wie Stock: Heizungen gehen nie automatisch aus – bewusst entscheiden.
-12. **CFS-Wechsel** (`T1–T15`, `M8200`) gesperrt, bis k2_box-Wechselablauf + Cutter (`CALIBRATE_CUT_POS`, braucht k2_motor-G-Codes) stehen.
+12. **ERLEDIGT 16.10.2026 (NOTIZ-cfs.md, nur Box 1):** Alter Stand – CFS-Wechsel (`T1–T15`, `M8200`) gesperrt, bis k2_box-Wechselablauf + Cutter (`CALIBRATE_CUT_POS`, braucht k2_motor-G-Codes) stehen.
 13. **`[k2_belt]`** eingetragen, aber gesperrt; Rüttel-Zyklus (Default-`cycle_gcode`) fährt X/Y per FORCE_MOVE ±200 mm ohne Endschalterschutz – erst nach X/Y-Homing-Freigabe.
 14. **`[z_align]`-Ersatz** fehlt (nur `z_tilt`).
 15. **ANNAHMEN:** by-id-Namen; RS485-Adapterpfad; `~/printer_data/gcodes`; Bedeutung `power` PC9; PA0 doppelt angesteuert (fan1 + temperature_fan, wie Stock) unkritisch; Düsen-PB1 doppelt (hotend_fan + extruder_fan, wie Stock) unkritisch; Stock-`PB1` im Override meinte die Düsen-MCU; `minimum_cruise_ratio 0.0` ≙ `max_accel_to_decel = max_accel`; `move_check_distance 3` statt 1 unkritisch; Upstream-Default `step_pulse_duration` 2 µs passt zu den Closed-loop-Treibern; kein `M84` am Druckende (wie Stock).
+
+## 7. Ergänzungen 16.10.2026 (Details in den Notizen)
+
+| Thema | Datei | Kurz |
+|---|---|---|
+| Sensorless X/Y-Homing | `NOTIZ-stall.md`, `homing.cfg`, `k2-motor.cfg` | Stock-Frame-Folge (Stall-Mode 1/2 an X/Y, Kp ID 70 300↔100, Schutzabfrage) über `KTWO_MOTOR_HOMING PHASE=BEGIN/END`; `FORCE_MOVE stepper_y -3` wie Stock |
+| Beschleunigungssensor | `NOTIZ-accel.md`, `../README-k2_lis2dw.md` | `[k2_lis2dw]` spricht das alte Creality-Protokoll, liefert Upstream-Datenstruktur; Erstlauf im Stand (`ACCELEROMETER_DEBUG_READ REG=0x0f` → 0x44) |
+| CFS-Farbwechsel | `NOTIZ-cfs.md`, `macros.cfg`, `k2-module.cfg`, `../README-k2_box.md` §8 | T0–T15 + M8200 P/C/R/L/W/F/O als `KTWO_BOX_*`-Kette, nur Box 1, ohne Freigaben nur Plan, Fehler im Druck → PAUSE |
+
+Gemeinsame Batch-Prüfung aller Module mit dieser Config (Upstream 9cb9975, Live-Dictionaries): **EXIT 0**,
+MCU-Ausgabe u. a. `config_endstop pin=PC7`, `config_prtouch_pres … clk_pin=PB13 sdo_pin=PB14`,
+`config_lis2dw oid=… spi_oid=…`, Strapping-Pins `max_duration=0`. Am Gerät ist alles UNGETESTET.
