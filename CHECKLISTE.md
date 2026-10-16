@@ -118,10 +118,15 @@ Audit und Änderungsbegründungen: `<projekt>/AUDIT-UND-AENDERUNGEN.md`.
   Klipper-unabhängig – Selbsttest ~~9/9~~ **31/31 ok** (15.10.2026, nachgezählt: 31
   `ok`-Zeilen – die Review-Angabe „32/32“ stimmt nicht mit der Ausgabe überein);
   Zustandsmaschine komplett portiert, 2000 Zufallsszenarien Original vs. Port: 0 Abweichungen
-- [ ] Optional: k2-vanilla-Pfad (Gamecard-Fork, offene Treiber) für Plus adaptieren –
-  Pflichtliste in PROTOKOLL-GESAMT.md 1.9 (Geometrie, Dual-Z, Chamber, Lüfter,
-  Thermistoren, Probe-Stack); motor.py-TODOs ggf. aus dessen motor_control.py
-  übernehmen (nur mit Live-Gegenprobe je Methode wegen 0x06/0x0c-Formdifferenz)
+- [~] ~~Optional: k2-vanilla-Pfad (Gamecard-Fork, offene Treiber) für Plus adaptieren~~
+  **ÜBERHOLT 16.10.2026:** Pflichtliste PROTOKOLL-GESAMT.md 1.9 (Geometrie, Dual-Z, Chamber, Lüfter,
+  Thermistoren, Mesh, Probe-Stack, closed-loop) ist in `pi-host/config-pi/` + eigenen Modulen umgesetzt.
+  Stattdessen: Gegenprüfung config-pi/Module gegen k2-vanilla-public – **ERLEDIGT (VANILLA-ABGLEICH-BEFUND-2026-10-16.md):**
+  A3 Mesh nach Homing, A8 on_error_gcode, A9 Kommentar umgesetzt; A1/A2 nachgeprüft und widerlegt.
+- [ ] Pi-Lücken aus dem Vanilla-Abgleich: A4 Düsenreinigung vor Z-Antasten, A5 RESUME mit Prime/Reinigung,
+  A6 CALIBRATE_CUT_POS-Ersatz (Stall-Mode 3 + Messfahrt), A7 CFS-Nachladen bei Runout, A10 z_align-Vergleich am Gerät
+  Zurückgestellt: Motor-Kalibrierfunktionen aus dessen motor_control.py (0x03 Encoder, 0x04 Elektrik-Offset,
+  0x07 Flash) – schreiben Motor-Flash/drehen Motor; nur bei echtem Bedarf, dann mit Einzelfreigabe
 
 ## Review 15.10.2026 (Agents) – Fixes + offene Punkte
 
