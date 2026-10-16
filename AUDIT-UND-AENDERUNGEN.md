@@ -821,6 +821,11 @@ selbst gegengeprüft; bei der Einarbeitung zusätzlich nachgeprüft (Abschnitt �
 
 - PRTOUCH-STOPP-BEWEIS-2026-10-16.md neu: Hypothese MCU-/Endstop-Stopp widerlegt, Host-Abbruch belegt; Kernstellen von uns geprüft.
 
+## 16.10.2026 spät – [k2_prtouch]-Entwurf
+
+- `pi-host/k2_prtouch.py` + Test + README neu (Entwurf eines weiteren KI-Agenten). Review: Sicherheitslogik geprüft (Schrittgrenze,
+  wait_moves, Notgrenze, Timeout, alle Fehlerwege mit Anheben); Fix: harte Obergrenze max_travel_mm ≤ 10 mm + Test.
+
 ## Anonymisierung (Repo-Fassung)
 
 Gegenüber der lokalen Forschungsablage sind im Repo folgende Werte durch syntaktisch

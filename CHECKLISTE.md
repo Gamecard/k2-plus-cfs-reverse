@@ -491,3 +491,7 @@ box 179 · boxmini 17 · cfsseq 28 · motor 134 · motor_mini 43 · auto_addr 33
 - [x] PrTouch-Stopp-Weg BEWIESEN (statisch): Host bricht ab, Swap-Leitung nur Synchronisation, kein trsync/Endstop – PRTOUCH-STOPP-BEWEIS-2026-10-16.md
 - [ ] PrTouch-Modul schreiben (kurze Schritte + Abbruch nach jedem Schritt)
 - [x] RE-Reste-Sammelbefund (RE-RESTE-BEFUND-2026-10-16.md): überwiegend TEILWEISE geklärt, Restpunkte brauchen Live-Tests
+- [x] Entwurf `pi-host/k2_prtouch.py` ([k2_prtouch]: eingebauter Kraftsensor, kurze Schritte ≤ 0,05 mm @ ≤ 5 mm/s, Abbruch
+  nach jedem Schritt, Notgrenze, max_travel ≤ 10 mm, allow_move-Freigabe, TEST_SWAP + Ruhetest) – offline 43/43, Gerätetest offen
+- [ ] k2_prtouch am Gerät: ANNAHMEN prüfen (clk/sdo PB13/PB14, Datenformat u32/s32, ned_lftr-Skalierung, lmt_dead, aqc_tick),
+  zuerst allow_move: False (nur Sensor lesen), dann eine Antastung über leerem Bett mit Hand am Not-Aus
