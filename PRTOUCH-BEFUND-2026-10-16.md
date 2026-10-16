@@ -85,3 +85,11 @@ Folge: **Adressangaben** der früheren MCU-Analysen (PrTouch-MCU, Bit-Spezifikat
 kein Aufruf des Stopp-Helfers von `stepper_stop_on_trigger`; die einzige gemeinsame Pin-Funktion setzt im prtouch-Lesepfad den
 Swap-Pin (Synchronisation). Plausibler Stopp-Weg (ANNAHME): Host hängt die Z-Stepper per `stepper_stop_on_trigger` an ein trsync
 und löst bei erkanntem Kontakt `trsync_trigger` aus.
+
+## NACHTRAG 16.10.2026 spät – Stopp-Weg BEWIESEN (PRTOUCH-STOPP-BEWEIS-2026-10-16.md)
+
+- Hypothese „Düse schaltet Swap-Leitung bei Kontakt → Main-Endstop/trsync stoppt Z“ ist **WIDERLEGT**.
+- Swap-Leitung (Düse PA15 → Main !PC7) = **nur Zeitsynchronisierung**: Düse setzt sie bei config/start HIGH, Main liest sie einmal bei start_prtouch_step.
+- Düse erkennt den Kontakt (Schwellen, tri_chxs), stoppt aber nichts; Host nutzt kein endstop_home/trsync/stepper_stop.
+- **Der Host bricht die Fahrt ab** und rechnet den Kontakt nachträglich (zoft). Folge für ein eigenes Modul: nur kurze, langsame
+  Abwärtsschritte mit Prüfung nach jedem Schritt und sofortigem Abbruch; kein Endstop auf !PC7 nötig.

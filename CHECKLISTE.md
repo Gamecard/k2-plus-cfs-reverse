@@ -488,5 +488,6 @@ box 179 · boxmini 17 · cfsseq 28 · motor 134 · motor_mini 43 · auto_addr 33
 - [x] Entwurf `pi-host/k2_box.py` ([k2_box]: Auto-Addr, Poll, Preload, Load/Unload, Moonraker-Status, gemeinsamer Bus-Lock
   mit [k2_motor]) – offline 9/9, Gerätetest offen
 - [x] KORREKTUR: Klipper-MCU-Basis 0x08003000 (Main + Düse); PrTouch „stoppt nicht selbst“ mit korrekter Basis bestätigt
-- [ ] PrTouch-Stopp-Weg über Host-trsync am Gerät/Log bestätigen; dann PrTouch-Modul schreiben
+- [x] PrTouch-Stopp-Weg BEWIESEN (statisch): Host bricht ab, Swap-Leitung nur Synchronisation, kein trsync/Endstop – PRTOUCH-STOPP-BEWEIS-2026-10-16.md
+- [ ] PrTouch-Modul schreiben (kurze Schritte + Abbruch nach jedem Schritt)
 - [x] RE-Reste-Sammelbefund (RE-RESTE-BEFUND-2026-10-16.md): überwiegend TEILWEISE geklärt, Restpunkte brauchen Live-Tests

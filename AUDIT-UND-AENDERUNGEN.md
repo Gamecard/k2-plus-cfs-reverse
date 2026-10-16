@@ -817,6 +817,10 @@ selbst gegengeprüft; bei der Einarbeitung zusätzlich nachgeprüft (Abschnitt �
 - `pi-host/k2_box.py` + `test_k2_box.py` + `README-k2_box.md` neu (Entwurf).
 - MCU-Basis 0x08003000 korrigiert (Nachträge in PRTOUCH- und GPIO-PHASE-BEFUND); RE-RESTE-BEFUND neu.
 
+## 16.10.2026 spät – PrTouch-Stopp-Weg
+
+- PRTOUCH-STOPP-BEWEIS-2026-10-16.md neu: Hypothese MCU-/Endstop-Stopp widerlegt, Host-Abbruch belegt; Kernstellen von uns geprüft.
+
 ## Anonymisierung (Repo-Fassung)
 
 Gegenüber der lokalen Forschungsablage sind im Repo folgende Werte durch syntaktisch
