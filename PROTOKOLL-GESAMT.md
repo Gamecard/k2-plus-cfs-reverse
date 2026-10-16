@@ -1,4 +1,4 @@
-# K2 Plus – Gesamt-Protokoll-Inventar (Stand 13.10.2026, Live-Log-Abgleich 15.10.2026, BEFUND2 16.10.2026)
+# K2 Plus – Gesamt-Protokoll-Inventar (Stand 13.10.2026, Live-Log-Abgleich 15.10.2026, BEFUND2 + REA-Motor 16.10.2026)
 
 Audit/Korrekturen der Nachbau-Module: `/home/pro/k2-fw-live-1.1.7.0/AUDIT-UND-AENDERUNGEN.md`.
 
@@ -155,14 +155,29 @@ NEU 15.10.2026 (Ghidra, R153): 0x01 LED-Refresh, 0x06 Feeder (FW-Bug: immer Stat
 0x08 = (LIVE 16.10.2026, Motor X) Variable lesen [idx 1..12] → 4 B LE (Host: float idx 1–10,
        int idx 11/12; Standby: 9 = 0.0016113, 10 = 0.0008057, 11 = 1106, Rest 0);
        Bedeutung je Index OFFEN. !! Creality-Host MOTOR_GET DATA=0/13 → Klipper-SHUTDOWN !!
+       REA 16.10.: idx 5 pos_fdb, 6 spd_fdb, 7 id_fdb, 8 iq_fdb (BELEGT, NO_ERR_CODE_TO_GET);
+       Host-Typkette fest 1–10/17/18 '<f', 11–16 '<I' (unsigned); 1–4/9–12 ohne Host-Namen
+Host-Tabelle Motor_cmd (REA 16.10., BELEGT): 01 reboot, 03 encoder_calibrate_official,
+       04 elec_offset_calibrate, 05 control, 06 sys_param, 07 flash_param, 08 get, 0b boot,
+       0c protection, 0d systemid, 0e read/set485_addr, 0f version, 11 stall_mode, 12 dev_uuid,
+       13 err_detail_data, 14 cut_detail_data, 15 pos_data_sample, 16 spd_data_sample
 ```
+
+- **REA-Befund 16.10.2026** (`REA-MOTOR-BEFUND-2026-10-16.md`, Details PROTOKOLL-485.md §3.1
+  „NACHTRAG (2)“): Crash-Ursache `MOTOR_GET DATA=0/13` **BELEGT** per Traceback
+  (`motor_get` Z. 1982 → `box_wrapper.py` Z. 384 `parse_num_to_byte` → `TypeError: 'NoneType'
+  object cannot be interpreted as an integer`): Creality-`gcode.py` lehnt den Bereich nur mit
+  Warnung ab (`get_int` → None), `motor_get` rechnet weiter → Absturz **vor** dem Senden, kein
+  Frame auf dem Bus. Interne Abfragen `MOTOR_GET NUM=1 DATA=7/8 EXTRUDER=1` = Stats-Hook
+  Extruder-Überstrom-Monitoring (|I| = hypot(id, iq)). Fehler-/Warnbits: key781..794 / key795..797.
 
 - **Live-Abfragen 16.10.2026** (`LIVE-ABFRAGEN-2026-10-16.md`, Details PROTOKOLL-485.md §3.1
   Nachtrag): 0x0F und 0x08 belegt (s. oben), 0x0E/0x0C bestätigt. **WARNUNG:** `MOTOR_GET`
   mit `DATA=0` oder `DATA=13` lässt `motor_control_wrapper.so` intern scheitern (key60) →
   Klipper-SHUTDOWN (2× reproduziert, Recovery `FIRMWARE_RESTART`). Nachbau:
   `query_motor_version()`, `read_variable(idx)` nur 1..12; `read_encoder` bleibt gesperrt
-  (Encoder-Index offen). `MOTOR_READ_ALL_PIN_IO` läuft **nicht** über RS485, sondern als
+  (~~Encoder-Index offen~~ → seit REA 16.10. `read_position_feedback()` = idx 5 pos_fdb,
+  dazu `read_speed_feedback()` idx 6, `read_current_feedback()` idx 7/8). `MOTOR_READ_ALL_PIN_IO` läuft **nicht** über RS485, sondern als
   Klipper-GPIO-Abfrage an der **Main-MCU** (PB9, PB10, !PB7, PB8, PB5, PB6, PA1, PB15).
 
 - **Pfad (LIVE 15.10.2026):** X/Y/Z/Z1 ausschließlich über serial_485 ttyS5 (geteilt mit
@@ -321,6 +336,10 @@ Details siehe Subagenten-Bericht in der Session-Historie.
   ttyS5, braucht für die GPIO-Phase aber weiter die Main-MCU. Eine eigene
   MOTOR_GET-Implementierung muss den Variablen-Index (1..12) **vor** dem Senden prüfen
   (Stock-Host crasht bei 0/13).
+  **NACHTRAG 16.10.2026 (REA):** Für einen Pi-Ersatz steht die Positionsrückmeldung als
+  0x08 **idx 5 (`pos_fdb`)** bereit (dazu 6 `spd_fdb`, 7/8 `id_fdb`/`iq_fdb`), direkt über
+  ttyS5 lesbar (`read_position_feedback()`); Einheit/Skalierung von pos_fdb noch offen
+  (Scan nach Homing/in Bewegung nötig).
 
 **Kreuzvergleich: fake-name/cfs-reverse-engineering (CFS-Hardware, 15.10.2026 gesichtet)**
 
@@ -419,9 +438,17 @@ ein FW-File pro Board. Noch nicht dekompiliert.
   `check_protection_code`, `motor_read485_addr`
 - LIVE 16.10.2026: `motor_version` = 0x0F [00] (Felder `fireware_ver`, `cmd_system_ver`,
   `protection_ver`, `flash_param_ver`, `logger_ver`; Motor X fw 1.9.7.81), `motor_get` =
-  0x08 [idx] (idx 1..12, Namen offen; Strings zeigen Stock-Aufrufe `MOTOR_GET NUM=1 DATA=7/8
+  0x08 [idx] (idx 1..12, ~~Namen offen~~; Strings zeigen Stock-Aufrufe `MOTOR_GET NUM=1 DATA=7/8
   EXTRUDER=1` und `MOTOR_GET NUM=1 DATA=1` in `_stats_motor_get_value`). **Host-Bug:**
   `MOTOR_GET DATA=0/13` → interner Fehler → Klipper-SHUTDOWN. Pin-IO über Main-MCU-GPIO.
+- REA 16.10.2026 (statisch, `REA-MOTOR-BEFUND-2026-10-16.md`): idx 5–8 = pos_fdb/spd_fdb/
+  id_fdb/iq_fdb (BELEGT); Typkette fest (1–10/17/18 float, 11–16 uint32); vollständige
+  Motor_cmd-Tabelle 0x01–0x16; `DATA=7/8 EXTRUDER=1` = `Motor_Control.stats` (Extruder-
+  Überstrom-Monitoring über transparent, nicht ttyS5); `DATA=1` = nur Hilfetext. Crash
+  DATA=0/13 belegt (Traceback, `parse_num_to_byte(None)`, kein Frame). Fehlerbits
+  `motor_error_dict` (key781..794), `motor_warning_dict` (key795..797), `ERR_CODE_TO_UNION`.
+  Offen: Bedeutung idx 1–4/9–12, Skalierung pos_fdb, Byte-Layout der 0x0C-Antwort,
+  Request-Formen 0x13–0x16.
 - Config: `motor_closed_loop: x,y,z,z1,e`, LESO/PID-Parameter je Achse
   (Pos-/Spd-/Cur-Loop), Stall-Pins je Achse
 - Board-FW: `fw/F008/mot*_022_C30-mot2_002_081.bin` (123K, Klartext-Strings)
@@ -438,7 +465,7 @@ ein FW-File pro Board. Noch nicht dekompiliert.
 | `belt_mdl.py` | Belt-Logik (reines Python, offen!) | komplett dokumentiert |
 | `filament_rack_wrapper.so` | Trockner/Regal (Addr 0x11) | Strings dokumentiert, Live offen |
 | `prtouch_v1/v2/v3_wrapper.so` | Druck-Leveling | v3 live belegt |
-| `motor_control_wrapper.so` | Closed-loop | live belegt (Cut; 0x0F/0x08 16.10.) |
+| `motor_control_wrapper.so` | Closed-loop | live belegt (Cut; 0x0F/0x08 16.10.); REA-Befund 16.10. (Motor_cmd, idx 5–8, Crash) |
 | `load_ai` + `usr/lib/yolov5/*.bin` | AI-Abfall-Erkennung (Kamera+Inference) | NICHT analysiert |
 | `cfs6` | `cfs6_100_G31-cfs6_222_000.bin` (145K Cortex-M) | Geladen in Ghidra: Basis ~~`0x08000000`~~ (**KORRIGIERT 15.10.2026: richtig `0x08004000`**, App-Image ohne Bootloader – passt zum Reset `0x08004144`), SP `0x20008030`, ~~798 Funktionen (alte Basis; Neuanalyse 15.10.2026 ausstehend)~~ **936 Funktionen @0x08004000 (Neuanalyse 15.10.2026)**; andere Gerätevariante (Heizung/Lüfter, Bus RS485 oder CAN), s. „CFS-FW Neuanalyse“ unten | Import-Rezept unten |
 

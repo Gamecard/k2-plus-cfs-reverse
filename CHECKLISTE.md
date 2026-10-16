@@ -186,14 +186,26 @@ motor 98 · motor_mini 30 · auto_addr 31 – alle grün.
 - [x] Motor 0x0F (version) live prüfen – **ERLEDIGT 16.10.2026:** `[00]` → 12 B
   (fireware_ver 1.9.7.81, cmd_system 1.3, protection 1.3, flash_param 2.75, logger 1.0;
   `motor.query_motor_version`, ersetzt Stub `motor_version_normal`)
-- [ ] **NEU 16.10.2026:** Bedeutung der 0x08-Indizes 1..12 klären – Scan nach Homing bzw.
-  während Bewegung wiederholen (Werte ≠ 0 zuordnen) und/oder Namen aus
-  `motor_control_wrapper.so` ziehen (Strings: Stock ruft `MOTOR_GET NUM=1 DATA=7/8 EXTRUDER=1`
-  und `MOTOR_GET NUM=1 DATA=1` in `_stats_motor_get_value`); erst danach ggf. `read_encoder`
-  freigeben. NIE `MOTOR_GET DATA=0` oder `DATA=13` senden (Host-Crash, s. AUDIT 16.10.)
-- [ ] **NEU 16.10.2026:** Offen, ob der Motor selbst 0x08 mit idx ≥ 13 verträgt (Crash bei
-  DATA=13 liegt im Host; nicht geprüft, ob ein Frame rausging) – nur mit eigenem Sender,
-  nicht über Stock-G-Code
+- [ ] **NEU 16.10.2026:** Bedeutung der 0x08-Indizes 1..12 klären – **TEILWEISE ERLEDIGT
+  16.10.2026 (REA, `REA-MOTOR-BEFUND-2026-10-16.md`):** idx 5 `pos_fdb`, 6 `spd_fdb`, 7 `id_fdb`,
+  8 `iq_fdb` BELEGT (Host-Dict `NO_ERR_CODE_TO_GET`), Typkette fest (1–10/17/18 `<f`, 11–16 `<I`);
+  `DATA=7/8 EXTRUDER=1` = Stats-Hook Extruder-Überstrom, `DATA=1` nur Hilfetext. Nachbau:
+  `VARIABLE_NAMES`, `read_position_feedback`/`read_speed_feedback`/`read_current_feedback`.
+  **Offen:** idx 1–4 und 9–12 (keine Host-Namen; Hypothesen 9/10 = ADC-LSB, 11 = Roh-Encoder?)
+  – Scan nach Homing/in Bewegung. `read_encoder` bleibt gesperrt (0x06-Altfalle, Ersatz =
+  `read_position_feedback`). NIE `MOTOR_GET DATA=0` oder `DATA=13` senden (Host-Crash)
+- [ ] **NEU 16.10.2026 (REA):** Skalierung/Einheit von `pos_fdb` (idx 5) und `spd_fdb` (idx 6)
+  klären (rad bzw. rad/s vermutet) – Scan nach Homing/bei bekannter Fahrt; Voraussetzung, um
+  pos_fdb im Pi-Ersatz zu nutzen
+- [ ] **NEU 16.10.2026 (REA):** Detail-/Sample-Kommandos 0x13 `err_detail_data`
+  (Host-Format `<I8BfHfiiffffffffi`), 0x14 `cut_detail_data`, 0x15 `pos_data_sample`,
+  0x16 `spd_data_sample` – Request-Formen unbelegt, live nie gesehen; im Nachbau nur Stubs
+  (NotImplementedError). Dazu: Byte-Layout der 8-B-Antwort von 0x0C [0b] (err_code/
+  warning_code → `motor_error_dict` key781..794 / `motor_warning_dict` key795..797)
+- [ ] **NEU 16.10.2026:** Offen, ob der Motor selbst 0x08 mit idx ≥ 13 verträgt – ~~(Crash bei
+  DATA=13 liegt im Host; nicht geprüft, ob ein Frame rausging)~~ Host kennt 13–18 (Typkette),
+  Crash ist belegt host-seitig ohne Frame (s. unten); am Motor weiter ungeprüft – nur mit
+  eigenem Sender, nicht über Stock-G-Code
 - [x] Motor 0x0C: Protection-Semantik (grant0013/k2-vanilla) gegen Plus-Frame `00*8` prüfen
   – **ERLEDIGT 15.10.2026:** Request `[0b]` → 8 B Status (00 = ok), `[05]` ohne Antwort;
   „8-Byte-Parameter“ WIDERLEGT (`motor.check_protection`)
@@ -300,6 +312,11 @@ Quelle: `live-logs-2026-10-15/` (lokal, nicht fürs Repo), Auswertung PROTOKOLL-
   den Variablen-Index **vor** dem Senden validieren (belegt: 1..12). Der Stock-Host
   (`motor_control_wrapper.so`) geht bei `DATA=0`/`DATA=13` in Klipper-SHUTDOWN (key60);
   Nachbau `read_variable` lehnt alles außerhalb 1..12 mit `ValueError` ab
+- [x] **Crash-Ursache MOTOR_GET DATA=0/13 – ERLEDIGT 16.10.2026 (Traceback + REA):**
+  `motor_control_wrapper.py` Z. 1982 `Motor_Control.motor_get` → `box_wrapper.py` Z. 384
+  `ParseData.parse_num_to_byte` → `TypeError: 'NoneType' object cannot be interpreted as an
+  integer`. Creality-`gcode.py` lehnt den Bereich (minval=1/maxval=12) nur mit Warnung ab
+  (`get_int` → None), `motor_get` rechnet weiter → Absturz vor dem Senden, **kein Frame**
 - [ ] Extruder-Motor nur über `transparent_send` (nozzle_mcu, Adresse 0x81) – Creality-
   Klipper-MCU-FW mit `config_transparent` oder eigene Lösung nötig
 

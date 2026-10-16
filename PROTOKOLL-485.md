@@ -801,6 +801,8 @@ Skript, lässt nur lesende Motor-G-Codes durch), Drucker im Standby, **nicht ref
 > bereit. Ob der **Motor** Index ≥ 13 verträgt, ist offen (bei 13 nicht geprüft, ob ein Frame
 > rausging). Nachbau `read_variable` akzeptiert deshalb nur 1..12; eine eigene Implementierung
 > muss den Index **vor** dem Senden validieren.
+> **→ Ursache seit 16.10. BELEGT (Traceback, s. „NACHTRAG 16.10.2026 (2)“ unten):** host-seitiger
+> TypeError in `parse_num_to_byte(None)`, **kein Frame** ging auf den Bus.
 
 - **0x0F Version** (`MOTOR_VERSION NUM=1 DATA=0`): TX `81 04 00 0f 00` → RX
   `f7 81 0f 00 0f 01 09 07 51 01 03 01 03 02 4b 01 00 02` (CRC ok). 12 B Nutzdaten, Feldnamen
@@ -828,7 +830,8 @@ Skript, lässt nur lesende Motor-G-Codes durch), Drucker im Standby, **nicht ref
   | 11 | `52 04 00 00` | 1106 | int | `f7 81 07 00 08 52 04 00 00 71` |
   | 12 | `00 00 00 00` | 0 | int | `f7 81 07 00 08 00 00 00 00 0a` |
 
-  Welcher Index Encoder/Position/Strom ist: **offen** (Stillstand → viele Nullen). Hinweis aus
+  Welcher Index Encoder/Position/Strom ist: ~~offen~~ **5–8 seit 16.10. REA-belegt**
+  (pos_fdb/spd_fdb/id_fdb/iq_fdb, s. NACHTRAG (2)); 1–4/9–12 weiter ohne Namen. Hinweis aus
   den Wrapper-Strings: Stock nutzt selbst `MOTOR_GET NUM=1 DATA=7 EXTRUDER=1`,
   `… DATA=8 EXTRUDER=1` und `MOTOR_GET NUM=1 DATA=1` (`_stats_motor_get_value`) – Kontext
   unbelegt. Nächster Schritt: Scan nach Homing/in Bewegung, Namen aus `motor_control_wrapper.so`.
@@ -843,9 +846,112 @@ Skript, lässt nur lesende Motor-G-Codes durch), Drucker im Standby, **nicht ref
   `fireware_ver`/`cmd_system_ver`/`protection_ver`/`flash_param_ver`/`logger_ver` + `raw`;
   Alias `motor_version`, in motor.py zusätzlich `motor_version_normal` = früherer Stub),
   `read_variable(idx)` (nur 1..12, sonst `ValueError` ohne Senden; Rückgabe `raw`, `float` (<f),
-  `int` (<i, Vorzeichen unbelegt), `type`/`value` nach `VARIABLE_TYPES` = Host-Dekodierung live
-  16.10.). `retries=0`; Timeout 0x0F/0x08 **unbelegt** (live kein Timeout gemessen) → 1,0 s.
+  `int` (~~<i, Vorzeichen unbelegt~~ → seit REA 16.10. `<I` unsigned wie der Host), `type`/`value`
+  nach `VARIABLE_TYPES` = Host-Dekodierung live 16.10.). `retries=0`; Timeout 0x0F/0x08 **unbelegt** (live kein Timeout gemessen) → 1,0 s.
   `cfswatch.py` dekodiert 0x0F-/0x08-Motorantworten. Selbsttests mit den Live-Frames.
+
+#### NACHTRAG 16.10.2026 (2): REA-Analyse `motor_control_wrapper.so` + Crash-Ursache belegt
+
+Quelle: statische Analyse (REA/Ghidra + eigene `llvm-objdump`-Auflöser für Cython-Stringtabelle,
+Konstanten, Tupel; nichts gesendet), Details und Adressen: `REA-MOTOR-BEFUND-2026-10-16.md`.
+Binary `rootfs-live/usr/share/klipper/klippy/extras/motor_control_wrapper.cpython-39.so`
+(armhf, Cython 0.29.21), SHA256 `d8191b77…b4b6e0f`. Adressen = ELF-vaddr (Ghidra +0x10000).
+
+**Motor_cmd (Host-Tabelle, Modul-Init @0x10168/0x10a9c, BELEGT):**
+
+| Cmd | Host-Name | Live | Nachbau |
+|---|---|---|---|
+| 0x01 | reboot | nie | Stub `reboot()` |
+| 0x03 | encoder_calibrate_official | nie | Stub `encoder_calibrate()` |
+| 0x04 | elec_offset_calibrate | nie | Stub `elec_offset_calibrate()` |
+| 0x05 | control | unbeantwortet | nicht gebaut |
+| 0x06 | sys_param | belegt | `read/write_sys_param` |
+| 0x07 | flash_param | nie | Stubs `get/set_flash_param` |
+| 0x08 | get | belegt | `read_variable` + Feedback-Helfer |
+| 0x0B | boot | nie (NIE senden) | Sperre `boot()` |
+| 0x0C | protection | belegt | `check_protection` |
+| 0x0D | systemid | nie | Stub `systemid()` |
+| 0x0E | read485_addr / set485_addr | belegt (Lesen) | `read_485_addr` |
+| 0x0F | version | belegt | `query_motor_version` |
+| 0x11 | stall_mode | belegt | `set_mode` / `get_stall_mode` |
+| 0x12 | dev_uuid | belegt | `read_uuid` |
+| 0x13 | err_detail_data | nie | Stub (Format `<I8BfHfiiffffffffi`) |
+| 0x14 | cut_detail_data | nie | Stub (Format wie 0x13 + `f`) |
+| 0x15 | pos_data_sample | nie | Stub |
+| 0x16 | spd_data_sample | nie | Stub |
+
+`Motor_Addr`: NUM-String '0'..'8' → 0x80..0x88, '9' → 0xFF (Broadcast); `MOTOR_NUM_TO_NAME`
+1..5 → x, y, z, z1, e. Frame = `Motor_Addr[NUM]` + Länge + `00` + Cmd + Payload + CRC.
+
+**0x08-Indexnamen (BELEGT 5–8):** Modul-Dict `NO_ERR_CODE_TO_GET` = {'pos_fdb':5, 'spd_fdb':6,
+'id_fdb':7, 'iq_fdb':8} (@0x10cf8–0x10d60), gelesen von `_motor_no_cut_detail_data` (iteriert
+`.items()`, je Index ein 0x08-Request). = Positions-, Drehzahl-, d- und q-Strom-Rückmeldung der
+FOC-Regelung. Für 1–4 und 9–12 gibt es im Host **keine** Namen (keine weitere Tabelle;
+`MOTOR_DATAS` ist nur die lokale Prüfliste [0..15] in `validate_data_params`).
+
+**Typkette (BELEGT, fest verdrahtet):** `motor_get` (@0x51524, Py-Z. 1987/1989) prüft
+`data in (1..10, 17, 18)` → `struct.unpack('<f', …)`, `data in (11..16)` → `struct.unpack('<I', …)`
+(**unsigned**). Dieselbe Kette in `motor_extruder_get` und `_motor_no_cut_detail_data`. Der Motor
+liefert keine Typinformation. Wertbytes = `result[5 : result[2]+2]` (= `[5:9]` bei Länge 7).
+Der Host kennt 13–18, per G-Code (`maxval=12`) sind sie aber unerreichbar; am Motor live nicht
+geprüft → Nachbau sperrt sie bewusst.
+
+**Crash-Mechanismus DATA=0/13 – BELEGT** (Drucker-`klippy.log` 16.10. 13:12:27, Traceback):
+
+```
+File ".../motor_control_wrapper.py", line 1982, in Motor_Control.motor_get
+File ".../box_wrapper.py", line 384, in ParseData.parse_num_to_byte
+TypeError: 'NoneType' object cannot be interpreted as an integer
+```
+
+Ablauf: `validate_data_params` (`get_int('DATA', 0, minval=0, maxval=15)`) lässt 0 und 13 durch;
+in `motor_get` folgt `data = gcmd.get_int('DATA', 0, minval=1, maxval=12)`. Creality's `gcode.py`
+wirft bei Bereichsverletzung **keinen** CommandError, sondern gibt nur eine Warnung aus und liefert
+`None`; `motor_get` rechnet weiter, `self.parse.parse_num_to_byte(None)` scheitert → `key60` →
+SHUTDOWN. `motor_send_data` wird **nie erreicht – kein Frame auf dem Bus** (REA-Variante A
+bestätigt, Variante B „UnboundLocalError 'value'“ widerlegt). Dieselbe Klasse droht vermutlich bei
+NUM=0 oder NUM≥11 (VERMUTET, nicht getestet).
+
+**Interne Abfragen DATA=7/8 EXTRUDER=1 (BELEGT):** `Motor_Control.stats(eventtime)` (Klipper-
+Stats-Timer, nur bei `overcurrent_switch` und `motor_params_init`) führt
+`MOTOR_GET NUM=1 DATA=7 EXTRUDER=1` / `DATA=8 EXTRUDER=1` aus, liest `_stats_motor_get_value`
+und schreibt `motor_control: <id> <iq> overcurrent=<hypot(id,iq)>` ins Log → **Extruder-
+Überstrom-Monitoring** |I| = √(id²+iq²), kein Zusammenhang mit der Cut-Erkennung. Transport über
+`transparent_send` der Düsen-MCU, nicht über ttyS5. `MOTOR_GET NUM=1 DATA=1` ist nur der
+Hilfetext („打印系统所支持变量“), kein interner Aufruf.
+
+**Fehler-/Warnbits (BELEGT als Bit→key):** `motor_error_dict` Bit 0..13 → key781..794
+(Encoder-Sprung, Encoder-Lesefehler, SW-Spitzen-, SW-Dauer-, HW-Überstrom, Drehzahl,
+Positionsgrenze, Positions-Sollwertsprung, Schleppfehler, R/L, instabil, Phase fehlt,
+Phasen-R-Differenz, Sonstige); `motor_warning_dict` Bit 0..2 → key795..797 (Kommunikation,
+Unterspannung, MCU-Übertemperatur). `ERR_CODE_TO_UNION` (Bitwert → Detailformat): 1 `<ii`
+lower/upper_encoder_pulse, 4 `<f` peak_overcurrent_A, 8 `<ff` continuous_overcurrent_A/time_s,
+32 speed_over_limit, 64 pos_over_limit_min/max, 128 pos_cmd_mutation_turns, 256 (vermutet)
+tracking_error. **Offen:** welche Bytes der 8-B-Antwort von 0x0C [0b] err_code bzw. warning_code
+tragen → Nachbau nur Bit-Decoder (`decode_error_bits`/`decode_warning_bits`), kein
+`decode_protection(8 B)`.
+
+**Hypothesen (VERMUTET, nicht gebaut):**
+
+| G-Code / Index | Cmd | Hypothese |
+|---|---|---|
+| idx 9 / 10 | 0x08 | 0.0016113 = 3,3 V/2048, 0.0008057 = 3,3 V/4096 → 2 bzw. 1 LSB eines 12-Bit-ADC (Strommess-Offset ia/ib?) |
+| idx 11 | 0x08 | 1106 = Roh-Encoderwert? (`encoder_fdb` ist in 0x13 ein int) |
+| MOTOR_FLASH_PARAM | 0x07 | `[DATA]` (+`00` bei 3/4, +ID bei 5/6); DATA=5 Schreiben (float `f`, uint16 `<H`, uint32 **`>I` Big-Endian**, int16 `<h`, sonst `>I`; Antwort Status 0 = OK), DATA=6 Lesen |
+| MOTOR_CONTROL | 0x05 | `[DATA]` bis 12, Antwort 3 Statusbytes (Enable/EN-Pin/Controller/PWM); DATA-Bedeutung offen |
+| MOTOR_STALL_MODE | 0x11 | 1 = Endschalter-/Blockiersignal, 2 = Notfall-Schutzausgang (Hilfetext, belegt); 4 = Messmodus für Cut-Positionierung (vermutet, `MOTOR_CHECK_CUT_POS`) |
+| MOTOR_CLEAR_ERR_WARN_CODE | 0x0C | `[05]` = Fehler/Warnungen löschen (Hilfetext belegt), `[0b]` = abfragen |
+| MOTOR_EXTRUDER_RETRY_PROCESS | – | reine G-Code-Folge, keine eigenen Frames (belegt) |
+
+**Nachbau** (`motor.py`, knapp `motor_mini.py`): `VARIABLE_NAMES` (5–8), `VARIABLE_HOST_FORMATS`
+(1..18, Host-Kette), `VARIABLE_TYPES` (1..12, `int` jetzt `<I`), `decode_variable` liefert
+zusätzlich `name`/`fmt`; `read_position_feedback()` (idx 5), `read_speed_feedback()` (6),
+`read_current_feedback()` (7+8 → id, iq, |i| = hypot); `MOTOR_CMD`, `FUNC_*` für 0x01–0x16,
+`MOTOR_ADDR_BY_NUM`, `MOTOR_NUM_TO_NAME`, `ERR_DETAIL_FORMAT`/`FIELDS`, `MOTOR_ERROR_BITS`,
+`MOTOR_WARNING_BITS`, `ERR_CODE_TO_UNION`; Stubs 0x01/0x0B/0x0D/0x13–0x16 (NotImplementedError,
+senden nichts). `read_encoder` bleibt gesperrt (0x06-Altfalle) und verweist auf
+`read_position_feedback` (Einheit/Skalierung von pos_fdb offen). `cfswatch.py` zeigt die Namen
+für idx 5–8.
 
 ## 4. Update-Werkzeuge
 

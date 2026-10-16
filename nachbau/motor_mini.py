@@ -20,9 +20,13 @@ LIVE-STAND 15.10.2026 (live-logs-2026-10-15/klippy.log*, lokal, nicht im Repo; s
   allow_locked). Wert-Plausibilität wie motor.py (1e-50 -> ValueError).
 - update_sys_params: 0x06 [03] – NUR mit confirm=True (wie motor.py)
 - Reine Builder: build_sys_param_write_payload, build_sys_param_update_payload
-- read_encoder: GESPERRT (0x08 = Variablen-Lesepfad, Encoder-Index offen)
+- read_position_feedback / read_speed_feedback / read_current_feedback:
+  0x08 idx 5 / 6 / 7+8 (pos_fdb/spd_fdb/id_fdb/iq_fdb, REA-belegt 16.10.;
+  Skalierung offen)
+- read_encoder: GESPERRT (0x06-Altfalle) -> read_position_feedback (idx 5)
 - WARNUNG: Creality-Host MOTOR_GET DATA=0/13 -> Klipper-SHUTDOWN (live 16.10.,
-  2x reproduziert) -> read_variable lehnt Index außerhalb 1..12 ab.
+  2x reproduziert; Ursache belegt: get_int -> None -> parse_num_to_byte
+  TypeError VOR dem Senden) -> read_variable lehnt Index außerhalb 1..12 ab.
 - query_version: Update-Pfad (0xF0/00, Decompile; live nie beobachtet) –
   FREI, reine "get version"-Abfrage (erster Schritt vor request-update).
   Die zustandsändernden F0-Sender (request_update/send_fw_len/update_end)
@@ -56,9 +60,12 @@ VERSION_FIELDS = (("fireware_ver", 4), ("cmd_system_ver", 2),
                   ("protection_ver", 2), ("flash_param_ver", 2),
                   ("logger_ver", 2))  # 12 B, Namen = Wrapper-Strings
 VARIABLE_INDEX_MIN, VARIABLE_INDEX_MAX = 1, 12  # 0/13: Host-Crash (s. oben)
-# Host-Dekodierung live 16.10. (Typ, NICHT Bedeutung)
+# Feste Host-Typkette (REA 16.10., motor_get Py-Z. 1987/1989): 1..10 '<f',
+# 11/12 '<I' (UNSIGNED; 13..16 '<I', 17/18 '<f' per G-Code unerreichbar).
 VARIABLE_TYPES = dict([(i, "float") for i in range(1, 11)]
                       + [(11, "int"), (12, "int")])
+# Indexnamen (REA belegt, Host-Dict NO_ERR_CODE_TO_GET); 1-4/9-12 ohne Namen
+VARIABLE_NAMES = {5: "pos_fdb", 6: "spd_fdb", 7: "id_fdb", 8: "iq_fdb"}
 SUB_SYS_WRITE = 0x01
 SUB_SYS_READ = 0x02
 SUB_SYS_UPDATE = 0x03
@@ -162,15 +169,16 @@ def _check_variable_index(idx):
 
 
 def decode_variable(idx, data):
-    """4 B 0x08-Antwort -> {'index','raw','float' (<f),'int' (<i, Vorzeichen
-    unbelegt),'type' (Host-Dekodierung),'value'}. Bedeutung je Index OFFEN."""
+    """4 B 0x08-Antwort -> {'index','name','raw','float' (<f),'int' (<I wie
+    Host),'type' (feste Host-Kette),'value'}. Namen nur 5..8, Skalierung offen."""
     _check_variable_index(idx)
     raw = bytes(data)
     if len(raw) != 4:
         raise ValueError("0x08 idx %d: 4 Bytes erwartet: %r" % (idx, raw))
-    f, i = struct.unpack("<f", raw)[0], struct.unpack("<i", raw)[0]
+    f, i = struct.unpack("<f", raw)[0], struct.unpack("<I", raw)[0]
     typ = VARIABLE_TYPES[idx]
-    return {"index": idx, "raw": raw, "float": f, "int": i, "type": typ,
+    return {"index": idx, "name": VARIABLE_NAMES.get(idx), "raw": raw,
+            "float": f, "int": i, "type": typ,
             "value": f if typ == "float" else i}
 
 
@@ -292,12 +300,26 @@ class MotorMini:
         return decode_variable(idx, self._tx(FUNC_VARIABLE, [idx],
                                              TIMEOUT_VARIABLE))
 
+    def read_position_feedback(self):
+        """pos_fdb (0x08 idx 5) -> float; Einheit/Skalierung offen."""
+        return self.read_variable(5)["value"]
+
+    def read_speed_feedback(self):
+        """spd_fdb (0x08 idx 6) -> float; Einheit offen."""
+        return self.read_variable(6)["value"]
+
+    def read_current_feedback(self):
+        """id_fdb/iq_fdb (idx 7, 8) -> {'id','iq','abs'=hypot} wie Host-Stats."""
+        i_d, i_q = self.read_variable(7)["value"], self.read_variable(8)["value"]
+        return {"id": i_d, "iq": i_q, "abs": math.hypot(i_d, i_q)}
+
     def read_encoder(self, *args, **kwargs):
-        """GESPERRT – sendet KEINEN Frame. 0x08 ist der Variablen-Lesepfad
-        (read_variable); welcher Index Encoder/Position ist, ist offen."""
+        """GESPERRT – sendet KEINEN Frame (0x06-Altfalle: 0x06 = Sys-Param).
+        Positionsrückmeldung = read_position_feedback (0x08 idx 5 pos_fdb,
+        Einheit/Skalierung offen)."""
         raise NotImplementedError(
-            "read_encoder gesperrt: 0x08 = Variablen-Lesepfad (read_variable, "
-            "idx 1..12), Encoder-/Positions-Index aber unbelegt")
+            "read_encoder gesperrt (0x06 = Sys-Param): Positionsrückmeldung = "
+            "read_position_feedback() (0x08 idx 5 pos_fdb, Skalierung offen)")
 
     def query_version(self):
         """Version über Update-Pfad abfragen (Func 0xf0/Sub 0x00). Rohdaten.
@@ -324,7 +346,7 @@ def selftest():
             return False
         return False
 
-    from serial485 import parse_frame, build_frame
+    from serial485 import parse_frame, build_frame, crc8_cal as _crc8
 
     class _Bus:
         """Prüft TX gegen Log-Bytes (data_send-Form ohne f7/CRC) und spielt
@@ -441,6 +463,20 @@ def selftest():
     check("0x08 idx 11 = 1106 (int)", r11["int"] == 1106 and r11["value"] == 1106)
     check("0x08 idx 12 = 0 (int)", r12["value"] == 0 and r12["type"] == "int")
     check("0x0F/0x08 Script verbraucht", not bus.script)
+    check("0x08 Namen 5..8 + '<I' unsigned",
+          decode_variable(5, bytes(4))["name"] == "pos_fdb" and r1["name"] is None
+          and decode_variable(8, bytes(4))["name"] == "iq_fdb"
+          and decode_variable(11, b"\xff\xff\xff\xff")["value"] == 0xFFFFFFFF)
+    def _vrx(v):
+        body = bytes([0x07, 0x00, FUNC_VARIABLE]) + struct.pack("<f", v)
+        return "f7 81 %s %02x" % (body.hex(" "), _crc8(body))
+    bus = _Bus([("81 04 00 08 %02x" % i, _vrx(v))
+                for i, v in ((5, 0.5), (6, 1.0), (7, 3.0), (8, -4.0))])
+    mf = MotorMini(bus, 0x81)
+    check("Feedback pos/spd/id,iq (idx 5..8) + hypot",
+          (mf.read_position_feedback(), mf.read_speed_feedback(),
+           mf.read_current_feedback()) == (0.5, 1.0, {"id": 3.0, "iq": -4.0, "abs": 5.0})
+          and not bus.script)
     for bad in (0, 13, -1, True, 1.0, None):
         check("0x08 idx-guard %r" % (bad,),
               raises(ValueError, MotorMini(nobus, 0x81).read_variable, bad))

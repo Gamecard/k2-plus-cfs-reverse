@@ -12,6 +12,11 @@ NACHTRAG 16.10.2026 (LIVE-ABFRAGEN-2026-10-16.md, Motor X 0x81, Standby,
 nicht referenziert, gesendet über Creality-G-Codes MOTOR_VERSION/MOTOR_GET):
 0x0F = Version ([00] -> 12 B) und 0x08 = Variablen-Lesepfad ([idx] -> 4 B LE,
 idx 1..12) sind live belegt -> query_motor_version(), read_variable().
+NACHTRAG 16.10.2026 (REA-MOTOR-BEFUND-2026-10-16.md, statische Analyse
+motor_control_wrapper.so + Traceback klippy.log 13:12:27): 0x08-Index 5..8 =
+pos_fdb/spd_fdb/id_fdb/iq_fdb (Host-Dict NO_ERR_CODE_TO_GET), Typkette des
+Hosts fest (1..10,17,18 '<f', 11..16 '<I'), Motor_cmd-Tabelle komplett,
+Crash-Ursache DATA=0/13 belegt (host-seitig, KEIN Frame auf dem Bus).
 
 Umfang:
 - LESEND (live belegt, senden erlaubt):
@@ -19,7 +24,9 @@ Umfang:
   check_protection (0x0C [0b]), get_stall_mode (0x11 [04]),
   read_485_addr (0x0E [02]), read_uuid (0x12 [02]),
   query_motor_version (0x0F [00] -> 12 B, live 16.10.),
-  read_variable (0x08 [idx], NUR idx 1..12 -> 4 B, live 16.10.)
+  read_variable (0x08 [idx], NUR idx 1..12 -> 4 B, live 16.10.),
+  read_position_feedback / read_speed_feedback / read_current_feedback
+  (0x08 idx 5 / 6 / 7+8, Namen REA-belegt, Skalierung/Einheit OFFEN)
 - SETZEN (live belegt, sendet): set_mode (0x11 [01]/[02]/[03], Antwort = Echo)
 - SCHREIBEN (live belegt, aber GESCHÜTZT): write_sys_param (0x06 [01, id]+<f)
   und update_sys_params (0x06 [03]) senden NUR mit confirm=True, sonst
@@ -28,12 +35,19 @@ Umfang:
 - Reine Builder (ohne Senden): build_sys_param_read_payload,
   build_sys_param_write_payload, build_sys_param_update_payload
 - decode_sys_param_float: Dekodier-Hilfe (<f, ohne Bus)
-- read_encoder: GESPERRT – 0x08 ist live der Variablen-Lesepfad
-  (read_variable); welcher Index Encoder/Position ist, ist OFFEN
-- WARNUNG Host-Bug (live 16.10., zweimal reproduziert): Creality
-  `MOTOR_GET … DATA=0` und `DATA=13` -> interner Fehler in
-  motor_control_wrapper.so (key60) -> Klipper-SHUTDOWN (Recovery
-  FIRMWARE_RESTART). read_variable bleibt deshalb im belegten Bereich 1..12.
+- read_encoder: GESPERRT (0x06-Altfalle) – Positionsrückmeldung =
+  read_position_feedback (0x08 idx 5 pos_fdb)
+- Detail-/Sample-Kommandos 0x13..0x16 (err_detail_data, cut_detail_data,
+  pos_data_sample, spd_data_sample) und 0x01/0x03/0x04/0x07/0x0B/0x0D:
+  nur Konstanten + NotImplementedError-Stubs (senden NICHTS)
+- WARNUNG Host-Bug (live 16.10., zweimal reproduziert, Ursache BELEGT):
+  Creality `MOTOR_GET … DATA=0` und `DATA=13` -> Klipper-SHUTDOWN.
+  Traceback (klippy.log 16.10. 13:12:27): motor_control_wrapper.py:1982
+  Motor_Control.motor_get -> box_wrapper.py:384 ParseData.parse_num_to_byte
+  -> TypeError: 'NoneType' object cannot be interpreted as an integer.
+  Creality-gcode.py lehnt DATA außerhalb minval=1/maxval=12 nur mit Warnung
+  ab (get_int -> None), motor_get rechnet weiter -> Absturz VOR dem Senden.
+  read_variable bleibt deshalb im G-Code-Bereich 1..12.
 - Pin-IO (MOTOR_READ_ALL_PIN_IO): KEIN RS485 – dir/step-Pins der Motoren
   hängen an der Main-MCU (Klipper-GPIO PB9, PB10, !PB7, PB8, PB5, PB6, PA1,
   PB15) -> pin_io bleibt Stub (Main-MCU nötig)
@@ -69,7 +83,8 @@ Stock wiederholt nur beim E-Motor (0x85) auf Anwendungsebene (IDs 9/10/25
 je 3x) – nicht nachgebaut (0x85 gesperrt).
 
 Nie beobachtet (bleiben Stubs bzw. unverändert): 0x01, 0x03, 0x04, 0x07,
-0x0B, 0x0D, 0xF0 (0x08/0x0F seit 16.10. live belegt, s. oben). 0x05 ([01]/[02] an X/Y bei BELT_TENSION)
+0x0B, 0x0D, 0x13-0x16, 0xF0 (0x08/0x0F seit 16.10. live belegt, s. oben;
+Bedeutung der Cmd-Bytes seit 16.10. aus der Host-Tabelle Motor_cmd belegt). 0x05 ([01]/[02] an X/Y bei BELT_TENSION)
 wurde nie beantwortet (klippy.log.2026-10-12:28621-28636) -> nicht gebaut.
 
 Frühere Belege: PROTOKOLL-GESAMT.md 1.5/1.7/2.2 (Cut-Kalibrierung, Update-
@@ -111,6 +126,83 @@ FUNC_FW_UPDATE = 0xF0      # Update-Pfad, Sub-Codes aus Decompile (Abschnitt 1.7
 FUNC_VARIABLE = 0x08       # live 16.10.: [idx] -> 4 B LE (Variablen-Lesepfad)
 FUNC_VERSION = 0x0F        # live 16.10.: [00] -> 12 B Versionsblock
 
+# Motor_cmd – vollständige Host-Tabelle (REA 16.10.2026, Modul-Init
+# motor_control_wrapper.so @0x10168, Dict-Aufbau @0x10a9c; BELEGT als
+# Host-Zuordnung Name -> Cmd-Byte). Live gesehen: 0x05 (unbeantwortet),
+# 0x06, 0x08, 0x0C, 0x0E, 0x0F, 0x11, 0x12. Alle anderen: NICHT senden,
+# nur Stubs (NotImplementedError).
+FUNC_REBOOT = 0x01
+FUNC_ENCODER_CALIBRATE = 0x03      # encoder_calibrate_official
+FUNC_ELEC_OFFSET_CALIBRATE = 0x04
+FUNC_FLASH_PARAM = 0x07            # MOTOR_FLASH_PARAM (Payload-Logik vermutet)
+FUNC_GET = FUNC_VARIABLE           # Host-Name "get"
+FUNC_BOOT = 0x0B                   # MOTOR_BOOT – NIE senden (Bootloader)
+FUNC_SYSTEMID = 0x0D
+FUNC_ERR_DETAIL_DATA = 0x13        # Fehlerdetails (Format s. ERR_DETAIL_FORMAT)
+FUNC_CUT_DETAIL_DATA = 0x14        # wie 0x13 + 1 float
+FUNC_POS_DATA_SAMPLE = 0x15        # Positions-Sample (Inhalt unbelegt)
+FUNC_SPD_DATA_SAMPLE = 0x16        # Drehzahl-Sample (Inhalt unbelegt)
+MOTOR_CMD = {
+    "reboot": FUNC_REBOOT, "encoder_calibrate_official": FUNC_ENCODER_CALIBRATE,
+    "elec_offset_calibrate": FUNC_ELEC_OFFSET_CALIBRATE, "control": FUNC_CONTROL,
+    "sys_param": FUNC_SYS_PARAM, "flash_param": FUNC_FLASH_PARAM,
+    "get": FUNC_GET, "boot": FUNC_BOOT, "protection": FUNC_PROTECTION,
+    "systemid": FUNC_SYSTEMID, "read485_addr": FUNC_ADDR,
+    "set485_addr": FUNC_ADDR, "version": FUNC_VERSION,
+    "stall_mode": FUNC_STALL_MODE, "dev_uuid": FUNC_UUID,
+    "err_detail_data": FUNC_ERR_DETAIL_DATA,
+    "cut_detail_data": FUNC_CUT_DETAIL_DATA,
+    "pos_data_sample": FUNC_POS_DATA_SAMPLE,
+    "spd_data_sample": FUNC_SPD_DATA_SAMPLE,
+}
+# Motor_Addr (Host, Schlüssel = NUM-String): '0'..'8' -> 0x80..0x88,
+# '9' -> 0xFF (Broadcast). MOTOR_NUM_TO_NAME 1..5 -> x, y, z, z1, e.
+# Hinweis: NUM 5 (e) -> 0x85 antwortet auf ttyS5 nie (Extruder transparent).
+MOTOR_ADDR_BY_NUM = dict([(str(n), 0x80 + n) for n in range(9)] + [("9", 0xFF)])
+MOTOR_NUM_TO_NAME = {1: "x", 2: "y", 3: "z", 4: "z1", 5: "e"}
+
+# 0x13 err_detail_data: Host-Unpack-Format @0x3a3f0 (BELEGT als Host-
+# Format; Request-Payload und Frame-Offset UNBELEGT, live nie gesehen).
+# 0x14 cut_detail_data: dasselbe + 1 float (Feldname unbelegt).
+ERR_DETAIL_FORMAT = "<I8BfHfiiffffffffi"
+CUT_DETAIL_FORMAT = ERR_DETAIL_FORMAT + "f"
+ERR_DETAIL_FIELDS = (
+    "err_code", "dev_uuid", "elec_offset", "phase_order_invert",
+    "elec_offset_err_deg", "encoder_fdb", "encoder_fdb_last",
+    "pos_fdb_encoder", "spd_fdb_encoder", "spd_fdb_ctrl", "id", "iq",
+    "board_detect_power_supply_V", "board_detect_temperature_C",
+    "pos_loop_pid_err", "step_increment")  # dev_uuid = 8 B
+
+# Fehler-/Warnbits (Host-Dicts motor_error_dict / motor_warning_dict,
+# Modul-Init, BELEGT als Bit -> key-Zuordnung; Kurztexte = Übersetzung der
+# key-Bedeutung laut REA-Befund). WELCHE Bytes der 8-B-Antwort von 0x0C [0b]
+# err_code bzw. warning_code tragen, ist UNBELEGT (live nur 8x 00) – daher
+# kein decode_protection(8 B), nur Bit-Decoder auf bereits bekannte Codes.
+MOTOR_ERROR_BITS = {
+    0: ("key781", "Encoder-Sprung"), 1: ("key782", "Encoder-Lesefehler"),
+    2: ("key783", "SW-Spitzenüberstrom"), 3: ("key784", "SW-Dauerüberstrom"),
+    4: ("key785", "HW-Überstrom"), 5: ("key786", "Drehzahl über Grenze"),
+    6: ("key787", "Positionsgrenze"), 7: ("key788", "Positions-Sollwertsprung"),
+    8: ("key789", "Schleppfehler"), 9: ("key790", "R/L-Fehler"),
+    10: ("key791", "instabil"), 11: ("key792", "Phase fehlt"),
+    12: ("key793", "Phasenwiderstand-Differenz"), 13: ("key794", "Sonstige"),
+}
+MOTOR_WARNING_BITS = {
+    0: ("key795", "Kommunikation"), 1: ("key796", "Unterspannung"),
+    2: ("key797", "MCU-Übertemperatur"),
+}
+# ERR_CODE_TO_UNION (Host): Fehlerbit-WERT -> (Format, Felder) der Detail-
+# daten. 256 -> tracking_error: Schlüssel VERMUTET (letztes Element).
+ERR_CODE_TO_UNION = {
+    1: ("<ii", ("lower_encoder_pulse", "upper_encoder_pulse")),
+    4: ("<f", ("peak_overcurrent_A",)),
+    8: ("<ff", ("continuous_overcurrent_A", "continuous_overcurrent_time_s")),
+    32: (None, ("speed_over_limit",)),
+    64: (None, ("pos_over_limit_min", "pos_over_limit_max")),
+    128: (None, ("pos_cmd_mutation_turns",)),
+    256: (None, ("tracking_error",)),
+}
+
 # 0x0F Version (live 16.10.2026, MOTOR_VERSION NUM=1 DATA=0):
 #   TX data_send `81 04 00 0f 00`
 #   RX `f7 81 0f 00 0f 01 09 07 51 01 03 01 03 02 4b 01 00 02`
@@ -128,14 +220,33 @@ VERSION_FIELDS = (("fireware_ver", 4), ("cmd_system_ver", 2),
 # Host-Text "系统所支持变量当前值" (aktueller Wert einer vom System
 # unterstützten Variable); Namen gibt der Host NICHT aus.
 # Host-Bug: DATA=0 und DATA=13 -> Klipper-SHUTDOWN (key60) -> nur 1..12.
+# Ursache BELEGT (Traceback 16.10. 13:12:27): G-Code-Grenze minval=1/
+# maxval=12 -> get_int -> None (nur Warnung) -> parse_num_to_byte(None)
+# -> TypeError, kein Frame geht raus.
 VARIABLE_LEN = 4
 VARIABLE_INDEX_MIN = 1
-VARIABLE_INDEX_MAX = 12
-# Host-Dekodierung live 16.10. (Typ, wie motor_control_wrapper.so den Wert
-# ausgab – NICHT die Bedeutung): idx 1..10 float, 11/12 int.
-VARIABLE_TYPES = {1: "float", 2: "float", 3: "float", 4: "float",
-                  5: "float", 6: "float", 7: "float", 8: "float",
-                  9: "float", 10: "float", 11: "int", 12: "int"}
+VARIABLE_INDEX_MAX = 12   # G-Code-Grenze des Hosts (maxval=12)
+# Indexnamen (REA BELEGT: Modul-Dict NO_ERR_CODE_TO_GET @0x10cf8-0x10d60,
+# genutzt von _motor_no_cut_detail_data). Index 1-4 und 9-12: KEIN Name im
+# Host (bounded negativ). Vermutet (nur Kommentar, keine Host-Belege):
+#   idx 9  = 0.0016113 = 3,3 V/2048 -> 2 LSB eines 12-Bit-ADC bei 3,3 V
+#   idx 10 = 0.0008057 = 3,3 V/4096 -> 1 LSB (z. B. Strommess-Offset ia/ib)
+#   idx 11 = 1106 -> evtl. Roh-Encoderwert (encoder_fdb ist in 0x13 ein int)
+VARIABLE_NAMES = {5: "pos_fdb", 6: "spd_fdb", 7: "id_fdb", 8: "iq_fdb"}
+IDX_POS_FDB, IDX_SPD_FDB, IDX_ID_FDB, IDX_IQ_FDB = 5, 6, 7, 8
+# Typkette des Hosts (REA BELEGT: motor_get @0x51524, Py-Zeile 1987/1989,
+# Vergleiche @0x51e04-0x520e8 und @0x526bc-0x527c8; gleiche Kette in
+# motor_extruder_get und _motor_no_cut_detail_data). Fest verdrahtet, der
+# Motor liefert keinen Typ. Wertbytes = result[5:result[2]+2] (Vollframe,
+# = [5:9] bei len 7 = die 4 Datenbytes). 13..18 kennt der Host, sie sind
+# per G-Code aber nicht erreichbar und am Motor live NICHT geprüft ->
+# read_variable sperrt sie bewusst.
+VARIABLE_HOST_FORMATS = dict([(i, "<f") for i in list(range(1, 11)) + [17, 18]]
+                             + [(i, "<I") for i in range(11, 17)])
+# Typ je G-Code-erreichbarem Index (1..12): "float" = '<f', "int" = '<I'
+# (UNSIGNED laut Host; bis 16.10. fälschlich '<i').
+VARIABLE_TYPES = dict((i, "float" if VARIABLE_HOST_FORMATS[i] == "<f" else "int")
+                      for i in range(VARIABLE_INDEX_MIN, VARIABLE_INDEX_MAX + 1))
 
 # Sub-Codes 0x06 (live)
 SUB_SYS_WRITE = 0x01       # "sys参数操作-写入成功" (klippy.log.2026-10-12:10707)
@@ -514,12 +625,13 @@ def build_variable_payload(idx):
 
 
 def decode_variable(idx, data):
-    """4 B 0x08-Antwort -> {'index', 'raw', 'float', 'int', 'type', 'value'}.
-    KEIN Bus-Zugriff.
+    """4 B 0x08-Antwort -> {'index', 'name', 'raw', 'fmt', 'float', 'int',
+    'type', 'value'}. KEIN Bus-Zugriff.
 
-    'float' = <f, 'int' = <i (signed; live nur positive Werte, Vorzeichen
-    UNBELEGT), 'type' = Host-Dekodierung live 16.10. (VARIABLE_TYPES),
-    'value' = Wert in diesem Typ. Bedeutung der Indizes OFFEN.
+    'float' = <f, 'int' = <I (UNSIGNED wie der Host, REA 16.10.),
+    'fmt'/'type' = feste Host-Typkette (VARIABLE_HOST_FORMATS), 'value' =
+    Wert in diesem Typ, 'name' = VARIABLE_NAMES (5..8) oder None.
+    Skalierung/Einheit OFFEN (auch für pos_fdb/spd_fdb/id/iq).
     Live: 33 33 d3 3a -> 0.0016113 (idx 9), 52 04 00 00 -> 1106 (idx 11).
     """
     _check_variable_index(idx)
@@ -527,10 +639,36 @@ def decode_variable(idx, data):
     if len(raw) != VARIABLE_LEN:
         raise ValueError("0x08 idx %d: %d statt 4 Bytes: %r" % (idx, len(raw), raw))
     f = struct.unpack("<f", raw)[0]
-    i = struct.unpack("<i", raw)[0]
+    i = struct.unpack("<I", raw)[0]
     typ = VARIABLE_TYPES[idx]
-    return {"index": idx, "raw": raw, "float": f, "int": i, "type": typ,
-            "value": f if typ == "float" else i}
+    return {"index": idx, "name": VARIABLE_NAMES.get(idx), "raw": raw,
+            "fmt": VARIABLE_HOST_FORMATS[idx], "float": f, "int": i,
+            "type": typ, "value": f if typ == "float" else i}
+
+
+def decode_error_bits(code):
+    """err_code (int-Bitmaske) -> Liste (bit, key, text). KEIN Bus-Zugriff.
+    Bit-Zuordnung BELEGT (motor_error_dict); woher der Code im 0x0C-Frame
+    kommt, ist UNBELEGT. Unbekannte Bits -> (bit, None, 'unbekannt')."""
+    return _decode_bits(code, MOTOR_ERROR_BITS)
+
+
+def decode_warning_bits(code):
+    """warning_code (int-Bitmaske) -> Liste (bit, key, text), s.
+    decode_error_bits (motor_warning_dict Bit 0..2)."""
+    return _decode_bits(code, MOTOR_WARNING_BITS)
+
+
+def _decode_bits(code, table):
+    if isinstance(code, bool) or not isinstance(code, int) or code < 0:
+        raise ValueError("Bitmaske muss int >= 0 sein: %r" % (code,))
+    out, bit = [], 0
+    while code >> bit:
+        if code >> bit & 1:
+            key, text = table.get(bit, (None, "unbekannt"))
+            out.append((bit, key, text))
+        bit += 1
+    return out
 
 
 def fw_checksum(data):
@@ -886,27 +1024,89 @@ class Motor:
 
         = Stock MOTOR_GET NUM=n DATA=idx. NUR idx 1..12 (live 16.10. Scan an
         Motor X, Standby: 1-8 = 0, 9 = 0.0016113, 10 = 0.0008057, 11 = 1106,
-        12 = 0); sonst ValueError OHNE Senden – Creality-Host stürzt bei
-        DATA=0/13 ab (Klipper-SHUTDOWN), Motorverhalten außerhalb unbelegt.
-        Der Typ je Index ist nur als Host-Dekodierung bekannt (VARIABLE_TYPES),
-        daher float UND int. retries=0, Timeout 1.0 s (UNBELEGT).
+        12 = 0); sonst ValueError OHNE Senden.
+        Begründung der Grenze: Der Creality-G-Code erlaubt nur DATA 1..12
+        (get_int maxval=12); DATA=0/13 führte live zum Host-Crash (Traceback
+        16.10. 13:12:27: motor_get:1982 -> parse_num_to_byte(None) ->
+        TypeError, kein Frame gesendet). Die Host-Typkette kennt zwar 13..18
+        (VARIABLE_HOST_FORMATS), am Motor ist das aber live NICHT geprüft –
+        bewusst gesperrt. Typ = feste Host-Kette (1..10 '<f', 11/12 '<I').
+        Namen: 5..8 = pos_fdb/spd_fdb/id_fdb/iq_fdb (VARIABLE_NAMES).
+        retries=0, Timeout 1.0 s (UNBELEGT).
         """
         payload = build_variable_payload(idx)
         return decode_variable(idx, self._tx(FUNC_VARIABLE, payload,
                                              TIMEOUT_VARIABLE))
 
+    motor_get = read_variable  # Host-Name
+
+    def read_position_feedback(self):
+        """pos_fdb (0x08 idx 5) -> float. LESEND.
+        Name REA-belegt (NO_ERR_CODE_TO_GET); Einheit/Skalierung OFFEN
+        (vermutlich rad oder Umdrehungen, live nur 0.0 im Stillstand)."""
+        return self.read_variable(IDX_POS_FDB)["value"]
+
+    def read_speed_feedback(self):
+        """spd_fdb (0x08 idx 6) -> float. LESEND. Einheit OFFEN (vermutlich
+        rad/s, vgl. protection_param_prt_over_speed_rad_s)."""
+        return self.read_variable(IDX_SPD_FDB)["value"]
+
+    def read_current_feedback(self):
+        """id_fdb/iq_fdb (0x08 idx 7, 8) -> {'id', 'iq', 'abs'}. LESEND,
+        2 Frames. 'abs' = hypot(id, iq) wie der Host-Stats-Hook
+        (Motor_Control.stats, overcurrent=|I|). Einheit vermutlich A."""
+        i_d = self.read_variable(IDX_ID_FDB)["value"]
+        i_q = self.read_variable(IDX_IQ_FDB)["value"]
+        return {"id": i_d, "iq": i_q, "abs": math.hypot(i_d, i_q)}
+
     def read_encoder(self, *args, **kwargs):
         """GESPERRT – sendet KEINEN Frame.
 
-        0x06 ist live Sys-Param (Lesen/Schreiben von Regelparametern), kein
-        Encoder. 0x08 ist live (16.10.) der Variablen-Lesepfad (read_variable,
-        idx 1..12); WELCHER Index Encoder/Position ist, ist OFFEN (Scan nur im
-        Stillstand, Motoren stromlos). Bis zur Klärung (Scan nach Homing/in
-        Bewegung, Namen aus motor_control_wrapper.so) bleibt read_encoder zu.
+        Alt-Falle: früher als 0x06 gedeutet; 0x06 ist live Sys-Param
+        (Lesen/Schreiben von Regelparametern), kein Encoder. Die Positions-
+        rückmeldung ist laut Host (REA 16.10.) 0x08 idx 5 = pos_fdb ->
+        read_position_feedback() nutzen (Einheit/Skalierung offen). Ein
+        Roh-Encoderwert (idx 11?) ist nur vermutet.
         """
         raise NotImplementedError(
-            "read_encoder gesperrt: 0x08 = Variablen-Lesepfad (read_variable, "
-            "idx 1..12), Encoder-/Positions-Index aber unbelegt")
+            "read_encoder gesperrt (0x06 = Sys-Param): Positionsrückmeldung = "
+            "read_position_feedback() (0x08 idx 5 pos_fdb, Skalierung offen)")
+
+    # --- Stubs aus der Host-Tabelle Motor_cmd (REA 16.10., live nie
+    # gesehen) – senden NICHTS ---
+
+    def err_detail_data(self, *args):
+        """TODO 0x13 err_detail_data: Host entpackt '<I8BfHfiiffffffffi'
+        (ERR_DETAIL_FIELDS, @0x3a3f0); Request-Payload unbelegt."""
+        raise NotImplementedError("TODO 0x13 err_detail_data: Request unbelegt, "
+                                  "live nie gesehen")
+
+    def cut_detail_data(self, *args):
+        """TODO 0x14 cut_detail_data: Format wie 0x13 + 1 float
+        (CUT_DETAIL_FORMAT); Request-Payload unbelegt."""
+        raise NotImplementedError("TODO 0x14 cut_detail_data: Request unbelegt, "
+                                  "live nie gesehen")
+
+    def pos_data_sample(self, *args):
+        """TODO 0x15 pos_data_sample (Host-Tabelle Motor_cmd); Inhalt unbelegt."""
+        raise NotImplementedError("TODO 0x15 pos_data_sample: unbelegt")
+
+    def spd_data_sample(self, *args):
+        """TODO 0x16 spd_data_sample (Host-Tabelle Motor_cmd); Inhalt unbelegt."""
+        raise NotImplementedError("TODO 0x16 spd_data_sample: unbelegt")
+
+    def reboot(self, *args):
+        """TODO 0x01 reboot (Host-Tabelle) – live nie gesehen, nicht senden."""
+        raise NotImplementedError("TODO 0x01 reboot: nicht nachgebaut")
+
+    def boot(self, *args):
+        """GESPERRT 0x0B boot (MOTOR_BOOT „使系统进入boot模式“) – Bootloader,
+        Haltemoment weg. Nie senden."""
+        raise NotImplementedError("0x0B boot gesperrt (Bootloader)")
+
+    def systemid(self, *args):
+        """TODO 0x0D systemid (Host-Tabelle) – Payload unbelegt."""
+        raise NotImplementedError("TODO 0x0D systemid: unbelegt")
 
     # --- Update-Pfad (Func 0xF0, live NIE beobachtet) ---
     # FREI (lesend): query_version (Sub 00), query_sector_size (Sub 03) – im
@@ -1006,7 +1206,14 @@ class Motor:
 
     def get_flash_param(self, param_id):
         """TODO: `MOTOR_FLASH_PARAM` – 0x07 live nie beobachtet (die Stock-
-        "flash_param"-Enumeration läuft live über 0x06, s. read_sys_param)."""
+        "flash_param"-Enumeration läuft live über 0x06, s. read_sys_param).
+
+        Hypothese REA 16.10. (VERMUTET, Vergleiche @0x4bbbc-0x4bd08):
+        Payload [DATA] (+ 00 bei DATA 3/4, + ID bei DATA 5/6); DATA=6 =
+        Lesen (Wert nach PARAMS_TYPE entpackt), DATA=5 = Schreiben (Wert
+        gepackt: float 'f' (nativ), uint16_t '<H', uint32_t '>I' BIG-ENDIAN,
+        int16_t '<h', sonst '>I'; Antwort Statusbyte 0 = Erfolg).
+        Parameter NUM 1..10, ID (0), PARAMS (''), PARAMS_TYPE ('float')."""
         raise NotImplementedError("TODO MOTOR_FLASH_PARAM lesen (ID=%r): 0x07 "
                                   "live nie beobachtet" % (param_id,))
 
@@ -1266,7 +1473,9 @@ def selftest():
         mm.encoder_calibrate, mm.elec_offset_calibrate, mm.check_protection_code,
         mm.pin_io,
         lambda: mm.set_e_stall_mode(1), lambda: mm.set_z_stall_mode(1),
-        lambda: mm.get_flash_param(0), lambda: mm.set_flash_param(0, 1)])
+        lambda: mm.get_flash_param(0), lambda: mm.set_flash_param(0, 1),
+        mm.err_detail_data, mm.cut_detail_data, mm.pos_data_sample,
+        mm.spd_data_sample, mm.reboot, mm.boot, mm.systemid])
     check("stubs not-implemented", stub_ok)
     check("stubs/Sperren senden nichts", nobus.calls == [])
     check("kurz-frame", raises(ValueError, parse_frame, bytes.fromhex("f7 81")))
@@ -1318,6 +1527,62 @@ def selftest():
           and res[11]["type"] == "int" and res[11]["raw"] == bytes.fromhex("52 04 00 00"))
     check("0x08 VARIABLE_TYPES 1..12", sorted(VARIABLE_TYPES) == list(range(1, 13))
           and [VARIABLE_TYPES[i] for i in (9, 10, 11, 12)] == ["float", "float", "int", "int"])
+    # REA 16.10.: feste Host-Typkette + Indexnamen
+    check("0x08 Host-Kette 1..10,17,18 '<f' / 11..16 '<I'",
+          sorted(VARIABLE_HOST_FORMATS) == list(range(1, 19))
+          and all(VARIABLE_HOST_FORMATS[i] == "<f" for i in list(range(1, 11)) + [17, 18])
+          and all(VARIABLE_HOST_FORMATS[i] == "<I" for i in range(11, 17)))
+    check("0x08 Namen 5..8", VARIABLE_NAMES == {5: "pos_fdb", 6: "spd_fdb",
+                                                7: "id_fdb", 8: "iq_fdb"}
+          and res[5]["name"] == "pos_fdb" and res[1]["name"] is None
+          and res[11]["fmt"] == "<I" and res[9]["fmt"] == "<f")
+    check("0x08 int unsigned '<I' (ff ff ff ff -> 4294967295)",
+          decode_variable(11, b"\xff\xff\xff\xff")["value"] == 0xFFFFFFFF
+          and decode_variable(12, b"\x00\x00\x00\x80")["int"] == 0x80000000)
+    check("0x08 Hostgrenze 13..18 bekannt, aber gesperrt",
+          all(raises(ValueError, decode_variable, i, bytes(4)) for i in range(13, 19)))
+    # Feedback-Helfer: synthetische Antworten (Bytes = struct.pack('<f'))
+    fb = {5: 1.5, 6: -2.25, 7: 3.0, 8: 4.0}
+    def _vrx(v):
+        body = bytes([0x07, 0x00, FUNC_VARIABLE]) + struct.pack("<f", v)
+        return "f7 81 %s %02x" % (body.hex(" "), crc8_cal(body))
+    bus = _FakeBus([("81 04 00 08 %02x" % i, _vrx(fb[i])) for i in (5, 6, 7, 8)])
+    mf = Motor(bus, 0x81)
+    pos, spd, cur = (mf.read_position_feedback(), mf.read_speed_feedback(),
+                     mf.read_current_feedback())
+    check("Feedback pos idx5 / spd idx6 / id,iq idx7,8 + hypot",
+          pos == 1.5 and spd == -2.25 and cur == {"id": 3.0, "iq": 4.0, "abs": 5.0}
+          and [c[2] for c in bus.calls] == [[5], [6], [7], [8]] and not bus.script)
+    check("motor_get Alias", Motor.motor_get is Motor.read_variable)
+    # Motor_cmd-Tabelle + Adressen + Fehlerbits (REA-Konstanten)
+    check("MOTOR_CMD Host-Tabelle", MOTOR_CMD["get"] == 0x08 == FUNC_VARIABLE
+          and MOTOR_CMD["version"] == 0x0F and MOTOR_CMD["protection"] == 0x0C
+          and MOTOR_CMD["sys_param"] == 0x06 and MOTOR_CMD["stall_mode"] == 0x11
+          and MOTOR_CMD["read485_addr"] == MOTOR_CMD["set485_addr"] == 0x0E
+          and MOTOR_CMD["dev_uuid"] == 0x12 and MOTOR_CMD["boot"] == 0x0B
+          and [MOTOR_CMD[k] for k in ("err_detail_data", "cut_detail_data",
+                                      "pos_data_sample", "spd_data_sample")]
+          == [0x13, 0x14, 0x15, 0x16] and len(MOTOR_CMD) == 19)
+    check("MOTOR_ADDR_BY_NUM 1..4 = MOTOR_ADDRS, '9' = FF",
+          tuple(MOTOR_ADDR_BY_NUM[str(n)] for n in range(1, 5)) == MOTOR_ADDRS
+          and MOTOR_ADDR_BY_NUM["9"] == 0xFF and MOTOR_ADDR_BY_NUM["0"] == 0x80)
+    check("ERR_DETAIL_FORMAT 66 B / 16 Felder",
+          struct.calcsize(ERR_DETAIL_FORMAT) == 66
+          and struct.calcsize(CUT_DETAIL_FORMAT) == 70 and len(ERR_DETAIL_FIELDS) == 16
+          and len(struct.unpack(ERR_DETAIL_FORMAT, bytes(66))) == 15 + 8)
+    check("Fehlerbits 0..13 -> key781..794, Warnbits 0..2 -> key795..797",
+          [MOTOR_ERROR_BITS[b][0] for b in range(14)] == ["key%d" % k for k in range(781, 795)]
+          and [MOTOR_WARNING_BITS[b][0] for b in range(3)] == ["key795", "key796", "key797"])
+    check("decode_error_bits 0x105 / 0x4000",
+          [b[:2] for b in decode_error_bits(0x105)] == [(0, "key781"), (2, "key783"), (8, "key789")]
+          and decode_error_bits(0x4000) == [(14, None, "unbekannt")]
+          and decode_error_bits(0) == [])
+    check("decode_warning_bits 0x6", [b[1] for b in decode_warning_bits(6)] == ["key796", "key797"]
+          and raises(ValueError, decode_warning_bits, -1)
+          and raises(ValueError, decode_error_bits, True))
+    check("ERR_CODE_TO_UNION Bitwerte", sorted(ERR_CODE_TO_UNION) == [1, 4, 8, 32, 64, 128, 256]
+          and all(struct.calcsize(v[0]) == 4 * len(v[1])
+                  for v in ERR_CODE_TO_UNION.values() if v[0]))
     for bad in (0, 13, -1, 255, True, 1.0, None, "9"):
         check("0x08 idx-guard %r (Host-Crash 0/13)" % (bad,),
               raises(ValueError, Motor(nobus, 0x81).read_variable, bad))

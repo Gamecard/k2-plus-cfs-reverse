@@ -547,6 +547,56 @@ selbst gegengeprüft; bei der Einarbeitung zusätzlich nachgeprüft (Abschnitt �
 - Selbsttests danach alle grün: serial485 93/93 · box 179 · boxmini 17 · cfsseq 28 ·
   motor 154 · motor_mini 58 · auto_addr 33 · cfswatch `--selftest` OK.
 
+## 16.10.2026 REA-Analyse motor_control_wrapper.so + Crash-Traceback
+
+- **Quelle:** statische Analyse `motor_control_wrapper.cpython-39.so` (REA/Ghidra 12.1.4 +
+  eigene `llvm-objdump`-Auflöser; nichts gesendet, kein Druckerzugriff), Ergebnis
+  `REA-MOTOR-BEFUND-2026-10-16.md` (Arbeitsdateien lokal, nicht im Repo).
+  Zusätzlich vom Nutzer belegt: Drucker-`klippy.log` 16.10. 13:12:27, Traceback:
+  `motor_control_wrapper.py line 1982 in Motor_Control.motor_get` →
+  `box_wrapper.py line 384 in ParseData.parse_num_to_byte` →
+  `TypeError: 'NoneType' object cannot be interpreted as an integer`.
+- **Befunde:**
+  - Crash-Ursache `MOTOR_GET DATA=0/13` **BELEGT**: Creality-`gcode.py` lehnt `DATA` außerhalb
+    `minval=1/maxval=12` nur mit Warnung ab (`get_int` → None), `motor_get` rechnet weiter,
+    `parse_num_to_byte(None)` → TypeError → key60 → SHUTDOWN. **Kein Frame ging auf den Bus**
+    (REA-Variante A bestätigt). Korrigiert die frühere AUDIT-Aussage „Index-Prüfung im Wrapper
+    fehlt/fehlerhaft“: die Prüfung existiert, ihr Fehlerpfad ist nur eine Warnung.
+  - 0x08-Indexnamen 5–8 = `pos_fdb`/`spd_fdb`/`id_fdb`/`iq_fdb` (Dict `NO_ERR_CODE_TO_GET`);
+    1–4/9–12 ohne Host-Namen (bounded negativ).
+  - Typkette fest: 1–10/17/18 `<f`, 11–16 `<I` **unsigned** → Nachbau-Korrektur (bisher `<i`).
+  - Vollständige `Motor_cmd`-Tabelle 0x01–0x16, `Motor_Addr`, `MOTOR_NUM_TO_NAME`,
+    `motor_error_dict` (Bit 0..13 → key781..794), `motor_warning_dict` (Bit 0..2 → key795..797),
+    `ERR_CODE_TO_UNION`, Unpack-Format `err_detail_data` `<I8BfHfiiffffffffi`.
+  - Interne `MOTOR_GET NUM=1 DATA=7/8 EXTRUDER=1` = `Motor_Control.stats` (Extruder-Überstrom-
+    Monitoring, |I| = hypot(id, iq), via transparent); `MOTOR_GET NUM=1 DATA=1` = Hilfetext.
+- **Code:**
+  - `nachbau/motor.py`: `VARIABLE_NAMES`, `IDX_*_FDB`, `VARIABLE_HOST_FORMATS` (1..18),
+    `VARIABLE_TYPES` (1..12, „int“ = `<I`), `decode_variable` (+`name`, `fmt`, `int` unsigned),
+    `Motor.read_position_feedback()` (idx 5), `read_speed_feedback()` (6),
+    `read_current_feedback()` (7/8, `abs` = hypot), Alias `motor_get`; `read_variable` bleibt
+    1..12 (Docstring: G-Code maxval=12 + Host-Crash belegt, 13..18 bewusst gesperrt);
+    `read_encoder` gesperrt mit Verweis auf `read_position_feedback`. Konstanten `MOTOR_CMD`,
+    `FUNC_REBOOT/ENCODER_CALIBRATE/ELEC_OFFSET_CALIBRATE/FLASH_PARAM/GET/BOOT/SYSTEMID/
+    ERR_DETAIL_DATA/CUT_DETAIL_DATA/POS_DATA_SAMPLE/SPD_DATA_SAMPLE`, `MOTOR_ADDR_BY_NUM`,
+    `MOTOR_NUM_TO_NAME`, `ERR_DETAIL_FORMAT/FIELDS`, `CUT_DETAIL_FORMAT`, `MOTOR_ERROR_BITS`,
+    `MOTOR_WARNING_BITS`, `ERR_CODE_TO_UNION`; Bit-Decoder `decode_error_bits` /
+    `decode_warning_bits` (kein `decode_protection(8 B)`: Byte-Layout der 0x0C-Antwort ist
+    aus dem Befund nicht ableitbar). Stubs (NotImplementedError, senden nichts):
+    `err_detail_data`, `cut_detail_data`, `pos_data_sample`, `spd_data_sample`, `reboot`,
+    `boot`, `systemid`. MOTOR_FLASH_PARAM-Hypothesen (inkl. `>I` Big-Endian) nur im Docstring.
+  - `nachbau/motor_mini.py`: `VARIABLE_NAMES`, `<I` unsigned, die drei Feedback-Helfer,
+    `read_encoder`-Docstring.
+  - `nachbau/cfswatch.py`: Namen für idx 5–8 in Request und Antwort
+    („Variable lesen idx 8 (iq_fdb)“, „Variable idx 5 pos_fdb = …“).
+- **Doku:** PROTOKOLL-485.md §3.1 „NACHTRAG 16.10.2026 (2)“ (Motor_cmd-Tabelle, Indexnamen,
+  Typkette, Crash-Mechanismus mit Traceback, Stats-Hook, Fehlerbits, Hypothesen-Tabelle),
+  PROTOKOLL-GESAMT.md (§1.5, §1.9 Pi-Ersatz: pos_fdb idx 5, §4, §5), CHECKLISTE.md (0x08
+  teilweise 5–8, Crash-Ursache erledigt; neu offen: Skalierung pos_fdb, 0x13–0x16,
+  0x0C-Byte-Layout), LIVE-ABFRAGEN-2026-10-16.md („Ursache belegt“), lokale Übergabenotiz (nicht im Repo).
+- Selbsttests danach alle grün: serial485 93/93 · box 179 · boxmini 17 · cfsseq 28 ·
+  motor 167 · motor_mini 60 · auto_addr 33 · cfswatch `--selftest` OK.
+
 ## Anonymisierung (Repo-Fassung)
 
 Gegenüber der lokalen Forschungsablage sind im Repo folgende Werte durch syntaktisch

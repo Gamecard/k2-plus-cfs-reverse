@@ -17,6 +17,7 @@ Lizenz: GPL-3.0-or-later (siehe `LICENSE`), Herkunft Dritter in `NOTICES.md`.
 | `AUDIT-UND-AENDERUNGEN.md` | Audit-Protokoll aller Korrekturen mit Begründung |
 | `CHECKLISTE.md` | Projektstatus (erledigt/offen) |
 | `LIVE-ABFRAGEN-2026-10-16.md` | Live-Abfragen Motor X 16.10.2026: 0x0F Version, 0x08 Variablen-Scan, Pin-IO, Host-Crash-Warnung |
+| `REA-MOTOR-BEFUND-2026-10-16.md` | Statische Analyse `motor_control_wrapper.so`: Motor_cmd-Tabelle, 0x08-Indexnamen, Typkette, Crash-Ursache, Fehlerbits |
 | `GHIDRA-CFS-BEFUND-2026-10-15.md` | Ghidra-Neuanalyse der CFS-FW R153: Dispatcher, Func-/Status-Tabelle, 0x0a-Layout |
 | `GHIDRA-CFS-BEFUND2-2026-10-16.md` | Zweite Ghidra-Runde: Temp/Feuchte, 0x15, Statuscodes 0x50–0x52, Motorblock-Flags, Auto-Addr-Box-Seite, Sensor-Pins |
 | `nachbau/` | Python-Module: `serial485`, `boxmini`, `box`, `motor_mini`, `motor`, `cfsseq`, `auto_addr` – alle mit Selbsttests; `cfswatch` = nur lesender Live-Monitor für `klippy.log` |
@@ -44,9 +45,9 @@ ssh root@<drucker> 'tail -F /mnt/UDISK/printer_data/logs/klippy.log' | python3 n
 Echte Hardware braucht `pyserial`; der Import erfolgt erst bei Benutzung
 (`Serial485(port, baud)`), die Tests laufen ohne.
 
-Stand der Selbsttests (16.10.2026 nach den Live-Abfragen, `ok`-Zeilen, 0 FAIL):
+Stand der Selbsttests (16.10.2026 nach dem REA-Motor-Befund, `ok`-Zeilen, 0 FAIL):
 `serial485` 93/93 (inkl. ref-hi: 16 CRC-Vektoren + 12 Nachrichten), `box` 179,
-`boxmini` 17, `cfsseq` 28, `motor` 154, `motor_mini` 58, `auto_addr` 33,
+`boxmini` 17, `cfsseq` 28, `motor` 167, `motor_mini` 60, `auto_addr` 33,
 `cfswatch --selftest` OK.
 
 > **WARNUNG – Creality-Host-Bug:** `MOTOR_GET … DATA=0` und `MOTOR_GET … DATA=13` lassen
@@ -55,6 +56,19 @@ Stand der Selbsttests (16.10.2026 nach den Live-Abfragen, `ok`-Zeilen, 0 FAIL):
 > G-Code-Parser es ablehnt). Recovery: `FIRMWARE_RESTART`, danach ~60 s bis Motoren/Box bereit.
 > Gültig sind nur **DATA=1..12**. Empfehlung: Motor-G-Codes nie frei über Moonraker senden,
 > sondern über eine Whitelist, die nur lesende Befehle und belegte Index-Bereiche durchlässt.
+> **Ursache belegt (Traceback):** `motor_get` Z. 1982 → `parse_num_to_byte(None)` → `TypeError` –
+> Creality-`gcode.py` lehnt den Bereich nur mit Warnung ab (`get_int` → None); es geht **kein
+> Frame** auf den Bus.
+
+REA-Motor-Befund 16.10.2026 (statische Analyse `motor_control_wrapper.so`, Details:
+`REA-MOTOR-BEFUND-2026-10-16.md`, `PROTOKOLL-485.md` §3.1 „NACHTRAG (2)“):
+
+- `0x08`-Indizes 5–8 = `pos_fdb`, `spd_fdb`, `id_fdb`, `iq_fdb` (Positions-, Drehzahl-, d-/q-Strom-
+  Rückmeldung) → `read_position_feedback()`, `read_speed_feedback()`, `read_current_feedback()`;
+  1–4/9–12 ohne Host-Namen, Skalierung offen. Typ fest im Host: 1–10 float, 11/12 `uint32`.
+- Vollständige Host-Tabelle `Motor_cmd` (0x01–0x16) als Konstanten; neue Kommandos
+  (0x13–0x16 Detail-/Sample-Daten u. a.) nur als Stubs, die nichts senden.
+- `MOTOR_GET … DATA=7/8 EXTRUDER=1` im Stock = Extruder-Überstrom-Monitoring (|I| = hypot(id, iq)).
 
 Live-Abfragen 16.10.2026 (Motor X 0x81, Standby, nur lesende Creality-G-Codes über Moonraker;
 Details: `LIVE-ABFRAGEN-2026-10-16.md`, `PROTOKOLL-485.md` §3.1):
@@ -132,7 +146,7 @@ RS485 protocol between the Creality K2 Plus host board and its lower boards
 by live captures and Ghidra analysis. License: GPL-3.0-or-later.
 
 Status 16.10.2026: all self-tests green (serial485 93/93 incl. Hi reference
-vectors, box 179, boxmini 17, cfsseq 28, motor 154, motor_mini 58, auto_addr 33,
+vectors, box 179, boxmini 17, cfsseq 28, motor 167, motor_mini 60, auto_addr 33,
 `cfswatch.py --selftest` OK).
 
 **WARNING – Creality host bug:** `MOTOR_GET … DATA=0` and `MOTOR_GET … DATA=13` make
@@ -140,6 +154,17 @@ vectors, box 179, boxmini 17, cfsseq 28, motor 154, motor_mini 58, auto_addr 33,
 (reproduced twice on 16.10.2026; recover with `FIRMWARE_RESTART`). Only `DATA=1..12` is
 valid. Never send motor G-codes freely via Moonraker – use a whitelist that only lets
 read-only commands and known index ranges through.
+Root cause confirmed by traceback: `motor_get` line 1982 → `parse_num_to_byte(None)` →
+`TypeError`; Creality's `gcode.py` only warns on out-of-range values (`get_int` returns None),
+so the host crashes **before** any frame is sent.
+
+Static analysis of `motor_control_wrapper.so` (16.10.2026, `REA-MOTOR-BEFUND-2026-10-16.md`,
+German): `0x08` indices 5–8 are `pos_fdb`, `spd_fdb`, `id_fdb`, `iq_fdb` (FOC position, speed and
+d/q current feedback; scaling still open) → `read_position_feedback()`, `read_speed_feedback()`,
+`read_current_feedback()`. The host decodes indices 1–10/17/18 as float and 11–16 as uint32.
+The full host command table `Motor_cmd` (0x01–0x16) is included as constants; unverified
+commands (0x13–0x16 detail/sample data etc.) are stubs that never transmit. The stock
+`MOTOR_GET … DATA=7/8 EXTRUDER=1` calls are extruder over-current monitoring.
 
 Live queries 16.10.2026 (motor X 0x81, idle, read-only stock G-codes via Moonraker;
 `LIVE-ABFRAGEN-2026-10-16.md`, German): `0x0F [00]` returns the 12-byte motor version

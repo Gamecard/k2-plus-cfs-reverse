@@ -291,6 +291,8 @@ class Decoder:
             txt += " lesen" if d[0] == motor.SUB_STALL_GET else " setzen %d" % d[0]
         elif fun == motor.FUNC_VARIABLE and len(d) == 1:
             txt += " lesen idx %d" % d[0]
+            if d[0] in motor.VARIABLE_NAMES:
+                txt += " (%s)" % motor.VARIABLE_NAMES[d[0]]
             if not motor.VARIABLE_INDEX_MIN <= d[0] <= motor.VARIABLE_INDEX_MAX:
                 txt += " (außerhalb 1..12 – Host-Crash bei MOTOR_GET DATA=0/13!)"
         elif fun == motor.FUNC_VERSION and list(d) == [motor.SUB_VERSION_GET]:
@@ -498,8 +500,9 @@ class Decoder:
                 and len(data) == motor.VARIABLE_LEN and len(req_data) == 1 \
                 and req_data[0] in motor.VARIABLE_TYPES:
             r = motor.decode_variable(req_data[0], data)
-            return "Variable idx %d = %s (%s; float %g / int %d)" % (
-                r["index"], ("%g" % r["value"]) if r["type"] == "float"
+            return "Variable idx %d%s = %s (%s; float %g / int %d)" % (
+                r["index"], " %s" % r["name"] if r["name"] else "",
+                ("%g" % r["value"]) if r["type"] == "float"
                 else r["value"], r["type"], r["float"], r["int"])
         if fun in AUTO_ADDR_FUNS:
             return "Auto-Addr-Antwort [%s]" % mask_bytes(data, 2, self.unmask)
@@ -912,6 +915,11 @@ def selftest():
                       hx("f7 81 07 00 08 52 04 00 00 71"))[0]
     check(t9.startswith("Variable idx 9 = 0.00161133 (float") and
           t11.startswith("Variable idx 11 = 1106 (int"), "Motor 0x08: %s | %s" % (t9, t11))
+    t5 = dm.response(0x81, motor.FUNC_VARIABLE, b"\x05",
+                     hx("f7 81 07 00 08 00 00 00 00 0a"))[0]
+    check(t5.startswith("Variable idx 5 pos_fdb = 0 (float")
+          and dm.request(0x81, motor.FUNC_VARIABLE, b"\x08")[0]
+          == "Motor X(0x81) Variable lesen idx 8 (iq_fdb)", "Motor 0x08 Namen: " + t5)
     tq = dm.request(0x81, motor.FUNC_VARIABLE, b"\x0b")[0]
     tq0 = dm.request(0x81, motor.FUNC_VARIABLE, b"\x0d")[0]
     check(tq == "Motor X(0x81) Variable lesen idx 11" and "Host-Crash" in tq0

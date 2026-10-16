@@ -44,3 +44,21 @@ Druckerstatus standby/complete/cancelled/error **und** Klipper-Zustand `ready`.
 **Empfehlung für andere Nutzer:** Motor-G-Codes nicht frei über Moonraker absetzen, sondern
 über eine Whitelist, die nur lesende Befehle und belegte Index-Bereiche durchlässt – ein
 einziger falscher Index (`MOTOR_GET DATA=0` oder `DATA=13`) reicht für einen Klipper-SHUTDOWN.
+
+### Ursache belegt (16.10.2026, Traceback + REA)
+Drucker-`klippy.log` 16.10. 13:12:27 (Log-Uhr UTC+8), Traceback nach `Internal error on command:MOTOR_GET`:
+
+```
+File ".../motor_control_wrapper.py", line 1982, in Motor_Control.motor_get
+File ".../box_wrapper.py", line 384, in ParseData.parse_num_to_byte
+TypeError: 'NoneType' object cannot be interpreted as an integer
+```
+
+Mechanismus (statische Analyse, `REA-MOTOR-BEFUND-2026-10-16.md` §1d): `motor_get` liest
+`DATA` per `gcmd.get_int('DATA', 0, minval=1, maxval=12)`. Creality's `gcode.py` wirft bei
+Bereichsverletzung keinen CommandError, sondern gibt nur eine Warnung aus („minimum of 1“) und
+liefert `None`; `motor_get` rechnet weiter, `parse_num_to_byte(None)` → TypeError → key60 →
+SHUTDOWN. **`motor_send_data` wird nie erreicht – bei DATA=0 und DATA=13 ging KEIN Frame auf den
+Bus.** Ob der Motor idx ≥ 13 verträgt, bleibt damit ungeprüft (Host kennt 13–18 in seiner
+Typkette). Zusätzlich aus REA: idx 5 = `pos_fdb`, 6 = `spd_fdb`, 7 = `id_fdb`, 8 = `iq_fdb`
+(Standby-Scan oben: alle 0.0, passt zu stromlosen Motoren); Typ 11/12 = `<I` (unsigned).
