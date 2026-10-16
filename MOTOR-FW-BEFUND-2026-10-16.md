@@ -12,6 +12,13 @@ lui/addi-Referenzen, Hilfsskripte. Host-Adressen = ELF-vaddr von `motor_control_
 **0** (spd_fdb −1,81 rad/s), bei +X **1** und hält im Stillstand die letzte Richtung (0 nach dem
 Einschalten) → **DIR-Eingang bestätigt** (`LIVE-ABFRAGEN-2026-10-16.md`, letzter Abschnitt).
 
+**Prüfvermerk 16.10.2026 (Host-Konstanten):** Die frühere Host-Konstantenauflösung hatte 13 Float-Konstanten
+falsch (Liste in `MOTOR-INIT-BEFUND-2026-10-16.md` §7). Dieser Befund nutzt aus ihr nur **int 8 @`0x1260f0`**
+(`zfill(8)`, §1) – nicht betroffen. Die übrigen Konstanten hier (z. B. −1.0 @`0x19d14`) stammen aus der
+**Motor-FW**, nicht aus der Host-Tabelle. Keine Korrektur nötig. Ergänzend belegt der Motor-Init-Befund §5 mit
+dem Handler 0x0E Sub 01 (@`0x107b4`) das **Adress-Strapping**: Adresse = 0x81 + 2·`pins+0x108` + `pins+0x110`
+(STEP/DIR) → X 0x81, Y 0x82, Z 0x83, Z1 0x84.
+
 ## 0. Motor-Firmware gefunden
 - Dateien `fw/F008|F012/mot{0,1,2}_022_C30-mot2_002_081.bin` (116412 B, alle SHA `67b364a6…`, untersucht)
   und `fw/F008|F012/motor/mot*_02{1,3}_C30-mot2_002_081.bin` (116396 B, SHA `92ff3130…`). Bis auf Binärrauschen

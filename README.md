@@ -19,6 +19,7 @@ Lizenz: GPL-3.0-or-later (siehe `LICENSE`), Herkunft Dritter in `NOTICES.md`.
 | `LIVE-ABFRAGEN-2026-10-16.md` | Live-Abfragen Motor X 16.10.2026: 0x0F Version, 0x08 Variablen-Scan, Pin-IO, Host-Crash-Warnung, Skalierung pos_fdb/idx 11 (Messfahrt) |
 | `REA-MOTOR-BEFUND-2026-10-16.md` | Statische Analyse `motor_control_wrapper.so`: Motor_cmd-Tabelle, 0x08-Indexnamen, Typkette, Crash-Ursache, Fehlerbits |
 | `MOTOR-FW-BEFUND-2026-10-16.md` | Statische Analyse der Motor-Firmware (WCH RISC-V): Befehlsregistrierung, STATUS-Bitfeld, 0x08-Tabelle idx 0..18, 0x0C-Layout, 0x13–0x16 |
+| `MOTOR-INIT-BEFUND-2026-10-16.md` | Statische Rekonstruktion der Stock-Motor-Init (`set_motor_pin`): Ablauf, Fehlerzweige, Param-Abgleich, Adress-Strapping, Vorgaben für den Pi-Ersatz |
 | `GHIDRA-CFS-BEFUND-2026-10-15.md` | Ghidra-Neuanalyse der CFS-FW R153: Dispatcher, Func-/Status-Tabelle, 0x0a-Layout |
 | `GHIDRA-CFS-BEFUND2-2026-10-16.md` | Zweite Ghidra-Runde: Temp/Feuchte, 0x15, Statuscodes 0x50–0x52, Motorblock-Flags, Auto-Addr-Box-Seite, Sensor-Pins |
 | `nachbau/` | Python-Module: `serial485`, `boxmini`, `box`, `motor_mini`, `motor`, `cfsseq`, `auto_addr` – alle mit Selbsttests; `cfswatch` = nur lesender Live-Monitor für `klippy.log` |
@@ -72,6 +73,20 @@ Details: `LIVE-ABFRAGEN-2026-10-16.md`, `PROTOKOLL-485.md` §3.1 „NACHTRAG (3)
   `counts_delta` (wrap-korrigiert), `read_position_feedback(with_counts=True)`.
 - `spd_fdb` (idx 6) im Stillstand ≈ 0; Einheit rad/s (seit Motor-FW-Befund). Hinweis: Creality-Klipper verlangt
   für `G1` alle Achsen referenziert (`G28 X Y` reicht nicht).
+
+Motor-Init-Befund 16.10.2026 (statische Analyse der Stock-Startsequenz, mit Live-Log-Gegenprobe und
+einer Zweitanalyse durch einen weiteren KI-Agenten; Details: `MOTOR-INIT-BEFUND-2026-10-16.md`):
+
+- `Motor_Control.set_motor_pin` = gesamte Boot-Motorsequenz: Dir/Step-Pins setzen → Broadcast `FF 0E 01`
+  → je Motor `0E 02` (max. 4 Runden) → Stall-Mode Z/Z1/E → `0C [0b]`/`0C [05]` → Pins zurück auf 0 →
+  Sys-Param-Abgleich → `auto_addr:start` (CFS-Auto-Addr erst danach). Fehlschlag: key798 + SHUTDOWN.
+- **Adress-Strapping belegt:** Die Motor-FW bildet die Adresse aus den DIR/STEP-Pegeln
+  (0x81 + 2·STEP + DIR → X 0x81, Y 0x82, Z 0x83, Z1 0x84).
+- Param-Abgleich (0x06): nur Config-Schlüssel `<motor>_<param>`, deren ID `configurable` ist (61 von 227),
+  plus IDs 9/10/25 lesend; Toleranz `abs_tol=1e-6`; Werte flüchtig → nach jedem Kaltstart neu schreiben.
+- `0x12 [02]` (UUID) ist **kein** Init-Schritt, sondern ein Webhook-Poll (`motor_dev_uuid`).
+- Stock-Bug: Der Param-Abgleich spricht den Extruder als 0x85 auf ttyS5 an (nur Timeouts), statt über
+  den transparent-Pfad der Düsen-MCU.
 
 Motor-FW-Befund 16.10.2026 (statische Analyse der Motor-Firmware selbst, Details:
 `MOTOR-FW-BEFUND-2026-10-16.md`, `PROTOKOLL-485.md` §3.1 „NACHTRAG (4)“):
@@ -186,6 +201,16 @@ by live captures and Ghidra analysis. License: GPL-3.0-or-later.
 Status 16.10.2026: all self-tests green (serial485 93/93 incl. Hi reference
 vectors, box 179, boxmini 17, cfsseq 28, motor 208, motor_mini 64, auto_addr 33,
 `cfswatch.py --selftest` OK).
+
+Stock motor init reconstructed statically (16.10.2026, `MOTOR-INIT-BEFUND-2026-10-16.md`, German;
+cross-checked against boot logs and a second analysis by another AI agent): `set_motor_pin` sets the
+DIR/STEP pins, broadcasts `FF 0E 01`, reads `0E 02` per motor (up to 4 rounds), sets the stall mode for
+Z/Z1/E, queries/clears protection (`0C [0b]`/`[05]`), restores the pins to 0, then syncs the volatile
+system parameters (`0x06`, only configurable IDs set in the config plus IDs 9/10/25, tolerance
+`abs_tol=1e-6`) and finally fires `auto_addr:start`. The motor firmware derives its bus address from the
+pin levels (**address strapping**: 0x81 + 2·STEP + DIR). `0x12 [02]` (UUID) is a webhook poll, not part
+of the init. Stock bug: the parameter sync addresses the extruder as 0x85 on ttyS5 instead of using the
+nozzle-MCU transparent path.
 
 Motor firmware found and analysed statically (16.10.2026, `MOTOR-FW-BEFUND-2026-10-16.md`,
 German): `fw/F008|F012/mot*_022_C30-mot2_002_081.bin` is a **WCH RISC-V (CH32V30x-class)**

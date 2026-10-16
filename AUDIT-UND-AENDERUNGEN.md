@@ -725,6 +725,42 @@ selbst gegengeprüft; bei der Einarbeitung zusätzlich nachgeprüft (Abschnitt �
 - Selbsttests danach alle grün: serial485 93/93 · box 179 · boxmini 17 · cfsseq 28 ·
   motor 208 · motor_mini 64 · auto_addr 33 · cfswatch `--selftest` OK.
 
+## 16.10.2026 Motor-Init-Befund (statisch, Stock-Startsequenz `set_motor_pin`)
+
+- **Anlass:** Für den Pi-Ersatz muss die Motor-Init des Stock-Hosts nachgebaut werden. Bisher war die
+  Bootsequenz nur aus Logs abgeleitet (PROTOKOLL-485.md §3.1), Strapping und Toleranz vermutet.
+- **Vorgehen:** Hauptanalyse mit einem eigenen Agenten (Ghidra 12.1.4 headless, Cython-Auflöser,
+  Python-Zeilennummern), dazu eine **Zweitanalyse mit einem weiteren KI-Agenten** (llvm-objdump-basiert)
+  als unabhängige Zweitmeinung; beide nur statisch, kein Druckerzugriff. Abgleich gegen `live-logs-2026-10-15/klippy.log` (Boot 16.10., lokal, nicht im Repo).
+- **Befund (neu `MOTOR-INIT-BEFUND-2026-10-16.md`):** `Motor_Control.set_motor_pin` @0xf87d8 (aus Creality's
+  `klippy._connect`) ist die gesamte Start-Sequenz; Fehlerzweige key798–802 (key803 nur im ungenutzten
+  Zweitpfad); Config-Override `<motor>_<param>` nur für `configurable` ∩ Config (61 von 227 IDs), IDs 9/10/25
+  immer gelesen; `isclose` mit Default `abs_tol=1e-6` (+ `rel_tol=1e-9`, live `precision:1e-06`); lesen/schreiben
+  je ≤ 3 Versuche, `06 [03]` je Motor; ID 226 nur Host. **Adress-Strapping BELEGT** über den Motor-FW-Handler
+  0x0E Sub 01: Adresse = 0x81 + 2·pin108 (STEP) + pin110 (DIR) → X 0x81, Y 0x82, Z 0x83, Z1 0x84.
+  Zeiten 0,1/0,2/0,05/1,0/5 s. **Stock-Bug:** `verify_sys_param` adressiert den Extruder als 0x85 auf ttyS5
+  (nur Timeouts ≈ 9 s), der vorhandene transparent-Pfad `motor_extruder_sys_param_init` wird nicht aufgerufen.
+- **Korrekturen an der Doku:**
+  - PROTOKOLL-485.md §3 (grant-Abschnitt) und §3.1 „Stock-Bootsequenz K2 Plus“: `12 02` (UUID) ist **kein**
+    Init-Schritt, sondern ein Client-Poll über den Webhook-Endpunkt `motor_dev_uuid` (Log-Tag
+    `[webhooks:_process_request]`, `klippy.log:2316/2339/2349`, vor „All motors are normal“ `:2422`; lokal,
+    nicht im Repo); Strapping von „vermutlich“ auf belegt; Schritt 10/11 präzisiert (Toleranz, Extruder-Bug,
+    `auto_addr:start`).
+  - PROTOKOLL-GESAMT.md: grant-Bootsequenz korrigiert, Pi-Ersatz-Nachtrag, §4 Start-Init.
+  - CHECKLISTE.md: Init-Logik erledigt; offen `motor_init.py` (Trockenlauf), Extruder-Transparent-Pfad.
+  - **Konstanten:** Die frühere Auflösung `pyx_consts.json` hatte 13 Float-Konstanten falsch (`vmov.f64 d0,#imm`
+    übersehen; z. B. 0.8 → 1.0, 3.8 → 5.0, 1e-06 → 20.0). Geprüft: `REA-MOTOR-BEFUND-2026-10-16.md` und
+    `MOTOR-FW-BEFUND-2026-10-16.md` stützen keine Aussage darauf (nur int-Konstanten) – je Prüfvermerk ergänzt,
+    keine inhaltliche Korrektur nötig.
+- **Wo die Zweitanalyse falsch lag:** (1) `12 02` als Teil der Init („läuft mit in der MOTOR_READ_ADDR-Runde“,
+  „UUID-Nachlese“) – widerlegt durch den Webhook-Log-Tag und fehlenden `dev_uuid`-Bezug in `set_motor_pin`;
+  (2) Pausen 0,8 s und 3,8 s – aus den falsch aufgelösten Konstanten, richtig 1,0 s und 5,0 s (Log bestätigt 1,0 s);
+  (3) Toleranz nur unspezifisch („`tolerance`/`precision`“), Strapping nur vermutet (kein FW-Beleg);
+  (4) Aufrufer als `klippy:ready` vermutet statt `klippy._connect`. **Übereinstimmend** waren Grundablauf,
+  Fehlerkeys, `switch=0`-Zweig, X/Y ohne Boot-Stall, Extruder über transparent, Filterlogik von
+  `verify_sys_param` und die Pin-Liste (inkl. Stall-Pins und `!PA9`, die nur die Zweitanalyse nennt).
+- **Code:** unverändert (`motor_init.py` folgt später). Selbsttests unverändert grün.
+
 ## Anonymisierung (Repo-Fassung)
 
 Gegenüber der lokalen Forschungsablage sind im Repo folgende Werte durch syntaktisch

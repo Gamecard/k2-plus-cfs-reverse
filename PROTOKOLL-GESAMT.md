@@ -1,4 +1,4 @@
-# K2 Plus – Gesamt-Protokoll-Inventar (Stand 13.10.2026, Live-Log-Abgleich 15.10.2026, BEFUND2 + REA-Motor + Motor-FW 16.10.2026)
+# K2 Plus – Gesamt-Protokoll-Inventar (Stand 13.10.2026, Live-Log-Abgleich 15.10.2026, BEFUND2 + REA-Motor + Motor-FW + Motor-Init 16.10.2026)
 
 Audit/Korrekturen der Nachbau-Module: `<projekt>/AUDIT-UND-AENDERUNGEN.md`.
 
@@ -337,8 +337,9 @@ Details siehe Subagenten-Bericht in der Session-Historie.
 - Hinweis Pi-Ersatz: Motoren hängen dort am **Transparent-Pfad der Main-MCU**
   (`config_transparent`, `transparent_send oid=%c write=%*s timeout_ms=%u` /
   `transparent_response`), Extruder 0x85 über Nozzle-MCU. Stock-Bootsequenz:
-  Broadcast `FF 0E 01` (Timeout normal) → UUID `8x 12 02` → Adresse `8x 0E 02` →
-  Stall-Mode → Protection-Check; Motoren antworten erst nach dem Stock-`_build_config`
+  Broadcast `FF 0E 01` (Timeout normal) → ~~UUID `8x 12 02` →~~ Adresse `8x 0E 02` →
+  Stall-Mode → Protection-Check (**KORREKTUR 16.10.2026:** `12 02` ist ein Webhook-Client-Poll
+  `motor_dev_uuid`, nicht Teil der Init – `MOTOR-INIT-BEFUND-2026-10-16.md`); Motoren antworten erst nach dem Stock-`_build_config`
   (UART-Init in der MCU-FW). Für einen Pi-Ersatz also zu klären, ob die Motoren am
   Plus direkt am `/dev/ttyS5`-Bus oder nur über die Main-MCU erreichbar sind.
   **GEKLÄRT 15.10.2026 (live):** am Plus direkt am ttyS5; nur der Extruder über
@@ -371,6 +372,17 @@ Details siehe Subagenten-Bericht in der Session-Historie.
   (`read_err_detail`, `read_stall_detail`, `read_pos_samples`, `read_spd_samples`; FW-statisch,
   live noch nicht geprüft). Vorsicht: `0x0C [0b]` gibt bei stall_mode 2 den Notfall-Pin frei
   (wie beim Stock); 0x0C 01–05 sind zustandsändernd und im Nachbau nur Konstanten.
+  **NACHTRAG 16.10.2026 (Motor-Init-Befund, `MOTOR-INIT-BEFUND-2026-10-16.md`):** Die Stock-Init
+  (`Motor_Control.set_motor_pin`, aufgerufen aus Creality's `klippy._connect`) ist statisch rekonstruiert
+  und mit einer Zweitanalyse abgeglichen. Für den Pi-Ersatz gilt: (1) **Adress-Strapping belegt** –
+  Motor-FW 0x0E Sub 01 bildet die Adresse aus DIR/STEP (0x81 + 2·STEP + DIR), also die Pins über die
+  Main-MCU **vor** dem Broadcast `FF 0E 01` setzen und danach physisch auf 0 zurück; (2) Adress-Runde
+  `0E 02` je Motor, max. 4 Runden mit 1,0 s Pause, erst bei vollständiger Antwort Stall-Mode Z/Z1/E,
+  `0C [0b]`, `0C [05]`; (3) **Param-Abgleich nach jedem Kaltstart** (flüchtig): nur `configurable` ∩
+  konfigurierte Schlüssel `<motor>_<param>` (61 von 227 IDs configurable) + IDs 9/10/25 lesend, Toleranz
+  `abs_tol=1e-6`, lesen/schreiben je ≤ 3 Versuche, `06 [03]` je Motor; (4) **Extruder über transparent**
+  (Stock-Bug: Param-Abgleich adressiert E als 0x85 auf ttyS5 → nur Timeouts); (5) CFS-Auto-Addr erst nach
+  `is_ready` (`auto_addr:start`). `12 02` (UUID) ist kein Init-Schritt.
 
 **Kreuzvergleich: fake-name/cfs-reverse-engineering (CFS-Hardware, 15.10.2026 gesichtet)**
 
@@ -495,6 +507,11 @@ ein FW-File pro Board. Noch nicht dekompiliert.
   Antwort-Builder @0xdd6e (STATUS-Bitfeld), GET-Sprungtabelle @0x1bce4 (idx 0..18),
   protection-Sprungtabelle @0x1bd30 (Subs 00..0B). Details/Variablentabelle: PROTOKOLL-485.md §3.1
   NACHTRAG (4).
+- **Start-Init (16.10.2026, `MOTOR-INIT-BEFUND-2026-10-16.md`):** `set_motor_pin` @0xf87d8 = gesamte
+  Boot-Motorsequenz (GPIO-Strapping → Broadcast → `0E 02` → Stall → Schutz → Restore → `verify_sys_param`
+  → `auto_addr:start`), Fehlerkeys key798–802, Config-Override `<motor>_<param>`, Toleranz 1e-6,
+  Extruder-Param-Bug (0x85 auf ttyS5). 13 Float-Konstanten der früheren Konstantenauflösung waren
+  falsch (keine Aussage der REA-/Motor-FW-Befunde betroffen).
 
 ---
 

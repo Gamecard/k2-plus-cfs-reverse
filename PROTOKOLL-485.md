@@ -709,8 +709,10 @@ Adressen dort: `0x81..0x84` = X/Y/Z/Z1 über Main-MCU-Transparent-Pfad
 (`transparent_send`/`transparent_response`), `0x85` = Extruder über Nozzle-MCU
 transparent. **LIVE 15.10.2026: gilt für den K2, NICHT für den K2 Plus** – dort laufen
 X/Y/Z/Z1 ausschließlich über serial_485 (`/dev/ttyS5`), nur der Extruder über
-`transparent_send` (Adresse 0x81 auf dessen eigenem Bus); 0x85 auf ttyS5 antwortet nie (§3.1). Stock-Bootsequenz (aus Logs): Broadcast-Addr-Set `FF 0E 01`, UUID-Abfrage
-`81/82 12 02`, Adress-Lesen `81/82 0E 02`, dann Stall-Mode und Protection-Check.
+`transparent_send` (Adresse 0x81 auf dessen eigenem Bus); 0x85 auf ttyS5 antwortet nie (§3.1). Stock-Bootsequenz (aus Logs): Broadcast-Addr-Set `FF 0E 01`, ~~UUID-Abfrage
+`81/82 12 02`,~~ Adress-Lesen `81/82 0E 02`, dann Stall-Mode und Protection-Check.
+**KORREKTUR 16.10.2026 (Motor-Init-Befund):** `12 02` gehört nicht zur Init, sondern ist ein Client-Poll
+über den Webhook-Endpunkt `motor_dev_uuid` (§3.1 „Stock-Bootsequenz“, `MOTOR-INIT-BEFUND-2026-10-16.md`).
 
 **Bewertung (Stand vor 15.10.2026):** Die drei auf dem Plus live gesehenen Bytes (0x06/0x0C/0x11) passen
 widerspruchsfrei zur Fremdtabelle, ID 70 erklärt die 300/100-Werte. Alles Übrige sind
@@ -757,19 +759,31 @@ byte-genau (z.B. `f7 81 04 00 0c 0b 95`, `f7 ff 04 00 0e 01 89`).
 - **Pfade:** X/Y/Z/Z1 + CFS 0x01 + Belt 0x21/0x22 teilen sich **einen** RS485-Port
   (ttyS5, 230400, eine Queue; Motor-, CFS- und Auto-Addr-Frames verschränkt, `klippy.log:4315-4373`).
 
-**Stock-Bootsequenz K2 Plus** (`klippy.log`, Boot 16.10.):
-1. 2127–2150 MCU-Connect (mcu ttyS2, nozzle_mcu ttyS3, rpi); 2167 serial_485 ttyS5.
+**Stock-Bootsequenz K2 Plus** (`klippy.log`, Boot 16.10.) – **KORRIGIERT 16.10.2026** nach der statischen
+Analyse von `set_motor_pin` (`MOTOR-INIT-BEFUND-2026-10-16.md`: Pseudocode, Fehlerzweige key798–803,
+Config-Steuerung, Strapping, Zeiten, Abgleich mit einer Zweitanalyse):
+1. 2127–2150 MCU-Connect (mcu ttyS2, nozzle_mcu ttyS3, rpi); 2167 serial_485 ttyS5. Die Sequenz läuft
+   in Creality's `klippy._connect()` (Log-Tag `[klippy:_connect:258]`) → `Motor_Control.set_motor_pin()`.
 2. 2259–2267 „initial set_pin_io“: dir/step-Pins der 4 Motoren über die Main-MCU auf
-   Config-Werte (vermutlich Strapping/Adresswahl der Motorboards).
-3. 2269 S485 `FF 0E 01` (Timeout) → 2313 transparent `FF 0E 01` (leer).
-4. 2317–2371 je Motor `0E 02` + `12 02` (erste Runde antwortet nur Z).
+   Config-Werte, per `query_gpio_status` zurückgelesen. ~~(vermutlich Strapping/Adresswahl der Motorboards)~~
+   **BELEGT: Adress-Strapping** – Motor-FW 0x0E Sub 01 liest DIR und STEP und setzt
+   Adresse = 0x81 + 2·STEP + DIR → X(0,0)=0x81, Y(1,0)=0x82, Z(0,1)=0x83, Z1(1,1)=0x84 (DIR, STEP physisch).
+3. 2269 S485 `FF 0E 01` (Timeout) → 2313 transparent `FF 0E 01` (leer); 2314 „broadcast retries:1“.
+4. 2317–2371 je Motor `0E 02` (erste Runde antwortet nur Z). ~~+ `12 02`~~ **KORREKTUR:** Die
+   `12 02`-Frames dazwischen (2316/2339/2349) tragen den Tag `[webhooks:_process_request]` und enden in
+   `get dev_uuid` (2370) – ein **Client-Poll** über den Endpunkt `motor_dev_uuid` (vermutlich Display), **nicht**
+   Teil der Init; `set_motor_pin` hat keinen `dev_uuid`-Bezug.
 5. 2376 transparent `81 0E 02` → Extruder meldet 0x81.
-6. 2379–2420 zweite Runde, alle antworten → 2422 „All motors are normal“.
+6. 2379–2420 zweite Runde (2386 „broadcast retries:2“), alle antworten → 2422 „All motors are normal“.
+   Max. `retries` (4) Runden, 1,0 s Pause; sonst key798 + SHUTDOWN.
 7. 2424–2439 Stall-Mode `[02]` an Z, Z1 (S485) und E (transparent); X/Y erst beim Homing.
 8. 2442–2469 `0C [0b]` an 0x81–0x84 + E → 8×00; 2471–2491 `0C [05]` → keine Antwort.
-9. 2492–2500 „restore set_pin_io“ (alle Pins 0).
-10. 2501–4303 flash_param-Enumeration stepper 1–5 (0x06 Sub 02/01/03), stepper 5 = 0x85 Timeouts.
-11. 4315–4373 `12 02` UUID erneut, verschränkt mit CFS-Auto-Addr (0xA2/0xA3).
+9. 2492–2500 „restore set_pin_io“ (alle Pins physisch 0), danach 1,0 s Pause.
+10. 2501–4303 Sys-Param-Abgleich `verify_sys_param` stepper 1–5 (0x06 Sub 02/01/03; nur `configurable` ∩
+    in der Config + IDs 9/10/25, Toleranz `abs_tol=1e-6`, live `precision:1e-06`), stepper 5 = 0x85 Timeouts
+    (**Stock-Bug:** Extruder ohne transparent-Zweig, ≈ 9 s ohne Wirkung).
+11. danach `auto_addr:start` → CFS-Auto-Addr (0xA0–0xA3, ab 4312). 4315–4373 `12 02` UUID erneut =
+    wieder Webhook-Poll, verschränkt mit Auto-Addr – nicht Teil der Motor-Init.
 Abweichungen zu grant (K2): alle vier Achsen antworten (grant: Z/Z1 stumm), Stall/Protection
 an X–Z1 über serial_485 statt transparent, GPIO-Setzen vor **und** nach der Abfrage.
 

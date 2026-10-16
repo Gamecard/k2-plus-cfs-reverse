@@ -250,7 +250,8 @@ motor 98 · motor_mini 30 · auto_addr 31 – alle grün.
 - [x] Motor 0x12 (dev_uuid) und 0x0E (read/set_addr) am Plus mitschneiden
   (Stock-Bootsequenz laut grant0013: `FF 0E 01`, `8x 12 02`, `8x 0E 02`) – **ERLEDIGT
   15.10.2026 (Live-Logs):** beide live, Bootsequenz Plus in PROTOKOLL-485.md §3.1
-  (`motor.read_485_addr`/`read_uuid`)
+  (`motor.read_485_addr`/`read_uuid`). **16.10.2026:** `12 02` gehört nicht zur Init
+  (Webhook-Poll `motor_dev_uuid`), s. `MOTOR-INIT-BEFUND-2026-10-16.md`
 - [x] Transparent-Pfad über Main-MCU (`transparent_send`/`transparent_response`) für
   Pi-Ersatz klären: Motoren am Plus direkt am Bus oder nur via MCU erreichbar? –
   **GEKLÄRT 15.10.2026:** X/Y/Z/Z1 direkt am ttyS5, **nur der Extruder** über transparent
@@ -339,9 +340,25 @@ Quelle: `live-logs-2026-10-15/` (lokal, nicht fürs Repo), Auswertung PROTOKOLL-
 ### Pi-Ersatz (Folgerungen aus der Live-Bootsequenz)
 - [ ] **Ein** RS485-Port (Stock ttyS5, 230400) reicht für X/Y/Z/Z1 + CFS + Belt – eine
   gemeinsame Queue, kein paralleler Zugriff (Motor-, CFS- und Auto-Addr-Frames verschränkt)
-- [ ] Pi muss die **Motor-Init** übernehmen (Broadcast `FF 0E 01`, `0E 02`/`12 02`, Stall-Mode,
+- [ ] Pi muss die **Motor-Init** übernehmen (Broadcast `FF 0E 01`, `0E 02`~~/`12 02`~~, Stall-Mode,
   Protection `0C [0b]`, flash_param-Lesen) und die **Sys-Params nach jedem Kaltstart neu
   schreiben** (0x06 Sub 01/03 flüchtig, sonst Board-Defaults Kp 300 / err_time 0,01 / …)
+  – **KORREKTUR 16.10.2026:** `12 02` (UUID) ist kein Init-Schritt, sondern Webhook-Poll
+  `motor_dev_uuid` (Client/Display)
+- [x] **Init-Logik des Stock-Hosts rekonstruiert – ERLEDIGT 16.10.2026** (`MOTOR-INIT-BEFUND-2026-10-16.md`,
+  statisch + Live-Log-Gegenprobe, abgeglichen mit einer Zweitanalyse): `set_motor_pin` @0xf87d8
+  (Pseudocode), Bedingungen/Fehlerzweige key798–803, Config-Steuerung (`<motor>_<param>`, nur
+  `configurable` ∩ Config, 61 von 227; IDs 9/10/25 immer gelesen; `isclose` abs_tol 1e-6; lesen/schreiben
+  je ≤ 3 Versuche; `06 [03]` je Motor; ID 226 nur Host), **Adress-Strapping belegt** (Motor-FW 0x0E Sub 01:
+  Adresse = 0x81 + 2·STEP + DIR), Zeiten 0,1/0,2/0,05/1,0/5 s, Stock-Bug Extruder-Param-Abgleich (0x85 auf ttyS5)
+- [ ] **`motor_init.py`** (Nachbau der Init nach `MOTOR-INIT-BEFUND-2026-10-16.md` §9) – zuerst nur
+  **Trockenlauf** gegen FakeBus und die Live-Log-Sequenz, kein Senden ohne Freigabe
+- [ ] **Extruder-Transparent-Pfad** für den Param-Abgleich nachbauen (E über nozzle_mcu `transparent_send`,
+  Adresse 0x81 – Stock-Bug 0x85 auf ttyS5 nicht übernehmen; Vorbild ungenutzter `motor_extruder_sys_param_init`)
+- [x] Konstanten-Gegenprüfung: 13 falsch aufgelöste Float-Konstanten der Vorarbeit korrigiert
+  (`MOTOR-INIT-BEFUND-2026-10-16.md` §7); `REA-MOTOR-BEFUND`/`MOTOR-FW-BEFUND` geprüft – keine Aussage beruht
+  darauf (Prüfvermerk in beiden Dateien). Offen nur, falls künftig weitere Float-Konstanten aus der alten
+  Tabelle zitiert werden: dann die korrigierte Tabelle verwenden
 - [ ] GPIO-Phase („initial/restore set_pin_io“ der Motor-dir/step-Pins) vor/nach der
   Adressabfrage braucht die **Main-MCU** – **BESTÄTIGT 16.10.2026:** `MOTOR_READ_ALL_PIN_IO`
   ist eine Klipper-GPIO-Abfrage (`gpio_status`, oid 11) an der Main-MCU (PB9, PB10, !PB7,

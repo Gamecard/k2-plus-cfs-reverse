@@ -6,6 +6,14 @@
 > interpreted as an integer`. Damit gilt **Variante A**: `get_int` liefert `None`, Absturz vor dem Senden,
 > **kein Frame auf dem Bus**. Variante B ist widerlegt. Umsetzung im Nachbau: PROTOKOLL-485.md §3.1
 > „NACHTRAG 16.10.2026 (2)“, AUDIT-UND-AENDERUNGEN.md.
+>
+> **Nachtrag 16.10.2026 (Konstanten-Gegenprüfung):** Die Auflösung `pyx_consts.json` (lokal, nicht im Repo) hat
+> **13 Float-Konstanten falsch** aufgelöst (`vmov.f64 d0,#imm` übersehen), z. B. `0x126034` 0.8 → **1.0**,
+> `0x126058` 3.8 → **5.0**, `0x126088` 1e-06 → 20.0; vollständige Liste vorher → nachher in
+> `MOTOR-INIT-BEFUND-2026-10-16.md` §7. **Geprüft: Keine Aussage dieses Befunds beruht auf diesen 13 Werten.**
+> Hier verwendet werden nur int-Konstanten (z. B. 1/12 in `motor_get` §1d, Schleife bis 16 in
+> `validate_data_params`), Strings und Tupel; die Werte idx 9/10 (0.0016113/0.0008057) sind Live-Messwerte, keine
+> Konstanten. Keine Korrektur nötig. Neue Zitate von Float-Konstanten nur aus der korrigierten Tabelle.
 
 Nur statische Analyse, nichts gesendet, kein Druckerzugriff.
 Binary: `rootfs-live/usr/share/klipper/klippy/extras/motor_control_wrapper.cpython-39.so`,
