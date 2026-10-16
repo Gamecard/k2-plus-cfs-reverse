@@ -664,7 +664,8 @@ Host: `motor_control_wrapper`: `motor_version/sys_param/flash_param`, `motor_rea
   CRC – im Frame fehlt also kein Byte, er trägt NUR den Float. Vanilla-Form wäre
   `[01, id] + <f` (→ hypothetisch `f7 81 09 00 06 01 46 00 00 96 43 8f`), ~~auf dem
   Plus NICHT live gesehen~~ **LIVE BELEGT 15.10.2026** (exakt dieser Frame, per
-  `build_frame` verifiziert). `read_encoder` in motor*.py bleibt gesperrt (0x08 nie live).
+  `build_frame` verifiziert). `read_encoder` in motor*.py bleibt gesperrt (0x08 nie live;
+  **NACHTRAG 16.10.2026:** 0x08 ist live der Variablen-Lesepfad, Encoder-Index offen, §3.1).
   NACHTRAG 15.10.2026: **ID 70 = `controller_pos_loop_pid_param_kp`
   (Positionsregler-Kp, CONFIGURABLE)** laut grant0013/k2-reverse-engineering
   `docs/motor_params_map.md:103` (Fremdquelle K2, Namen aus klippy.log) →
@@ -695,12 +696,12 @@ selbst, dass sein eigener Code nur leere Motor-Antworten bekommt. Gesichtet:
 | `0x05` | control | **live 15.10.2026**: `[01]`/`[02]` an X/Y bei BELT_TENSION, nie Antwort; Semantik offen |
 | `0x06` | sys_param read/write | **live**: `[02,id]` lesen / `[01,id]+<f>` schreiben / `[03]` übernehmen; flüchtig (§3.1) |
 | `0x07` | flash_param read/write | unbelegt (Stubs `get/set_flash_param`) |
-| `0x08` | get feedback | unbelegt – Kandidat fürs echte Encoder-Lesen |
+| `0x08` | get feedback | **live 16.10.2026** (Motor X): `[idx]` → 4 B LE = „aktueller Wert einer vom System unterstützten Variable“, idx 1..12; Bedeutung je Index offen (§3.1) |
 | `0x0B` | boot | unbelegt (Motoren); bei CFS = Loader-Check an 0xFF |
 | `0x0C` | protection status | **live**: Request `[0b]` → 8 B Status (8×`00` = ok); `[05]` ohne Antwort – „protection status“ bestätigt |
 | `0x0D` | systemid | unbelegt |
 | `0x0E` | read/set_addr | **live 15.10.2026**: `addr 0E [02]` → `[addr]`; `FF 0E [01]` Broadcast ohne Antwort |
-| `0x0F` | version | unbelegt (belegt nur F0/00 via `query_version`) |
+| `0x0F` | version | **live 16.10.2026** (Motor X): `[00]` → 12 B Versionsblock (fw 1.9.7.81 …, §3.1) |
 | `0x11` | stall_mode | **live**: `[01]/[02]/[03]` setzen, `[04]` lesen → `[mode,00]` |
 | `0x12` | dev_uuid | **live 15.10.2026**: `addr 12 [02]` → 8 B, Präfix `cd ab` + 6 B individuell |
 
@@ -717,6 +718,8 @@ widerspruchsfrei zur Fremdtabelle, ID 70 erklärt die 300/100-Werte. Alles Übri
 Stubs bleiben gesperrt, bis je Kommando ein Plus-Mitschnitt vorliegt (CHECKLISTE.md).
 **NACHTRAG 15.10.2026:** live belegt sind jetzt zusätzlich 0x05, 0x0E, 0x12 (s. Tabelle);
 weiterhin nie gesehen: 0x01, 0x03, 0x04, 0x07, 0x08, 0x0B (an Motoren), 0x0D, 0x0F, 0xF0.
+**NACHTRAG 16.10.2026:** 0x08 und 0x0F live belegt (gezielte Abfrage Motor X, §3.1);
+weiterhin nie gesehen: 0x01, 0x03, 0x04, 0x07, 0x0B (an Motoren), 0x0D, 0xF0.
 
 ### 3.1 LIVE BELEGT 15.10.2026: Motor-Kommunikation K2 Plus (klippy.log 05.–16.10.)
 
@@ -783,6 +786,66 @@ Volle Tabelle (lokal, nicht im Repo): `/tmp/claude-0/livelog-motor/params.csv`.
 `read_485_addr` (0x0E [02]), `read_uuid` (0x12 [02]), `SYS_PARAM_NAMES` (227 Einträge),
 `MOTOR_RETRIES = 0`, Timeouts 0x06/0x12 1,0 s (live 0x85-Timeouts 1,002–1,009 s),
 0x0E/0x0C 0,05 s (live 0,052–0,066 s); `read_encoder` bleibt gesperrt.
+
+#### NACHTRAG 16.10.2026: Live-Abfragen Motor X (0x81) – 0x0F, 0x08, Pin-IO
+
+Quelle: `LIVE-ABFRAGEN-2026-10-16.md` (Rohdaten Scan: `arbeitsdateien-lokal/motor_get_scan.txt`,
+lokal, nicht im Repo). Gesendet über Moonraker mit Creality-G-Codes (lokales Whitelist-Wrapper-
+Skript, lässt nur lesende Motor-G-Codes durch), Drucker im Standby, **nicht referenziert** (Motoren stromlos/inaktiv).
+
+> **WARNUNG – Creality-Host-Bug (zweimal reproduziert):** `MOTOR_GET … DATA=0` und
+> `MOTOR_GET … DATA=13` lösen in `motor_control_wrapper.so` einen internen Fehler aus
+> (`key60: Internal error on command:MOTOR_GET`) → **Klipper geht in SHUTDOWN**. DATA=0 wird
+> schon vom G-Code-Parser abgelehnt („minimum of 1“) und crasht trotzdem. Gültig: **DATA=1..12**.
+> Recovery: `FIRMWARE_RESTART` (`POST /printer/firmware_restart`), danach ~60 s bis Motoren/Box
+> bereit. Ob der **Motor** Index ≥ 13 verträgt, ist offen (bei 13 nicht geprüft, ob ein Frame
+> rausging). Nachbau `read_variable` akzeptiert deshalb nur 1..12; eine eigene Implementierung
+> muss den Index **vor** dem Senden validieren.
+
+- **0x0F Version** (`MOTOR_VERSION NUM=1 DATA=0`): TX `81 04 00 0f 00` → RX
+  `f7 81 0f 00 0f 01 09 07 51 01 03 01 03 02 4b 01 00 02` (CRC ok). 12 B Nutzdaten, Feldnamen
+  aus den Wrapper-Strings:
+
+  | Bytes | Feld | Wert |
+  |---|---|---|
+  | 0–3 | `fireware_ver` | `01 09 07 51` = 1.9.7.81 |
+  | 4–5 | `cmd_system_ver` | `01 03` = 1.3 |
+  | 6–7 | `protection_ver` | `01 03` = 1.3 |
+  | 8–9 | `flash_param_ver` | `02 4b` = 2.75 (minor dezimal) |
+  | 10–11 | `logger_ver` | `01 00` = 1.0 |
+
+  Nicht verwechseln mit dem Update-Pfad F0/00 (`query_version`, live nie beobachtet).
+- **0x08 Variablen-Lesepfad** (`MOTOR_GET NUM=1 DATA=idx`, Host-Text „系统所支持变量当前值“ =
+  aktueller Wert einer vom System unterstützten Variable): TX `81 04 00 08 <idx>` → RX
+  `f7 81 07 00 08 <4 B LE> crc`. Der Host dekodiert je Index als float oder int, gibt aber
+  **keine Namen** aus. Scan Motor X (Standby):
+
+  | idx | Rohbytes | Host-Wert | Typ (Host-Dekodierung) | RX-Frame |
+  |---|---|---|---|---|
+  | 1–8 | `00 00 00 00` | 0.0 | float | `f7 81 07 00 08 00 00 00 00 0a` |
+  | 9 | `33 33 d3 3a` | 0.0016113 | float | `f7 81 07 00 08 33 33 d3 3a e6` |
+  | 10 | `33 33 53 3a` | 0.0008057 | float | `f7 81 07 00 08 33 33 53 3a 50` |
+  | 11 | `52 04 00 00` | 1106 | int | `f7 81 07 00 08 52 04 00 00 71` |
+  | 12 | `00 00 00 00` | 0 | int | `f7 81 07 00 08 00 00 00 00 0a` |
+
+  Welcher Index Encoder/Position/Strom ist: **offen** (Stillstand → viele Nullen). Hinweis aus
+  den Wrapper-Strings: Stock nutzt selbst `MOTOR_GET NUM=1 DATA=7 EXTRUDER=1`,
+  `… DATA=8 EXTRUDER=1` und `MOTOR_GET NUM=1 DATA=1` (`_stats_motor_get_value`) – Kontext
+  unbelegt. Nächster Schritt: Scan nach Homing/in Bewegung, Namen aus `motor_control_wrapper.so`.
+- **0x0E** `[02]` → `f7 81 04 00 0e 81 00` (eigene Adresse 0x81, bestätigt §3.1).
+- **0x0C** `[0b]` (`MOTOR_AUTO_CHECK_PROTECTION NUM=1 DATA=11`) → `f7 81 0b 00 0c 00×8 fb`
+  (keine Fehler, bestätigt §3.1).
+- **Pin-IO** (`MOTOR_READ_ALL_PIN_IO`): **kein RS485** – Klipper-GPIO-Abfrage `gpio_status`
+  (oid 11) an der **Main-MCU**: PB9, PB10, !PB7, PB8, PB5, PB6, PA1, PB15 = 0 (dir/step-Pins der
+  4 Motoren). Für einen Pi-Ersatz heißt das: die GPIO-Phase (initial/restore `set_pin_io`)
+  braucht weiter die Main-MCU.
+- **Nachbau** (`nachbau/motor.py` / `motor_mini.py`): `query_motor_version()` (0x0F [00] → dict
+  `fireware_ver`/`cmd_system_ver`/`protection_ver`/`flash_param_ver`/`logger_ver` + `raw`;
+  Alias `motor_version`, in motor.py zusätzlich `motor_version_normal` = früherer Stub),
+  `read_variable(idx)` (nur 1..12, sonst `ValueError` ohne Senden; Rückgabe `raw`, `float` (<f),
+  `int` (<i, Vorzeichen unbelegt), `type`/`value` nach `VARIABLE_TYPES` = Host-Dekodierung live
+  16.10.). `retries=0`; Timeout 0x0F/0x08 **unbelegt** (live kein Timeout gemessen) → 1,0 s.
+  `cfswatch.py` dekodiert 0x0F-/0x08-Motorantworten. Selbsttests mit den Live-Frames.
 
 ## 4. Update-Werkzeuge
 

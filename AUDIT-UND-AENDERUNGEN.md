@@ -502,6 +502,51 @@ selbst gegengeprüft; bei der Einarbeitung zusätzlich nachgeprüft (Abschnitt �
 - Selbsttests 16.10.2026 alle grün: serial485 93/93 · box 179 · boxmini 17 · cfsseq 28 ·
   motor 134 · motor_mini 43 · auto_addr 33 · cfswatch `--selftest` OK.
 
+## 16.10.2026 Live-Abfragen Motor X
+
+- **Quelle:** `LIVE-ABFRAGEN-2026-10-16.md` (Belege: klippy.log + gcode_store des Druckers,
+  13:10–13:15 Log-Uhr UTC+8; Scan-Rohdaten `arbeitsdateien-lokal/motor_get_scan.txt` – lokal, nicht im Repo).
+  Gesendet wurden nur lesende Creality-G-Codes über Moonraker (lokales Whitelist-Wrapper-Skript,
+  das nur lesende Motor-G-Codes durchlässt; nicht im Repo),
+  Drucker im Standby, nicht referenziert.
+- **Befunde:** 0x0F = Version (`[00]` → 12 B: fireware_ver 1.9.7.81, cmd_system 1.3,
+  protection 1.3, flash_param 2.75, logger 1.0); 0x08 = Variablen-Lesepfad (`[idx]` → 4 B LE,
+  idx 1..12; Host dekodiert 1–10 float, 11/12 int; Bedeutung offen); 0x0E `[02]` → 0x81 und
+  0x0C `[0b]` → 8×00 bestätigt; `MOTOR_READ_ALL_PIN_IO` = GPIO-Abfrage der Main-MCU
+  (PB9, PB10, !PB7, PB8, PB5, PB6, PA1, PB15), kein RS485.
+- **Vorfall – zwei durch uns ausgelöste Klipper-Shutdowns:** `MOTOR_GET … DATA=0` und
+  `MOTOR_GET … DATA=13` (Index-Grenzen beim Scan) lösten in `motor_control_wrapper.so` einen
+  internen Fehler aus (`key60: Internal error on command:MOTOR_GET`) → Klipper SHUTDOWN.
+  DATA=0 lehnt schon der G-Code-Parser ab („minimum of 1“) und crasht trotzdem. **Beide
+  Male per `FIRMWARE_RESTART` (`POST /printer/firmware_restart`) behoben**, danach ~60 s bis
+  Motoren/Box bereit (Motor-Init + Auto-Addr laufen neu); kein Druck lief, keine Bewegung.
+  **Ursache:** Creality-Host-Bug (Index-Prüfung im Wrapper fehlt/fehlerhaft), nicht der
+  Motor – ob der Motor idx ≥ 13 verträgt, ist offen. **Gegenmaßnahme:** Das lokale
+  Whitelist-Wrapper-Skript lässt nur noch `DATA=1..12` (Regex) und `NUM=1..4` zu und sendet nur, wenn
+  Druckerstatus standby/complete/cancelled/error **und** Klipper-Zustand `ready` ist
+  (sonst Abbruch ohne Senden).
+- **Code:**
+  - `nachbau/motor.py`: `FUNC_VERSION` 0x0F, `FUNC_VARIABLE` 0x08, `VERSION_FIELDS`,
+    `VARIABLE_TYPES` (Host-Dekodierung live 16.10.), `build_motor_version_payload`,
+    `decode_motor_version`, `build_variable_payload`, `decode_variable`;
+    `Motor.query_motor_version()` (Aliase `motor_version`, `motor_version_normal` – ersetzt
+    den Stub) und `Motor.read_variable(idx)` (nur 1..12, sonst `ValueError` ohne Senden, mit
+    Hinweis auf den Host-Crash; Rückgabe `raw`/`float`/`int`/`type`/`value`). retries=0,
+    Timeout 0x0F/0x08 **unbelegt** → 1,0 s. `read_encoder` bleibt gesperrt (Docstring: 0x08
+    ist der Variablen-Lesepfad, Encoder-Index offen); `pin_io`-Docstring nennt die GPIOs.
+  - `nachbau/motor_mini.py`: dieselben Funktionen eigenständig (ohne Import von motor.py).
+  - `nachbau/cfswatch.py`: Motor-Requests 0x08 („Variable lesen idx N“, Warnung außerhalb
+    1..12) und 0x0F („Version abfragen“), Antworten dekodiert (Version im Klartext, Variable
+    nach Host-Typ + float/int).
+  - Selbsttests mit den Live-Frames (TX in data_send-Form, RX Vollframes mit Geräte-CRC;
+    keine UUIDs).
+- **Doku:** PROTOKOLL-485.md §3/§3.1 (Fremdtabelle 0x08/0x0F, Nachtrag mit Warnung,
+  Versions- und Variablentabelle, Pin-IO), PROTOKOLL-GESAMT.md (§1.5, §1.9 Pi-Ersatz, §4, §5),
+  CHECKLISTE.md (0x08 teilweise, 0x0F erledigt; neu: Index-Bedeutung, idx ≥ 13 am Motor,
+  Host-Crash-Hinweis Pi-Ersatz), lokale Übergabenotiz (nicht im Repo).
+- Selbsttests danach alle grün: serial485 93/93 · box 179 · boxmini 17 · cfsseq 28 ·
+  motor 154 · motor_mini 58 · auto_addr 33 · cfswatch `--selftest` OK.
+
 ## Anonymisierung (Repo-Fassung)
 
 Gegenüber der lokalen Forschungsablage sind im Repo folgende Werte durch syntaktisch
@@ -521,9 +566,11 @@ verifizierte CRCs (CRC-8/ATM über `[len..data]`), die Selbsttests laufen damit 
 | Motor-UUID (0x12-Antwort, 8 Byte, Präfix `cd ab`) | `cd ab 00 00 00 00 00 00` (Antwortframe `f7 81 0b 00 12 cd ab 00×6 ad`, CRC neu: `0xad`) |
 | Gekürzte Angaben (`…`) in der Doku | nur Platzhalter-Präfixe (`SN-DEMO-…`, `1012…`, Vendor-Felder `1`·`01`·…), nie echte Teilstücke |
 | cfswatch-Selbsttest (`SELFTEST_LOG`) | RFID-Frame mit Platzhalter-Vendor (CRC `0xd7`), 0x14 mit `153SN-DEPLATZHALTER00` (CRC `0x42`), 0xa2 mit UUID-Präfix `a0 a1` (CRC `0x25`); Bedienbeispiel mit neutralem `ssh root@<drucker> …` statt lokalem Login-Alias |
+| Zugangsdetails (lokale Wrapper-/Login-Pfade, SSH-Alias, Passwort-/Agent-Konfiguration, Passwörter) | neutral formuliert, z. B. „lokales Whitelist-Wrapper-Skript für lesende Motor-G-Codes über Moonraker“; die Whitelist-Idee und die Absturz-Warnung (`MOTOR_GET DATA=0/13` → Klipper-SHUTDOWN) sind inhaltlich vollständig erhalten |
+| Motor-`dev_uuid` (z. B. aus Moonraker-Statusobjekten) | nicht übernommen; Live-Abfragen 16.10. (`LIVE-ABFRAGEN-2026-10-16.md`) enthalten keine UUIDs, Motor-UUID nur als Platzhalter `cd ab 00×6` |
 
 Nicht im Repo: Klartextquelle `auto_addr_wrapper.py` (Creality, 729 Zeilen; Zeilenangaben
 „Orig :<zeile>“ bzw. „:604-607“ beziehen sich auf sie), Firmware-/Config-Tarball,
-lokale Übergabenotizen, die Live-Logs `live-logs-2026-10-15/` (Zeilenangaben wie
+lokale Übergabenotizen, die Rohdaten der Live-Abfragen 16.10. (`arbeitsdateien-lokal/`), das lokale Whitelist-Wrapper-Skript, die Live-Logs `live-logs-2026-10-15/` (Zeilenangaben wie
 `klippy.log:2512` beziehen sich auf sie) sowie Zugangsdaten/Login-Hinweise zum Drucker (auch der lokale SSH-Alias aus den cfswatch-Beispielen). Die Seriennummer aus den Dumps von `fake-name/cfs-reverse-engineering`
 ist nicht übernommen.

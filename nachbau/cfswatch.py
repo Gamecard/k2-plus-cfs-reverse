@@ -93,7 +93,8 @@ MOTOR_FUN_NAMES = {
     motor.FUNC_CONTROL: "Control", motor.FUNC_SYS_PARAM: "Sys-Param",
     motor.FUNC_PROTECTION: "Schutzstatus", motor.FUNC_ADDR: "Adresse",
     motor.FUNC_SET_MODE: "Stall-Mode", motor.FUNC_UUID: "UUID",
-    motor.FUNC_FW_UPDATE: "FW-Update",
+    motor.FUNC_FW_UPDATE: "FW-Update", motor.FUNC_VERSION: "Version",
+    motor.FUNC_VARIABLE: "Variable",
 }
 AUTO_ADDR_FUNS = (0xA0, 0xA1, 0xA2, 0xA3)
 DEDUP_FUNS = (box.FUNC_GET_BOX_STATE, box.FUNC_MEASURING_WHEEL,
@@ -288,6 +289,12 @@ class Decoder:
                 txt += " [%s]" % hexs(d)
         elif fun == motor.FUNC_SET_MODE and d:
             txt += " lesen" if d[0] == motor.SUB_STALL_GET else " setzen %d" % d[0]
+        elif fun == motor.FUNC_VARIABLE and len(d) == 1:
+            txt += " lesen idx %d" % d[0]
+            if not motor.VARIABLE_INDEX_MIN <= d[0] <= motor.VARIABLE_INDEX_MAX:
+                txt += " (außerhalb 1..12 – Host-Crash bei MOTOR_GET DATA=0/13!)"
+        elif fun == motor.FUNC_VERSION and list(d) == [motor.SUB_VERSION_GET]:
+            txt += " abfragen"
         elif d:
             txt += " [%s]" % hexs(d)
         return txt
@@ -311,7 +318,8 @@ class Decoder:
             return ("ungültiger Frame (%s)" % e, SEV_ERR, None, None)
         st, addr = frame[3], frame[1]
         if addr != box.BOX_ADDR or fun in AUTO_ADDR_FUNS:
-            return (self._other_resp(addr, fun, data), SEV_INFO, None, None)
+            return (self._other_resp(addr, fun, data, req_data), SEV_INFO,
+                    None, None)
         sev = SEV_INFO
         slots = None
         parts = []
@@ -480,7 +488,19 @@ class Decoder:
         return ("0x0a %s: [%s] Status 0x%02x" % (r["kind"], hexs(r["raw"]), st),
                 SEV_WARN, None, None)
 
-    def _other_resp(self, addr, fun, data):
+    def _other_resp(self, addr, fun, data, req_data=b""):
+        if addr in motor.MOTOR_ADDRS and fun == motor.FUNC_VERSION \
+                and len(data) == motor.VERSION_LEN:
+            v = motor.decode_motor_version(data)
+            return ("Version fw %s, cmd_system %s, protection %s, flash_param %s, "
+                    "logger %s" % tuple(v[n] for n, _ in motor.VERSION_FIELDS))
+        if addr in motor.MOTOR_ADDRS and fun == motor.FUNC_VARIABLE \
+                and len(data) == motor.VARIABLE_LEN and len(req_data) == 1 \
+                and req_data[0] in motor.VARIABLE_TYPES:
+            r = motor.decode_variable(req_data[0], data)
+            return "Variable idx %d = %s (%s; float %g / int %d)" % (
+                r["index"], ("%g" % r["value"]) if r["type"] == "float"
+                else r["value"], r["type"], r["float"], r["int"])
         if fun in AUTO_ADDR_FUNS:
             return "Auto-Addr-Antwort [%s]" % mask_bytes(data, 2, self.unmask)
         if fun == motor.FUNC_UUID and len(data) == motor.UUID_LEN:
@@ -880,6 +900,23 @@ def selftest():
     check("Auto-Addr-Antwort [01 00 ** **" in txt, "UUID maskiert")
     check("Bus: crc = 0x99" in txt, "CRC-Fehler gemeldet")
     check("Motor X(0x81) UUID [02] -> KEINE ANTWORT" in txt, "Motor-Name")
+    # Motor 0x0F/0x08 (Live-Frames 16.10.2026, Motor X) direkt am Decoder
+    dm = Decoder()
+    tv = dm.response(0x81, motor.FUNC_VERSION, b"\x00", hx(
+        "f7 81 0f 00 0f 01 09 07 51 01 03 01 03 02 4b 01 00 02"))[0]
+    check(tv == "Version fw 1.9.7.81, cmd_system 1.3, protection 1.3, "
+          "flash_param 2.75, logger 1.0", "Motor 0x0F Version: " + tv)
+    t9 = dm.response(0x81, motor.FUNC_VARIABLE, b"\x09",
+                     hx("f7 81 07 00 08 33 33 d3 3a e6"))[0]
+    t11 = dm.response(0x81, motor.FUNC_VARIABLE, b"\x0b",
+                      hx("f7 81 07 00 08 52 04 00 00 71"))[0]
+    check(t9.startswith("Variable idx 9 = 0.00161133 (float") and
+          t11.startswith("Variable idx 11 = 1106 (int"), "Motor 0x08: %s | %s" % (t9, t11))
+    tq = dm.request(0x81, motor.FUNC_VARIABLE, b"\x0b")[0]
+    tq0 = dm.request(0x81, motor.FUNC_VARIABLE, b"\x0d")[0]
+    check(tq == "Motor X(0x81) Variable lesen idx 11" and "Host-Crash" in tq0
+          and dm.request(0x81, motor.FUNC_VERSION, b"\x00")[0]
+          == "Motor X(0x81) Version abfragen", "Motor 0x08/0x0F-Request")
     # Flags 0x91 (BEFUND2 §8) + 0x15-Fehlerfall direkt am Decoder
     dec = Decoder()
     t91 = dec.response(0x01, box.FUNC_GET_BOX_STATE, b"",

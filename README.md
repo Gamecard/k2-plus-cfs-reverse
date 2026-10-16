@@ -16,6 +16,7 @@ Lizenz: GPL-3.0-or-later (siehe `LICENSE`), Herkunft Dritter in `NOTICES.md`.
 | `API-box_wrapper.md` | Live-introspektierte API-Fläche der CFS-`.so` |
 | `AUDIT-UND-AENDERUNGEN.md` | Audit-Protokoll aller Korrekturen mit Begründung |
 | `CHECKLISTE.md` | Projektstatus (erledigt/offen) |
+| `LIVE-ABFRAGEN-2026-10-16.md` | Live-Abfragen Motor X 16.10.2026: 0x0F Version, 0x08 Variablen-Scan, Pin-IO, Host-Crash-Warnung |
 | `GHIDRA-CFS-BEFUND-2026-10-15.md` | Ghidra-Neuanalyse der CFS-FW R153: Dispatcher, Func-/Status-Tabelle, 0x0a-Layout |
 | `GHIDRA-CFS-BEFUND2-2026-10-16.md` | Zweite Ghidra-Runde: Temp/Feuchte, 0x15, Statuscodes 0x50–0x52, Motorblock-Flags, Auto-Addr-Box-Seite, Sensor-Pins |
 | `nachbau/` | Python-Module: `serial485`, `boxmini`, `box`, `motor_mini`, `motor`, `cfsseq`, `auto_addr` – alle mit Selbsttests; `cfswatch` = nur lesender Live-Monitor für `klippy.log` |
@@ -43,10 +44,29 @@ ssh root@<drucker> 'tail -F /mnt/UDISK/printer_data/logs/klippy.log' | python3 n
 Echte Hardware braucht `pyserial`; der Import erfolgt erst bei Benutzung
 (`Serial485(port, baud)`), die Tests laufen ohne.
 
-Stand der Selbsttests (16.10.2026 nach Review 2 und BEFUND2, `ok`-Zeilen, 0 FAIL):
+Stand der Selbsttests (16.10.2026 nach den Live-Abfragen, `ok`-Zeilen, 0 FAIL):
 `serial485` 93/93 (inkl. ref-hi: 16 CRC-Vektoren + 12 Nachrichten), `box` 179,
-`boxmini` 17, `cfsseq` 28, `motor` 134, `motor_mini` 43, `auto_addr` 33,
+`boxmini` 17, `cfsseq` 28, `motor` 154, `motor_mini` 58, `auto_addr` 33,
 `cfswatch --selftest` OK.
+
+> **WARNUNG – Creality-Host-Bug:** `MOTOR_GET … DATA=0` und `MOTOR_GET … DATA=13` lassen
+> `motor_control_wrapper.so` intern scheitern (`key60: Internal error on command:MOTOR_GET`)
+> → **Klipper geht in SHUTDOWN** (16.10.2026 zweimal reproduziert; DATA=0 crasht, obwohl der
+> G-Code-Parser es ablehnt). Recovery: `FIRMWARE_RESTART`, danach ~60 s bis Motoren/Box bereit.
+> Gültig sind nur **DATA=1..12**. Empfehlung: Motor-G-Codes nie frei über Moonraker senden,
+> sondern über eine Whitelist, die nur lesende Befehle und belegte Index-Bereiche durchlässt.
+
+Live-Abfragen 16.10.2026 (Motor X 0x81, Standby, nur lesende Creality-G-Codes über Moonraker;
+Details: `LIVE-ABFRAGEN-2026-10-16.md`, `PROTOKOLL-485.md` §3.1):
+
+- `0x0F [00]` = Motor-Version, 12 B: fireware 1.9.7.81, cmd_system 1.3, protection 1.3,
+  flash_param 2.75, logger 1.0 → `query_motor_version()`.
+- `0x08 [idx]` = Variablen-Lesepfad, 4 B LE, idx 1..12 (Host: 1–10 float, 11/12 int;
+  Bedeutung je Index offen) → `read_variable(idx)` lehnt alles außerhalb 1..12 ohne Senden ab;
+  `read_encoder` bleibt gesperrt. `cfswatch` dekodiert beide und warnt bei idx außerhalb 1..12.
+- `MOTOR_READ_ALL_PIN_IO` läuft **nicht** über RS485, sondern als GPIO-Abfrage an der
+  Main-MCU (PB9, PB10, !PB7, PB8, PB5, PB6, PA1, PB15) – ein Pi-Ersatz braucht dafür weiter
+  die Main-MCU.
 
 Ghidra-BEFUND2 16.10.2026 (Details: `GHIDRA-CFS-BEFUND2-2026-10-16.md`):
 
@@ -112,8 +132,22 @@ RS485 protocol between the Creality K2 Plus host board and its lower boards
 by live captures and Ghidra analysis. License: GPL-3.0-or-later.
 
 Status 16.10.2026: all self-tests green (serial485 93/93 incl. Hi reference
-vectors, box 179, boxmini 17, cfsseq 28, motor 134, motor_mini 43, auto_addr 33,
+vectors, box 179, boxmini 17, cfsseq 28, motor 154, motor_mini 58, auto_addr 33,
 `cfswatch.py --selftest` OK).
+
+**WARNING – Creality host bug:** `MOTOR_GET … DATA=0` and `MOTOR_GET … DATA=13` make
+`motor_control_wrapper.so` fail internally (`key60`) and put **Klipper into SHUTDOWN**
+(reproduced twice on 16.10.2026; recover with `FIRMWARE_RESTART`). Only `DATA=1..12` is
+valid. Never send motor G-codes freely via Moonraker – use a whitelist that only lets
+read-only commands and known index ranges through.
+
+Live queries 16.10.2026 (motor X 0x81, idle, read-only stock G-codes via Moonraker;
+`LIVE-ABFRAGEN-2026-10-16.md`, German): `0x0F [00]` returns the 12-byte motor version
+block (firmware 1.9.7.81, cmd_system 1.3, protection 1.3, flash_param 2.75, logger 1.0,
+`query_motor_version()`); `0x08 [idx]` reads a 4-byte LE system variable for idx 1..12
+(meaning per index still open; `read_variable()` rejects other indices without sending,
+`read_encoder` stays disabled); `MOTOR_READ_ALL_PIN_IO` is a GPIO query on the main MCU,
+not an RS485 command.
 
 New: `nachbau/cfswatch.py`, a read-only live monitor for `klippy.log` (never
 transmits, masks SN/UUID/vendor). Second Ghidra pass (`GHIDRA-CFS-BEFUND2-2026-10-16.md`):

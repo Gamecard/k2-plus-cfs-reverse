@@ -178,8 +178,22 @@ motor 98 · motor_mini 30 · auto_addr 31 – alle grün.
   war die Antwort; Werte flüchtig (PROTOKOLL-485.md §3.1, umgesetzt in motor.py)
 - [ ] Erase (0xF0/0x06) belegen: nur CFS-Typ 1/10 dekompiliert, für Motoren unbelegt
   (im Nachbau nur mit `erase=True`)
-- [ ] Motor 0x08 (laut grant0013 „get feedback“) live prüfen – Kandidat fürs echte
-  Encoder-Lesen; `read_encoder` bleibt bis dahin gesperrt
+- [x] Motor 0x08 (laut grant0013 „get feedback“) live prüfen – Kandidat fürs echte
+  Encoder-Lesen; `read_encoder` bleibt bis dahin gesperrt – **TEILWEISE ERLEDIGT 16.10.2026
+  (live, Motor X, Standby):** 0x08 = Variablen-Lesepfad `[idx]` → 4 B LE, idx 1..12 gescannt
+  (9 = 0.0016113, 10 = 0.0008057, 11 = 1106, Rest 0), Bedeutung je Index **offen**
+  (`motor.read_variable`, `VARIABLE_TYPES`); `read_encoder` bleibt gesperrt
+- [x] Motor 0x0F (version) live prüfen – **ERLEDIGT 16.10.2026:** `[00]` → 12 B
+  (fireware_ver 1.9.7.81, cmd_system 1.3, protection 1.3, flash_param 2.75, logger 1.0;
+  `motor.query_motor_version`, ersetzt Stub `motor_version_normal`)
+- [ ] **NEU 16.10.2026:** Bedeutung der 0x08-Indizes 1..12 klären – Scan nach Homing bzw.
+  während Bewegung wiederholen (Werte ≠ 0 zuordnen) und/oder Namen aus
+  `motor_control_wrapper.so` ziehen (Strings: Stock ruft `MOTOR_GET NUM=1 DATA=7/8 EXTRUDER=1`
+  und `MOTOR_GET NUM=1 DATA=1` in `_stats_motor_get_value`); erst danach ggf. `read_encoder`
+  freigeben. NIE `MOTOR_GET DATA=0` oder `DATA=13` senden (Host-Crash, s. AUDIT 16.10.)
+- [ ] **NEU 16.10.2026:** Offen, ob der Motor selbst 0x08 mit idx ≥ 13 verträgt (Crash bei
+  DATA=13 liegt im Host; nicht geprüft, ob ein Frame rausging) – nur mit eigenem Sender,
+  nicht über Stock-G-Code
 - [x] Motor 0x0C: Protection-Semantik (grant0013/k2-vanilla) gegen Plus-Frame `00*8` prüfen
   – **ERLEDIGT 15.10.2026:** Request `[0b]` → 8 B Status (00 = ok), `[05]` ohne Antwort;
   „8-Byte-Parameter“ WIDERLEGT (`motor.check_protection`)
@@ -279,7 +293,13 @@ Quelle: `live-logs-2026-10-15/` (lokal, nicht fürs Repo), Auswertung PROTOKOLL-
   Protection `0C [0b]`, flash_param-Lesen) und die **Sys-Params nach jedem Kaltstart neu
   schreiben** (0x06 Sub 01/03 flüchtig, sonst Board-Defaults Kp 300 / err_time 0,01 / …)
 - [ ] GPIO-Phase („initial/restore set_pin_io“ der Motor-dir/step-Pins) vor/nach der
-  Adressabfrage braucht die **Main-MCU**
+  Adressabfrage braucht die **Main-MCU** – **BESTÄTIGT 16.10.2026:** `MOTOR_READ_ALL_PIN_IO`
+  ist eine Klipper-GPIO-Abfrage (`gpio_status`, oid 11) an der Main-MCU (PB9, PB10, !PB7,
+  PB8, PB5, PB6, PA1, PB15), kein RS485
+- [ ] **HINWEIS 16.10.2026 (Host-Crash):** Eine eigene MOTOR_GET-/0x08-Implementierung muss
+  den Variablen-Index **vor** dem Senden validieren (belegt: 1..12). Der Stock-Host
+  (`motor_control_wrapper.so`) geht bei `DATA=0`/`DATA=13` in Klipper-SHUTDOWN (key60);
+  Nachbau `read_variable` lehnt alles außerhalb 1..12 mit `ValueError` ab
 - [ ] Extruder-Motor nur über `transparent_send` (nozzle_mcu, Adresse 0x81) – Creality-
   Klipper-MCU-FW mit `config_transparent` oder eigene Lösung nötig
 

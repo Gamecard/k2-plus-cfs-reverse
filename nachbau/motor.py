@@ -8,12 +8,18 @@ Sperren, gleiche Retry-/Timeout-Regeln).
 LIVE-STAND 15.10.2026 (Auswertung live-logs-2026-10-15/klippy.log*, lokal, nicht im Repo, 6 Logs,
 10 Boot-Enumerationen; Zeilenangaben "Datei:Zeile" beziehen sich auf diesen
 Ordner, "klippy.log" = Boot 16.10. 01:15 Druckerzeit).
+NACHTRAG 16.10.2026 (LIVE-ABFRAGEN-2026-10-16.md, Motor X 0x81, Standby,
+nicht referenziert, gesendet über Creality-G-Codes MOTOR_VERSION/MOTOR_GET):
+0x0F = Version ([00] -> 12 B) und 0x08 = Variablen-Lesepfad ([idx] -> 4 B LE,
+idx 1..12) sind live belegt -> query_motor_version(), read_variable().
 
 Umfang:
 - LESEND (live belegt, senden erlaubt):
   read_sys_param / read_sys_param_raw (0x06 [02, id]),
   check_protection (0x0C [0b]), get_stall_mode (0x11 [04]),
-  read_485_addr (0x0E [02]), read_uuid (0x12 [02])
+  read_485_addr (0x0E [02]), read_uuid (0x12 [02]),
+  query_motor_version (0x0F [00] -> 12 B, live 16.10.),
+  read_variable (0x08 [idx], NUR idx 1..12 -> 4 B, live 16.10.)
 - SETZEN (live belegt, sendet): set_mode (0x11 [01]/[02]/[03], Antwort = Echo)
 - SCHREIBEN (live belegt, aber GESCHÜTZT): write_sys_param (0x06 [01, id]+<f)
   und update_sys_params (0x06 [03]) senden NUR mit confirm=True, sonst
@@ -22,7 +28,15 @@ Umfang:
 - Reine Builder (ohne Senden): build_sys_param_read_payload,
   build_sys_param_write_payload, build_sys_param_update_payload
 - decode_sys_param_float: Dekodier-Hilfe (<f, ohne Bus)
-- read_encoder: GESPERRT (0x08 "get feedback" nie beobachtet)
+- read_encoder: GESPERRT – 0x08 ist live der Variablen-Lesepfad
+  (read_variable); welcher Index Encoder/Position ist, ist OFFEN
+- WARNUNG Host-Bug (live 16.10., zweimal reproduziert): Creality
+  `MOTOR_GET … DATA=0` und `DATA=13` -> interner Fehler in
+  motor_control_wrapper.so (key60) -> Klipper-SHUTDOWN (Recovery
+  FIRMWARE_RESTART). read_variable bleibt deshalb im belegten Bereich 1..12.
+- Pin-IO (MOTOR_READ_ALL_PIN_IO): KEIN RS485 – dir/step-Pins der Motoren
+  hängen an der Main-MCU (Klipper-GPIO PB9, PB10, !PB7, PB8, PB5, PB6, PA1,
+  PB15) -> pin_io bleibt Stub (Main-MCU nötig)
 - Update-Pfad (Func 0xF0, aus mcu_util_485-Decompile; auf dem Motorbus
   live NIE beobachtet): query_version/query_sector_size frei (Abfragen),
   request_update/send_fw_len/update_end NUR mit confirm=True (Bootloader-
@@ -55,7 +69,7 @@ Stock wiederholt nur beim E-Motor (0x85) auf Anwendungsebene (IDs 9/10/25
 je 3x) – nicht nachgebaut (0x85 gesperrt).
 
 Nie beobachtet (bleiben Stubs bzw. unverändert): 0x01, 0x03, 0x04, 0x07,
-0x08, 0x0B, 0x0D, 0x0F, 0xF0. 0x05 ([01]/[02] an X/Y bei BELT_TENSION)
+0x0B, 0x0D, 0xF0 (0x08/0x0F seit 16.10. live belegt, s. oben). 0x05 ([01]/[02] an X/Y bei BELT_TENSION)
 wurde nie beantwortet (klippy.log.2026-10-12:28621-28636) -> nicht gebaut.
 
 Frühere Belege: PROTOKOLL-GESAMT.md 1.5/1.7/2.2 (Cut-Kalibrierung, Update-
@@ -81,8 +95,9 @@ import struct
 #
 # Fremd-Hypothesen grant0013 (K2) für live NIE beobachtete Codes – nur
 # Abgleich, NICHT senden: 0x01 reboot, 0x03 encoder_cal, 0x04
-# elec_offset_cal, 0x07 flash_param, 0x08 get feedback, 0x0B boot,
-# 0x0D systemid, 0x0F version.
+# elec_offset_cal, 0x07 flash_param, 0x0B boot, 0x0D systemid.
+# (0x08 "get feedback" -> live 16.10. Variablen-Lesepfad; 0x0F "version"
+# -> live 16.10. bestätigt.)
 FUNC_CONTROL = 0x05        # [01]/[02] live nie beantwortet -> NICHT gebaut
 FUNC_SYS_PARAM = 0x06
 FUNC_READ_ENCODER = FUNC_SYS_PARAM  # Alt-Name, NUR Kompatibilität – nicht senden!
@@ -93,6 +108,34 @@ FUNC_SET_MODE = 0x11       # Stall-Mode: [01]/[02]/[03] setzen, [04] lesen
 FUNC_STALL_MODE = FUNC_SET_MODE
 FUNC_UUID = 0x12           # [02] -> 8 B UUID (Präfix cd ab)
 FUNC_FW_UPDATE = 0xF0      # Update-Pfad, Sub-Codes aus Decompile (Abschnitt 1.7)
+FUNC_VARIABLE = 0x08       # live 16.10.: [idx] -> 4 B LE (Variablen-Lesepfad)
+FUNC_VERSION = 0x0F        # live 16.10.: [00] -> 12 B Versionsblock
+
+# 0x0F Version (live 16.10.2026, MOTOR_VERSION NUM=1 DATA=0):
+#   TX data_send `81 04 00 0f 00`
+#   RX `f7 81 0f 00 0f 01 09 07 51 01 03 01 03 02 4b 01 00 02`
+#   12 B = fireware_ver 4 B (1.9.7.81) | cmd_system_ver 2 B (1.3) |
+#          protection_ver 2 B (1.3) | flash_param_ver 2 B (2.75) |
+#          logger_ver 2 B (1.0). Feldnamen = Strings motor_control_wrapper.so.
+SUB_VERSION_GET = 0x00
+VERSION_LEN = 12
+VERSION_FIELDS = (("fireware_ver", 4), ("cmd_system_ver", 2),
+                  ("protection_ver", 2), ("flash_param_ver", 2),
+                  ("logger_ver", 2))
+
+# 0x08 Variable (live 16.10.2026, MOTOR_GET NUM=1 DATA=idx, Scan 1..12,
+# Rohdaten lokal, nicht im Repo): TX `81 04 00 08 <idx>`, RX 4 B LE.
+# Host-Text "系统所支持变量当前值" (aktueller Wert einer vom System
+# unterstützten Variable); Namen gibt der Host NICHT aus.
+# Host-Bug: DATA=0 und DATA=13 -> Klipper-SHUTDOWN (key60) -> nur 1..12.
+VARIABLE_LEN = 4
+VARIABLE_INDEX_MIN = 1
+VARIABLE_INDEX_MAX = 12
+# Host-Dekodierung live 16.10. (Typ, wie motor_control_wrapper.so den Wert
+# ausgab – NICHT die Bedeutung): idx 1..10 float, 11/12 int.
+VARIABLE_TYPES = {1: "float", 2: "float", 3: "float", 4: "float",
+                  5: "float", 6: "float", 7: "float", 8: "float",
+                  9: "float", 10: "float", 11: "int", 12: "int"}
 
 # Sub-Codes 0x06 (live)
 SUB_SYS_WRITE = 0x01       # "sys参数操作-写入成功" (klippy.log.2026-10-12:10707)
@@ -121,6 +164,11 @@ TIMEOUT_PROTECTION = 0.05  # 0x0C ([05]-Timeouts 0.052-0.066 s)
 TIMEOUT_ADDR = 0.05        # 0x0E (0.052-0.061 s)
 TIMEOUT_UUID = 1.0         # 0x12 (1.002-1.006 s)
 TIMEOUT_STALL = 1.0        # 0x11: nie Timeout beobachtet -> UNBELEGT (TIMEOUT_LONG)
+# 0x0F/0x08: live 16.10. nur je 1 Antwort (Moonraker-G-Code), kein Timeout
+# beobachtet -> Wert UNBELEGT, 1.0 s (serial485 TIMEOUT_LONG). retries=0
+# wie alle Motor-Sendungen.
+TIMEOUT_VERSION = 1.0      # unbelegt
+TIMEOUT_VARIABLE = 1.0     # unbelegt
 
 # Sub-Codes Update-Pfad (Beleg: PROTOKOLL-GESAMT.md 1.7, je 1 Byte, 3 Retries)
 SUB_GET_VERSION = 0x00     # get version
@@ -422,6 +470,67 @@ def build_sys_param_update_payload():
     """0x06-Update-Payload [03] ("Updata param"), Antwort [01]
     (klippy.log:2869/2875). REINER BUILDER, sendet nichts."""
     return [SUB_SYS_UPDATE]
+
+
+def build_motor_version_payload():
+    """0x0F-Payload [00] (live 16.10.: `81 04 00 0f 00`). Builder."""
+    return [SUB_VERSION_GET]
+
+
+def decode_motor_version(data):
+    """12 B 0x0F-Antwort -> dict. KEIN Bus-Zugriff.
+
+    fireware_ver "a.b.c.d" (4 Bytes dezimal), die übrigen "major.minor"
+    (minor dezimal: 02 4b -> "2.75"); 'raw' = Rohbytes.
+    Live 16.10.: 01 09 07 51 01 03 01 03 02 4b 01 00 -> fireware_ver
+    1.9.7.81, cmd_system_ver 1.3, protection_ver 1.3, flash_param_ver 2.75,
+    logger_ver 1.0.
+    """
+    raw = bytes(data)
+    if len(raw) != VERSION_LEN:
+        raise ValueError("0x0F: %d statt %d Bytes: %r" % (len(raw), VERSION_LEN, raw))
+    out, pos = {}, 0
+    for name, n in VERSION_FIELDS:
+        out[name] = ".".join(str(b) for b in raw[pos:pos + n])
+        pos += n
+    out["raw"] = raw
+    return out
+
+
+def _check_variable_index(idx):
+    if isinstance(idx, bool) or not isinstance(idx, int) \
+            or not VARIABLE_INDEX_MIN <= idx <= VARIABLE_INDEX_MAX:
+        raise ValueError(
+            "0x08-Index muss int %d..%d sein (live belegt): %r – Index 0/13 "
+            "lässt den Creality-Host (motor_control_wrapper.so, MOTOR_GET "
+            "DATA=0/13) in Klipper-SHUTDOWN laufen; Verhalten des Motors "
+            "außerhalb 1..12 unbelegt" % (VARIABLE_INDEX_MIN, VARIABLE_INDEX_MAX, idx))
+
+
+def build_variable_payload(idx):
+    """0x08-Payload [idx], idx 1..12 (live 16.10.: `81 04 00 08 09`). Builder."""
+    _check_variable_index(idx)
+    return [idx]
+
+
+def decode_variable(idx, data):
+    """4 B 0x08-Antwort -> {'index', 'raw', 'float', 'int', 'type', 'value'}.
+    KEIN Bus-Zugriff.
+
+    'float' = <f, 'int' = <i (signed; live nur positive Werte, Vorzeichen
+    UNBELEGT), 'type' = Host-Dekodierung live 16.10. (VARIABLE_TYPES),
+    'value' = Wert in diesem Typ. Bedeutung der Indizes OFFEN.
+    Live: 33 33 d3 3a -> 0.0016113 (idx 9), 52 04 00 00 -> 1106 (idx 11).
+    """
+    _check_variable_index(idx)
+    raw = bytes(data)
+    if len(raw) != VARIABLE_LEN:
+        raise ValueError("0x08 idx %d: %d statt 4 Bytes: %r" % (idx, len(raw), raw))
+    f = struct.unpack("<f", raw)[0]
+    i = struct.unpack("<i", raw)[0]
+    typ = VARIABLE_TYPES[idx]
+    return {"index": idx, "raw": raw, "float": f, "int": i, "type": typ,
+            "value": f if typ == "float" else i}
 
 
 def fw_checksum(data):
@@ -753,16 +862,51 @@ class Motor:
 
     # --- Gesperrt ---
 
+    # --- 0x0F Version / 0x08 Variablen (live 16.10.2026) ---
+
+    def query_motor_version(self):
+        """Motor-Version im Normalbetrieb (0x0F [00]) -> dict. LESEND.
+
+        = Stock MOTOR_VERSION NUM=n DATA=0. Live 16.10. (Motor X):
+        `81 04 00 0f 00` -> `f7 81 0f 00 0f 01 09 07 51 01 03 01 03 02 4b 01
+        00 02` = fireware_ver 1.9.7.81, cmd_system_ver 1.3, protection_ver
+        1.3, flash_param_ver 2.75, logger_ver 1.0 (s. decode_motor_version).
+        retries=0, Timeout 1.0 s (UNBELEGT). Nicht verwechseln mit
+        query_version() (Update-Pfad F0/00, live nie beobachtet).
+        """
+        return decode_motor_version(self._tx(FUNC_VERSION,
+                                             build_motor_version_payload(),
+                                             TIMEOUT_VERSION))
+
+    motor_version = query_motor_version         # Wrapper-Name
+    motor_version_normal = query_motor_version  # früherer Stub-Name
+
+    def read_variable(self, idx):
+        """Variable lesen (0x08 [idx]) -> dict (s. decode_variable). LESEND.
+
+        = Stock MOTOR_GET NUM=n DATA=idx. NUR idx 1..12 (live 16.10. Scan an
+        Motor X, Standby: 1-8 = 0, 9 = 0.0016113, 10 = 0.0008057, 11 = 1106,
+        12 = 0); sonst ValueError OHNE Senden – Creality-Host stürzt bei
+        DATA=0/13 ab (Klipper-SHUTDOWN), Motorverhalten außerhalb unbelegt.
+        Der Typ je Index ist nur als Host-Dekodierung bekannt (VARIABLE_TYPES),
+        daher float UND int. retries=0, Timeout 1.0 s (UNBELEGT).
+        """
+        payload = build_variable_payload(idx)
+        return decode_variable(idx, self._tx(FUNC_VARIABLE, payload,
+                                             TIMEOUT_VARIABLE))
+
     def read_encoder(self, *args, **kwargs):
         """GESPERRT – sendet KEINEN Frame.
 
         0x06 ist live Sys-Param (Lesen/Schreiben von Regelparametern), kein
-        Encoder. Fremd-Kandidat 0x08 "get feedback" (grant0013, K2) wurde in
-        keinem Live-Log beobachtet -> bleibt gesperrt bis Live-Beleg.
+        Encoder. 0x08 ist live (16.10.) der Variablen-Lesepfad (read_variable,
+        idx 1..12); WELCHER Index Encoder/Position ist, ist OFFEN (Scan nur im
+        Stillstand, Motoren stromlos). Bis zur Klärung (Scan nach Homing/in
+        Bewegung, Namen aus motor_control_wrapper.so) bleibt read_encoder zu.
         """
         raise NotImplementedError(
-            "read_encoder gesperrt: 0x06 = Sys-Param (live), 0x08 'get feedback' "
-            "nie beobachtet – Encoder-Lesen unbelegt")
+            "read_encoder gesperrt: 0x08 = Variablen-Lesepfad (read_variable, "
+            "idx 1..12), Encoder-/Positions-Index aber unbelegt")
 
     # --- Update-Pfad (Func 0xF0, live NIE beobachtet) ---
     # FREI (lesend): query_version (Sub 00), query_sector_size (Sub 03) – im
@@ -873,14 +1017,11 @@ class Motor:
 
     def pin_io(self, *args):
         """TODO: Pin-IO – live über die Main-MCU (set_pin_io, klippy.log:
-        2259-2267/2492-2500), NICHT über den Motorbus; hier nicht nachgebaut."""
+        2259-2267/2492-2500; MOTOR_READ_ALL_PIN_IO 16.10. = Klipper-GPIO
+        gpio_status PB9, PB10, !PB7, PB8, PB5, PB6, PA1, PB15), NICHT über den
+        Motorbus; hier nicht nachgebaut."""
         raise NotImplementedError("TODO Pin-IO: läuft über Main-MCU, nicht RS485")
 
-    def motor_version_normal(self):
-        """TODO: `motor_version` im Normalbetrieb – 0x0F live nie beobachtet;
-        belegt ist nur der Update-Pfad (query_version, F0/00)."""
-        raise NotImplementedError("TODO motor_version (Normalbetrieb): 0x0F nie "
-                                  "beobachtet; belegt nur F0/00 via query_version()")
 
 
 # --- Selbsttest (keine Hardware, kein Netzwerk nötig) ---
@@ -1123,7 +1264,7 @@ def selftest():
     mm = Motor(nobus, 0x84)
     stub_ok = all(raises(NotImplementedError, f) for f in [
         mm.encoder_calibrate, mm.elec_offset_calibrate, mm.check_protection_code,
-        mm.pin_io, mm.motor_version_normal,
+        mm.pin_io,
         lambda: mm.set_e_stall_mode(1), lambda: mm.set_z_stall_mode(1),
         lambda: mm.get_flash_param(0), lambda: mm.set_flash_param(0, 1)])
     check("stubs not-implemented", stub_ok)
@@ -1132,6 +1273,56 @@ def selftest():
     corrupt = bytearray(bytes.fromhex("f7 81 07 00 06 00 00 96 43 09"))
     corrupt[-1] ^= 0xFF
     check("crc-fehler", raises(ValueError, parse_frame, bytes(corrupt)))
+
+    # 7b. 0x0F Version + 0x08 Variablen (LIVE-ABFRAGEN-2026-10-16.md,
+    #     Scan-Rohdaten lokal, nicht im Repo; Motor X, Standby)
+    V_RX = "f7 81 0f 00 0f 01 09 07 51 01 03 01 03 02 4b 01 00 02"
+    bus = _FakeBus([("81 04 00 0f 00", V_RX), ("81 04 00 0f 00", V_RX)])
+    v = Motor(bus, 0x81).query_motor_version()
+    check("0x0F Version live (fw 1.9.7.81 ...)",
+          v == {"fireware_ver": "1.9.7.81", "cmd_system_ver": "1.3",
+                "protection_ver": "1.3", "flash_param_ver": "2.75",
+                "logger_ver": "1.0",
+                "raw": bytes.fromhex("01 09 07 51 01 03 01 03 02 4b 01 00")}
+          and bus.calls[0][3] == {"timeout": TIMEOUT_VERSION, "retries": 0})
+    check("0x0F Alias motor_version_normal",
+          Motor(bus, 0x81).motor_version_normal()["flash_param_ver"] == "2.75"
+          and not bus.script)
+    check("0x0F Vollframe TX", build_frame(0x81, FUNC_VERSION,
+                                           build_motor_version_payload())[1:-1]
+          == bytes.fromhex("81 04 00 0f 00"))
+    check("0x0F Längen-Guard",
+          raises(ValueError, decode_motor_version, bytes(11))
+          and raises(ValueError, decode_motor_version, bytes(13)))
+    scan = {i: "00 00 00 00" for i in range(1, 13)}
+    scan.update({9: "33 33 d3 3a", 10: "33 33 53 3a", 11: "52 04 00 00"})
+    crcs = {i: "0a" for i in range(1, 13)}
+    crcs.update({9: "e6", 10: "50", 11: "71"})  # Geräte-CRC aus dem Scan
+    bus = _FakeBus([("81 04 00 08 %02x" % i,
+                     "f7 81 07 00 08 %s %s" % (scan[i], crcs[i]))
+                    for i in range(1, 13)])
+    mv = Motor(bus, 0x81)
+    res = {i: mv.read_variable(i) for i in range(1, 13)}
+    check("0x08 idx 1..12 gelesen, retries=0",
+          not bus.script and len(bus.calls) == 12 and all(
+              c[2] == [i + 1] and c[3] == {"timeout": TIMEOUT_VARIABLE, "retries": 0}
+              for i, c in enumerate(bus.calls)))
+    check("0x08 idx 1-8/12 = 0", all(res[i]["value"] == 0 and res[i]["raw"] == bytes(4)
+                                     for i in list(range(1, 9)) + [12]))
+    check("0x08 idx 9 float 0.0016113",
+          abs(res[9]["float"] - 0.0016113281017169356) < 1e-12
+          and res[9]["type"] == "float" and res[9]["value"] == res[9]["float"])
+    check("0x08 idx 10 float 0.0008057",
+          abs(res[10]["value"] - 0.0008056640508584678) < 1e-12)
+    check("0x08 idx 11 int 1106", res[11]["int"] == 1106 and res[11]["value"] == 1106
+          and res[11]["type"] == "int" and res[11]["raw"] == bytes.fromhex("52 04 00 00"))
+    check("0x08 VARIABLE_TYPES 1..12", sorted(VARIABLE_TYPES) == list(range(1, 13))
+          and [VARIABLE_TYPES[i] for i in (9, 10, 11, 12)] == ["float", "float", "int", "int"])
+    for bad in (0, 13, -1, 255, True, 1.0, None, "9"):
+        check("0x08 idx-guard %r (Host-Crash 0/13)" % (bad,),
+              raises(ValueError, Motor(nobus, 0x81).read_variable, bad))
+    check("0x08 Längen-Guard", raises(ValueError, decode_variable, 9, bytes(3)))
+    check("0x08 Guards senden nichts", nobus.calls == [])
 
     # 8. Update-Pfad (Doku 1.7 + Disassembly, live nie beobachtet)
     bus = _FakeBus([

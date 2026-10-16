@@ -149,7 +149,21 @@ NEU 15.10.2026 (Ghidra, R153): 0x01 LED-Refresh, 0x06 Feeder (FW-Bug: immer Stat
 0x0e = (LIVE 15.10.2026) addr 0E [02] → [addr]; FF 0E [01] Broadcast ohne Antwort
 0x12 = (LIVE 15.10.2026) addr 12 [02] → 8 B UUID (Präfix cd ab)
 0x05 = (LIVE 15.10.2026) [01]/[02] an X/Y bei BELT_TENSION, nie Antwort (Semantik offen)
+0x0f = (LIVE 16.10.2026, Motor X) Version [00] → 12 B: fireware_ver 1.9.7.81 | cmd_system 1.3 |
+       protection 1.3 | flash_param 2.75 | logger 1.0
+       (f7 81 0f 00 0f 01 09 07 51 01 03 01 03 02 4b 01 00 02)
+0x08 = (LIVE 16.10.2026, Motor X) Variable lesen [idx 1..12] → 4 B LE (Host: float idx 1–10,
+       int idx 11/12; Standby: 9 = 0.0016113, 10 = 0.0008057, 11 = 1106, Rest 0);
+       Bedeutung je Index OFFEN. !! Creality-Host MOTOR_GET DATA=0/13 → Klipper-SHUTDOWN !!
 ```
+
+- **Live-Abfragen 16.10.2026** (`LIVE-ABFRAGEN-2026-10-16.md`, Details PROTOKOLL-485.md §3.1
+  Nachtrag): 0x0F und 0x08 belegt (s. oben), 0x0E/0x0C bestätigt. **WARNUNG:** `MOTOR_GET`
+  mit `DATA=0` oder `DATA=13` lässt `motor_control_wrapper.so` intern scheitern (key60) →
+  Klipper-SHUTDOWN (2× reproduziert, Recovery `FIRMWARE_RESTART`). Nachbau:
+  `query_motor_version()`, `read_variable(idx)` nur 1..12; `read_encoder` bleibt gesperrt
+  (Encoder-Index offen). `MOTOR_READ_ALL_PIN_IO` läuft **nicht** über RS485, sondern als
+  Klipper-GPIO-Abfrage an der **Main-MCU** (PB9, PB10, !PB7, PB8, PB5, PB6, PA1, PB15).
 
 - **Pfad (LIVE 15.10.2026):** X/Y/Z/Z1 ausschließlich über serial_485 ttyS5 (geteilt mit
   CFS 0x01 + Belt), Extruder nur über `transparent_send`/0x81. Alle Motor-Requests
@@ -301,6 +315,12 @@ Details siehe Subagenten-Bericht in der Session-Historie.
   Plus direkt am `/dev/ttyS5`-Bus oder nur über die Main-MCU erreichbar sind.
   **GEKLÄRT 15.10.2026 (live):** am Plus direkt am ttyS5; nur der Extruder über
   transparent – die grant-Architektur gilt für den K2, nicht den Plus.
+  **NACHTRAG 16.10.2026 (live):** Die dir/step-Pins der 4 Motoren (initial/restore
+  `set_pin_io`, `MOTOR_READ_ALL_PIN_IO`) sind Klipper-GPIOs der **Main-MCU** (PB9, PB10,
+  !PB7, PB8, PB5, PB6, PA1, PB15) → ein Pi-Ersatz spricht die Motoren zwar direkt über
+  ttyS5, braucht für die GPIO-Phase aber weiter die Main-MCU. Eine eigene
+  MOTOR_GET-Implementierung muss den Variablen-Index (1..12) **vor** dem Senden prüfen
+  (Stock-Host crasht bei 0/13).
 
 **Kreuzvergleich: fake-name/cfs-reverse-engineering (CFS-Hardware, 15.10.2026 gesichtet)**
 
@@ -397,6 +417,11 @@ ein FW-File pro Board. Noch nicht dekompiliert.
 - `motor_control_wrapper` (1,1 MB): `motor_version/sys_param/flash_param`,
   `motor_encoder_calibrate`, `motor_elec_offset_calibrate`, `set_e/z_stall_mode`,
   `check_protection_code`, `motor_read485_addr`
+- LIVE 16.10.2026: `motor_version` = 0x0F [00] (Felder `fireware_ver`, `cmd_system_ver`,
+  `protection_ver`, `flash_param_ver`, `logger_ver`; Motor X fw 1.9.7.81), `motor_get` =
+  0x08 [idx] (idx 1..12, Namen offen; Strings zeigen Stock-Aufrufe `MOTOR_GET NUM=1 DATA=7/8
+  EXTRUDER=1` und `MOTOR_GET NUM=1 DATA=1` in `_stats_motor_get_value`). **Host-Bug:**
+  `MOTOR_GET DATA=0/13` → interner Fehler → Klipper-SHUTDOWN. Pin-IO über Main-MCU-GPIO.
 - Config: `motor_closed_loop: x,y,z,z1,e`, LESO/PID-Parameter je Achse
   (Pos-/Spd-/Cur-Loop), Stall-Pins je Achse
 - Board-FW: `fw/F008/mot*_022_C30-mot2_002_081.bin` (123K, Klartext-Strings)
@@ -413,7 +438,7 @@ ein FW-File pro Board. Noch nicht dekompiliert.
 | `belt_mdl.py` | Belt-Logik (reines Python, offen!) | komplett dokumentiert |
 | `filament_rack_wrapper.so` | Trockner/Regal (Addr 0x11) | Strings dokumentiert, Live offen |
 | `prtouch_v1/v2/v3_wrapper.so` | Druck-Leveling | v3 live belegt |
-| `motor_control_wrapper.so` | Closed-loop | live belegt (Cut) |
+| `motor_control_wrapper.so` | Closed-loop | live belegt (Cut; 0x0F/0x08 16.10.) |
 | `load_ai` + `usr/lib/yolov5/*.bin` | AI-Abfall-Erkennung (Kamera+Inference) | NICHT analysiert |
 | `cfs6` | `cfs6_100_G31-cfs6_222_000.bin` (145K Cortex-M) | Geladen in Ghidra: Basis ~~`0x08000000`~~ (**KORRIGIERT 15.10.2026: richtig `0x08004000`**, App-Image ohne Bootloader – passt zum Reset `0x08004144`), SP `0x20008030`, ~~798 Funktionen (alte Basis; Neuanalyse 15.10.2026 ausstehend)~~ **936 Funktionen @0x08004000 (Neuanalyse 15.10.2026)**; andere Gerätevariante (Heizung/Lüfter, Bus RS485 oder CAN), s. „CFS-FW Neuanalyse“ unten | Import-Rezept unten |
 

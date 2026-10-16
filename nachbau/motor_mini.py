@@ -8,7 +8,10 @@ Details, Param-Namen-Tabelle und Update-Pfad dort.
 LIVE-STAND 15.10.2026 (live-logs-2026-10-15/klippy.log*, lokal, nicht im Repo; s. motor.py):
 - LESEND (senden erlaubt): read_sys_param (0x06 [02, id]),
   check_protection (0x0C [0b] -> 8 B), get_stall_mode (0x11 [04]),
-  read_485_addr (0x0E [02]), read_uuid (0x12 [02] -> 8 B)
+  read_485_addr (0x0E [02]), read_uuid (0x12 [02] -> 8 B),
+  query_motor_version (0x0F [00] -> 12 B) und read_variable (0x08 [idx],
+  NUR idx 1..12 -> 4 B) – beide live 16.10.2026 an Motor X
+  (LIVE-ABFRAGEN-2026-10-16.md)
 - set_mode (0x11 [01]/[02]/[03], Antwort = Echo) – sendet, live belegt
 - write_sys_param: 0x06 [01, id] + <f – sendet NUR mit confirm=True
   (sonst PermissionError); verändert Motorregelparameter, FLÜCHTIG bis
@@ -17,7 +20,9 @@ LIVE-STAND 15.10.2026 (live-logs-2026-10-15/klippy.log*, lokal, nicht im Repo; s
   allow_locked). Wert-Plausibilität wie motor.py (1e-50 -> ValueError).
 - update_sys_params: 0x06 [03] – NUR mit confirm=True (wie motor.py)
 - Reine Builder: build_sys_param_write_payload, build_sys_param_update_payload
-- read_encoder: GESPERRT (0x08 nie beobachtet, 0x06 = Sys-Param)
+- read_encoder: GESPERRT (0x08 = Variablen-Lesepfad, Encoder-Index offen)
+- WARNUNG: Creality-Host MOTOR_GET DATA=0/13 -> Klipper-SHUTDOWN (live 16.10.,
+  2x reproduziert) -> read_variable lehnt Index außerhalb 1..12 ab.
 - query_version: Update-Pfad (0xF0/00, Decompile; live nie beobachtet) –
   FREI, reine "get version"-Abfrage (erster Schritt vor request-update).
   Die zustandsändernden F0-Sender (request_update/send_fw_len/update_end)
@@ -29,7 +34,7 @@ sondern nur transparent über die (vermutlich) Nozzle-MCU unter 0x81
 (klippy.log:2375/2376) – nicht in diesem Modul.
 
 Retries/Timeouts wie Stock: alle Motor-Kommandos retries=0 (1 Sendung);
-Timeout 0x06/0x12 = 1.0 s, 0x0C/0x0E = 0.05 s, 0x11 unbelegt (1.0 s).
+Timeout 0x06/0x12 = 1.0 s, 0x0C/0x0E = 0.05 s, 0x11/0x0F/0x08 unbelegt (1.0 s).
 """
 
 import math
@@ -44,6 +49,16 @@ FUNC_ADDR = 0x0E
 FUNC_SET_MODE = 0x11
 FUNC_UUID = 0x12
 FUNC_FW_UPDATE = 0xF0      # Update-Pfad, Sub-Codes aus Decompile
+FUNC_VARIABLE = 0x08       # live 16.10.: [idx] -> 4 B LE
+FUNC_VERSION = 0x0F        # live 16.10.: [00] -> 12 B
+SUB_VERSION_GET = 0x00
+VERSION_FIELDS = (("fireware_ver", 4), ("cmd_system_ver", 2),
+                  ("protection_ver", 2), ("flash_param_ver", 2),
+                  ("logger_ver", 2))  # 12 B, Namen = Wrapper-Strings
+VARIABLE_INDEX_MIN, VARIABLE_INDEX_MAX = 1, 12  # 0/13: Host-Crash (s. oben)
+# Host-Dekodierung live 16.10. (Typ, NICHT Bedeutung)
+VARIABLE_TYPES = dict([(i, "float") for i in range(1, 11)]
+                      + [(11, "int"), (12, "int")])
 SUB_SYS_WRITE = 0x01
 SUB_SYS_READ = 0x02
 SUB_SYS_UPDATE = 0x03
@@ -61,6 +76,8 @@ TIMEOUT_PROTECTION = 0.05
 TIMEOUT_ADDR = 0.05
 TIMEOUT_UUID = 1.0
 TIMEOUT_STALL = 1.0        # unbelegt (nie Timeout beobachtet)
+TIMEOUT_VERSION = 1.0      # 0x0F unbelegt (live nur 1 Antwort, kein Timeout)
+TIMEOUT_VARIABLE = 1.0     # 0x08 unbelegt
 # Update-Pfad: Binary bricht nach 3 Fehlversuchen ab (mcu_util_485
 # `cmp r6,#3` @0x1562c), serial485 macht retries+1 Versuche -> 2.
 UPDATE_RETRIES = 2
@@ -119,6 +136,42 @@ def build_sys_param_write_payload(param_id, value):
 def build_sys_param_update_payload():
     """[03] "Updata param" -> Antwort [01] (klippy.log:2869/2875). Builder."""
     return [SUB_SYS_UPDATE]
+
+
+def decode_motor_version(data):
+    """12 B 0x0F-Antwort -> dict (fireware_ver "a.b.c.d", Rest "major.minor",
+    minor dezimal; 'raw'). Live: 01 09 07 51 01 03 01 03 02 4b 01 00 ->
+    1.9.7.81 / 1.3 / 1.3 / 2.75 / 1.0."""
+    raw = bytes(data)
+    if len(raw) != 12:
+        raise ValueError("0x0F: 12 Bytes erwartet: %r" % (raw,))
+    out, pos = {}, 0
+    for name, n in VERSION_FIELDS:
+        out[name] = ".".join(str(b) for b in raw[pos:pos + n])
+        pos += n
+    out["raw"] = raw
+    return out
+
+
+def _check_variable_index(idx):
+    if isinstance(idx, bool) or not isinstance(idx, int) \
+            or not VARIABLE_INDEX_MIN <= idx <= VARIABLE_INDEX_MAX:
+        raise ValueError("0x08-Index muss int 1..12 sein: %r – MOTOR_GET "
+                         "DATA=0/13 lässt den Creality-Host in Klipper-SHUTDOWN "
+                         "laufen; außerhalb 1..12 unbelegt" % (idx,))
+
+
+def decode_variable(idx, data):
+    """4 B 0x08-Antwort -> {'index','raw','float' (<f),'int' (<i, Vorzeichen
+    unbelegt),'type' (Host-Dekodierung),'value'}. Bedeutung je Index OFFEN."""
+    _check_variable_index(idx)
+    raw = bytes(data)
+    if len(raw) != 4:
+        raise ValueError("0x08 idx %d: 4 Bytes erwartet: %r" % (idx, raw))
+    f, i = struct.unpack("<f", raw)[0], struct.unpack("<i", raw)[0]
+    typ = VARIABLE_TYPES[idx]
+    return {"index": idx, "raw": raw, "float": f, "int": i, "type": typ,
+            "value": f if typ == "float" else i}
 
 
 class MotorMini:
@@ -223,11 +276,28 @@ class MotorMini:
 
     dev_uuid = read_uuid
 
+    def query_motor_version(self):
+        """0x0F [00] -> dict (MOTOR_VERSION DATA=0; live 16.10. Motor X
+        `81 04 00 0f 00` -> fw 1.9.7.81 ...). retries=0, Timeout unbelegt."""
+        return decode_motor_version(self._tx(FUNC_VERSION, [SUB_VERSION_GET],
+                                             TIMEOUT_VERSION))
+
+    motor_version = query_motor_version
+
+    def read_variable(self, idx):
+        """0x08 [idx] -> dict (MOTOR_GET DATA=idx), NUR idx 1..12, sonst
+        ValueError ohne Senden (Host-Crash bei 0/13). Live-Scan 16.10. Motor X
+        (Standby): 1-8 = 0, 9 = 0.0016113, 10 = 0.0008057, 11 = 1106, 12 = 0."""
+        _check_variable_index(idx)
+        return decode_variable(idx, self._tx(FUNC_VARIABLE, [idx],
+                                             TIMEOUT_VARIABLE))
+
     def read_encoder(self, *args, **kwargs):
-        """GESPERRT – sendet KEINEN Frame (0x08 nie beobachtet, s. motor.py)."""
+        """GESPERRT – sendet KEINEN Frame. 0x08 ist der Variablen-Lesepfad
+        (read_variable); welcher Index Encoder/Position ist, ist offen."""
         raise NotImplementedError(
-            "read_encoder gesperrt: 0x06 = Sys-Param (live), 0x08 'get feedback' "
-            "nie beobachtet – Encoder-Lesen unbelegt")
+            "read_encoder gesperrt: 0x08 = Variablen-Lesepfad (read_variable, "
+            "idx 1..12), Encoder-/Positions-Index aber unbelegt")
 
     def query_version(self):
         """Version über Update-Pfad abfragen (Func 0xf0/Sub 0x00). Rohdaten.
@@ -344,6 +414,38 @@ def selftest():
         check("set_mode guard %r" % (bad,),
               raises((TypeError, ValueError), MotorMini(nobus, 0x81).set_mode, *bad))
     check("Guards senden nichts", nobus.calls == [])
+
+    # 3b. 0x0F / 0x08 gegen Live-Frames 16.10. (Motor X, Standby)
+    bus = _Bus([
+        ("81 04 00 0f 00",
+         "f7 81 0f 00 0f 01 09 07 51 01 03 01 03 02 4b 01 00 02"),
+        ("81 04 00 08 01", "f7 81 07 00 08 00 00 00 00 0a"),
+        ("81 04 00 08 09", "f7 81 07 00 08 33 33 d3 3a e6"),
+        ("81 04 00 08 0a", "f7 81 07 00 08 33 33 53 3a 50"),
+        ("81 04 00 08 0b", "f7 81 07 00 08 52 04 00 00 71"),
+        ("81 04 00 08 0c", "f7 81 07 00 08 00 00 00 00 0a"),
+    ])
+    mv = MotorMini(bus, 0x81)
+    v = mv.query_motor_version()
+    check("0x0F Version 1.9.7.81 / 1.3 / 1.3 / 2.75 / 1.0",
+          (v["fireware_ver"], v["cmd_system_ver"], v["protection_ver"],
+           v["flash_param_ver"], v["logger_ver"])
+          == ("1.9.7.81", "1.3", "1.3", "2.75", "1.0")
+          and len(v["raw"]) == 12
+          and bus.calls[0][3] == {"timeout": TIMEOUT_VERSION, "retries": 0})
+    r1, r9, r10, r11, r12 = [mv.read_variable(i) for i in (1, 9, 10, 11, 12)]
+    check("0x08 idx 1 = 0.0", r1["value"] == 0.0 and r1["type"] == "float"
+          and bus.calls[1][3] == {"timeout": TIMEOUT_VARIABLE, "retries": 0})
+    check("0x08 idx 9 = 0.0016113", abs(r9["float"] - 0.0016113281) < 1e-9)
+    check("0x08 idx 10 = 0.0008057", abs(r10["value"] - 0.0008056641) < 1e-9)
+    check("0x08 idx 11 = 1106 (int)", r11["int"] == 1106 and r11["value"] == 1106)
+    check("0x08 idx 12 = 0 (int)", r12["value"] == 0 and r12["type"] == "int")
+    check("0x0F/0x08 Script verbraucht", not bus.script)
+    for bad in (0, 13, -1, True, 1.0, None):
+        check("0x08 idx-guard %r" % (bad,),
+              raises(ValueError, MotorMini(nobus, 0x81).read_variable, bad))
+    check("0x0F Längen-Guard", raises(ValueError, decode_motor_version, bytes(11)))
+    check("0x08 Guards senden nichts", nobus.calls == [])
 
     # 4. query_version (Update-Pfad, retries=2 = 3 Versuche)
     class _Rec:
