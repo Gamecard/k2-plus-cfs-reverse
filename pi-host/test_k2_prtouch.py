@@ -1091,9 +1091,20 @@ def _integration_env(cfg_over=None, z_true=0.0, homing_speed=5.0):
 
         def __init__(self):
             self.cmds, self.out = {}, []
+            # Echte Upstream-Namensprüfung (gcode.py register_command) ohne
+            # GCodeDispatch.__init__ – fängt ungültige Namen wie K2_* ab.
+            real = ugcode.GCodeDispatch.__new__(ugcode.GCodeDispatch)
+            real.printer = Printer
+            real.ready_gcode_handlers = real.gcode_handlers = {}
+            real.base_gcode_handlers, real.gcode_help = {}, {}
+            self._real = real
 
         def register_command(self, cmd, fn, when_not_ready=False, desc=None):
             assert cmd not in self.cmds, cmd
+            self._real.register_command(cmd, fn, when_not_ready, desc)
+            # Parser-Gegenprobe: Befehlszeile muss genau diesen Namen ergeben.
+            parts = ugcode.GCodeDispatch.args_r.split(cmd.upper())
+            assert ''.join(parts[:3]).strip() == cmd, "Parser zerlegt %r" % cmd
             self.cmds[cmd] = fn
 
         def respond_info(self, msg, log=True):
@@ -1233,10 +1244,10 @@ def test_upstream_integration():
           all(c in gc.cmds for c in ("PROBE", "QUERY_PROBE",
                                      "PROBE_ACCURACY", "PROBE_CALIBRATE",
                                      "Z_OFFSET_APPLY_PROBE",
-                                     "K2_PRTOUCH_PROBE_STEPS",
-                                     "K2_PRTOUCH_TEST_SWAP"))
-          and "K2_PRTOUCH_HOME_Z" not in gc.cmds
-          and "K2_PRTOUCH_PROBE" not in gc.cmds, str(sorted(gc.cmds)))
+                                     "KTWO_PRTOUCH_PROBE_STEPS",
+                                     "KTWO_PRTOUCH_TEST_SWAP"))
+          and "KTWO_PRTOUCH_HOME_Z" not in gc.cmds
+          and "KTWO_PRTOUCH_PROBE" not in gc.cmds, str(sorted(gc.cmds)))
     cfgcmds = [c for _, c in rec["config"]]
     check("(upstream) config_prtouch_pres mit Pin-Namen wie Stock",
           "config_prtouch_pres oid=0 idx=0 swp_pin=PA15 clk_pin=PB13 "
@@ -1380,8 +1391,8 @@ def test_upstream_integration_guards():
     check("(upstream) mode steps: kein 'probe', HOME_Z/MESH/PROBE_STEPS da",
           env4["printer"].lookup_object("probe", None) is None
           and all(c in env4["gcode"].cmds for c in (
-              "K2_PRTOUCH_HOME_Z", "K2_PRTOUCH_MESH",
-              "K2_PRTOUCH_PROBE_STEPS"))
+              "KTWO_PRTOUCH_HOME_Z", "KTWO_PRTOUCH_MESH",
+              "KTWO_PRTOUCH_PROBE_STEPS"))
           and "PROBE" not in env4["gcode"].cmds)
 
 def main():

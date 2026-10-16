@@ -62,7 +62,7 @@ niemand antwortet, ≈9 s Timeouts ohne Wirkung). Vorbild ist der ungenutzte
 Sicherheit: Schreibende Bus-Schritte (Broadcast, Stall-Mode, 0C [05],
 Param-Schreiben, 06 [03]) sowie das GPIO-Setzen laufen NUR mit
 ``allow_write: True`` (Default False → nur lesen + Plan ausgeben). Der
-G-Code ``K2_MOTOR_INIT`` ohne ``ALLOW_WRITE=1`` gibt ebenfalls nur den Plan
+G-Code ``KTWO_MOTOR_INIT`` ohne ``ALLOW_WRITE=1`` gibt ebenfalls nur den Plan
 aus. Der Broadcast läuft zusätzlich nur nach gesetzten Strapping-Pegeln
 (P1) – ohne Pins bekämen alle Motoren dieselbe Adresse.
 
@@ -74,35 +74,33 @@ k2_transport), damit Tests mit Fake-MCU/Fake-RS485 laufen (s.
 test_k2_motor.py). Ohne Klipper importierbar (reine Logik + Fakes).
 
 G-Codes:
-- ``K2_MOTOR_INIT [DRY_RUN=1] [ALLOW_WRITE=1]`` – Init-Lauf (Default:
+- ``KTWO_MOTOR_INIT [DRY_RUN=1] [ALLOW_WRITE=1]`` – Init-Lauf (Default:
   Plan ausgeben, nichts senden)
-- ``K2_MOTOR_STATUS`` – liest je Motor Version (0x0F), Schutz (0x0C [0b]
+- ``KTWO_MOTOR_STATUS`` – liest je Motor Version (0x0F), Schutz (0x0C [0b]
   dekodiert) und Feedback idx 5/6 (0x08, pos_fdb/spd_fdb) – nur lesend.
 """
 
 import math
-import os
 import struct
-import sys
 import time
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-if _HERE not in sys.path:
-    sys.path.insert(0, _HERE)
-_REPO = next((d for d in (os.path.dirname(_HERE), os.path.dirname(os.path.dirname(_HERE)))
-              if os.path.isdir(os.path.join(d, "nachbau"))), os.path.dirname(_HERE))
-_NACHBAU = os.path.join(_REPO, "nachbau")
-if os.path.isdir(_NACHBAU) and _NACHBAU not in sys.path:
-    sys.path.insert(0, _NACHBAU)
-
+# Import-Regel (Fix 16.10.2026, s. k2_transport.py): eigener Ordner NIE in
+# sys.path (unter Klipper = klippy/extras/, verdeckte "statistics" u. a.);
+# k2_transport relativ (Klipper-Paket extras), Fallback absolut (Tests).
 try:
-    from k2_transport import Rs485Transport, TransparentTransport  # noqa: F401
-except Exception as _e:  # pragma: no cover
-    raise ImportError("k2_transport.py wird benötigt (gleicher Ordner): %s" % _e)
+    from . import k2_transport as _K2T
+except ImportError:
+    try:
+        import k2_transport as _K2T
+    except ImportError as _e:  # pragma: no cover
+        raise ImportError("k2_transport.py wird benötigt (gleicher Ordner): %s" % _e)
+Rs485Transport = _K2T.Rs485Transport
+TransparentTransport = _K2T.TransparentTransport
+KlippyTransparentAdapter = _K2T.KlippyTransparentAdapter
 
 # Nachbau-Helfer optional (für Decoder-Vergleich, kein Muss – unten vendored).
 try:
-    import motor as _M  # noqa: F401
+    _M = _K2T.import_nachbau("motor")
     _HAVE_MOTOR = True
 except Exception:
     _M = None
@@ -113,6 +111,9 @@ except Exception:
 # =====================================================================
 
 NUM_BY_NAME_INIT = {"x": 1, "y": 2, "z": 3, "z1": 4, "e": 1}
+
+# Gemeinsamer RS485-Bus (Abschnitt/Objekt aus k2_485.py)
+BUS_SECTION = "k2_485"
 MOTOR_NAME_TO_NUM = {"x": 1, "y": 2, "z": 3, "z1": 4, "e": 5}
 VERIFY_ORDER = ("x", "y", "z", "z1", "e")
 PIN_MOTORS = ("x", "y", "z", "z1")
@@ -683,6 +684,36 @@ def pin_number_from_enum(enum_pin, pin_name):
     raise ValueError("Pin %r nicht in Enumeration" % (pin_name,))
 
 
+
+def reactor_sleep(reactor):
+    """Relative Pause für Klipper: reactor.pause() erwartet eine ABSOLUTE
+    Weckzeit (upstream reactor.py: pause(waketime)). Ohne Reactor -> time.sleep."""
+    if reactor is None or not hasattr(reactor, "pause"):
+        return time.sleep
+    return lambda s: reactor.pause(reactor.monotonic() + float(s))
+
+def _mcu_chip_name(name):
+    """Config-/Objektname -> Pin-Chip-Name ('mcu nozzle_mcu' -> 'nozzle_mcu')."""
+    name = str(name).strip()
+    return name[4:].strip() if name.startswith("mcu ") else name
+
+
+def _lookup_mcu(printer, name):
+    """MCU-Objekt nach Config-Namen (wie k2_prtouch._lookup_mcu, Fix 16.10.2026).
+
+    Upstream registriert '[mcu]' als 'mcu' und '[mcu nozzle_mcu]' als
+    'mcu nozzle_mcu' (mcu.py add_printer_objects/get_printer_mcu). Config-Wert
+    'nozzle_mcu' wird daher zuerst als 'mcu nozzle_mcu' gesucht; der volle
+    Objektname ('mcu nozzle_mcu') und 'mcu' gehen direkt. Fallback: wörtlich."""
+    name = str(name).strip()
+    if name != "mcu" and not name.startswith("mcu "):
+        try:
+            return printer.lookup_object("mcu " + name)
+        except Exception:
+            pass
+    return printer.lookup_object(name)
+
+
 class GpioOps:
     """Protokoll: Strapping-Pins setzen + optional zurücklesen."""
 
@@ -702,8 +733,8 @@ class KlippyGpio(GpioOps):
     """Echte GPIO-Anbindung (ANNAHMEN, s. BERICHT.md §Review-Korrekturen).
 
     REVIEW 1 (Pins zu spät – FIX): Alle Strapping-Pins werden im KONSTRUKTOR
-    (load_config-Phase, vor klippy:connect) per ``ppins.setup_pin("digital_out",
-    pin)`` angelegt. ``ppins.setup_pin`` registriert intern
+    (load_config-Phase, vor klippy:connect) per ``pins.setup_pin("digital_out",
+    pin)`` angelegt (Upstream-Objekt ``pins``). ``setup_pin`` registriert intern
     ``mcu.register_config_callback`` + ``create_oid`` + ``config_digital_out``
     (Upstream-Muster inkl. ``[duplicate_pin_override]`` für das Zeitmultiplex
     mit ``config_stepper``). Zur Laufzeit wird nur noch gesetzt – kein Lazy-
@@ -725,22 +756,52 @@ class KlippyGpio(GpioOps):
     Controller ruft ``sync()`` nach jedem Setzen vor Broadcast/Weiterlesen.
     Gekapselt hinter GpioOps (Tests mit FakePrinter prüfen print_time>0).
 
-    REVIEW 3 (query_stub – FIX): ``query_gpio_status oid=%c gpio_pin=%c`` →
-    ``gpio_status oid=%c status=%c`` per ``mcu.lookup_query_command``,
-    oid via ``create_oid`` FRÜH (Konstruktor). Dictionary-Prüfung
-    (mcu-main-F008-GD32F303RET6.dict.json): Befehle ``query_gpio_status`` (75)
-    und Antwort ``gpio_status`` (-20) vorhanden, aber KEIN passender
-    ``config_*``-Befehl für dieses oid – daher ANNAHME: kein config-Befehl
-    nötig, eigenes Query-OID für alle Pins geteilt (Stock-Log: oid 11 für alle
-    8 Pins, beide Phasen – ebenfalls geteilt, vermutlich eigenes Objekt oder
-    erstes ``config_digital_out``-oid; als ANNAHME markiert und optional).
-    Falls der Befehl im MCU-Dictionary fehlt (reine Upstream-FW), liefert
-    ``handle_connect`` keinen Query-Adapter und ``query_pin`` fällt auf None
-    zurück (Prüfung übersprungen).
+    REVIEW 3 (query_stub – FIX) + FIRMWARE-BEFUND 16.10.2026 (Abfrage-OID):
+    ``query_gpio_status oid=%c gpio_pin=%c`` → ``gpio_status oid=%c status=%c``
+    per ``mcu.lookup_query_command``. Dictionary (mcu-main-F008-
+    GD32F303RET6.dict.json): Befehl 75 + Antwort -20 vorhanden, KEIN
+    zugehöriger ``config_*``-Befehl. Disassembly des Main-MCU-Images
+    (fw/F008/mcu0_140_G32-mcu0_022_000.bin, Basis 0x08003000, Befehlstabelle
+    @0x0800743C, 12-Byte-Einträge; die Handler-Adresse zu einem Info-Wort
+    (Byte0 = msgid) steht 12 Byte WEITER – die Liste HANDLER-TABELLE.txt
+    ordnet deshalb um einen Eintrag verschoben zu; gegengeprüft an
+    config_digital_out → 0x08006050 (gpio_out_setup + oid_alloc) und
+    config_transparent → 0x080036AC (oid_alloc + USART-Init)):
+    Handler query_gpio_status = 0x08003424: liest ``args[1]`` (Pin), Port =
+    Pin>>4 aus der Tabelle 0x0800987C (GPIOA..E 0x40010800…), Bit = Pin&15,
+    liest Register-Offset 0x0C (GD32 GPIOx_OCTL = Ausgangs-Latch, NICHT
+    ISTAT) und antwortet ``gpio_status`` mit ``args[0]`` UNVERÄNDERT als oid.
+    KEIN oid_lookup/oid_alloc → die OID ist reine Antwort-Kennung. Daher wird
+    KEINE OID per ``create_oid`` verbraucht (vorher: eigenes OID ohne
+    config-Befehl), sondern die Konstante ``GPIO_QUERY_OID`` (0) genutzt –
+    das Upstream-Antwort-Routing filtert nur nach (``gpio_status``, oid), und
+    nur dieses Modul sendet ``query_gpio_status``. Stock nutzte oid 11 für alle
+    Pins (Log ``:2259–2266``) – ebenfalls nur Kennung. Folge der OCTL-Lesung:
+    die Rücklesung bestätigt den von der MCU AUSGEGEBENEN Pegel (wie Stock
+    key799/800), keinen Leitungsfehler. Fehlt der Befehl im Dictionary
+    (Upstream-FW), liefert ``handle_connect`` keinen Query und ``query_pin``
+    None (Prüfung übersprungen).
+
+    STRAPPING-PINS ``max_duration`` (Fix 16.10.2026): Upstream-
+    ``MCU_digital_out`` hat Default ``max_duration = 2 s`` – steht ein Pin
+    länger auf Nicht-Default (z. B. Z-STEP 1, Z1 DIR/STEP 1, Y-DIR !PB7 phys 1
+    während der ~10 s Init), schaltet die MCU ab. Stock ruft für JEDEN
+    Dir/Step-Pin (``motor_x/y/z/z1_init``, 0x73ba8/0x73c54 …) und für
+    ``enable_pin_pa9`` (0xce8bc) ``setup_max_duration(0.0)`` auf (BELEGT:
+    PYOBJ 'setup_max_duration' + CONST float 0.0 direkt nach 'digital_out'/
+    'motor_<m>_dir|step', arbeitsdateien-lokal/lokale Analyse-Dateien).
+    Wir machen es genauso (= Upstream-Muster für statische Pins, vgl.
+    output_pin.py ``setup_max_duration(0.)``, stepper_enable). Start- und
+    Shutdown-Wert bleiben Upstream-Default (= Invertierung → phys. 0, bei
+    ``!PA9`` phys. 1 = Treiber aus).
     """
 
     QUERY_FMT = "query_gpio_status oid=%c gpio_pin=%c"
     QUERY_RESP = "gpio_status oid=%c status=%c"
+    # Firmware wertet die OID nicht aus (s. Docstring) -> keine create_oid.
+    GPIO_QUERY_OID = 0
+    # Stock: setup_max_duration(0.0) für alle Strapping-Pins (s. Docstring).
+    STRAPPING_MAX_DURATION = 0.0
 
     def __init__(self, printer, main_mcu_name="mcu", pin_specs=None):
         self.printer = printer
@@ -759,46 +820,42 @@ class KlippyGpio(GpioOps):
             if raw not in seen:
                 seen.add(raw)
                 uniq.append(raw)
-        # FRÜH (vor connect): ppins.setup_pin für jeden Main-MCU-Pin.
+        # FRÜH (vor connect): pins.setup_pin für jeden Main-MCU-Pin
+        # (Upstream-Objekt 'pins', pins.py:138; Stock ebenso 'pins').
         # Pins anderer MCUs (z.B. 'nozzle_mcu:PB12' E-Stall) werden übersprungen
         # – sie gehören nicht zum Strapping und haben eigene MCU-Objekte.
-        ppins = printer.lookup_object("ppins")
-        mcu = printer.lookup_object(main_mcu_name)
+        ppins = printer.lookup_object("pins")
+        chip = _mcu_chip_name(main_mcu_name)
         for raw in uniq:
             if ":" in str(raw):
-                prefix = str(raw).split(":", 1)[0].lstrip("!^~")
-                if prefix != main_mcu_name:
+                prefix = str(raw).split(":", 1)[0].lstrip("!^~").strip()
+                if prefix not in (main_mcu_name, chip):
                     continue
-            # ANNAHME Upstream-Signatur: setup_pin('digital_out', pin_raw).
-            self._pins[raw] = ppins.setup_pin("digital_out", raw)
-        # Pin-Nummern (gpio_pin-Byte) früh auflösen, Fehler erst bei query.
+            # Upstream-Signatur: setup_pin('digital_out', pin_desc) -> MCU_digital_out
+            pin = ppins.setup_pin("digital_out", raw)
+            # Statischer Pin wie Stock: max_duration 0 (kein MCU-Shutdown, wenn
+            # der Strapping-Pegel länger als 2 s ansteht, s. Docstring).
+            if hasattr(pin, "setup_max_duration"):
+                pin.setup_max_duration(self.STRAPPING_MAX_DURATION)
+            self._pins[raw] = pin
+        # Pin-Nummern (gpio_pin-Byte) – das Dictionary (Enumeration 'pin') ist
+        # erst nach dem Connect da; hier nur versuchen, sonst lazy in query_pin.
         for raw in list(self._pins.keys()):
             try:
                 self._pin_numbers[raw] = self._resolve_pin_number(raw)
             except Exception:
                 pass
-        # Eigenes Query-OID früh (vor connect). Kein config-Befehl (s. Docstring).
-        self._query_oid = mcu.create_oid()
+        # Antwort-Kennung ohne create_oid (Firmware wertet die OID nicht aus).
+        self._query_oid = self.GPIO_QUERY_OID
 
     def _resolve_pin_number(self, pin_raw):
-        # 1) ppins.lookup_pin (ANNAHME Upstream-API, mehrere Rückgabeformen).
+        # Upstream: pins.lookup_pin liefert nur den Pin-NAMEN (pin_params
+        # ['pin'] = 'PB9') und registriert den Pin als belegt – daher NICHT
+        # verwendet. Nummer aus der MCU-Enumeration 'pin' (Dictionary, erst
+        # nach dem Connect verfügbar).
+        # 1) mcu.get_enumeration('pin', name) / get_enumerations()['pin'].
         try:
-            ppins = self.printer.lookup_object("ppins")
-            if hasattr(ppins, "lookup_pin"):
-                res = ppins.lookup_pin(pin_raw)
-                if isinstance(res, (list, tuple)) and len(res) == 2:
-                    return int(res[1])
-                if isinstance(res, int):
-                    return int(res)
-                if hasattr(res, "pin"):
-                    return int(res.pin)
-                if isinstance(res, dict) and "pin" in res:
-                    return int(res["pin"])
-        except Exception:
-            pass
-        # 2) mcu.get_enumeration('pin', name) / get_enumerations()['pin'].
-        try:
-            mcu = self.printer.lookup_object(self.main_mcu_name)
+            mcu = _lookup_mcu(self.printer, self.main_mcu_name)
             if hasattr(mcu, "get_enumeration"):
                 return int(mcu.get_enumeration("pin", _clean_pin_name(pin_raw)))
             if hasattr(mcu, "get_enumerations"):
@@ -806,9 +863,9 @@ class KlippyGpio(GpioOps):
                 return pin_number_from_enum(enum, pin_raw)
         except Exception:
             pass
-        # 3) Direkte Enumeration über ppins (Test-Helper).
+        # 2) Direkte Enumeration über das pins-Objekt (nur Test-Helper).
         try:
-            ppins = self.printer.lookup_object("ppins")
+            ppins = self.printer.lookup_object("pins")
             if hasattr(ppins, "get_enumerations"):
                 enum = dict(ppins.get_enumerations()).get("pin", {})
                 return pin_number_from_enum(enum, pin_raw)
@@ -819,27 +876,21 @@ class KlippyGpio(GpioOps):
     def handle_connect(self):
         """Query-Befehl nach klippy:connect auflösen (optional, sonst None)."""
         try:
-            mcu = self.printer.lookup_object(self.main_mcu_name)
+            mcu = _lookup_mcu(self.printer, self.main_mcu_name)
         except Exception:
             self._query = None
             self._query_available = False
             return
         try:
-            if hasattr(mcu, "try_lookup_query_command"):
-                self._query = mcu.try_lookup_query_command(
-                    self.QUERY_FMT, self.QUERY_RESP, oid=self._query_oid)
-                if self._query is None:
+            # Upstream: try_lookup_command(msgformat) -> None, wenn der Befehl
+            # im Dictionary fehlt (mcu.py:1206); erst dann den Query anlegen.
+            if hasattr(mcu, "try_lookup_command"):
+                if mcu.try_lookup_command(self.QUERY_FMT) is None:
+                    self._query = None
                     self._query_available = False
                     return
-            elif hasattr(mcu, "try_lookup_command"):
-                self._query = mcu.try_lookup_command(
-                    self.QUERY_FMT, self.QUERY_RESP, oid=self._query_oid)
-                if self._query is None:
-                    self._query_available = False
-                    return
-            else:
-                self._query = mcu.lookup_query_command(
-                    self.QUERY_FMT, self.QUERY_RESP, oid=self._query_oid)
+            self._query = mcu.lookup_query_command(
+                self.QUERY_FMT, self.QUERY_RESP, oid=self._query_oid)
             self._query_available = True
         except Exception:
             self._query = None
@@ -856,7 +907,7 @@ class KlippyGpio(GpioOps):
             toolhead = self.printer.lookup_object("toolhead")
             print_time = toolhead.get_last_move_time()
         except Exception:
-            mcu = self.printer.lookup_object(self.main_mcu_name)
+            mcu = _lookup_mcu(self.printer, self.main_mcu_name)
             reactor = self.printer.get_reactor()
             print_time = mcu.estimated_print_time(reactor.monotonic()) + 0.100
         if print_time is None or float(print_time) <= 0:
@@ -1458,28 +1509,46 @@ class PrinterK2Motor:
             raise config.error("[k2_motor] Config-Fehler: %s" % exc)
         self.main_mcu_name = self.cfg.get("main_mcu", "mcu")
         self.nozzle_mcu_name = self.cfg.get("nozzle_mcu", "nozzle_mcu")
-        self.mcu = self.printer.lookup_object(self.main_mcu_name)
-        self.nozzle_mcu = self.printer.lookup_object(self.nozzle_mcu_name)
+        # MCU-Namen robust auflösen (Fix 16.10.2026): 'nozzle_mcu' ->
+        # Upstream-Objekt 'mcu nozzle_mcu'; voller Name geht weiterhin.
+        try:
+            self.mcu = _lookup_mcu(self.printer, self.main_mcu_name)
+            self.nozzle_mcu = _lookup_mcu(self.printer, self.nozzle_mcu_name)
+        except Exception as exc:
+            raise config.error("[k2_motor] MCU nicht gefunden (main_mcu=%r, "
+                               "nozzle_mcu=%r): %s" % (self.main_mcu_name,
+                                                       self.nozzle_mcu_name, exc))
         # REVIEW 1 (FIX): Alles Konfigurierende VOR klippy:connect.
         # - Strapping-Pins (motor_<m>_dir/_step + Enable) sofort per
-        #   ppins.setup_pin anlegen (KlippyGpio-Konstruktor). Danach nur setzen.
+        #   pins.setup_pin anlegen (KlippyGpio-Konstruktor). Danach nur setzen.
         # - Transparent-OID früh per create_oid + register_config_callback
         #   (config_transparent läuft im Config-Callback vor finalize, wie
         #   Stock-_build_config @0xa04fc). Lookup erst nach connect.
         self._gpio = KlippyGpio(
             self.printer, self.main_mcu_name,
             pin_specs=self._strapping_pin_specs())
-        from k2_transport import KlippyTransparentAdapter
         self._oid = self.nozzle_mcu.create_oid()
         self.nozzle_mcu.register_config_callback(self._build_transparent_config)
         self._tadapter = KlippyTransparentAdapter(self.nozzle_mcu, self._oid)
         self._transparent = None
+        # RS485-Bus X/Y/Z/Z1 = gemeinsames Objekt 'k2_485' (Modul k2_485.py,
+        # EIN Port/Lock für Motoren + CFS + Belt). Steht [k2_485] in der Config,
+        # wird es hier sofort geladen (printer.load_object) – die Reihenfolge
+        # der Abschnitte ist damit egal; sonst Suche beim Connect.
+        self._bus = None
         self._rs485 = None
+        try:
+            if hasattr(config, "has_section") and config.has_section(BUS_SECTION):
+                self._bus = self.printer.load_object(config, BUS_SECTION)
+        except Exception as exc:
+            raise config.error("[k2_motor] [%s] nicht ladbar: %s" % (BUS_SECTION, exc))
         self.controller = None
         self.printer.register_event_handler("klippy:connect", self.handle_connect)
-        self.gcode.register_command("K2_MOTOR_INIT", self.cmd_init,
+        # G-Code-Namen: Upstream verbietet Buchstabe+Ziffer am Anfang
+        # (gcode.py register_command) -> KTWO_ statt K2_ (Fix 16.10.2026).
+        self.gcode.register_command("KTWO_MOTOR_INIT", self.cmd_init,
                                     desc="K2-Motor-Init (DRY_RUN=1 nur Plan)")
-        self.gcode.register_command("K2_MOTOR_STATUS", self.cmd_status,
+        self.gcode.register_command("KTWO_MOTOR_STATUS", self.cmd_status,
                                     desc="K2-Motor-Status (Version/Schutz/Feedback)")
 
     def _strapping_pin_specs(self):
@@ -1494,18 +1563,46 @@ class PrinterK2Motor:
             specs.append(ENABLE_PIN_RAW)
         return specs
 
-    def _build_transparent_config(self, eventtime):
-        # Config-Callback (vor finalize): Düsen-Kaskade anmelden.
-        # ANNAHME: Creality-MCU-FW kennt config_transparent (Dictionary 74).
+    def _build_transparent_config(self):
+        # Config-Callback (vor finalize): Düsen-Kaskade anmelden. Upstream ruft
+        # Config-Callbacks OHNE Argument auf (mcu.py _send_config: cb()).
+        # Creality-MCU-FW kennt config_transparent (Dictionary-ID 74).
         self.nozzle_mcu.add_config_cmd("config_transparent oid=%d" % self._oid)
 
     def _ensure_transports(self):
-        # ANNAHME: RS485-Bus als injizierter Python-Seriell-Port. Hier Platzhalter:
-        # Der Betreiber stellt ``self._rs485_bus`` (serial485-artig, /dev/ttyS5).
-        # Ohne Bus bleibt das Modul im Diagnose-Modus (nur Plan).
+        """RS485-Transport für X/Y/Z/Z1 aus dem Objekt 'k2_485' bauen.
+
+        Klare Fehlermeldung, wenn [k2_485] fehlt. Ob der Port wirklich offen
+        ist, zeigt sich erst beim ersten Frame (k2_485 öffnet faul/beim
+        Connect und meldet Port-Fehler selbst)."""
         if self._rs485 is not None:
-            return
-        raise RuntimeError("RS485-Bus nicht verdrahtet (ANNAHME: eigener Port nötig)")
+            return self._rs485
+        bus = self._bus
+        if bus is None:
+            try:
+                bus = self.printer.lookup_object(BUS_SECTION)
+            except Exception:
+                bus = None
+        if bus is None:
+            raise RuntimeError(
+                "[k2_motor] RS485-Bus fehlt: Abschnitt [%s] (serial: <by-id-Pfad>, "
+                "baud: 230400) in printer.cfg anlegen – ohne ihn sind X/Y/Z/Z1 "
+                "nicht erreichbar (nur KTWO_MOTOR_INIT DRY_RUN=1 geht)" % BUS_SECTION)
+        self._bus = bus
+        self._rs485 = Rs485Transport(bus, name=BUS_SECTION)
+        return self._rs485
+
+    def _ensure_controller(self):
+        """Controller ohne Init-Lauf bauen (für lesende Befehle)."""
+        if self.controller is None:
+            self._ensure_transports()
+            if self._transparent is None:
+                self._transparent = TransparentTransport(self._tadapter, oid=self._oid)
+            self.controller = K2MotorController(
+                self.cfg, self._rs485, self._transparent, self._gpio,
+                pause=reactor_sleep(self.reactor), logger=self.gcode,
+                send_event=getattr(self.printer, "send_event", None))
+        return self.controller
 
     def handle_connect(self):
         # Nur noch Lookups nach dem Connect (Stock L3089: transparent-Lookup
@@ -1526,13 +1623,16 @@ class PrinterK2Motor:
             except Exception as exc:
                 self.gcode.respond_info("[k2_motor] Auto-Init übersprungen: %s" % exc)
                 return
-            self._run(auto=True)
+            try:
+                self._run(auto=True)
+            except (RuntimeError, OSError) as exc:
+                self.gcode.respond_info("[k2_motor] Auto-Init abgebrochen: %s" % exc)
 
     def _run(self, auto=False):
-        from k2_transport import TransparentTransport
+        self._ensure_transports()
         if self._transparent is None:
             self._transparent = TransparentTransport(self._tadapter, oid=self._oid)
-        pause = getattr(self.reactor, "pause", time.sleep)
+        pause = reactor_sleep(self.reactor)  # relative Sekunden -> absolute Weckzeit
         send_event = getattr(self.printer, "send_event", None)
         self.controller = K2MotorController(
             self.cfg, self._rs485, self._transparent, self._gpio,
@@ -1559,15 +1659,22 @@ class PrinterK2Motor:
             gcmd.respond_info(ctl.describe_plan())
             gcmd.respond_info("ALLOW_WRITE=0 (allow_write=False): nur gelesen, nichts geschrieben.")
             return
-        res = self._run()
+        try:
+            self._ensure_transports()
+            res = self._run()
+        except (RuntimeError, OSError) as exc:
+            # Bus/Port-Fehler ([k2_485]) als G-Code-Fehler, kein Shutdown.
+            msg = str(exc)
+            raise gcmd.error(msg if msg.startswith("[") else "[k2_motor] " + msg)
         gcmd.respond_info("[k2_motor] Status: %s (Fehler: %d)" % (
             res.get("status"), len(res.get("errors", []))))
 
     def cmd_status(self, gcmd):
-        if self.controller is None:
-            gcmd.respond_info("[k2_motor] noch nicht initialisiert (kein Controller).")
-            return
-        st = self.controller.motor_status()
+        try:
+            ctl = self._ensure_controller()
+        except RuntimeError as exc:
+            raise gcmd.error(str(exc))
+        st = ctl.motor_status()
         for m, e in st.items():
             ver = e.get("version", e.get("version_error"))
             pro = e.get("protection", e.get("protection_error"))

@@ -170,14 +170,14 @@ Timeouts, STATUS≠0, `CfsStatusError`).
    Erwartet: `Klipper ready`, `FIRMWARE_RESTART` sauber, Dictionaries melden je 75
    Befehle/32 Antworten (lokale MCU-Dictionaries). Abbruch bei: kein Connect, falsche MCU-Version,
    `gpio_status`-Test fehlgeschlagen → UART-Verdrahtung/Baud prüfen, STOP.
-2. Motor-Init DRY_RUN: `K2_MOTOR_INIT DRY_RUN=1`. Erwartet: Plan P0–P9 mit 167
+2. Motor-Init DRY_RUN: `KTWO_MOTOR_INIT DRY_RUN=1`. Erwartet: Plan P0–P9 mit 167
    Schritten, Strapping X 0x81/Y 0x82/Z 0x83/Z1 0x84 (MOTOR-INIT-BEFUND §10).
    Abbruch bei: Plan weicht vom Befund ab (Pins/IDs) → Config korrigieren, STOP.
-3. Motor-Init lesend (`allow_write: False`): `K2_MOTOR_INIT`. Erwartet: nur Reads,
+3. Motor-Init lesend (`allow_write: False`): `KTWO_MOTOR_INIT`. Erwartet: nur Reads,
    danach key798-analog („kein Broadcast im Diagnose-Modus", pi-host/README §4) –
    das ist KEIN Modulfehler. Abbruch bei: SHUTDOWN mit anderer Ursache, Framing-/CRC-Fehler → Bus prüfen, STOP.
 4. Motor-Init schreibend (`allow_write: True`, Strapping gesetzt, `confirm`):
-   `K2_MOTOR_INIT ALLOW_WRITE=1`. Erwartet: „All motors are normal", Stall Z/Z1/E,
+   `KTWO_MOTOR_INIT ALLOW_WRITE=1`. Erwartet: „All motors are normal", Stall Z/Z1/E,
    `0C [0b]` 8×00, Restore-Pegel 0, Param-Abgleich (flüchtige IDs, Toleranz 1e-6),
    Event `k2_motor:ready` (MOTOR-INIT-BEFUND §2/§4). Abbruch bei: key798 (Adress-Runde
    unvollständig → Strapping/Pegel prüfen), key799/800 (GPIO-Resend → Pins prüfen),

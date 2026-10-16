@@ -1,4 +1,4 @@
-> **ENTWURF – am echten Gerät UNGETESTET (Stand 16.10.2026).** Klipper-Zusatzmodul für Upstream-Klipper auf einem Pi-Host; nur offline mit simulierter MCU/Motoren getestet (`python3 test_k2_motor.py`, 9/9). Entwurf durch einen weiteren KI-Agenten, Review und drei Korrekturen (Pins vor Connect, gültige print_time, query_gpio_status) durch uns.
+> **ENTWURF – am echten Gerät UNGETESTET (Stand 16.10.2026).** Klipper-Zusatzmodul für Upstream-Klipper auf einem Pi-Host; nur offline mit simulierter MCU/Motoren getestet (`python3 test_k2_motor.py`, 11/11) und im Batch-Modus gegen Upstream-Klipper 9cb9975 ohne Testpatches (config-pi/README.md §5, Lauf F–I). Upstream-Fix 16.10.2026 abends: §8. Entwurf durch einen weiteren KI-Agenten, Review und drei Korrekturen (Pins vor Connect, gültige print_time, query_gpio_status) durch uns.
 
 # BERICHT – Klipper-Zusatzmodul [k2_motor] (Entwurf, 16.10.2026)
 
@@ -12,7 +12,7 @@ nur gelesen.
 | Datei | Zweck | Stand |
 |---|---|---|
 | `k2_transport.py` | Zwei Transporte mit gleicher Schnittstelle `transact(addr, fun, data, timeout, retries) → (status, fun, data)`: `Rs485Transport` (X/Y/Z/Z1) + `TransparentTransport` (E via Düsen-MCU, volle Frames mit `serial485.build_frame`/`parse_frame`, CRC + Absenderprüfung, retries=0 wie Stock) | neu, getestet |
-| `k2_motor_init.py` | Klipper-Modul `[k2_motor]`: Config wie Stock-`[motor_control]` + `allow_write`/`shutdown_on_failure`/`auto_init`/`nozzle_mcu`/`main_mcu`; Ablauf P0–P9 nach Befund; E-Param via transparent 0x81 (Stock-Bug 0x85 NICHT nachgebaut, Guard im Code); Fehler analog key798–803 (Shutdown nur per Option); Event `k2_motor:ready`; G-Codes `K2_MOTOR_INIT`/`K2_MOTOR_STATUS` | neu, getestet |
+| `k2_motor_init.py` | Klipper-Modul `[k2_motor]`: Config wie Stock-`[motor_control]` + `allow_write`/`shutdown_on_failure`/`auto_init`/`nozzle_mcu`/`main_mcu`; Ablauf P0–P9 nach Befund; E-Param via transparent 0x81 (Stock-Bug 0x85 NICHT nachgebaut, Guard im Code); Fehler analog key798–803 (Shutdown nur per Option); Event `k2_motor:ready`; G-Codes `KTWO_MOTOR_INIT`/`KTWO_MOTOR_STATUS` | neu, getestet |
 | `test_k2_motor.py` | `FakeMcu` (transparent + digital_out) + `FakeRs485Bus` (0x81–0x84 inkl. Broadcast/Strapping-Guard, Param mit Echo) → kompletter Init-Lauf; Plan-Vergleich gegen `motor_init.build_init_plan`; E-nur-transparent; allow_write=False; Live-Frame-CRC; dazu `FakePrinter`-Lebenszyklus (Review 1–3: Config-vor-connect, print_time>0, query+Fallback) | neu, **9/9 ok** (s. §6) |
 | `BERICHT.md` | diese Datei (inkl. §6 Review-Korrekturen) | neu |
 
@@ -36,8 +36,10 @@ K2MotorController (reine Logik P0–P9, ohne Klipper importierbar)
    │       transact() → (status, fun, data), bevorzugt transact_full()
    ├─► TransparentTransport ──► TransparentMcuAdapter.exchange()
    │       build_frame() → transparent_send(timeout_ms) → parse_frame()
-   └─► GpioOps (set_pin/query_pin) ──► KlippyGpio (ppins/output_pin + optional
-           query_gpio_status, wenn Creality-MCU-FW vorhanden)
+   │       bus = Objekt 'k2_485' (Modul k2_485.py, EIN Port für Motoren/CFS/Belt)
+   └─► GpioOps (set_pin/query_pin) ──► KlippyGpio (pins.setup_pin digital_out,
+           max_duration 0 wie Stock; optional query_gpio_status, wenn
+           Creality-MCU-FW vorhanden)
 ```
 
 **Wiederverwendung statt Neuerfindung:** Phasen, Reihenfolge, Payloads, Pausen
@@ -72,9 +74,9 @@ lesende Schritte + Plan (kein GPIO-Setzen, kein Broadcast/Stall/Clear/
 Write/Update). `motor_status()` liest Version/Schutz/Feedback (nur lesend).
 Guard: E NIE als 0x85 (Exception statt Senden).
 
-**G-Codes:** `K2_MOTOR_INIT [DRY_RUN=1] [ALLOW_WRITE=1]` (Default: Plan +
+**G-Codes:** `KTWO_MOTOR_INIT [DRY_RUN=1] [ALLOW_WRITE=1]` (Default: Plan +
 Diagnose; Schreiben nur mit `allow_write: True` UND ohne DRY_RUN),
-`K2_MOTOR_STATUS` (0x0F-Version dekodiert, 0x0C-[0b] via
+`KTWO_MOTOR_STATUS` (0x0F-Version dekodiert, 0x0C-[0b] via
 `decode_protection_local`, 0x08 idx 5/6 als Float – nur lesend).
 
 **Events:** Nach P9 `send_event("k2_motor:ready")` (statt Stock-
@@ -83,10 +85,12 @@ Stock wegen gemeinsamer ttyS5-Queue).
 
 ## 3. Einbindung in Upstream-Klipper
 
-1. Dateien kopieren (kein `nachbau/` nötig – beide Module sind standalone,
-   Fallback-Frame-Helfer eingebaut):
+1. Dateien kopieren (vollständiger Weg: `config-pi/README.md` §3):
    - `k2_transport.py` → `klippy/extras/k2_transport.py`
    - `k2_motor_init.py` → `klippy/extras/k2_motor.py`
+   - `k2_485.py` → `klippy/extras/k2_485.py` + `nachbau/*.py` →
+     `klippy/extras/k2_nachbau/` (RS485-Bus für X/Y/Z/Z1; für reines
+     `DRY_RUN` nicht nötig – k2_transport hat Fallback-Frame-Helfer)
 2. `printer.cfg`-Beispiel (Pins wie Werks-`motor_control.cfg` F008, Werte
    gekürzt – volle Param-Liste aus `motor_control.cfg` übernehmen):
 
@@ -126,19 +130,24 @@ x_controller_spd_loop_pid_param_ki: 6.0
 # [stepper_*] (Strapping vor dem Broadcast, danach wieder Stepper-Betrieb).
 # Synchronisation per M400 (wie Stock L3096/3164).
 
+[k2_485]
+# gemeinsamer RS485-Bus (Stock /dev/ttyS5) – X/Y/Z/Z1, CFS, Belt
+serial: /dev/serial/by-id/usb-…-if00-port0
+baud: 230400
+
 [mcu]
 # ... Main-MCU (Empfehlung: Creality-FW mit query_gpio_status + transparent_*,
 # s. §4) ...
 
-[nozzle_mcu]
+[mcu nozzle_mcu]
 # ... Düsen-MCU mit config_transparent (Creality-FW) ...
 ```
 
 3. Ablauf prüfen:
-   - `K2_MOTOR_INIT DRY_RUN=1` → Plan ausgeben, nichts senden.
-   - `allow_write: True` + `K2_MOTOR_INIT` → echter Init (Pins → Broadcast →
+   - `KTWO_MOTOR_INIT DRY_RUN=1` → Plan ausgeben, nichts senden.
+   - `allow_write: True` + `KTWO_MOTOR_INIT` → echter Init (Pins → Broadcast →
      Runden → Stall → Schutz → Clear → Restore → Param → `k2_motor:ready`).
-   - `K2_MOTOR_STATUS` → Version/Schutz/Feedback je Motor.
+   - `KTWO_MOTOR_STATUS` → Version/Schutz/Feedback je Motor.
 4. CFS-Auto-Addr auf `k2_motor:ready` warten lassen (statt `auto_addr:start`).
 
 ## 4. Offene Punkte / Annahmen (alles Unbelegte ist als ANNAHME markiert)
@@ -230,7 +239,7 @@ x_controller_spd_loop_pid_param_ki: 6.0
    transparent-Versuche) + Plan-Text mit `allow_write=False`-Hinweis.
    (Erwarteter Nebeneffekt im Diagnose-Modus: key798, da RS485 ohne
    Broadcast nicht antwortet – geloggt, kein Shutdown bei Default.)
-6. **K2_MOTOR_STATUS – ok:** 5 Motoren je Version `1.9.7.81` (live-Werte),
+6. **KTWO_MOTOR_STATUS – ok:** 5 Motoren je Version `1.9.7.81` (live-Werte),
    Schutz ok (8x00 dekodiert), pos_fdb/spd_fdb 0.0.
 
 Hinweis zur Ausgabe: Der Diagnose-Lauf loggt erwartbar
@@ -345,6 +354,36 @@ Config-vor-connect, 8. print_time, 9. query+Fallback. Geändert:
 Aufrufe, `PrinterK2Motor`-Frühconfig + `ENABLE_PIN_RAW`/`pin_number_from_enum`),
 `k2_transport.py` (nur `KlippyTransparentAdapter`-Docstring: Lebenszyklus
 config-vor-connect/lookup-danach), `test_k2_motor.py` (Fakes + 3 Tests).
+
+## 8. Upstream-Fix (16.10.2026 abends, Batch-Lauf F ohne Testpatches)
+
+- **G-Codes** `KTWO_MOTOR_INIT`/`KTWO_MOTOR_STATUS` (Upstream lehnt `K2_*` ab).
+- **`pins`** statt `ppins`; Pin-Nummer für `query_gpio_status` aus der
+  MCU-Enumeration (nicht `pins.lookup_pin`, das nur Namen liefert und den Pin
+  als belegt markiert).
+- **Config-Callback** `_build_transparent_config(self)` ohne Argument.
+- **MCU-Namen** über `_lookup_mcu` (`nozzle_mcu` → Objekt `mcu nozzle_mcu`).
+- **Strapping-Pins `max_duration = 0`** (`setup_max_duration(0.0)`, BELEGT
+  als Stock-Aufruf in `motor_x/y/z/z1_init` + `enable_pin_pa9`). Vorher
+  Upstream-Default 2 s → MCU-Shutdown, sobald ein Strapping-Pegel länger als
+  2 s ansteht (Init dauert ~10 s). Batch: `config_digital_out … max_duration=0`.
+- **Abfrage-OID:** Der Firmware-Handler von `query_gpio_status` (0x08003424)
+  liest nur `gpio_pin` (GD32 `GPIOx_OCTL`, Ausgangs-Latch) und spiegelt die
+  OID unverändert in `gpio_status` – kein `oid_lookup`, kein `config_*`.
+  Daher keine `create_oid` mehr (Konstante `GPIO_QUERY_OID = 0`); die
+  Rücklesung bestätigt den ausgegebenen Pegel, nicht die Leitung.
+  `try_lookup_command(fmt)` (Upstream-Signatur, ein Argument) prüft vorab,
+  ob der Befehl im Dictionary steht.
+- **RS485 X/Y/Z/Z1** über das Objekt `k2_485` (`Rs485Transport(bus)`):
+  bei vorhandenem `[k2_485]` per `printer.load_object` beim Laden, sonst
+  Suche beim Connect; fehlt es → klare Meldung „Abschnitt [k2_485] … anlegen“.
+  `KTWO_MOTOR_STATUS` baut den Controller bei Bedarf selbst (nur lesend).
+  Bus-/Port-Fehler → G-Code-Fehler statt Shutdown.
+- **Importe:** kein `sys.path.insert` mehr; `from . import k2_transport`
+  (Fallback absolut für die Tests), nachbau nur angehängt (k2_transport).
+- Tests: `test_k2_motor.py` 11/11 (Fakes jetzt Upstream-nah: `pins`,
+  `mcu nozzle_mcu`, `cb()`, `try_lookup_command(fmt)`, `max_duration`,
+  Namensregel; neu: Hülle mit/ohne `k2_485`), `test_k2_485.py` 32/32.
 
 ## 7. Quellen (alle nur gelesen)
 

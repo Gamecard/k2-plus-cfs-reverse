@@ -14,7 +14,7 @@ in pi-host/k2_transport.py). Prüft:
 7. Lesende Abfragen + 0x0a-Poll (retries=0) + Moonraker-get_status.
 8. Preload OPs + Auto-Addr nach k2_motor:ready + Guards (nie 0x50/0x06,
    keine Bursts, Cut-Platzhalter).
-9. G-Codes K2_BOX_STATUS/LOAD/UNLOAD/PRELOAD via FakePrinter.
+9. G-Codes KTWO_BOX_STATUS/LOAD/UNLOAD/PRELOAD via FakePrinter.
 
 Fakes:
 - FakeBoxBus: simuliert Box-Zustände (IDLE/PRELOAD/PRINT/ERROR), Hub-Maske,
@@ -324,7 +324,30 @@ class FakeGcode:
         self.infos.append(str(msg))
 
     def register_command(self, name, func, desc=None):
+        if not upstream_gcode_name_ok(name):
+            raise RuntimeError("Can't register '%s' as it is an invalid name" % name)
         self.commands[name] = func
+
+
+def upstream_gcode_name_ok(cmd):
+    """Nachbau der Namensprüfung aus Upstream gcode.py register_command
+    (Buchstabe+Ziffer am Anfang ist ungültig, z. B. K2_…)."""
+    try:
+        c = cmd.upper().split()[0]
+        float(c[1:])
+        if c[0].isupper() and c[1].isdigit():
+            return True
+    except Exception:
+        pass
+    if (cmd.upper() != cmd or not cmd.replace('_', 'A').isalnum()
+            or cmd[0].isdigit() or cmd[1:2].isdigit()):
+        return False
+    # Upstream-Parser (gcode.py _process_commands, args_r '([A-Z_]+|[A-Z*])')
+    # zerlegt den Befehl: Ziffern im Namen kappen ihn (KTWO_485_X -> KTWO_485)
+    # -> "Unknown command" trotz erfolgreicher Registrierung.
+    import re as _re
+    parts = _re.split('([A-Z_]+|[A-Z*])', cmd.upper())
+    return ''.join(parts[:3]).strip() == cmd
 
 
 class FakePrinter:
@@ -661,7 +684,23 @@ def test_gcodes():
     assert len(bus.calls) == n and any("Trockenlauf" in m for m in g5.infos)
     st = mod.get_status()
     assert "hub_mask" in st and "slots" in st, st
-    return "STATUS/LOAD/UNLOAD/PRELOAD + DRY_RUN + get_status ok"
+    # Bus da, Port aber weg ([k2_485] ohne Adapter): G-Code-Fehler statt
+    # "Internal error" + Shutdown (Batch-Probe G 16.10.2026).
+    class DeadBus:
+        def transact_full(self, *a, **k):
+            raise RuntimeError("[k2_485] Port /dev/x nicht zu öffnen (Test)")
+        transact = transact_full
+    mod.controller, mod._bus = None, DeadBus()  # Controller neu mit totem Bus
+    for fn, params in ((mod.cmd_load, {"SLOT": "B"}), (mod.cmd_unload, {"SLOT": "B"}),
+                       (mod.cmd_preload, {"SLOT": "C", "OP": "1"})):
+        try:
+            fn(FakeGcmd(params))
+        except ValueError as exc:  # FakeGcmd.error
+            assert "RS485-Bus-Fehler" in str(exc), exc
+        else:
+            raise AssertionError("%s: Bus-Fehler ohne G-Code-Fehler" % fn.__name__)
+    return ("STATUS/LOAD/UNLOAD/PRELOAD + DRY_RUN + get_status ok, Bus-Fehler -> "
+            "G-Code-Fehler")
 
 
 # =====================================================================

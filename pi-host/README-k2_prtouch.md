@@ -45,7 +45,7 @@ Emulation von `probe_prepare`/`probe_finish`, ergänzt um eigene Prüfungen (*):
 9. Immer (try/finally, auch bei jeder Ausnahme): `stop_prtouch_step` →
    `stop_prtouch_pres sta_swap=1`. Optional (`diag_readout: True`) danach der
    eingefrorene Ring in Stock-Reihenfolge (Status `[oid,2,0,0,0]`, FTR/SRC
-   idx 0…56 mit len 64−idx, step analog) – nur Diagnose, in `K2_PRTOUCH_STATUS`.
+   idx 0…56 mit len 64−idx, step analog) – nur Diagnose, in `KTWO_PRTOUCH_STATUS`.
 
 Fehler werden als `printer.command_error` gemeldet (kein Klipper-Shutdown).
 
@@ -205,6 +205,14 @@ statt über das nicht existierende `ppins`-Objekt/`get_enumeration`; Stepper-OID
 über `toolhead.get_kinematics().get_steppers()` (Upstream legt keine
 `stepper_x`-Objekte an); fehlende Config-Schlüssel (`stepper_*_oid`, `can_brk_*`)
 werden jetzt gelesen; `stop_prtouch_pres` sendet immer `sta_swap=1`.
+Nachtrag 16.10.2026 abends (Batch-Lauf gegen Upstream): G-Code-Namen `K2_*`
+waren für Upstream ungültig (`register_command`: 2. Zeichen Ziffer) → jetzt
+`KTWO_PRTOUCH_*`; der Integrationstest registriert die Befehle seitdem über
+die ECHTE `gcode.GCodeDispatch.register_command` und prüft die Zerlegung durch
+den Upstream-Parser (`args_r`). Die Reihenfolge-Falle (`import statistics`
+landete auf `extras/statistics.py`, weil andere Module `klippy/extras/` vorn in
+`sys.path` einfügten) ist in k2_motor/k2_box/k2_belt behoben – k2_prtouch
+selbst war nicht betroffen.
 
 ### A.5 ANNAHMEN des Hauptwegs (offline nicht prüfbar, im Code markiert)
 
@@ -223,8 +231,8 @@ werden jetzt gelesen; `stop_prtouch_pres` sendet immer `sta_swap=1`.
 
 ### A.6 Erstlauf (Pflicht-Reihenfolge)
 
-1. `allow_move: False`: `K2_PRTOUCH_TEST_SWAP`, `K2_PRTOUCH_READ`, `QUERY_PROBE`
-   (muss `open` melden), `K2_PRTOUCH_STATUS`.
+1. `allow_move: False`: `KTWO_PRTOUCH_TEST_SWAP`, `KTWO_PRTOUCH_READ`, `QUERY_PROBE`
+   (muss `open` melden), `KTWO_PRTOUCH_STATUS`.
 2. `PROBE` mit `allow_move: False` → muss mit „allow_move“-Fehler abbrechen, ohne
    Bewegung.
 3. `allow_move: True`, Z per `SET_KINEMATIC_POSITION Z=10` (nur für den Test!),
@@ -251,11 +259,11 @@ Leitung, `mode: steps`. Gesamt 138/138 + Review-Test; `test_k2_box.py` und
 
 `KLIPPER_SRC=/pfad/zu/klipper python3 test_k2_prtouch.py` – ohne die Variable werden die 21 Upstream-Prüfungen übersprungen (geprüft gegen Upstream-Commit 9cb9975).
 
-## B. Rückfall: zeitgesteuerte Schrittfahrt (`mode: steps` / `K2_PRTOUCH_PROBE_STEPS`)
+## B. Rückfall: zeitgesteuerte Schrittfahrt (`mode: steps` / `KTWO_PRTOUCH_PROBE_STEPS`)
 
 Der bisherige Weg (`K2PrtouchController.probe_point`) bleibt unverändert
-erhalten. `K2_PRTOUCH_PROBE_STEPS` (früher `K2_PRTOUCH_PROBE`) gibt es in beiden
-Modi; `K2_PRTOUCH_HOME_Z` und `K2_PRTOUCH_MESH` nur bei `mode: steps` (dann ohne
+erhalten. `KTWO_PRTOUCH_PROBE_STEPS` (früher `K2_PRTOUCH_PROBE`) gibt es in beiden
+Modi; `KTWO_PRTOUCH_HOME_Z` und `KTWO_PRTOUCH_MESH` nur bei `mode: steps` (dann ohne
 `probe`-Objekt, kein `probe:z_virtual_endstop`). Der folgende Altbericht
 beschreibt diesen Rückfallweg; durch A überholte Punkte sind markiert.
 
@@ -319,9 +327,9 @@ printer.cfg [k2_prtouch]
   `datas` s32-LE (pres roh, step Zähler → mm via `step_dist_mm`
   0,0025, relativ zum Ende). `tri_pose ≈ 0`, `bst_pose` interpoliert,
   `zoft = bst−tri`.
-- G-Codes: `K2_PRTOUCH_PROBE_STEPS [X Y DRY_RUN]`, `K2_PRTOUCH_HOME_Z`,
-  `K2_PRTOUCH_MESH [COUNT]`, `K2_PRTOUCH_TEST_SWAP`, `K2_PRTOUCH_READ`,
-  `K2_PRTOUCH_STATUS`. `get_status()` für Moonraker (allow_move, step,
+- G-Codes: `KTWO_PRTOUCH_PROBE_STEPS [X Y DRY_RUN]`, `KTWO_PRTOUCH_HOME_Z`,
+  `KTWO_PRTOUCH_MESH [COUNT]`, `KTWO_PRTOUCH_TEST_SWAP`, `KTWO_PRTOUCH_READ`,
+  `KTWO_PRTOUCH_STATUS`. `get_status()` für Moonraker (allow_move, step,
   letztes Ergebnis – kein Bus-Poll).
 - `apax` ist bewusst NICHT enthalten (BELEGT 0 Treffer in 11532 Log-Zeilen,
   Host-Befund: separates Aux-Modul, für Z-Probe entbehrlich).
@@ -337,7 +345,7 @@ printer.cfg [k2_prtouch]
   `z_lift_mm` (Default 2,0), klare Meldung, kein Weiterprobe (außer
   genau einer `can_brk`-Wiederholung). Tests (b)+(c).
 - **S3 Freigabe:** `allow_move` Default False → nur Swap/Ruhe/Lesen/Plan,
-  keine Z-Bewegung. `K2_PRTOUCH_PROBE_STEPS DRY_RUN=1` ebenfalls bewegungslos.
+  keine Z-Bewegung. `KTWO_PRTOUCH_PROBE_STEPS DRY_RUN=1` ebenfalls bewegungslos.
   Test (d).
 - **S4 Vorabtests:** `TEST_SWAP`-Äquivalent (beide MCU-Seiten müssen
   antworten; Fehlertext wie Stock `PR_ERR_CODE_SWAP_PIN_DETECTI`) +
@@ -402,16 +410,16 @@ step_acq_tkms: 0.390625
 # [homing_override]
 # gcode:
 #   {% if params.Z is defined %}
-#     K2_PRTOUCH_HOME_Z
+#     KTWO_PRTOUCH_HOME_Z
 #   {% else %}
 #     G28 X Y
 #   {% endif %}
 # Danach: BED_MESH_PROFILE LOAD="default" wie Stock (sensorless.cfg).
 ```
 
-Erstlauf-Reihenfolge: `K2_PRTOUCH_TEST_SWAP` → `K2_PRTOUCH_READ` →
-`K2_PRTOUCH_PROBE_STEPS DRY_RUN=1` → `allow_move: True` + `K2_PRTOUCH_PROBE_STEPS` →
-`K2_PRTOUCH_HOME_Z` → `K2_PRTOUCH_MESH COUNT=3`.
+Erstlauf-Reihenfolge: `KTWO_PRTOUCH_TEST_SWAP` → `KTWO_PRTOUCH_READ` →
+`KTWO_PRTOUCH_PROBE_STEPS DRY_RUN=1` → `allow_move: True` + `KTWO_PRTOUCH_PROBE_STEPS` →
+`KTWO_PRTOUCH_HOME_Z` → `KTWO_PRTOUCH_MESH COUNT=3`.
 
 ## 4a. Stand nach Gerätetest 16.10.2026 (PRTOUCH-LESETEST-BEFUND)
 
@@ -464,7 +472,7 @@ Erstlauf-Reihenfolge: `K2_PRTOUCH_TEST_SWAP` → `K2_PRTOUCH_READ` →
     PRES_CHECK `dif=55285` über 7668 Samples + `threshld` 3000).
 11. **can_brk:** UND-Regel (best≤53 UND step≤42 UND zoft≥0,040 → False)
     aus genau 1 Beobachtung (T58). Nachbarschafts-Vergleich
-    (`final deutlich über Umgebung`) nur in `K2_PRTOUCH_MESH`
+    (`final deutlich über Umgebung`) nur in `KTWO_PRTOUCH_MESH`
     (ANNAHME Schranke 0,05 mm).
 12. **zoft-Semantik:** `Z = A + zoft` mit `A` = Z bei Trigger (tiefster
     Punkt). BELEGT `C=A+B` an 93 Punkten, `zoft` 0,010–0,040.
@@ -475,14 +483,14 @@ Erstlauf-Reihenfolge: `K2_PRTOUCH_TEST_SWAP` → `K2_PRTOUCH_READ` →
     Upstream-Version); Fallback manuelle `stepper_*_oid` in Config.
 15. **Klipper-APIs (alle ANNAHME, Version beachten):**
     `register_config_callback`, `create_oid`, `add_config_cmd`,
-    `lookup_query_command(cmd, resp, oid=)`, `ppins.lookup_pin`,
+    `lookup_query_command(cmd, resp, oid=)`, `pins.lookup_pin` (Altcode, ungenutzt),
     `mcu.get_enumeration('pin')`, `toolhead.manual_move/wait_moves/
     get_position`, `heater.get_temp()`, `bed_mesh.get_mesh_limits()`,
     `SET_KINEMATIC_POSITION`, Reactor-`pause`. Vor Gerätetest gegen
     Upstream-Quellen prüfen (s. §5).
 16. **Upstream-Probe-API:** ÜBERHOLT – jetzt Hauptweg (Teil A). Alt: Bewusst NICHT voll implementiert (zu
-    versionsabhängig). Stattdessen eigener `K2_PRTOUCH_MESH` (ANNAHME
-    `bed_mesh`-Übergabe) + `K2_PRTOUCH_HOME_Z` via
+    versionsabhängig). Stattdessen eigener `KTWO_PRTOUCH_MESH` (ANNAHME
+    `bed_mesh`-Übergabe) + `KTWO_PRTOUCH_HOME_Z` via
     `SET_KINEMATIC_POSITION` (homing_override-Vorschlag oben).
 17. **Temperaturkomp/Fallkomp/Outlier/Gauß/Regional:** Weggelassen
     (`samples=1`, `z_offset=0`, Komp rein per `zoft`; im Nivellierungs-Log
@@ -504,19 +512,19 @@ Erstlauf-Reihenfolge: `K2_PRTOUCH_TEST_SWAP` → `K2_PRTOUCH_READ` →
    (SPEZIFIKATION Offene Punkte). Bis dahin: NUR DRY_RUN + READ +
    TEST_SWAP.
 3. **Trockenlauf ohne Bewegung:** `allow_move: False` lassen;
-   `K2_PRTOUCH_TEST_SWAP`, `K2_PRTOUCH_READ`, `K2_PRTOUCH_PROBE_STEPS DRY_RUN=1`
+   `KTWO_PRTOUCH_TEST_SWAP`, `KTWO_PRTOUCH_READ`, `KTWO_PRTOUCH_PROBE_STEPS DRY_RUN=1`
    müssen Plan + Ruhewerte liefern, ohne dass sich Z bewegt.
 4. **Erste echte Antastung vorbereitet:** Bett frei, Düse sauber,
    Hand am Notausschalter; `step_mm` 0,02, `max_travel` klein (z.B.
    1,0 für den allerersten Versuch über dem Bett), `z_lift` 2,0;
    Temperaturen 140/50 einhalten (Warnung ernst nehmen, selbst heizen
    per Stock-Makro G29-Fluss, nicht per Modul).
-5. **Logs sichern:** `klippy.log` + `K2_PRTOUCH_STATUS` nach jedem
+5. **Logs sichern:** `klippy.log` + `KTWO_PRTOUCH_STATUS` nach jedem
    Versuch; bei `emergency/max_travel/timeout/can_brk False` sofort
    stoppen, Ursache (ANNAHMEN §4) prüfen, keine Wiederholung mit
    `allow_move` erzwingen.
-6. **Mesh erst nach Einzelpunkten:** Erst mehrere `K2_PRTOUCH_PROBE_STEPS`
-   an Bettmitte (Streuung < 0,02?), dann `K2_PRTOUCH_MESH COUNT=3`,
+6. **Mesh erst nach Einzelpunkten:** Erst mehrere `KTWO_PRTOUCH_PROBE_STEPS`
+   an Bettmitte (Streuung < 0,02?), dann `KTWO_PRTOUCH_MESH COUNT=3`,
    Matrix gegen Stock-Profil (`default` −0,061…0,224) plausibilisieren.
    `can_brk False` → versetzten Wiederholungswert verwenden (wie T59),
    schlechten Wert NICHT ins Mesh übernehmen.

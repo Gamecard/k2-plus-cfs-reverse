@@ -17,7 +17,7 @@ nur gelesen. Unbelegtes ist unten als **ANNAHME** markiert, Belege mit Fundstell
 
 | Datei | Zweck | Stand |
 |---|---|---|
-| `k2_box.py` | Klipper-Modul `[k2_box]`: Config wie `[k2_motor]`-Stil + `box_addr`/`poll_interval`; Controller A0–A6 (Auto-Addr nach `k2_motor:ready`, 0x0a-Poll retries=0, RFID/Remain/Version/HW lesend, Preload 0x0d op 0–3, Extrude/Retrude live-identisch, Cut-Platzhalter); Guards (allow_write, nie 0x50/0x06, keine Bursts, ein Lock mit `[k2_motor]`); G-Codes `K2_BOX_STATUS/LOAD/UNLOAD/PRELOAD`; `get_status` für Moonraker | neu, getestet |
+| `k2_box.py` | Klipper-Modul `[k2_box]`: Config wie `[k2_motor]`-Stil + `box_addr`/`poll_interval`; Controller A0–A6 (Auto-Addr nach `k2_motor:ready`, 0x0a-Poll retries=0, RFID/Remain/Version/HW lesend, Preload 0x0d op 0–3, Extrude/Retrude live-identisch, Cut-Platzhalter); Guards (allow_write, nie 0x50/0x06, keine Bursts, ein Lock mit `[k2_motor]`); G-Codes `KTWO_BOX_STATUS/LOAD/UNLOAD/PRELOAD`; `get_status` für Moonraker | neu, getestet |
 | `test_k2_box.py` | `FakeBoxBus` (Zustände, Hub-Maske, Odometer +50 mm/Poll, Fehler 0x0c bei ~245 mm für Slot A wie Kanal-A-Defekt, RFID/Remain/Version/HW, Auto-Addr 0xA0–0xA3) + `FakeMotorBus` (gleicher Lock) + `FakePrinter` → 9 Prüfungen (Load, Fehlerabbruch, Unload, allow_write, Live-Frames, Lock, Lesen/Poll/Status, Preload/Addr/Guards, G-Codes) | neu, **9/9 ok** (s. §5) |
 | `serial485_patch/serial485.py` | Kopie von `nachbau/serial485.py` mit zwei Fixes (B.1 `_done`-Begrenzung, B.2 Bg-Race) + 7 neue Selbsttest-Checks | neu, **72/72 ok** (65 bestehend + 7 neu) |
 | `serial485_patch/fix.diff` | `diff -u` Original → Kopie (Beleg der Änderung, Original unverändert) | neu |
@@ -107,20 +107,21 @@ Test-Vergleiche). Der Test beweist Byte-Gleichheit (15 + 7 Frames).
   EIN Lock über die ganze Transaktion, vgl. `MAX_BUS_HOLD_S`). Test mit
   gemeinsamem `threading.Lock` beweist keine Überlappung (8 Transaktionen).
 
-**G-Codes:** `K2_BOX_STATUS` (frischer Poll + Bericht, lesend),
-`K2_BOX_LOAD SLOT=A..D [DRY_RUN=1]`, `K2_BOX_UNLOAD SLOT=… [DRY_RUN=1]`,
-`K2_BOX_PRELOAD SLOT=… OP=0..3 [DRY_RUN=1]`. Ohne allow_write bzw. mit
+**G-Codes:** `KTWO_BOX_STATUS` (frischer Poll + Bericht, lesend),
+`KTWO_BOX_LOAD SLOT=A..D [DRY_RUN=1]`, `KTWO_BOX_UNLOAD SLOT=… [DRY_RUN=1]`,
+`KTWO_BOX_PRELOAD SLOT=… OP=0..3 [DRY_RUN=1]`. Ohne allow_write bzw. mit
 DRY_RUN nur Plan (nichts gesendet). Fehler als `CfsStatusError`-Klartext
 (z.B. 0x0c Odometer-Stillstand); Shutdown nur per `shutdown_on_failure`.
 
 ## 3. Einbindung in Upstream-Klipper
 
-1. Dateien kopieren (nachbau/ wird zur Laufzeit per sys.path gefunden –
-   Pfadsuche wie `k2_transport.py`; für Klipper ohne nachbau/ die vier
-   Dateien mit kopieren – ANNAHME, s. §4):
-   - `k2_box.py` → `klippy/extras/k2_box.py`
-   - `nachbau/box.py`, `cfsseq.py`, `auto_addr.py`, `serial485.py` →
-     daneben (oder Pfad anpassen)
+1. Dateien kopieren (vollständiger Weg: `config-pi/README.md` §3):
+   - `k2_box.py`, `k2_transport.py`, `k2_485.py` → `klippy/extras/`
+   - `nachbau/*.py` (mind. `box.py`, `cfsseq.py`, `auto_addr.py`,
+     `serial485.py`) → `klippy/extras/k2_nachbau/`. k2_box fügt seinen
+     Ordner NICHT in `sys.path` ein; `k2_transport.ensure_nachbau_path()`
+     hängt `k2_nachbau/` nur an und prüft die Herkunft der Module
+     (Fix 16.10.2026, Import-Falle `statistics`).
 2. `printer.cfg`-Beispiel (zusammen mit `[k2_motor]`, Pins gekürzt):
 
 ```ini
@@ -145,16 +146,18 @@ shutdown_on_failure: False  # True → SHUTDOWN bei Box-Fehler (sonst nur Meldun
 auto_init: True
 poll_interval: 4.0          # s, Original-Herzschlag alle ~4 s
 
-# ANNAHME geteilter Bus (s. §4): dieselbe ttyS5-Instanz als Objekt 'k2_485'
-# für BEIDE Module registrieren (EIN Lock, Halbduplex). Upstream hat keinen
-# zentralen 485-Manager – Port-Verwaltung bleibt beim Betreiber.
+# Geteilter Bus: Modul k2_485.py stellt EINE Serial485-Instanz als Objekt
+# 'k2_485' bereit (EIN Lock, Halbduplex) – für [k2_motor], [k2_box], [k2_belt].
+[k2_485]
+serial: /dev/serial/by-id/usb-…-if00-port0
+baud: 230400
 ```
 
 3. Ablauf prüfen:
-   - `K2_BOX_STATUS` → Poll + `Zustand=STATE_IDLE Hub=0x00 Temp=… Slots=…`
+   - `KTWO_BOX_STATUS` → Poll + `Zustand=STATE_IDLE Hub=0x00 Temp=… Slots=…`
      (geht auch mit `allow_write: False`).
-   - `K2_BOX_LOAD SLOT=B DRY_RUN=1` → Plan, nichts gesendet.
-   - `allow_write: True` + `K2_BOX_LOAD SLOT=B` → echter Box-Load
+   - `KTWO_BOX_LOAD SLOT=B DRY_RUN=1` → Plan, nichts gesendet.
+   - `allow_write: True` + `KTWO_BOX_LOAD SLOT=B` → echter Box-Load
      (Heizen/Fahren per Makro M8200/BOX_LOAD_MATERIAL davor – hier nur Box).
    - Auto-Addr läuft nach `k2_motor:ready` von selbst (vorher `wait_motor`).
 
@@ -165,10 +168,12 @@ poll_interval: 4.0          # s, Original-Herzschlag alle ~4 s
 register_timer`, `send_event`, `gcode.respond_info/error`, `GCodeCommand.
 get_int` – gegen die bekannte API geschrieben (Muster `k2_motor_init.py`),
 Kapselung in Controller/Hülle, vor Hardware-Lauf gegen echten Quellbaum prüfen.
-- **Geteilter Bus:** Upstream hat keinen 485-Manager – ANNAHME `printer`-Objekt
-  `'k2_485'` mit derselben `serial485.Serial485`-Instanz für `[k2_motor]`
-  (`Rs485Transport`) und `[k2_box]` (`BoxAction`). Ohne Bus Diagnose-Modus
-  (wie `[k2_motor]` ohne Bus). Lock-Teilung im Test mit einem `Lock` bewiesen.
+- **Geteilter Bus:** Upstream hat keinen 485-Manager – seit 16.10.2026 liefert
+  `[k2_485]` (`k2_485.py`) das `printer`-Objekt `'k2_485'` mit derselben
+  `serial485.Serial485`-Instanz für `[k2_motor]` (`Rs485Transport`),
+  `[k2_box]` (`BoxAction`) und `[k2_belt]`. Ohne `[k2_485]` Diagnose-Modus
+  („Abschnitt [k2_485] fehlt“); Port-/Bus-Fehler bei LOAD/UNLOAD/PRELOAD →
+  G-Code-Fehler (kein Shutdown). Lock-Teilung im Test mit einem `Lock` bewiesen.
 - **Auto-Addr-Persistenz:** Uniids nur in-memory (`_addr_store`); Stock speichert
   in `printer.cfg` (`mb_addr_table_uniids`) – Übernahme in `configfile` fehlt
   (Entwurf). `expect_addr=None` für 0xFE-Broadcasts (Beleg §6.8).

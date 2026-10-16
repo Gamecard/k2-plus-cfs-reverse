@@ -52,7 +52,7 @@ HAUPTWEG (mode: probe, Default, Stand 16.10.2026 abends):
   Klassen: K2PrtouchProbeCore (rein, testbar), K2PrtouchPrinterProbe /
   K2PrtouchEndstopWrapper / K2DescendHelper / K2ProbeOffsets (Hülle).
 
-RÜCKFALL (mode: steps bzw. K2_PRTOUCH_PROBE_STEPS): zeitgesteuerte
+RÜCKFALL (mode: steps bzw. KTWO_PRTOUCH_PROBE_STEPS): zeitgesteuerte
 Schrittfahrt K2PrtouchController.probe_point mit hostseitiger Auswertung.
 
 Sicherheit (verbindlich, im Code durchgesetzt + getestet):
@@ -73,7 +73,7 @@ Sicherheit (verbindlich, im Code durchgesetzt + getestet):
      einmaliger can_brk-Wiederholung versetzt).
   S3 Bewegung nur mit allow_move: True (Default False → nur
      Selbsttest/TEST_SWAP/Sensor lesen, keine Z-Bewegung);
-     G-Code K2_PRTOUCH_PROBE_STEPS [DRY_RUN=1].
+     G-Code KTWO_PRTOUCH_PROBE_STEPS [DRY_RUN=1].
   S4 Vor jeder Antastung TEST_SWAP-Äquivalent + Sensor-Ruhetest
      (Rauschen/Drift, analog PRES_CHECK); sonst Abbruch VOR Bewegung.
   S5 Temperaturen (Düse 140/Bett 50) nur als Empfehlung prüfen (Warnung),
@@ -82,13 +82,13 @@ Sicherheit (verbindlich, im Code durchgesetzt + getestet):
 G-Codes (PrinterK2Prtouch):
 - mode probe: Upstream-Befehle (PROBE, QUERY_PROBE, PROBE_ACCURACY,
   PROBE_CALIBRATE, Z_OFFSET_APPLY_PROBE) + G28 Z/BED_MESH_CALIBRATE/… .
-- K2_PRTOUCH_PROBE_STEPS [X=.. Y=.. DRY_RUN=1] – Rückfall-Einzelantastung
+- KTWO_PRTOUCH_PROBE_STEPS [X=.. Y=.. DRY_RUN=1] – Rückfall-Einzelantastung
   (beide Modi).
-- nur mode steps: K2_PRTOUCH_HOME_Z [DRY_RUN=1], K2_PRTOUCH_MESH
+- nur mode steps: KTWO_PRTOUCH_HOME_Z [DRY_RUN=1], KTWO_PRTOUCH_MESH
   [COUNT=.. DRY_RUN=1] (eigene Ersatzbefehle wie bisher).
-- K2_PRTOUCH_TEST_SWAP – Sync-/Versionscheck ohne Bewegung.
-- K2_PRTOUCH_READ – Sensor lesen ohne Bewegung.
-- K2_PRTOUCH_STATUS – letzter Status (auch Moonraker via get_status).
+- KTWO_PRTOUCH_TEST_SWAP – Sync-/Versionscheck ohne Bewegung.
+- KTWO_PRTOUCH_READ – Sensor lesen ohne Bewegung.
+- KTWO_PRTOUCH_STATUS – letzter Status (auch Moonraker via get_status).
 
 ANNAHMEN sind im Code mit „ANNAHME:“ markiert und in BERICHT.md gelistet.
 """
@@ -902,6 +902,14 @@ def check_emergency(pres_datas, baseline0, cfg):
 # =====================================================================
 # Gekapselte MCU-/Toolhead-Zugriffe (Logik testbar, vgl. k2_box.py)
 # =====================================================================
+
+
+def reactor_sleep(reactor):
+    """Relative Pause für Klipper: reactor.pause() erwartet eine ABSOLUTE
+    Weckzeit (upstream reactor.py: pause(waketime)). Ohne Reactor -> time.sleep."""
+    if reactor is None or not hasattr(reactor, "pause"):
+        return time.sleep
+    return lambda s: reactor.pause(reactor.monotonic() + float(s))
 
 class PrtouchMcuOps:
     """Protokoll pres-Seite (Düse) + step-Seite (Main)."""
@@ -1744,7 +1752,7 @@ class K2PrtouchProbeCore:
         if not self.cfg.get("allow_move"):
             raise self.error(
                 "[k2_prtouch] Antasten/Homing gesperrt: allow_move: False "
-                "(Default). Erst K2_PRTOUCH_TEST_SWAP/K2_PRTOUCH_READ "
+                "(Default). Erst KTWO_PRTOUCH_TEST_SWAP/KTWO_PRTOUCH_READ "
                 "prüfen, dann allow_move: True setzen. Keine Bewegung.")
         params = self.get_params(gcmd)
         sp = float(params.get("probe_speed", 0.0))
@@ -1919,7 +1927,7 @@ def _resolve_pin_number(printer, mcu_name, pin_raw):
     """Pin-Name -> Nummer (alt, seit 16.10.2026 NICHT mehr genutzt: die
     Hülle schickt Pin-NAMEN wie Stock, Upstream löst sie selbst auf)."""
     try:
-        ppins = printer.lookup_object("ppins")
+        ppins = printer.lookup_object("pins")
         if hasattr(ppins, "lookup_pin"):
             res = ppins.lookup_pin(pin_raw)
             if isinstance(res, (list, tuple)) and len(res) == 2:
@@ -2159,19 +2167,19 @@ class PrinterK2Prtouch:
             except Exception as exc:
                 raise config.error("[k2_prtouch] Probe-Einrichtung: %s"
                                    % exc)
-        cmds = [("K2_PRTOUCH_PROBE_STEPS", self.cmd_probe,
+        cmds = [("KTWO_PRTOUCH_PROBE_STEPS", self.cmd_probe,
                  "Rückfall: zeitgesteuerte Schrittfahrt [X=.. Y=.. "
                  "DRY_RUN=1]"),
-                ("K2_PRTOUCH_TEST_SWAP", self.cmd_swap,
+                ("KTWO_PRTOUCH_TEST_SWAP", self.cmd_swap,
                  "Sync-/Versionscheck ohne Bewegung"),
-                ("K2_PRTOUCH_READ", self.cmd_read,
+                ("KTWO_PRTOUCH_READ", self.cmd_read,
                  "Sensor lesen ohne Bewegung"),
-                ("K2_PRTOUCH_STATUS", self.cmd_status, "Letzter Status")]
+                ("KTWO_PRTOUCH_STATUS", self.cmd_status, "Letzter Status")]
         if self.cfg["mode"] == "steps":
             # Nur im Rückfallmodus: eigene Ersatzbefehle für G28 Z / Mesh.
-            cmds += [("K2_PRTOUCH_HOME_Z", self.cmd_home_z,
+            cmds += [("KTWO_PRTOUCH_HOME_Z", self.cmd_home_z,
                       "Rückfall: Z-Homing Bettmitte [DRY_RUN=1]"),
-                     ("K2_PRTOUCH_MESH", self.cmd_mesh,
+                     ("KTWO_PRTOUCH_MESH", self.cmd_mesh,
                       "Rückfall: Raster-Mesh [COUNT=.. DRY_RUN=1]")]
         for cmd, fn, desc in cmds:
             self.gcode.register_command(cmd, fn, desc=desc)
@@ -2271,7 +2279,7 @@ class PrinterK2Prtouch:
             self.probe.core.attach(pres, step)
         self.controller = K2PrtouchController(
             self.cfg, pres, step, KlippyToolhead(self.printer),
-            pause=getattr(self.reactor, "pause", time.sleep),
+            pause=reactor_sleep(self.reactor),
             logger=self.gcode)
 
     def _ctl(self):

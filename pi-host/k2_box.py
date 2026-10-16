@@ -28,8 +28,8 @@ Grundlagen (nur gelesen, nichts gesendet):
   keinen Transparent-Pfad, nur RS485 0x01)
 - CHECKLISTE.md Abschnitt „Kanal A“ (echter Live-Ablauf Preload/Extrude/
   Retrude + Fehler 0x0c bei ~245 mm und 0x19 beim Rückzug – als Testvorbild)
-- pi-host/k2_transport.py (Rs485Transport-Schnittstelle + sys.path-Muster
-  für nachbau/; Bus-Lock-Teilung: EIN Port, EINE Queue, EIN Lock)
+- pi-host/k2_transport.py (Rs485Transport-Schnittstelle + nachbau-Suche
+  ensure_nachbau_path/check_nachbau_module; Bus-Lock-Teilung: EIN Port, EINE Queue, EIN Lock)
 - Original-Makros config/F008_CR0CN240319C13/box.cfg + gcode_macro.cfg
   (BOX_LOAD_MATERIAL-Kette HEATING→CUT→RETRUDE→EXTRUDE→FLUSH→END,
   BOX_QUIT_MATERIAL-Kette, M8200 P/C/R/L/W/F/O → CR_BOX_PRE_OPT/CUT/
@@ -81,31 +81,30 @@ Alle Bus-Zugriffe laufen über BoxAction (gekapselt, Tests mit Fake-Bus).
 Ohne Klipper importierbar (reine Logik + Fakes, s. test_k2_box.py).
 
 G-Codes:
-- ``K2_BOX_STATUS`` – frischer 0x0a-Poll (lesend) + Bericht.
-- ``K2_BOX_LOAD SLOT=A..D [DRY_RUN=1]`` – Box-Load (Extrude-Ablauf A4).
+- ``KTWO_BOX_STATUS`` – frischer 0x0a-Poll (lesend) + Bericht.
+- ``KTWO_BOX_LOAD SLOT=A..D [DRY_RUN=1]`` – Box-Load (Extrude-Ablauf A4).
   Default: Plan ausgeben, nichts senden (ohne allow_write bzw. mit DRY_RUN).
-- ``K2_BOX_UNLOAD SLOT=A..D [DRY_RUN=1]`` – Box-Unload (Retrude-Ablauf A5).
-- ``K2_BOX_PRELOAD SLOT=A..D OP=0..3 [DRY_RUN=1]`` – 0x0d op (0 disable,
+- ``KTWO_BOX_UNLOAD SLOT=A..D [DRY_RUN=1]`` – Box-Unload (Retrude-Ablauf A5).
+- ``KTWO_BOX_PRELOAD SLOT=A..D OP=0..3 [DRY_RUN=1]`` – 0x0d op (0 disable,
   1 enable, 2 Force mit RFID, 3 Force ohne RFID).
 """
 
-import os
 import struct
-import sys
 import threading
 import time
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-if _HERE not in sys.path:
-    sys.path.insert(0, _HERE)
-_REPO = next((d for d in (os.path.dirname(_HERE), os.path.dirname(os.path.dirname(_HERE)))
-              if os.path.isdir(os.path.join(d, "nachbau"))), os.path.dirname(_HERE))
-_NACHBAU = os.path.join(_REPO, "nachbau")
-if os.path.isdir(_NACHBAU) and _NACHBAU not in sys.path:
-    sys.path.insert(0, _NACHBAU)
+# Import-Regel (Fix 16.10.2026, s. k2_transport.py): eigener Ordner NIE in
+# sys.path; Geschwister relativ (Klipper-Paket extras), Fallback absolut für
+# die Offline-Tests; nachbau/ hängt k2_transport.ensure_nachbau_path() an.
+try:
+    from . import k2_transport as _K2T
+except ImportError:
+    import k2_transport as _K2T
+_NACHBAU = _K2T.ensure_nachbau_path()
 
 try:
     import box as _BOX  # noqa: F401
+    _K2T.check_nachbau_module(_BOX)
     from box import (BoxAction, CfsStatusError, StatusBytes,  # noqa: F401
                      func_retries, preload_force_timeout, status_name,
                      parse_box_state, get_rfid, get_remain_len,
@@ -122,6 +121,7 @@ except Exception as _e:  # pragma: no cover
 
 try:
     import cfsseq as _SEQ  # noqa: F401
+    _K2T.check_nachbau_module(_SEQ)
     from cfsseq import (slot_to_mask, RETRUDE_TO_BUFFER_REPEATS,  # noqa: F401
                         EXTRUDE_MODE_STAGE1, EXTRUDE_MODE_FEED_START,
                         EXTRUDE_MODE_QUERY, EXTRUDE_MODE_STOP_BUFFER,
@@ -136,12 +136,14 @@ except Exception as _e:  # pragma: no cover
 
 try:
     import auto_addr as _AA  # noqa: F401
+    _K2T.check_nachbau_module(_AA)
     _HAVE_AA = True
 except Exception as _e:  # pragma: no cover
     raise ImportError("nachbau/auto_addr.py wird benötigt: %s" % _e)
 
 try:
     import serial485 as _S485  # noqa: F401
+    _K2T.check_nachbau_module(_S485)
     _HAVE_S485 = True
 except Exception:  # pragma: no cover
     _S485 = None
@@ -320,6 +322,14 @@ def parse_klipper_config(config):
 # =====================================================================
 # Auto-Addr-Adapter (Box-Seite, erst nach k2_motor:ready)
 # =====================================================================
+
+
+def reactor_sleep(reactor):
+    """Relative Pause für Klipper: reactor.pause() erwartet eine ABSOLUTE
+    Weckzeit (upstream reactor.py: pause(waketime)). Ohne Reactor -> time.sleep."""
+    if reactor is None or not hasattr(reactor, "pause"):
+        return time.sleep
+    return lambda s: reactor.pause(reactor.monotonic() + float(s))
 
 class BoxAutoAddrSerial:
     """Adapter: auto_addr-Serial-API um einen Box-Bus (serial485-artig).
@@ -773,13 +783,13 @@ class PrinterK2Box:
                                                 self.handle_motor_ready)
         except Exception:
             pass
-        self.gcode.register_command("K2_BOX_STATUS", self.cmd_status,
+        self.gcode.register_command("KTWO_BOX_STATUS", self.cmd_status,
                                     desc="K2-Box-Status (0x0a-Poll, lesend)")
-        self.gcode.register_command("K2_BOX_LOAD", self.cmd_load,
+        self.gcode.register_command("KTWO_BOX_LOAD", self.cmd_load,
                                     desc="K2-Box-Load SLOT=A..D [DRY_RUN=1]")
-        self.gcode.register_command("K2_BOX_UNLOAD", self.cmd_unload,
+        self.gcode.register_command("KTWO_BOX_UNLOAD", self.cmd_unload,
                                     desc="K2-Box-Unload SLOT=A..D [DRY_RUN=1]")
-        self.gcode.register_command("K2_BOX_PRELOAD", self.cmd_preload,
+        self.gcode.register_command("KTWO_BOX_PRELOAD", self.cmd_preload,
                                     desc="K2-Box-Preload SLOT=A..D OP=0..3")
 
     def _ensure_bus(self):
@@ -795,15 +805,16 @@ class PrinterK2Box:
                 return self._bus
             except Exception:
                 continue
-        raise RuntimeError("RS485-Bus nicht verdrahtet (ANNAHME: printer-Objekt "
-                           "'k2_485' mit derselben ttyS5-Instanz wie [k2_motor])")
+        raise RuntimeError("RS485-Bus nicht verdrahtet: Abschnitt [k2_485] fehlt "
+                           "in printer.cfg (printer-Objekt 'k2_485', dieselbe "
+                           "Instanz wie [k2_motor]/[k2_belt])")
 
     def _ensure_controller(self):
         if self.controller is not None:
             return self.controller
         bus = self._ensure_bus()
         self.controller = K2BoxController(
-            self.cfg, bus, pause=getattr(self.reactor, "pause", time.sleep),
+            self.cfg, bus, pause=reactor_sleep(self.reactor),
             logger=self.gcode,
             send_event=getattr(self.printer, "send_event", None))
         return self.controller
@@ -874,7 +885,7 @@ class PrinterK2Box:
                 val = None
             if val is not None:
                 return val
-        raise ValueError("SLOT=A..D fehlt (z.B. K2_BOX_LOAD SLOT=B)")
+        raise ValueError("SLOT=A..D fehlt (z.B. KTWO_BOX_LOAD SLOT=B)")
 
     def cmd_status(self, gcmd):
         try:
@@ -928,6 +939,12 @@ class PrinterK2Box:
         except (ValueError, PermissionError) as exc:
             gcmd.respond_info("[k2_box] %s" % exc)
             return
+        except (RuntimeError, OSError) as exc:
+            # RS485-Bus/Port ([k2_485] Port fehlt/gezogen, Timeout): G-Code-
+            # Fehler (bricht Makro/Druck ab) statt "Internal error"+Shutdown.
+            msg = "[k2_box] Load SLOT=%s: RS485-Bus-Fehler: %s" % (slot, exc)
+            gcmd.respond_info(msg)
+            raise gcmd.error(msg) if hasattr(gcmd, "error") else RuntimeError(msg)
         gcmd.respond_info("[k2_box] Load SLOT=%s ok (Odometer %s mm)" % (
             res.get("slot"), res.get("odo_mm")))
 
@@ -965,6 +982,12 @@ class PrinterK2Box:
         except (ValueError, PermissionError) as exc:
             gcmd.respond_info("[k2_box] %s" % exc)
             return
+        except (RuntimeError, OSError) as exc:
+            # RS485-Bus/Port ([k2_485] Port fehlt/gezogen, Timeout): G-Code-
+            # Fehler (bricht Makro/Druck ab) statt "Internal error"+Shutdown.
+            msg = "[k2_box] Unload SLOT=%s: RS485-Bus-Fehler: %s" % (slot, exc)
+            gcmd.respond_info(msg)
+            raise gcmd.error(msg) if hasattr(gcmd, "error") else RuntimeError(msg)
         gcmd.respond_info("[k2_box] Unload SLOT=%s ok" % (res.get("slot"),))
 
     def cmd_preload(self, gcmd):
@@ -1008,6 +1031,12 @@ class PrinterK2Box:
         except (ValueError, PermissionError) as exc:
             gcmd.respond_info("[k2_box] %s" % exc)
             return
+        except (RuntimeError, OSError) as exc:
+            # RS485-Bus/Port ([k2_485] Port fehlt/gezogen, Timeout): G-Code-
+            # Fehler (bricht Makro/Druck ab) statt "Internal error"+Shutdown.
+            msg = "[k2_box] Preload SLOT=%s: RS485-Bus-Fehler: %s" % (slot, exc)
+            gcmd.respond_info(msg)
+            raise gcmd.error(msg) if hasattr(gcmd, "error") else RuntimeError(msg)
         gcmd.respond_info("[k2_box] Preload SLOT=%s OP=%s ok" % (
             res.get("slot"), res.get("op")))
 

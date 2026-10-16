@@ -47,23 +47,95 @@ geschrieben – ANNAHME, s. BERICHT.md):
 Kein Netzwerk, kein Druckerzugriff. Reine Frame-Logik, ohne Hardware lauffähig.
 """
 
+import importlib
 import os
 import sys
 
-# --- nachbau/ per sys.path einbinden (nur lesend) ---------------------------
+# --- nachbau/ finden und ANHÄNGEN (Fix 16.10.2026, Import-Falle) -------------
+# Früher: sys.path.insert(0, <eigener Ordner>) + insert(0, nachbau/). Unter
+# Klipper ist der eigene Ordner klippy/extras/ – vorne in sys.path verdeckt er
+# Standardmodule (k2_prtouch: "import statistics" -> extras/statistics.py,
+# statistics.median fehlt). Regeln jetzt:
+#   1. Der Modulordner kommt NIE in sys.path. Geschwister (k2_transport usw.)
+#      laden die Module per "from . import X" (Klipper-Paket extras), Fallback
+#      "import X" nur für die Offline-Tests (pi-host/ ist dort sys.path[0]).
+#   2. nachbau/ wird nur ANGEHÄNGT (sys.path.append): Namen der Standard-
+#      bibliothek, von klippy/ und site-packages haben Vorrang, nachbau kann
+#      nichts verdecken. Die nachbau-Dateien importieren sich gegenseitig
+#      absolut ("import serial485"), deshalb muss der Ordner in sys.path.
+#   3. import_nachbau()/check_nachbau_module() prüfen, dass ein Modul wirklich
+#      aus nachbau/ kommt (z. B. kein pip-Paket "box"), sonst klare Meldung.
+# Suchreihenfolge (erster Ordner mit serial485.py gewinnt):
+#   $K2_NACHBAU_DIR                 (Override, z. B. für Tests)
+#   <modulordner>/k2_nachbau/       INSTALLATIONSWEG Pi: klippy/extras/k2_nachbau/
+#   <modulordner>/../nachbau/       Repo: pi-host/../nachbau (Offline-Tests)
+#   <modulordner>/../../nachbau/    alter Weg: <klipper>/nachbau/ (Stand 16.10. früh)
+NACHBAU_ENV = "K2_NACHBAU_DIR"
+NACHBAU_SUBDIR = "k2_nachbau"
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_REPO = next((d for d in (os.path.dirname(_HERE), os.path.dirname(os.path.dirname(_HERE)))
-              if os.path.isdir(os.path.join(d, "nachbau"))), os.path.dirname(_HERE))
-# _HERE = <projekt>/pi-host, _REPO = <projekt> (sucht nachbau/ eine oder zwei Ebenen höher)
-_NACHBAU = os.path.join(_REPO, "nachbau")
-if os.path.isdir(_NACHBAU) and _NACHBAU not in sys.path:
-    sys.path.insert(0, _NACHBAU)
+
+
+def nachbau_candidates(here=_HERE):
+    """Kandidaten-Ordner für nachbau/ in Suchreihenfolge."""
+    out = []
+    env = os.environ.get(NACHBAU_ENV, "").strip()
+    if env:
+        out.append(env)
+    out.append(os.path.join(here, NACHBAU_SUBDIR))
+    out.append(os.path.join(os.path.dirname(here), "nachbau"))
+    out.append(os.path.join(os.path.dirname(os.path.dirname(here)), "nachbau"))
+    return out
+
+
+def find_nachbau_dir(here=_HERE):
+    """Erster Kandidat mit serial485.py (realpath) oder None."""
+    for cand in nachbau_candidates(here):
+        if os.path.isfile(os.path.join(cand, "serial485.py")):
+            return os.path.realpath(cand)
+    return None
+
+
+NACHBAU_DIR = find_nachbau_dir()
+
+
+def ensure_nachbau_path():
+    """nachbau/ ANHÄNGEN (nie vorne einfügen). -> Ordner oder None."""
+    if NACHBAU_DIR is None:
+        return None
+    known = set(os.path.realpath(p) for p in sys.path if p)
+    if NACHBAU_DIR not in known:
+        sys.path.append(NACHBAU_DIR)
+    return NACHBAU_DIR
+
+
+def check_nachbau_module(mod):
+    """ImportError, wenn ``mod`` nicht aus NACHBAU_DIR stammt (Namenskollision)."""
+    name = getattr(mod, "__name__", "?")
+    path = getattr(mod, "__file__", None)
+    where = os.path.dirname(os.path.realpath(path)) if path else None
+    if NACHBAU_DIR is None or where != NACHBAU_DIR:
+        raise ImportError(
+            "Modul %r kommt aus %s statt aus nachbau/ (%s) – Namenskollision "
+            "(z. B. pip-Paket gleichen Namens) oder nachbau/ fehlt; Installation "
+            "s. config-pi/README.md §3" % (name, where, NACHBAU_DIR))
+    return mod
+
+
+def import_nachbau(name):
+    """nachbau-Modul laden (Pfad anhängen, Herkunft prüfen)."""
+    if ensure_nachbau_path() is None:
+        raise ImportError(
+            "nachbau/ nicht gefunden (gesucht: %s) – Installation s. "
+            "config-pi/README.md §3" % ", ".join(nachbau_candidates()))
+    return check_nachbau_module(importlib.import_module(name))
+
 
 try:
     # Bevorzugt: geprüfte Implementierung aus dem Nachbau verwenden.
-    from serial485 import build_frame as _nb_build_frame  # noqa: F401
-    from serial485 import parse_frame as _nb_parse_frame  # noqa: F401
-    from serial485 import crc8_cal as _nb_crc8  # noqa: F401
+    _nb_s485 = import_nachbau("serial485")
+    _nb_build_frame = _nb_s485.build_frame
+    _nb_parse_frame = _nb_s485.parse_frame
+    _nb_crc8 = _nb_s485.crc8_cal
     _HAVE_NACHBAU = True
 except Exception:  # pragma: no cover – Fallback für Klipper ohne nachbau/
     _HAVE_NACHBAU = False

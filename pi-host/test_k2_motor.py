@@ -321,7 +321,30 @@ class FakeGcode:
         self.scripts.append(str(script))
 
     def register_command(self, name, func, desc=None):
+        # Upstream gcode.py: Buchstabe+Ziffer am Anfang = ungültig (K2_…).
+        if not upstream_gcode_name_ok(name):
+            raise RuntimeError("Can't register '%s' as it is an invalid name" % name)
         self.commands[name] = func
+
+
+def upstream_gcode_name_ok(cmd):
+    """Nachbau der Namensprüfung aus Upstream gcode.py register_command."""
+    try:
+        c = cmd.upper().split()[0]
+        float(c[1:])
+        if c[0].isupper() and c[1].isdigit():
+            return True  # klassischer G-Code (G1, M400 …)
+    except Exception:
+        pass
+    if (cmd.upper() != cmd or not cmd.replace('_', 'A').isalnum()
+            or cmd[0].isdigit() or cmd[1:2].isdigit()):
+        return False
+    # Upstream-Parser (gcode.py _process_commands, args_r '([A-Z_]+|[A-Z*])')
+    # zerlegt den Befehl: Ziffern im Namen kappen ihn (KTWO_485_X -> KTWO_485)
+    # -> "Unknown command" trotz erfolgreicher Registrierung.
+    import re as _re
+    parts = _re.split('([A-Z_]+|[A-Z*])', cmd.upper())
+    return ''.join(parts[:3]).strip() == cmd
 
 
 class FakeOutputPin:
@@ -336,6 +359,10 @@ class FakeOutputPin:
         self.phys = 0
         self.last_print_time = None
         self.calls = []
+        self.max_duration = 2.0  # Upstream-Default MCU_digital_out
+
+    def setup_max_duration(self, max_duration):
+        self.max_duration = float(max_duration)
 
     def set_digital(self, print_time, value):
         # REVIEW-Test (b): print_time <= 0 ablehnen wie Klipper (Timer zu nah).
@@ -364,11 +391,10 @@ class FakePpins:
         self.pins[pin_raw] = pin
         return pin
 
-    def lookup_pin(self, pin_raw):
-        # ANNAHME-Rückgabe (mcu, pin_num) – KlippyGpio versteht mehrere Formen.
-        if pin_raw in self.pins:
-            return (self.printer.main_mcu, self.pins[pin_raw].pin_number)
-        return (self.printer.main_mcu, fake_pin_number(pin_raw))
+    def lookup_pin(self, pin_raw, *a, **kw):
+        # Upstream: pin_params-Dict mit Pin-NAMEN (kein Zahlwert) – darf vom
+        # Modul NICHT zur Nummernauflösung genutzt werden.
+        raise AssertionError("pins.lookup_pin darf nicht aufgerufen werden")
 
     def get_enumerations(self):
         return {"pin": dict(FAKE_PIN_ENUM)}
@@ -447,38 +473,28 @@ class FakeConfigMcu:
             return FakeTransparentQuery(self, oid)
         raise RuntimeError("unbekannter Query-Befehl: %r" % (fmt,))
 
-    def try_lookup_query_command(self, fmt, resp, oid=None, **kw):
-        try:
-            return self.lookup_query_command(fmt, resp, oid=oid, **kw)
-        except Exception:
-            # REVIEW 3: Fallback None, wenn Befehl im Dictionary fehlt.
-            # Lebenszyklus-Fehler (vor connect) ebenfalls als None – der
-            # Aufrufer (handle_connect) läuft nur nach connect.
-            if "query_gpio_status" in fmt and not self.supports_query_gpio:
-                return None
-            if "transparent_send" in fmt and not self.supports_transparent:
-                return None
-            return None
-
-    def lookup_command(self, fmt, **kw):
+    def lookup_command(self, fmt, cq=None):
         if not self.printer.connected:
             raise RuntimeError("lookup_command vor connect verboten")
         if "set_digital_out" in fmt:
             return ("set_digital_out", fmt)
+        if "query_gpio_status" in fmt and self.supports_query_gpio:
+            return ("query_gpio_status", fmt)
+        if "transparent_send" in fmt and self.supports_transparent:
+            return ("transparent_send", fmt)
         raise RuntimeError("unbekannter Befehl: %r" % (fmt,))
 
-    def try_lookup_command(self, fmt, **kw):
+    def try_lookup_command(self, fmt):
+        # Upstream mcu.py:1206 – genau EIN Argument, None wenn unbekannt.
         try:
-            return self.lookup_command(fmt, **kw)
+            return self.lookup_command(fmt)
         except Exception:
             return None
 
-    def get_enumeration(self, kind, name):
-        if kind == "pin":
-            return fake_pin_number(name)
-        raise ValueError("Enumeration %r unbekannt" % (kind,))
-
     def get_enumerations(self):
+        # Upstream: Dictionary erst nach dem Connect (identify) verfügbar.
+        if not self.printer.connected:
+            raise RuntimeError("get_enumerations vor connect (kein Dictionary)")
         return {"pin": dict(FAKE_PIN_ENUM)}
 
     def estimated_print_time(self, monotonic):
@@ -488,7 +504,7 @@ class FakeConfigMcu:
 class FakePrinter:
     """Minimaler Klipper-Lebenszyklus: Config-Phase -> fire_connect()."""
 
-    def __init__(self, supports_query_gpio=True):
+    def __init__(self, supports_query_gpio=True, bus=None):
         self.connected = False
         self.reactor = FakeReactor()
         self.toolhead = FakeToolhead()
@@ -499,16 +515,26 @@ class FakePrinter:
                                         supports_query_gpio=False,
                                         supports_transparent=True)
         self.pp = FakePpins(self)
-        self.objects = {"ppins": self.pp, "mcu": self.main_mcu,
-                        "nozzle_mcu": self.nozzle_mcu,
+        # Upstream-Objektnamen: 'pins' (pins.py), 'mcu', 'mcu nozzle_mcu'.
+        self.objects = {"pins": self.pp, "mcu": self.main_mcu,
+                        "mcu nozzle_mcu": self.nozzle_mcu,
                         "toolhead": self.toolhead, "gcode": self.gcode}
+        if bus is not None:
+            self.objects["k2_485"] = bus
         self._connect_handlers = []
+        self.loaded = []
 
-    def lookup_object(self, name):
+    def lookup_object(self, name, default=RuntimeError):
         try:
             return self.objects[name]
         except KeyError:
-            raise RuntimeError("Objekt %r fehlt" % (name,))
+            if default is not RuntimeError:
+                return default
+            raise RuntimeError("Unknown config object '%s'" % (name,))
+
+    def load_object(self, config, section, default=RuntimeError):
+        self.loaded.append(section)
+        return self.lookup_object(section, default)
 
     def get_reactor(self):
         return self.reactor
@@ -519,9 +545,10 @@ class FakePrinter:
 
     def fire_connect(self):
         # Config-Callbacks laufen NOCH vor connect (add_config_cmd erlaubt).
+        # Upstream mcu.py _send_config: Callbacks OHNE Argument.
         for mcu in (self.main_mcu, self.nozzle_mcu):
             for cb in list(mcu._callbacks):
-                cb(0.0)
+                cb()
         self.connected = True
         for cb in list(self._connect_handlers):
             cb()
@@ -759,7 +786,7 @@ def test_allow_write_false():
 
 
 def test_status_lesen():
-    """K2_MOTOR_STATUS: Version 0x0F, Schutz 0x0C dekodiert, Feedback 5/6."""
+    """KTWO_MOTOR_STATUS: Version 0x0F, Schutz 0x0C dekodiert, Feedback 5/6."""
     cfg, gpio, bus, mcu, rs485, transp, ctl, events = build_system()
     st = ctl.motor_status()
     assert set(st) == {"x", "y", "z", "z1", "e"}, st.keys()
@@ -780,12 +807,17 @@ def test_review_config_vor_connect():
     # FRÜH (Config-Phase): KlippyGpio legt alle Pins + Query-OID an.
     gpio = K.KlippyGpio(printer, "mcu", pin_specs=specs)
     assert len(gpio._pins) == 9, "Pins %d != 9" % len(gpio._pins)
-    assert gpio._query_oid == 1, "Query-OID %r" % (gpio._query_oid,)
+    # Firmware wertet die Query-OID nicht aus -> keine OID verbraucht.
+    assert gpio._query_oid == K.KlippyGpio.GPIO_QUERY_OID == 0, gpio._query_oid
+    assert printer.main_mcu._oid_counter == 0, "Query darf keine OID belegen"
+    # Strapping-Pins statisch wie Stock (setup_max_duration(0.0)):
+    md = {r: p.max_duration for r, p in printer.pp.pins.items()}
+    assert set(md.values()) == {0.0}, "max_duration %r" % (md,)
     # Transparent analog: OID + Callback VOR connect (Review 1, zweite Hälfte).
     t_oid = printer.nozzle_mcu.create_oid()
     assert t_oid == 1, "transparent-OID %r" % (t_oid,)
     printer.nozzle_mcu.register_config_callback(
-        lambda e: printer.nozzle_mcu.add_config_cmd(
+        lambda: printer.nozzle_mcu.add_config_cmd(
             "config_transparent oid=%d" % t_oid))
     # Connect: Config-Callbacks laufen, danach connected.
     printer.fire_connect()
@@ -801,7 +833,7 @@ def test_review_config_vor_connect():
             (lambda: printer.main_mcu.create_oid(), "create_oid"),
             (lambda: printer.main_mcu.add_config_cmd("config_digital_out oid=9"),
              "add_config_cmd"),
-            (lambda: printer.main_mcu.register_config_callback(lambda e: None),
+            (lambda: printer.main_mcu.register_config_callback(lambda: None),
              "register_config_callback")]:
         try:
             fn()
@@ -809,8 +841,8 @@ def test_review_config_vor_connect():
             pass
         else:
             raise AssertionError("%s nach connect NICHT abgelehnt!" % label)
-    return "9 Pins + Query-OID 1 vor connect, transparent-cmd %s, 4 Nach-Connects abgelehnt" % (
-        printer.nozzle_mcu.config_cmds,)
+    return ("9 Pins (max_duration 0) vor connect, Query ohne OID-Verbrauch, "
+            "transparent-cmd %s, 4 Nach-Connects abgelehnt" % (printer.nozzle_mcu.config_cmds,))
 
 
 def test_review_print_time():
@@ -876,6 +908,116 @@ def test_review_query():
         gpio._pin_numbers["!PB7"],)
 
 
+class FakeCmdError(Exception):
+    pass
+
+
+class FakeKGcmd:
+    error = FakeCmdError
+
+    def __init__(self, params=None):
+        self.params = dict(params or {})
+        self.infos = []
+
+    def get_int(self, name, default=None, **kw):
+        return int(self.params.get(name, default))
+
+    def respond_info(self, msg):
+        self.infos.append(str(msg))
+
+
+class FakeKConfig:
+    """ConfigWrapper-Nachbau für [k2_motor] (get/get_options/has_section)."""
+
+    def __init__(self, printer, opts, sections=()):
+        self.printer = printer
+        self.opts = dict(opts)
+        self.sections = set(sections)
+
+    def get_printer(self):
+        return self.printer
+
+    def get_name(self):
+        return "k2_motor"
+
+    def get_options(self):
+        return dict(self.opts)
+
+    def get(self, key, default=None):
+        return self.opts.get(key, default)
+
+    def has_section(self, name):
+        return name in self.sections
+
+    def error(self, msg):
+        return ValueError(msg)
+
+
+def _huelle_opts(nozzle="nozzle_mcu"):
+    opts = test_options()
+    opts.update({"allow_write": "False", "auto_init": "False",
+                 "main_mcu": "mcu", "nozzle_mcu": nozzle})
+    return opts
+
+
+def test_huelle_upstream():
+    """Klipper-Hülle: KTWO_-Namen, 'pins', nozzle_mcu-Auflösung, Callback ohne
+    Argument, max_duration 0, Bus 'k2_485' für X/Y/Z/Z1."""
+    bus = FakeRs485Bus(gpio=FakeGpio())
+    printer = FakePrinter(bus=bus)
+    obj = K.load_config(FakeKConfig(printer, _huelle_opts(), sections=("k2_485",)))
+    assert sorted(printer.gcode.commands) == ["KTWO_MOTOR_INIT", "KTWO_MOTOR_STATUS"], \
+        printer.gcode.commands
+    assert all(upstream_gcode_name_ok(c) for c in printer.gcode.commands)
+    assert not upstream_gcode_name_ok("K2_MOTOR_INIT"), "Regel-Nachbau defekt"
+    assert obj.nozzle_mcu is printer.nozzle_mcu, "nozzle_mcu -> 'mcu nozzle_mcu'"
+    assert printer.loaded == ["k2_485"], "load_object(k2_485) fehlt: %r" % printer.loaded
+    assert obj._bus is bus
+    md = sorted(set(p.max_duration for p in printer.pp.pins.values()))
+    assert len(printer.pp.pins) == 9 and md == [0.0], (len(printer.pp.pins), md)
+    printer.fire_connect()  # ruft Config-Callbacks OHNE Argument
+    assert printer.nozzle_mcu.config_cmds == ["config_transparent oid=1"], \
+        printer.nozzle_mcu.config_cmds
+    tr = obj._ensure_transports()
+    assert isinstance(tr, T.Rs485Transport) and tr.bus is bus
+    g = FakeKGcmd()
+    obj.cmd_status(g)
+    assert any(i.startswith("[k2_motor] x: version=") for i in g.infos), g.infos
+    assert {a for a, _f, _d, _k in bus.calls} == {0x81, 0x82, 0x83, 0x84}, \
+        "Status X/Y/Z/Z1 muss über k2_485 laufen"
+    # voller Objektname geht weiterhin
+    p2 = FakePrinter(bus=bus)
+    o2 = K.load_config(FakeKConfig(p2, _huelle_opts("mcu nozzle_mcu")))
+    assert o2.nozzle_mcu is p2.nozzle_mcu
+    return "KTWO_MOTOR_INIT/STATUS, pins, 9 Pins max_duration 0, cb(), Bus k2_485 (%d Frames)" % (
+        len(bus.calls),)
+
+
+def test_huelle_ohne_bus():
+    """Ohne [k2_485]: klare Fehlermeldung statt None-Absturz."""
+    printer = FakePrinter()
+    obj = K.load_config(FakeKConfig(printer, _huelle_opts()))
+    printer.fire_connect()
+    try:
+        obj._ensure_transports()
+    except RuntimeError as exc:
+        msg = str(exc)
+    else:
+        raise AssertionError("ohne k2_485 kein Fehler")
+    assert "[k2_485]" in msg and "serial:" in msg, msg
+    for fn, params in ((obj.cmd_status, {}), (obj.cmd_init, {"ALLOW_WRITE": 1})):
+        try:
+            fn(FakeKGcmd(params))
+        except FakeCmdError as exc:
+            assert "[k2_485]" in str(exc), exc
+        else:
+            raise AssertionError("%s ohne Bus ohne Fehler" % fn.__name__)
+    g = FakeKGcmd({"DRY_RUN": 1})
+    obj.cmd_init(g)  # Trockenlauf geht ohne Bus
+    assert g.infos and "P" in g.infos[0]
+    return "Meldung: %s" % msg[:70]
+
+
 # =====================================================================
 # Runner
 # =====================================================================
@@ -886,10 +1028,12 @@ TESTS = [
     ("Plan-Vergleich motor_init", test_plan_vergleich),
     ("Extruder via transparent 0x81 (nie 0x85)", test_extruder_transparent),
     ("allow_write=False schreibt nichts", test_allow_write_false),
-    ("K2_MOTOR_STATUS liest 0x0F/0x0C/0x08", test_status_lesen),
+    ("KTWO_MOTOR_STATUS liest 0x0F/0x0C/0x08", test_status_lesen),
     ("REVIEW 1: Config vor connect", test_review_config_vor_connect),
     ("REVIEW 2: print_time > 0", test_review_print_time),
     ("REVIEW 3: query + Fallback", test_review_query),
+    ("Hülle Upstream (Namen/pins/MCU/cb/max_duration/k2_485)", test_huelle_upstream),
+    ("Hülle ohne [k2_485] -> klare Meldung", test_huelle_ohne_bus),
 ]
 
 
