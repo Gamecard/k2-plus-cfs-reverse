@@ -495,8 +495,9 @@ box 179 · boxmini 17 · cfsseq 28 · motor 134 · motor_mini 43 · auto_addr 33
   TEST_SWAP-Ablauf, READ-Parameter), Sensor über Düsen-MCU live gelesen, Paketformat (gepackt, Delta) + Ringpuffer (8er-Blöcke)
   entschlüsselt, k2_prtouch korrigiert (73/73). KORREKTUR: Z-Stopp über Endstop PC7 + trsync (STOPP-BEWEIS §1 widerlegt).
 - [x] PrTouch: PA15-Umschaltung bei Kontakt **BELEGT** (Fingerdruck-Test 16.10.2026: 19/19 Auslösungen PC7→0 + tri=1 bei Kraft ≥ ~4 400, 0 Fehlauslöser in Ruhe, Re-Arm per sta_swap=1) → Pi-Weg Standard-Probe auf !PC7
-- [ ] pi-host: `[k2_prtouch]` auf Upstream-`[probe]` (pin !PC7) + Arm/Disarm-Hook (start/stop_prtouch_pres) umbauen; Schrittfahrt nur noch Rückfall
-- [ ] PrTouch: Stock-Antastlauf emulieren → Abbildung ned_*/holds/lmt_dead; Main-MCU-Lesepfad (read_prtouch_step) live
+- [x] pi-host: `[k2_prtouch]` auf Upstream-Probe umgebaut (16.10.2026): registriert `probe`, Endstop !PC7 + trsync, Arm/Disarm in Stock-Reihenfolge (Disarm immer per finally), Signalweg-/Ruhe-/PC7-Prüfung vor jeder Fahrt, allow_move-Sperre, ≤ 5 mm/s, Wegbegrenzung; Schrittfahrt als `mode: steps`. 138/138 Tests (21 gegen echte Upstream-Dateien, Commit 9cb9975). **Am Gerät mit Bewegung UNGETESTET** (ANNAHMEN P1–P6 im README)
+- [x] PrTouch: Stock-Antastlauf emuliert → Abbildung BELEGT (PRTOUCH-LESETEST-BEFUND §7): [60, 93750, 5, 1000, 800, 4000, 10000, 500, 128], aqc 46875; ned_hftr/lftr ×1000, lmt_dead=int(pres_ded_tkms)
+- [ ] PrTouch: Main-MCU-Lesepfad (read_prtouch_step) live; Stopp unter Bewegung (Pi bzw. Einzelfreigabe)
 - [ ] Bustest Teil 2 (schreibend/MCU): Motor-Init mit Strapping, Extruder transparent, Box-Preload – braucht Klipper bzw. Pi
 - [x] KORREKTUR: Klipper-MCU-Basis 0x08003000 (Main + Düse); PrTouch „stoppt nicht selbst“ mit korrekter Basis bestätigt
 - [x] PrTouch-Stopp-Weg BEWIESEN (statisch): Host bricht ab, Swap-Leitung nur Synchronisation, kein trsync/Endstop – PRTOUCH-STOPP-BEWEIS-2026-10-16.md

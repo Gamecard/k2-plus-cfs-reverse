@@ -37,12 +37,35 @@ Stil wie pi-host/k2_motor_init.py und k2_box.py:
   Klippy-Adapter nur in der Hülle, Fakes nur in den Tests).
 - Bewegung nur mit Freigabe (allow_move, Default False).
 
+HAUPTWEG (mode: probe, Default, Stand 16.10.2026 abends):
+  [k2_prtouch] registriert sich als Upstream-Probe (Objekt 'probe',
+  Pseudo-Pin probe:z_virtual_endstop). Stopp über einen normalen
+  MCU_endstop auf step_swap_pin (Default !PC7, Main-MCU) mit trsync – wie
+  Stock (BELEGT: Emulation + Fingerdruck-Test 19/19). Vor jeder Fahrt:
+  Signalweg-Test (sta_swap 0/1 über den Endstop), Stock-probe_prepare
+  (cont_prtouch_step -> start_prtouch_pres mit ack-Prüfung ->
+  start_prtouch_step), Ruhetest, PC7 nicht ausgelöst; nach jeder Fahrt
+  (auch bei Ausnahme): stop_prtouch_step + stop_prtouch_pres sta_swap=1.
+  Damit gehen PROBE, QUERY_PROBE, PROBE_ACCURACY, PROBE_CALIBRATE,
+  G28 Z (endstop_pin: probe:z_virtual_endstop), BED_MESH_CALIBRATE,
+  Z_TILT_ADJUST usw. Geprüft gegen Upstream-Klipper (Commit s. README).
+  Klassen: K2PrtouchProbeCore (rein, testbar), K2PrtouchPrinterProbe /
+  K2PrtouchEndstopWrapper / K2DescendHelper / K2ProbeOffsets (Hülle).
+
+RÜCKFALL (mode: steps bzw. K2_PRTOUCH_PROBE_STEPS): zeitgesteuerte
+Schrittfahrt K2PrtouchController.probe_point mit hostseitiger Auswertung.
+
 Sicherheit (verbindlich, im Code durchgesetzt + getestet):
+  S0 Probe-Hauptweg: Fahrt nur mit allow_move: True, Antastgeschwindigkeit
+     hart <= 5 mm/s (auch PROBE_SPEED=/G28-homing_speed), Weg außerhalb G28
+     <= probe_max_travel_mm (Default 8, max 10), Entschärfen bei jeder
+     Ausnahme, Abbruch VOR der Fahrt bei ack err != 0, Signalweg-/Ruhetest-
+     Fehler oder schon ausgelöstem Endstop.
   S1 MCU stoppt nicht selbst → Abwärtsfahrt NUR in kurzen Schritten
      (step_mm Default 0.02, Maximum 0.05) mit niedriger Geschwindigkeit
      (Default 5mm/s, Maximum 5mm/s), nach JEDEM Schritt wait_moves
      (M400-Äquivalent), dann lesen/auswerten, bei Kontakt SOFORT stoppen
-     und anheben.
+     und anheben. (Gilt für den Rückfall-Schrittweg.)
   S2 Harte Grenzen: max_travel_mm pro Antastung (Default 5mm Stock-Hub),
      Kraft-Notgrenze (Roh-Abweichung vom Nullpunkt > emergency_thresh →
      sofort Abbruch + Fehler), Timeout; bei jedem Fehler: Sampling stoppen,
@@ -50,18 +73,19 @@ Sicherheit (verbindlich, im Code durchgesetzt + getestet):
      einmaliger can_brk-Wiederholung versetzt).
   S3 Bewegung nur mit allow_move: True (Default False → nur
      Selbsttest/TEST_SWAP/Sensor lesen, keine Z-Bewegung);
-     G-Code K2_PRTOUCH_PROBE [DRY_RUN=1].
+     G-Code K2_PRTOUCH_PROBE_STEPS [DRY_RUN=1].
   S4 Vor jeder Antastung TEST_SWAP-Äquivalent + Sensor-Ruhetest
      (Rauschen/Drift, analog PRES_CHECK); sonst Abbruch VOR Bewegung.
   S5 Temperaturen (Düse 140/Bett 50) nur als Empfehlung prüfen (Warnung),
      nicht selbst heizen.
 
 G-Codes (PrinterK2Prtouch):
-- K2_PRTOUCH_PROBE [X=.. Y=.. DRY_RUN=1] – Einzelantastung.
-- K2_PRTOUCH_HOME_Z [DRY_RUN=1] – Bettmitte antasten + SET_KINEMATIC_POSITION
-  (homing_override-Vorschlag s. BERICHT).
-- K2_PRTOUCH_MESH [COUNT=.. DRY_RUN=1] – eigenes Raster (Fallback, falls
-  Upstream-Probe-API zu unsicher); erzeugt bed_mesh-kompatible Matrix.
+- mode probe: Upstream-Befehle (PROBE, QUERY_PROBE, PROBE_ACCURACY,
+  PROBE_CALIBRATE, Z_OFFSET_APPLY_PROBE) + G28 Z/BED_MESH_CALIBRATE/… .
+- K2_PRTOUCH_PROBE_STEPS [X=.. Y=.. DRY_RUN=1] – Rückfall-Einzelantastung
+  (beide Modi).
+- nur mode steps: K2_PRTOUCH_HOME_Z [DRY_RUN=1], K2_PRTOUCH_MESH
+  [COUNT=.. DRY_RUN=1] (eigene Ersatzbefehle wie bisher).
 - K2_PRTOUCH_TEST_SWAP – Sync-/Versionscheck ohne Bewegung.
 - K2_PRTOUCH_READ – Sensor lesen ohne Bewegung.
 - K2_PRTOUCH_STATUS – letzter Status (auch Moonraker via get_status).
@@ -141,16 +165,25 @@ CLOCK_FREQ = 120000000  # BELEGT Dict :82 + Stats freq=119998498/222
 PRES_N = 64  # BELEGT PRES_TIME 64 Punkte
 STEP_N = 64  # BELEGT STEP_TIME 64 Punkte
 PRES_DT_S = 0.00078125  # BELEGT pres_acq_tkms 0.78125
-# STEP_DT aus STEP_TIME-Fenster 0.0244s/64 ≈ 0.38ms (BELEGT Fenster,
-# ANNAHME Faktor; SPEZIFIKATION §2.2: aqc_tick ≈ 45700).
-STEP_DT_S = 0.0244 / 64.0
+# BELEGT 16.10.2026 (Emulation Stock-probe_prepare): step_acq_tkms
+# 0.390625 ms -> aqc_tick 46875 (alte ANNAHME 0.0244s/64 bzw. 45700 FALSCH).
+STEP_DT_S = 0.000390625
 
-# Stock-Live-Werte (BELEGT liveconfig/printer-live.cfg/Mitschnitt):
-STOCK_CFG_REGS = 60  # 1280/128 per Kommentar printer-live.cfg:343
-STOCK_ACQ_TICK = int(round(PRES_DT_S * CLOCK_FREQ))  # 93750
-STOCK_AQC_TICK = 45700  # ANNAHME Spanne 45600-46000 (§2.2)
-STOCK_NED = (5, 1, 0.8)  # pres_tri_fter (BELEGT Werte, ANNAHME Mapping)
-STOCK_HOLDS = (4000, 10000, 500)  # pres_tri_hold (BELEGT Werte)
+# Stock-Konfigwerte (printer-live.cfg [prtouch_v3]) und ihre Abbildung auf
+# die MCU-Parameter – BELEGT 16.10.2026 per Emulation des Stock-Moduls
+# (Stock-probe_prepare/home_start mitgelesen, Zuordnung durch gezielte
+# Variation der Konfigwerte eindeutig). Umrechnung: stock_to_mcu_params().
+STOCK_CFG_REGS = 60  # pres_cfg_regs
+STOCK_PRES_ACQ_TKMS = 0.78125  # pres_acq_tkms [ms]
+STOCK_STEP_ACQ_TKMS = 0.390625  # step_acq_tkms [ms]
+STOCK_TRI_FTER = (5, 1, 0.8)  # pres_tri_fter
+STOCK_TRI_HOLD = (4000, 10000, 500)  # pres_tri_hold
+STOCK_DED_TKMS = 128.0  # pres_ded_tkms
+STOCK_ACQ_TICK = 93750  # = round(0.78125/1000 * 120 MHz)
+STOCK_AQC_TICK = 46875  # = round(0.390625/1000 * 120 MHz)
+STOCK_NED = (5, 1000, 800)  # MCU-Werte ned_tftr/hftr/lftr (BELEGT)
+STOCK_HOLDS = (4000, 10000, 500)  # MCU-Werte min/max/add_hold (BELEGT)
+STOCK_LMT_DEAD = 128  # MCU-Wert lmt_dead = int(pres_ded_tkms) (BELEGT)
 STOCK_SPEED = 5.0  # BELEGT STEP_DATA-Fall + liveconfig speed
 STOCK_HUB = 5.0  # BELEGT horizontal_move_z + PRTOUCH_MOVE Z5.00
 STOCK_FANS = 0.6  # BELEGT prth_min_fans + DISTUURB_CTL
@@ -175,6 +208,13 @@ SPEED_DEFAULT = 5.0
 SPEED_MAX = 5.0
 MAX_TRAVEL_MAX = 10.0  # Review 16.10.: harte Obergrenze, Stock-Hub 5 mm
 MAX_TRAVEL_DEFAULT = 5.0  # Stock-Hub
+# Probe-Hauptweg (mode: probe): maximaler Abwärtsweg je Antastung außerhalb
+# von G28 (PROBE, BED_MESH_CALIBRATE, Z_TILT_ADJUST …). Default 8 mm deckt
+# horizontal_move_z 5 + Bettwelligkeit ab; harte Grenze wie MAX_TRAVEL_MAX.
+PROBE_MAX_TRAVEL_DEFAULT = 8.0
+ARM_SETTLE_DEFAULT_S = 0.2  # ANNAHME: Wartezeit nach dem Scharfschalten
+ARM_SETTLE_MAX_S = 2.0
+MODES = ("probe", "steps")
 Z_LIFT_DEFAULT = 2.0  # wie sample_retract_dist 2.0
 TIMEOUT_DEFAULT_S = 30.0  # wie z_align timeout 30s
 
@@ -232,6 +272,65 @@ def split_cs0_pin(spec):
 # =====================================================================
 # Config (rein + Klipper-Hülle)
 # =====================================================================
+
+def _num_list(raw, default, count, name):
+    """'5, 1, 0.8' / [5, 1, 0.8] / None -> Tupel aus count Zahlen."""
+    if raw is None or (isinstance(raw, str) and raw.strip() == ""):
+        return tuple(float(v) for v in default)
+    if isinstance(raw, (list, tuple)):
+        parts = list(raw)
+    else:
+        parts = [p for p in str(raw).replace(";", ",").split(",")
+                 if p.strip() != ""]
+    try:
+        vals = tuple(float(str(p).strip()) for p in parts)
+    except ValueError:
+        raise ValueError("%s muss %d Zahlen enthalten: %r"
+                         % (name, count, raw))
+    if len(vals) != count:
+        raise ValueError("%s muss %d Zahlen enthalten: %r"
+                         % (name, count, raw))
+    return vals
+
+
+def stock_to_mcu_params(pres_cfg_regs, pres_acq_tkms, pres_tri_fter,
+                        pres_tri_hold, pres_ded_tkms, step_acq_tkms,
+                        clock_freq_pres=CLOCK_FREQ,
+                        clock_freq_step=CLOCK_FREQ):
+    """Stock-Konfigwerte -> MCU-Parameter für start_prtouch_pres/_step.
+
+    BELEGT 16.10.2026 (Emulation des Stock-Moduls, Zuordnung durch
+    Variation eindeutig; beide MCUs 120 MHz laut klippy.log):
+      cfg_regs = pres_cfg_regs
+      acq_tick = round(pres_acq_tkms / 1000 * CLOCK_FREQ Düse)
+      ned_tftr = pres_tri_fter[0]
+      ned_hftr = round(pres_tri_fter[1] * 1000)
+      ned_lftr = round(pres_tri_fter[2] * 1000)
+      min/max/add_hold = pres_tri_hold
+      lmt_dead = int(pres_ded_tkms)   (abgeschnitten, nicht gerundet)
+      aqc_tick = round(step_acq_tkms / 1000 * CLOCK_FREQ Main)
+    Stock live: [60, 93750, 5, 1000, 800, 4000, 10000, 500, 128], 46875.
+    ANNAHME (nicht prüfbar): ned_tftr/ned_hftr stehen im Dictionary als
+    %c; Stock sendet trotzdem 1000 (VLQ-kodiert, Upstream-msgproto
+    PT_byte kodiert ebenfalls ohne Begrenzung) – wir senden exakt wie Stock.
+    """
+    f = tuple(float(v) for v in pres_tri_fter)
+    h = tuple(pres_tri_hold)
+    return {
+        "cfg_regs": int(pres_cfg_regs),
+        "acq_tick": int(round(float(pres_acq_tkms) / 1000.0
+                              * float(clock_freq_pres))),
+        "ned_tftr": int(round(f[0])),
+        "ned_hftr": int(round(f[1] * 1000.0)),
+        "ned_lftr": int(round(f[2] * 1000.0)),
+        "min_hold": int(round(float(h[0]))),
+        "max_hold": int(round(float(h[1]))),
+        "add_hold": int(round(float(h[2]))),
+        "lmt_dead": int(float(pres_ded_tkms)),
+        "aqc_tick": int(round(float(step_acq_tkms) / 1000.0
+                              * float(clock_freq_step))),
+    }
+
 
 def parse_options(opts):
     """Reines Dict (keys klein) -> strukturierte Config.
@@ -303,6 +402,37 @@ def parse_options(opts):
         raise ValueError("emergency_thresh muss > contact_thresh sein "
                          "(sonst löst jeder Kontakt die Notgrenze aus)")
 
+    # --- Betriebsart + Probe-Hauptweg (Upstream-[probe]-Ersatz) ---
+    cfg["mode"] = (_str("mode", "probe") or "probe").lower()
+    if cfg["mode"] not in MODES:
+        raise ValueError("mode muss 'probe' oder 'steps' sein: %r"
+                         % (o.get("mode"),))
+    # 'speed' = Upstream-Optionsname (ProbeParameterHelper); Default ist
+    # probe_speed, damit beide Wege dieselbe Geschwindigkeit nutzen.
+    cfg["speed"] = _float("speed", cfg["probe_speed"])
+    if not 0.0 < cfg["speed"] <= SPEED_MAX + 1e-12:
+        raise ValueError("speed muss in (0, %.1f] sein (S1): %r"
+                         % (SPEED_MAX, o.get("speed")))
+    cfg["z_offset"] = _float("z_offset", 0.0)  # wie Stock (Düse = Taster)
+    pe = _str("position_endstop", None)
+    cfg["position_endstop"] = (cfg["z_offset"] if pe is None
+                               else _float("position_endstop", 0.0))
+    cfg["probe_max_travel_mm"] = _float("probe_max_travel_mm",
+                                        PROBE_MAX_TRAVEL_DEFAULT)
+    if not 0.0 < cfg["probe_max_travel_mm"] <= MAX_TRAVEL_MAX + 1e-12:
+        raise ValueError("probe_max_travel_mm muss in (0, %.1f] sein: %r"
+                         % (MAX_TRAVEL_MAX, o.get("probe_max_travel_mm")))
+    cfg["arm_settle_s"] = _float("arm_settle_s", ARM_SETTLE_DEFAULT_S)
+    if not 0.0 <= cfg["arm_settle_s"] <= ARM_SETTLE_MAX_S + 1e-12:
+        raise ValueError("arm_settle_s muss in [0, %.1f] sein: %r"
+                         % (ARM_SETTLE_MAX_S, o.get("arm_settle_s")))
+    # Signalweg-Test PA15->PC7 über den Endstop vor JEDER Fahrt (sta_swap
+    # 0 -> Endstop ausgelöst, 1 -> frei), Ruhetest nach dem Scharfschalten,
+    # optionale Diagnose-Auslesung des eingefrorenen Rings danach (Stock).
+    cfg["swap_check"] = _bool("swap_check", True)
+    cfg["rest_check"] = _bool("rest_check", True)
+    cfg["diag_readout"] = _bool("diag_readout", False)
+
     # --- MCUs / Pins (Stock-Defaults aus printer-live.cfg) ---
     cfg["main_mcu"] = _str("main_mcu", "mcu") or "mcu"
     cfg["nozzle_mcu"] = _str("nozzle_mcu", "nozzle_mcu") or "nozzle_mcu"
@@ -333,25 +463,33 @@ def parse_options(opts):
         if cfg["pres_sdo_pin"] is None:
             cfg["pres_sdo_pin"] = d_sdo
 
-    # --- Stock-Sampling-Parameter ---
-    cfg["cfg_regs"] = _int("cfg_regs", STOCK_CFG_REGS)
-    cfg["acq_tick"] = _int("acq_tick", STOCK_ACQ_TICK)
-    cfg["aqc_tick"] = _int("aqc_tick", STOCK_AQC_TICK)
-    cfg["ned_tftr"] = _int("ned_tftr", STOCK_NED[0])
-    cfg["ned_hftr"] = _int("ned_hftr", STOCK_NED[1])
-    # ANNAHME ned_lftr: live 0.8 (float) vs Dict %u. Skalierung
-    # konfigurierbar: MCU-Wert = round(ned_lftr * ned_lftr_scale).
-    # Default scale 10 → 8. Exakter Faktor nur per Roh-Mitschnitt klärbar.
-    cfg["ned_lftr"] = _float("ned_lftr", STOCK_NED[2])
-    cfg["ned_lftr_scale"] = _int("ned_lftr_scale", 10)
-    cfg["min_hold"] = _int("min_hold", STOCK_HOLDS[0])
-    cfg["max_hold"] = _int("max_hold", STOCK_HOLDS[1])
-    cfg["add_hold"] = _int("add_hold", STOCK_HOLDS[2])
-    # ANNAHME lmt_dead: Herkunft offen (§2.1). Kandidat prth_err_dead 0.2
-    # vs %u → Default 200 (= 0.2*1000). Vor Gerätetest per Debug prüfen.
-    cfg["lmt_dead"] = _int("lmt_dead", 200)
-    if cfg["ned_lftr_scale"] <= 0:
-        raise ValueError("ned_lftr_scale muss > 0 sein")
+    # --- Sampling-Parameter (Stock-Stil, BELEGT 16.10.2026) ---
+    # Eingabe wie printer-live.cfg [prtouch_v3]; MCU-Werte werden daraus
+    # berechnet (stock_to_mcu_params). Direkte MCU-Optionen (cfg_regs,
+    # acq_tick, aqc_tick, ned_*, *_hold, lmt_dead) übersteuern einzeln.
+    if "ned_lftr_scale" in o:
+        raise ValueError("ned_lftr_scale entfällt (alte ANNAHME widerlegt): "
+                         "ned_lftr = round(pres_tri_fter[2] * 1000) – "
+                         "pres_tri_fter oder ned_lftr (MCU-Wert) setzen")
+    cfg["clock_freq"] = _float("clock_freq", CLOCK_FREQ)
+    if cfg["clock_freq"] <= 0:
+        raise ValueError("clock_freq muss > 0 sein")
+    cfg["pres_cfg_regs"] = _int("pres_cfg_regs", STOCK_CFG_REGS)
+    cfg["pres_acq_tkms"] = _float("pres_acq_tkms", STOCK_PRES_ACQ_TKMS)
+    cfg["step_acq_tkms"] = _float("step_acq_tkms", STOCK_STEP_ACQ_TKMS)
+    cfg["pres_ded_tkms"] = _float("pres_ded_tkms", STOCK_DED_TKMS)
+    cfg["pres_tri_fter"] = _num_list(o.get("pres_tri_fter"), STOCK_TRI_FTER,
+                                     3, "pres_tri_fter")
+    cfg["pres_tri_hold"] = _num_list(o.get("pres_tri_hold"), STOCK_TRI_HOLD,
+                                     3, "pres_tri_hold")
+    mcu_p = stock_to_mcu_params(
+        cfg["pres_cfg_regs"], cfg["pres_acq_tkms"], cfg["pres_tri_fter"],
+        cfg["pres_tri_hold"], cfg["pres_ded_tkms"], cfg["step_acq_tkms"],
+        cfg["clock_freq"], cfg["clock_freq"])
+    for key, val in mcu_p.items():
+        cfg[key] = _int(key, val) if key in o else int(val)
+    if cfg["acq_tick"] <= 0 or cfg["aqc_tick"] <= 0:
+        raise ValueError("acq_tick/aqc_tick müssen > 0 sein")
 
     # --- Datenformat (ANNAHME, zentral konfigurierbar) ---
     # BELEGT: ticks/datas sind Byte-Arrays (%.*s), 64 Samples, little/
@@ -368,7 +506,6 @@ def parse_options(opts):
     cfg["data_format"] = _str("data_format", "<i") or "<i"
     cfg["tick_size"] = _int("tick_size", 4)
     cfg["data_size"] = _int("data_size", 4)
-    cfg["clock_freq"] = _float("clock_freq", CLOCK_FREQ)
     for k in ("tick_format", "data_format"):
         try:
             struct.calcsize(cfg[k])
@@ -457,7 +594,15 @@ def parse_klipper_config(config):
               "packing", "tick_format", "data_format", "tick_size", "data_size",
               "clock_freq", "step_dist_mm", "retry_dx", "retry_dy",
               "retry_lift_mm", "temp_nozzle_warn", "temp_bed_warn",
-              "temp_tolerance", "shutdown_on_failure"):
+              "temp_tolerance", "shutdown_on_failure",
+              # Probe-Hauptweg + Stock-Stil-Sampling (16.10.2026):
+              "mode", "speed", "z_offset", "position_endstop",
+              "probe_max_travel_mm", "arm_settle_s", "swap_check",
+              "rest_check", "diag_readout", "pres_cfg_regs",
+              "pres_acq_tkms", "step_acq_tkms", "pres_tri_fter",
+              "pres_tri_hold", "pres_ded_tkms", "rest_min_consec",
+              "stepper_x_oid", "stepper_y_oid", "stepper_z_oid",
+              "can_brk_min_best", "can_brk_min_step", "can_brk_max_zoft"):
         if k not in opts:
             v = _g(k, None)
             if v is not None and str(v) != "":
@@ -466,8 +611,9 @@ def parse_klipper_config(config):
 
 
 def ned_lftr_mcu_value(cfg):
-    """ned_lftr (float, z.B. 0.8) -> MCU-%u-Wert (ANNAHME Skalierung)."""
-    return int(round(float(cfg["ned_lftr"]) * int(cfg["ned_lftr_scale"])))
+    """MCU-Wert ned_lftr (BELEGT: round(pres_tri_fter[2] * 1000), 0.8 -> 800;
+    schon in parse_options berechnet)."""
+    return int(cfg["ned_lftr"])
 
 
 def build_start_pres_tuple(cfg, oid):
@@ -853,8 +999,35 @@ class KlippyPresMcu(PrtouchMcuOps):
                 "note": "s. K2PrtouchController.test_swap"}
 
     def start_sampling(self):
+        """start_prtouch_pres (Antast-Modus = Düse scharf) -> ack-Dict.
+        Antwort ack_prtouch (BELEGT live 16.10.: err 0 bei Erfolg)."""
         args = build_start_pres_tuple(self.cfg, self.oid)
-        return self._q_start.send(list(args))
+        return _ack_dict(self._q_start.send(list(args)))
+
+    def disarm(self):
+        """Düse entschärfen: stop_prtouch_pres sta_swap=1 (BELEGT
+        Fingerdruck-Test 16.10.: setzt PA15/PC7 wieder auf 1). Wirft bei
+        Kommunikationsfehler (Aufrufer entscheidet)."""
+        return _ack_dict(self._q_stop.send([self.oid, 1]))
+
+    def read_frozen(self):
+        """Diagnose nach dem Entschärfen, Stock-Reihenfolge (BELEGT per
+        Emulation 16.10.): read_prtouch_pres [oid, 2, 0, 0, 0] (Status,
+        len 0), dann is_src=0 (FTR) und is_src=1 (SRC) je idx 0,8,…,56 mit
+        len = 64 - idx (Antwort je Abfrage <= 8 Samples, gepackt)."""
+        status = self._q_read.send([self.oid, 2, 0, 0, 0])
+        out = {"status": {k: status.get(k) for k in
+                          ("tri_chxs", "buf_len", "idx", "len")
+                          if hasattr(status, "get")}}
+        for name, is_src in (("ftr", 0), ("src", 1)):
+            ts, ds = [], []
+            for idx in range(0, PRES_N, READ_CHUNK):
+                res = self._q_read.send([self.oid, is_src, 0, idx,
+                                         PRES_N - idx])
+                ts += decode_ticks(bytes(res["ticks"]), self.cfg)
+                ds += decode_pres_datas(bytes(res["datas"]), self.cfg)
+            out[name] = merge_ring(ts, ds, PRES_N)
+        return out
 
     def read_pres(self):
         # BELEGT live 16.10.2026: is_src=1 = Rohwerte (Skala wie Stock-
@@ -869,10 +1042,22 @@ class KlippyPresMcu(PrtouchMcuOps):
         return merge_ring(ts, ds, PRES_N)
 
     def stop_sampling(self, ok=True):
+        # BELEGT 16.10.2026: sta_swap=1 = Leitung high (Ruhe, PC7=1);
+        # sta_swap=0 zöge sie auf „ausgelöst“. Daher immer 1 (Stock-
+        # probe_finish ebenso); ok bleibt nur als API-Parameter.
+        _ = ok
         try:
-            return self._q_stop.send([self.oid, 1 if ok else 0])
+            return self._q_stop.send([self.oid, 1])
         except Exception:
             return None
+
+
+def _ack_dict(r):
+    """ack_prtouch-Antwort -> dict(err, expar0, expar1) (fehlende = 0)."""
+    get = r.get if hasattr(r, "get") else (lambda k, d=None: d)
+    return {"err": int(get("err", 0) or 0),
+            "expar0": int(get("expar0", 0) or 0),
+            "expar1": int(get("expar1", 0) or 0)}
 
 
 class KlippyStepMcu(PrtouchMcuOps):
@@ -883,10 +1068,15 @@ class KlippyStepMcu(PrtouchMcuOps):
         self.mcu = mcu
         self.cfg = cfg
         self.oid = int(oid)
-        self._q_start = self._q_read = self._q_stop = None
+        self._q_start = self._q_read = self._q_stop = self._q_cont = None
 
     def handle_connect(self):
         mcu = self.mcu
+        # BELEGT (Emulation Stock-probe_prepare 16.10.2026): Antwort auf
+        # cont_prtouch_step ist resault_prtouch_step_cnt (cnt_x/y/z).
+        # ANNAHME: start/stop_prtouch_step antworten mit ack_prtouch.
+        self._q_cont = mcu.lookup_query_command(
+            CMD_CONT_STEP, RESP_STEP_CNT, oid=self.oid)
         self._q_start = mcu.lookup_query_command(
             CMD_START_STEP, RESP_ACK, oid=self.oid)
         self._q_read = mcu.lookup_query_command(
@@ -906,8 +1096,32 @@ class KlippyStepMcu(PrtouchMcuOps):
                 "note": "s. K2PrtouchController.test_swap"}
 
     def start_sampling(self):
-        return self._q_start.send(list(build_start_step_tuple(self.cfg,
-                                                              self.oid)))
+        """start_prtouch_step [oid, aqc_tick] -> ack-Dict (ANNAHME Antwort
+        ack_prtouch wie bei pres)."""
+        return _ack_dict(self._q_start.send(
+            list(build_start_step_tuple(self.cfg, self.oid))))
+
+    def cont_step(self):
+        """cont_prtouch_step (Stock-probe_prepare Schritt 1) -> Zähler."""
+        r = self._q_cont.send([self.oid])
+        get = r.get if hasattr(r, "get") else (lambda k, d=None: d)
+        return {"cnt_x": get("cnt_x"), "cnt_y": get("cnt_y"),
+                "cnt_z": get("cnt_z")}
+
+    def disarm(self):
+        """stop_prtouch_step (Stock-probe_finish Schritt 1)."""
+        return _ack_dict(self._q_stop.send([self.oid]))
+
+    def read_frozen(self):
+        """Diagnose (Stock-Reihenfolge, BELEGT per Emulation): read_prtouch_
+        step [oid, 0, 0], dann idx 0,8,…,56 mit len = 64 - idx."""
+        self._q_read.send([self.oid, 0, 0])
+        ts, ds = [], []
+        for idx in range(0, STEP_N, READ_CHUNK):
+            res = self._q_read.send([self.oid, idx, STEP_N - idx])
+            ts += decode_ticks(bytes(res["ticks"]), self.cfg)
+            ds += decode_step_counts(bytes(res["datas"]), self.cfg)
+        return {"step": merge_ring(ts, ds, STEP_N)}
 
     def read_pres(self):
         raise NotImplementedError("step-MCU hat kein pres")
@@ -1055,13 +1269,14 @@ class K2PrtouchController:
                          c["allow_move"], c["step_mm"], STEP_MM_MAX,
                          c["probe_speed"], SPEED_MAX, c["max_travel_mm"],
                          c["z_lift_mm"], c["probe_timeout_s"]))
-        lines.append("pres: cfg_regs=%d acq_tick=%d ned=(%d,%d,%d->%d) "
+        lines.append("pres: cfg_regs=%d acq_tick=%d ned=(%d,%d,%d/%d) "
                      "holds=(%d,%d,%d) lmt_dead=%d" % (
                          c["cfg_regs"], c["acq_tick"], c["ned_tftr"],
                          c["ned_hftr"], c["ned_lftr"],
                          ned_lftr_mcu_value(c), c["min_hold"],
                          c["max_hold"], c["add_hold"], c["lmt_dead"]))
-        lines.append("step: aqc_tick=%d (ANNAHME ~45700)" % c["aqc_tick"])
+        lines.append("step: aqc_tick=%d (Stock 46875 = 0,390625 ms)"
+                     % c["aqc_tick"])
         lines.append("Pins: pres_swap=%s step_swap=%s clk=%s sdo=%s "
                      "(ANNAHME clk/sdo aus pres_cs0_pin)" % (
                          c["pres_swap_pin"], c["step_swap_pin"],
@@ -1420,11 +1635,289 @@ class K2PrtouchController:
 
 
 # =====================================================================
+# Probe-Hauptweg (mode: probe) – reine Logik, ohne Klipper testbar
+# =====================================================================
+#
+# Mechanismus (BELEGT 16.10.2026, PRTOUCH-LESETEST-BEFUND §3/§6 +
+# Emulation Stock-probe_prepare/probe_finish):
+#   Düse scharf (start_prtouch_pres, Antast-Parameter) -> Kontakt zieht
+#   PA15 (Düse) und damit PC7 (Main) auf 0 -> normaler Upstream-
+#   MCU_endstop auf !PC7 mit trsync stoppt Z IN DER MCU -> danach
+#   stop_prtouch_pres sta_swap=1 (PC7 wieder 1).
+# Stock-Reihenfolge, hier übernommen:
+#   prepare: cont_prtouch_step -> start_prtouch_pres -> start_prtouch_step
+#   Fahrt:   endstop_home (Upstream HomingMove/probing_move)
+#   finish:  stop_prtouch_step -> stop_prtouch_pres sta_swap=1
+#            (-> optional Diagnose: eingefrorenen Ring lesen)
+# Zusätzlich (eigene Sicherheit, nicht Stock): Signalweg-Test über den
+# Endstop, Ruhetest nach dem Scharfschalten, PC7-Prüfung vor der Fahrt,
+# allow_move-Sperre, Geschwindigkeitsgrenze 5 mm/s, Wegbegrenzung außerhalb
+# von G28, Entschärfen bei JEDER Ausnahme (try/finally).
+#
+# ANNAHMEN (offline bzw. gegen Upstream NICHT prüfbar, vor erster echter
+# Fahrt am Gerät klären):
+#   P1 Stopp unter Bewegung: PA15->PC7->endstop_home/trsync reagiert schnell
+#      genug (Upstream-Abtastung 4x15 µs, homing.py:9-10); nur im Stand per
+#      Fingerdruck belegt, nicht während einer Fahrt.
+#   P2 arm_settle_s 0,2 s reicht, damit die Düsen-MCU ihren Ruhewert
+#      übernimmt (Stock-Wartezeit nicht bekannt).
+#   P3 Ruhetest (read_prtouch_pres) ist auch bei zusätzlich gestartetem
+#      start_prtouch_step zulässig (live belegt nur ohne step-Seite, Test D).
+#   P4 Signalweg-Test vor jeder Fahrt (sta_swap 0/1 ohne laufende Messung)
+#      stört nichts – entspricht Stock-TEST_SWAP, dort aber ohne Endstop.
+#   P5 start/stop_prtouch_step antworten mit ack_prtouch (err 0 = ok).
+#   P6 Main-MCU-Endstop auf PC7 parallel zu config_prtouch_step swp_pin=PC7
+#      (wie Stock, BELEGT per Emulation) – auf Upstream ohne Pin-Konflikt,
+#      da config_prtouch_step den Pin nur als Namen im Config-Text trägt.
+
+def compute_probe_target_z(cur_z, z_min, max_travel, is_homing):
+    """Zielhöhe der Abwärtsfahrt.
+
+    G28 (Homing via probe:z_virtual_endstop): Upstream-Verhalten, bis
+    position_min (die Ausgangshöhe ist dort unbekannt/erzwungen).
+    Sonst (PROBE, BED_MESH_CALIBRATE, …): höchstens max_travel unter der
+    aktuellen Höhe, nie unter position_min.
+    """
+    if is_homing:
+        return float(z_min)
+    return max(float(z_min), float(cur_z) - float(max_travel))
+
+
+class K2PrtouchProbeCore:
+    """Antast-Sitzung für den Upstream-Probe-Weg (probe.py-Session-API).
+
+    Abhängigkeiten (alle injiziert, Fakes in den Tests):
+      get_params(gcmd) -> dict wie Upstream ProbeParameterHelper
+      descend: descend_until_trigger(gcmd, params),
+               pull_trigger_positions(), clear_trigger_positions()
+      query_triggered() -> bool (Endstop step_swap_pin, True = ausgelöst)
+      wait_moves(), pause(sekunden)
+      pres/step (attach() nach klippy:connect): set_swap, start_sampling,
+               read_pres, disarm, [read_frozen] bzw. cont_step,
+               start_sampling, disarm, [read_frozen]
+      error: Fehlerklasse (Klipper: printer.command_error – andere
+             Ausnahmen würden in Klipper einen Shutdown auslösen).
+    """
+
+    def __init__(self, cfg, get_params, descend, query_triggered,
+                 wait_moves, pause, error=K2PrtouchError, logger=None):
+        self.cfg = dict(cfg)
+        self.get_params = get_params
+        self.descend = descend
+        self.query_triggered = query_triggered
+        self.wait_moves = wait_moves
+        self.pause = pause
+        self.error = error
+        self.log = logger
+        self.pres = self.step = None
+        self.armed = False
+        self.arm_count = 0
+        self.disarm_count = 0
+        self.last = None
+
+    def attach(self, pres, step):
+        self.pres, self.step = pres, step
+
+    def _info(self, msg):
+        try:
+            if self.log is not None:
+                if hasattr(self.log, "respond_info"):
+                    self.log.respond_info(msg)
+                else:
+                    self.log.info(msg)
+        except Exception:
+            pass
+
+    def _wrap(self, what, fn, *args):
+        """MCU-Aufruf; fremde Ausnahmen -> self.error (kein Shutdown)."""
+        try:
+            return fn(*args)
+        except Exception as exc:
+            if isinstance(exc, self.error):
+                raise
+            raise self.error("[k2_prtouch] %s fehlgeschlagen: %s"
+                             % (what, exc))
+
+    # --- Freigabe / Grenzen -------------------------------------------
+    def check_allowed(self, gcmd):
+        """allow_move + Geschwindigkeitsgrenze; wirft VOR jeder Bewegung."""
+        if not self.cfg.get("allow_move"):
+            raise self.error(
+                "[k2_prtouch] Antasten/Homing gesperrt: allow_move: False "
+                "(Default). Erst K2_PRTOUCH_TEST_SWAP/K2_PRTOUCH_READ "
+                "prüfen, dann allow_move: True setzen. Keine Bewegung.")
+        params = self.get_params(gcmd)
+        sp = float(params.get("probe_speed", 0.0))
+        if not 0.0 < sp <= SPEED_MAX + 1e-12:
+            raise self.error(
+                "[k2_prtouch] Antastgeschwindigkeit %.2f mm/s unzulässig "
+                "(hart <= %.1f mm/s). Bei G28: homing_speed und "
+                "second_homing_speed in [stepper_z] <= %.1f setzen. "
+                "Keine Bewegung." % (sp, SPEED_MAX, SPEED_MAX))
+        return params
+
+    # --- Scharf schalten / entschärfen ----------------------------------
+    def arm(self):
+        """Düse scharf schalten (mit Vorabprüfungen). Wirft self.error.
+
+        Entschärft NICHT selbst – run_probe räumt per finally auf.
+        """
+        if self.pres is None or self.step is None:
+            raise self.error("[k2_prtouch] noch nicht verbunden "
+                             "(klippy:connect abwarten) – keine Bewegung.")
+        c = self.cfg
+        info = {}
+        if c.get("swap_check", True):
+            # Signalweg PA15 -> PC7 -> Endstop prüfen (wie Stock-TEST_SWAP,
+            # aber direkt über den Stopp-Endstop): sta_swap=0 muss den
+            # Endstop auslösen, sta_swap=1 muss ihn freigeben.
+            a0 = self._wrap("stop_prtouch_pres sta_swap=0",
+                            self.pres.set_swap, 0)
+            t0 = bool(self._wrap("Endstop-Abfrage", self.query_triggered))
+            a1 = self._wrap("stop_prtouch_pres sta_swap=1",
+                            self.pres.set_swap, 1)
+            t1 = bool(self._wrap("Endstop-Abfrage", self.query_triggered))
+            info["swap"] = {"triggered": (t0, t1),
+                            "err": (int(a0.get("err", 0)),
+                                    int(a1.get("err", 0))),
+                            "pres_ver": a0.get("expar1")}
+            if not (t0 and not t1):
+                raise self.error(
+                    "[k2_prtouch] Signalweg-Test fehlgeschlagen: Endstop "
+                    "%s meldete ausgelöst=%s bei sta_swap=0 und %s bei "
+                    "sta_swap=1 (erwartet True/False). Verkabelung, "
+                    "step_swap_pin-Invertierung (!PC7) oder pres_swap_pin "
+                    "prüfen – keine Bewegung."
+                    % (c.get("step_swap_pin"), t0, t1))
+        # Stock-probe_prepare: cont_step -> start_pres -> start_step.
+        info["cont"] = self._wrap("cont_prtouch_step", self.step.cont_step)
+        ack = self._wrap("start_prtouch_pres", self.pres.start_sampling)
+        info["ack_pres"] = ack
+        if int(ack.get("err", 0)) != 0:
+            raise self.error(
+                "[k2_prtouch] Düse ließ sich nicht scharf schalten: "
+                "start_prtouch_pres ack err=%d (expar0=%s expar1=%s) – "
+                "keine Bewegung." % (int(ack.get("err", 0)),
+                                     ack.get("expar0"), ack.get("expar1")))
+        ack2 = self._wrap("start_prtouch_step", self.step.start_sampling)
+        info["ack_step"] = ack2
+        if int(ack2.get("err", 0)) != 0:
+            raise self.error(
+                "[k2_prtouch] start_prtouch_step ack err=%d – keine "
+                "Bewegung." % int(ack2.get("err", 0)))
+        self.armed = True
+        self.arm_count += 1
+        settle = float(c.get("arm_settle_s", ARM_SETTLE_DEFAULT_S))
+        if settle > 0:
+            self.pause(settle)
+        if c.get("rest_check", True):
+            _t, d = self._wrap("read_prtouch_pres (Ruhetest)",
+                               self.pres.read_pres)
+            datas = decode_pres_datas(d, c)
+            ok, ri = check_rest_ok(datas, c)
+            info["rest"] = ri
+            if not ok:
+                raise self.error(
+                    "[k2_prtouch] Sensor-Ruhetest nach dem Scharfschalten "
+                    "fehlgeschlagen: dif=%d > %d (len=%d) – keine Bewegung."
+                    % (ri["dif"], c["rest_max_dif"], ri["len"]))
+        if bool(self._wrap("Endstop-Abfrage", self.query_triggered)):
+            raise self.error(
+                "[k2_prtouch] Düse meldet bereits Kontakt (Endstop %s "
+                "ausgelöst) VOR der Fahrt – keine Bewegung. Düse frei? "
+                "Restkraft/Filament an der Düse?" % (c.get("step_swap_pin"),))
+        return info
+
+    def disarm(self):
+        """Stock-probe_finish: stop_prtouch_step, dann stop_prtouch_pres
+        sta_swap=1. Versucht IMMER beide; gibt Fehlerliste zurück."""
+        errs = []
+        for name, obj in (("stop_prtouch_step", self.step),
+                          ("stop_prtouch_pres sta_swap=1", self.pres)):
+            if obj is None:
+                continue
+            try:
+                obj.disarm()
+            except Exception as exc:
+                errs.append("%s: %s" % (name, exc))
+        self.armed = False
+        self.disarm_count += 1
+        return errs
+
+    def _diag(self):
+        out = {}
+        for name, obj in (("pres", self.pres), ("step", self.step)):
+            if obj is None or not hasattr(obj, "read_frozen"):
+                continue
+            try:
+                r = obj.read_frozen()
+                out[name] = {k: (len(v[1]) if isinstance(v, tuple) else v)
+                             for k, v in r.items()}
+            except Exception as exc:
+                out[name + "_error"] = str(exc)
+        return out
+
+    # --- Upstream-Session-API (vgl. probe.py ProbeEndstopWrapper) ------
+    def start_probe_session(self, gcmd):
+        self.check_allowed(gcmd)
+        self.descend.clear_trigger_positions()
+        return self
+
+    def run_probe(self, gcmd):
+        params = self.check_allowed(gcmd)
+        # Düse in Ruhe scharf schalten (Schwelle relativ zum Ruhewert beim
+        # Scharfschalten, BELEGT Fingerdruck-Test §6):
+        self.wait_moves()
+        last = {"status": "arming"}
+        self.last = last
+        pending = None
+        try:
+            last["arm"] = self.arm()
+            last["status"] = "armed"
+            self.descend.descend_until_trigger(gcmd, params)
+            last["status"] = "ok"
+        except BaseException as exc:
+            pending = exc
+            last["status"] = "error"
+            last["error"] = str(exc)
+            raise
+        finally:
+            errs = self.disarm()
+            if errs:
+                last["disarm_errors"] = errs
+            else:
+                try:
+                    if self.query_triggered():
+                        last["warn"] = ("Endstop nach dem Entschärfen noch "
+                                        "ausgelöst")
+                except Exception:
+                    pass
+            if self.cfg.get("diag_readout"):
+                last["diag"] = self._diag()
+            if errs and pending is None:
+                raise self.error("[k2_prtouch] Entschärfen fehlgeschlagen: "
+                                 "%s" % "; ".join(errs))
+
+    def pull_probed_results(self):
+        return self.descend.pull_trigger_positions()
+
+    def end_probe_session(self):
+        self.descend.clear_trigger_positions()
+        if self.armed:  # sollte nie vorkommen – trotzdem sicher entschärfen
+            self.disarm()
+
+    def get_status(self):
+        return {"armed": self.armed, "arms": self.arm_count,
+                "disarms": self.disarm_count, "last": self.last}
+
+
+# =====================================================================
 # Klipper-Hülle [k2_prtouch] (ANNAHMEN zur Upstream-API, s. BERICHT)
 # =====================================================================
 
 def _resolve_pin_number(printer, mcu_name, pin_raw):
-    """Pin-Name -> Nummer (wie KlippyGpio, ANNAHME API-Varianten)."""
+    """Pin-Name -> Nummer (alt, seit 16.10.2026 NICHT mehr genutzt: die
+    Hülle schickt Pin-NAMEN wie Stock, Upstream löst sie selbst auf)."""
     try:
         ppins = printer.lookup_object("ppins")
         if hasattr(ppins, "lookup_pin"):
@@ -1448,6 +1941,187 @@ def _resolve_pin_number(printer, mcu_name, pin_raw):
     raise ValueError("Pin-Nummer für %r nicht auflösbar" % (pin_raw,))
 
 
+def _upstream(name):
+    """Upstream-Modul aus klippy/extras laden (im Paket relativ, in den
+    Tests über einen 'extras'-Paketpfad). ANNAHME: Datei liegt als
+    klippy/extras/k2_prtouch.py (wie jedes Zusatzmodul)."""
+    import importlib
+    if __package__:
+        try:
+            return importlib.import_module("." + name, __package__)
+        except ImportError:
+            pass
+    return importlib.import_module("extras." + name)
+
+
+def _lookup_mcu(printer, name):
+    """MCU-Objekt nach Config-Namen. Upstream registriert '[mcu]' als 'mcu'
+    und '[mcu nozzle_mcu]' als 'mcu nozzle_mcu' (mcu.py:1250-1260,
+    get_printer_mcu). Fallback: Name wörtlich."""
+    name = str(name).strip()
+    if name != "mcu" and not name.startswith("mcu "):
+        try:
+            return printer.lookup_object("mcu " + name)
+        except Exception:
+            pass
+    return printer.lookup_object(name)
+
+
+class K2ProbeOffsets:
+    """Wie Upstream ProbeOffsetsHelper (probe.py:410), aber z_offset mit
+    Default 0 (Stock: Düse = Taster, keine XY-Versätze)."""
+
+    def __init__(self, cfg):
+        self.x_offset = 0.0
+        self.y_offset = 0.0
+        self.z_offset = float(cfg.get("z_offset", 0.0))
+
+    def get_offsets(self, gcmd=None):
+        return self.x_offset, self.y_offset, self.z_offset
+
+
+class K2DescendHelper:
+    """Abwärtsfahrt bis Endstop – nachgebaut nach Upstream
+    DescendToEndstopHelper (probe.py:246-275), zusätzlich mit Wegbegrenzung
+    außerhalb von G28 (compute_probe_target_z) und erneuter
+    Geschwindigkeitsprüfung."""
+
+    def __init__(self, config, mcu_probe, probe_offsets, cfg, probe_mod,
+                 manual_probe_mod):
+        self.printer = config.get_printer()
+        self.mcu_probe = mcu_probe
+        self.probe_offsets = probe_offsets
+        self.cfg = cfg
+        self.manual_probe = manual_probe_mod
+        self.z_min_position = probe_mod.lookup_minimum_z(config)
+        self.results = []
+        # Z-Stepper an den Endstop hängen (trsync stoppt sie in der MCU):
+        probe_mod.LookupZSteppers(config, self.mcu_probe.add_stepper)
+
+    def descend_until_trigger(self, gcmd, params):
+        toolhead = self.printer.lookup_object("toolhead")
+        pos = toolhead.get_position()
+        speed = float(params["probe_speed"])
+        if not 0.0 < speed <= SPEED_MAX + 1e-12:
+            raise self.printer.command_error(
+                "[k2_prtouch] probe_speed %.2f > %.1f mm/s" % (speed,
+                                                               SPEED_MAX))
+        is_homing = gcmd.get_command() == "G28"
+        pos[2] = compute_probe_target_z(
+            pos[2], self.z_min_position, self.cfg["probe_max_travel_mm"],
+            is_homing)
+        phoming = self.printer.lookup_object("homing")
+        check_movement = not phoming.check_probe_first_home(gcmd)
+        ppos = phoming.probing_move(self.mcu_probe, pos, speed,
+                                    check_movement=check_movement)
+        offsets = self.probe_offsets.get_offsets()
+        self.results.append(self.manual_probe.create_probe_result(ppos,
+                                                                  offsets))
+
+    def pull_trigger_positions(self):
+        res = self.results
+        self.results = []
+        return res
+
+    def clear_trigger_positions(self):
+        self.pull_trigger_positions()
+
+
+class K2PrtouchEndstopWrapper:
+    """Endstop + Probe-Session (vgl. Upstream ProbeEndstopWrapper
+    probe.py:545 / BLTouchProbe bltouch.py:26): MCU_endstop-Schnittstelle
+    für HomingMove (get_mcu/add_stepper/get_steppers/home_start/home_wait/
+    query_endstop, mcu.py:345-411) + Session-API an K2PrtouchProbeCore."""
+
+    def __init__(self, mcu_endstop, core):
+        self.mcu_endstop = mcu_endstop
+        self.core = core
+        self.get_mcu = mcu_endstop.get_mcu
+        self.add_stepper = mcu_endstop.add_stepper
+        self.get_steppers = mcu_endstop.get_steppers
+        self.home_start = mcu_endstop.home_start
+        self.home_wait = mcu_endstop.home_wait
+        self.query_endstop = mcu_endstop.query_endstop
+
+    def start_probe_session(self, gcmd):
+        self.core.start_probe_session(gcmd)
+        return self
+
+    def run_probe(self, gcmd):
+        self.core.run_probe(gcmd)
+
+    def pull_probed_results(self):
+        return self.core.pull_probed_results()
+
+    def end_probe_session(self):
+        self.core.end_probe_session()
+
+
+class K2PrtouchPrinterProbe:
+    """Das 'probe'-Objekt (vgl. Upstream PrinterProbe probe.py:608 und
+    PrinterBLTouch bltouch.py:281): PROBE, QUERY_PROBE, PROBE_ACCURACY,
+    PROBE_CALIBRATE, Z_OFFSET_APPLY_PROBE, probe:z_virtual_endstop sowie
+    alle ProbePointsHelper-Nutzer (BED_MESH_CALIBRATE, Z_TILT_ADJUST,
+    SCREWS_TILT_CALCULATE …)."""
+
+    def __init__(self, config, cfg):
+        probe_mod = _upstream("probe")
+        manual_probe_mod = _upstream("manual_probe")
+        self.printer = printer = config.get_printer()
+        self.reactor = printer.get_reactor()
+        self.cfg = cfg
+        self.probe_offsets = K2ProbeOffsets(cfg)
+        self.param_helper = probe_mod.ProbeParameterHelper(config)
+        # Upstream liest 'speed' (Default 5.0); unser cfg['speed'] ist
+        # identisch bzw. fällt auf probe_speed zurück und ist hart <= 5.
+        self.param_helper.speed = float(cfg["speed"])
+        ppins = printer.lookup_object("pins")
+        self.mcu_endstop = ppins.setup_pin("endstop", cfg["step_swap_pin"])
+        gcode = printer.lookup_object("gcode")
+        self.core = K2PrtouchProbeCore(
+            cfg, self.param_helper.get_probe_params, None,
+            self._query_triggered, self._wait_moves, self._pause,
+            error=printer.command_error, logger=gcode)
+        self.mcu_probe = K2PrtouchEndstopWrapper(self.mcu_endstop, self.core)
+        self.core.descend = K2DescendHelper(
+            config, self.mcu_probe, self.probe_offsets, cfg, probe_mod,
+            manual_probe_mod)
+        self.probe_session = probe_mod.SampleAveragingHelper(
+            config, self.param_helper, self.mcu_probe.start_probe_session)
+        self.cmd_helper = probe_mod.ProbeCommandHelper(
+            config, self, self.mcu_probe.query_endstop)
+        probe_mod.HomingViaProbeHelper(config, float(cfg["position_endstop"]),
+                                       self.mcu_probe.query_endstop)
+        printer.add_object("probe", self)
+
+    # Hilfen für den Kern (Klipper-APIs: mcu.py:1234, toolhead.py:422)
+    def _query_triggered(self):
+        mcu = self.mcu_endstop.get_mcu()
+        pt = mcu.estimated_print_time(self.reactor.monotonic())
+        return bool(self.mcu_endstop.query_endstop(pt))
+
+    def _wait_moves(self):
+        self.printer.lookup_object("toolhead").wait_moves()
+
+    def _pause(self, seconds):
+        self.reactor.pause(self.reactor.monotonic() + float(seconds))
+
+    # Upstream-Probe-Schnittstelle (probe.py:621-628)
+    def get_probe_params(self, gcmd=None):
+        return self.param_helper.get_probe_params(gcmd)
+
+    def get_offsets(self, gcmd=None):
+        return self.probe_offsets.get_offsets(gcmd)
+
+    def get_status(self, eventtime):
+        st = self.cmd_helper.get_status(eventtime)
+        st["k2_prtouch"] = self.core.get_status()
+        return st
+
+    def start_probe_session(self, gcmd):
+        return self.probe_session.start_probe_session(gcmd)
+
+
 class PrinterK2Prtouch:
     """Klipper-Objekt [k2_prtouch]."""
 
@@ -1462,72 +2136,75 @@ class PrinterK2Prtouch:
         self.pres_oid = self.step_oid = None
         self.pres_mcu = self.step_mcu = None
         self.controller = None
+        self.probe = None
         self._pin_nums = {}
-        # MCU-Objekte (Namen aus Config):
+        # MCU-Objekte (Upstream-Namen 'mcu' / 'mcu nozzle_mcu'):
         try:
-            self.mcu_pres = self.printer.lookup_object(
-                self.cfg["nozzle_mcu"])
-            self.mcu_step = self.printer.lookup_object(
-                self.cfg["main_mcu"])
+            self.mcu_pres = _lookup_mcu(self.printer, self.cfg["nozzle_mcu"])
+            self.mcu_step = _lookup_mcu(self.printer, self.cfg["main_mcu"])
         except Exception as exc:
             raise config.error("[k2_prtouch] MCU nicht gefunden "
                                "(nozzle_mcu/main_mcu): %s" % exc)
-        # ANNAHME Upstream: register_config_callback vor connect.
-        try:
-            self.mcu_pres.register_config_callback(self._build_pres_config)
-            self.mcu_step.register_config_callback(self._build_step_config)
-        except Exception as exc:
-            raise config.error("[k2_prtouch] register_config_callback: %s "
-                               "(ANNAHME Upstream-API)" % exc)
+        # Upstream: register_config_callback vor connect (mcu.py:1131).
+        self.mcu_pres.register_config_callback(self._build_pres_config)
+        self.mcu_step.register_config_callback(self._build_step_config)
         self.printer.register_event_handler("klippy:connect",
                                             self.handle_connect)
-        for cmd, fn, desc in (
-                ("K2_PRTOUCH_PROBE", self.cmd_probe,
-                 "Einzelantastung [X=.. Y=.. DRY_RUN=1]"),
-                ("K2_PRTOUCH_HOME_Z", self.cmd_home_z,
-                 "Z-Homing Bettmitte [DRY_RUN=1]"),
-                ("K2_PRTOUCH_MESH", self.cmd_mesh,
-                 "Raster-Mesh [COUNT=.. DRY_RUN=1]"),
+        # Hauptweg: Upstream-Probe auf step_swap_pin (Default !PC7).
+        if self.cfg["mode"] == "probe":
+            try:
+                self.probe = K2PrtouchPrinterProbe(config, self.cfg)
+            except config.error:
+                raise
+            except Exception as exc:
+                raise config.error("[k2_prtouch] Probe-Einrichtung: %s"
+                                   % exc)
+        cmds = [("K2_PRTOUCH_PROBE_STEPS", self.cmd_probe,
+                 "Rückfall: zeitgesteuerte Schrittfahrt [X=.. Y=.. "
+                 "DRY_RUN=1]"),
                 ("K2_PRTOUCH_TEST_SWAP", self.cmd_swap,
                  "Sync-/Versionscheck ohne Bewegung"),
                 ("K2_PRTOUCH_READ", self.cmd_read,
                  "Sensor lesen ohne Bewegung"),
-                ("K2_PRTOUCH_STATUS", self.cmd_status,
-                 "Letzter Status")):
-            try:
-                self.gcode.register_command(cmd, fn, desc=desc)
-            except Exception:
-                pass
+                ("K2_PRTOUCH_STATUS", self.cmd_status, "Letzter Status")]
+        if self.cfg["mode"] == "steps":
+            # Nur im Rückfallmodus: eigene Ersatzbefehle für G28 Z / Mesh.
+            cmds += [("K2_PRTOUCH_HOME_Z", self.cmd_home_z,
+                      "Rückfall: Z-Homing Bettmitte [DRY_RUN=1]"),
+                     ("K2_PRTOUCH_MESH", self.cmd_mesh,
+                      "Rückfall: Raster-Mesh [COUNT=.. DRY_RUN=1]")]
+        for cmd, fn, desc in cmds:
+            self.gcode.register_command(cmd, fn, desc=desc)
 
     # --- Config-Phase (vor connect) ---
     def _build_pres_config(self):
         mcu = self.mcu_pres
         self.pres_oid = mcu.create_oid()
-        swp = _resolve_pin_number(self.printer, self.cfg["nozzle_mcu"],
-                                  self.cfg["pres_swap_pin"])
-        clk = _resolve_pin_number(self.printer, self.cfg["nozzle_mcu"],
-                                  self.cfg["pres_clk_pin"])
-        sdo = _resolve_pin_number(self.printer, self.cfg["nozzle_mcu"],
-                                  self.cfg["pres_sdo_pin"])
+        # Pins als NAMEN wie Stock (BELEGT wörtlich: swp_pin=PA15
+        # clk_pin=PB13 sdo_pin=PB14); Upstream löst '[ _]pin=NAME' über den
+        # PinResolver der MCU auf (pins.py:16/41, mcu.py:1022-1025) und
+        # msgproto kodiert *_pin über die 'pin'-Enumeration
+        # (msgproto.py:125-135). Kein ppins.lookup_pin -> kein Konflikt mit
+        # dem Endstop auf PC7 (Stock nutzt PC7 ebenso doppelt).
+        swp = _clean_pin_name(self.cfg["pres_swap_pin"])
+        clk = _clean_pin_name(self.cfg["pres_clk_pin"])
+        sdo = _clean_pin_name(self.cfg["pres_sdo_pin"])
         self._pin_nums.update({"pres_swp": swp, "clk": clk, "sdo": sdo})
-        # ANNAHME add_config_cmd-Signatur (Upstream-Muster, is_init).
         mcu.add_config_cmd(
-            "config_prtouch_pres oid=%d idx=%d swp_pin=%d clk_pin=%d "
-            "sdo_pin=%d" % (self.pres_oid, int(self.cfg["pres_idx"]),
+            "config_prtouch_pres oid=%d idx=%d swp_pin=%s clk_pin=%s "
+            "sdo_pin=%s" % (self.pres_oid, int(self.cfg["pres_idx"]),
                             swp, clk, sdo))  # is_init False wie Stock
 
     def _build_step_config(self):
         mcu = self.mcu_step
         self.step_oid = mcu.create_oid()
-        swp = _resolve_pin_number(self.printer, self.cfg["main_mcu"],
-                                  self.cfg["step_swap_pin"])
+        swp = _clean_pin_name(self.cfg["step_swap_pin"])
         self._pin_nums["step_swp"] = swp
-        # Stepper-OIDs: ANNAHME Auto-Lookup, sonst manuelle Config.
         ox, oy, oz = self._stepper_oids()
         self._pin_nums.update({"ox": ox, "oy": oy, "oz": oz})
         mcu.add_config_cmd(
             "config_prtouch_step oid=%d oid_xstp=%d oid_ystp=%d "
-            "oid_zstp=%d swp_pin=%d" % (self.step_oid, ox, oy, oz, swp))
+            "oid_zstp=%d swp_pin=%s" % (self.step_oid, ox, oy, oz, swp))
 
     def _stepper_oids(self):
         c = self.cfg
@@ -1536,23 +2213,30 @@ class PrinterK2Prtouch:
                 and c["stepper_z_oid"] is not None):
             return (int(c["stepper_x_oid"]), int(c["stepper_y_oid"]),
                     int(c["stepper_z_oid"]))
-        # ANNAHME: Stepper-Objekte tragen ihre MCU-OID (je nach
-        # Upstream-Version get_oid()/_oid/oid). Vor Gerätetest prüfen!
-        out = []
-        # BELEGT per Emulation des Stock-Moduls (16.10.2026): Stock trägt als
-        # oid_zstp den LETZTEN Z-Stepper ein (K2: stepper_z1); z/z1 laufen
-        # synchron. Fallback stepper_z, falls kein stepper_z1 existiert.
-        names = ["stepper_x", "stepper_y", "stepper_z1"]
+        # Upstream: Stepper sind KEINE eigenen Printer-Objekte, sondern
+        # über toolhead.get_kinematics().get_steppers() erreichbar
+        # (probe.py:203-206); MCU_stepper.get_oid() (stepper.py:132), OID
+        # schon im Konstruktor vergeben (stepper.py:33).
+        # BELEGT (Emulation 16.10.): oid_zstp = LETZTER Z-Stepper (stepper_z1).
+        steppers = {}
         try:
-            self.printer.lookup_object("stepper_z1")
+            kin = self.printer.lookup_object("toolhead").get_kinematics()
+            for st in kin.get_steppers():
+                steppers[st.get_name()] = st
         except Exception:
-            names[2] = "stepper_z"
+            pass
+        names = ["stepper_x", "stepper_y",
+                 "stepper_z1" if "stepper_z1" in steppers else "stepper_z"]
+        out = []
         for name in names:
-            try:
-                st = self.printer.lookup_object(name)
-            except Exception as exc:
-                raise RuntimeError("Stepper %r nicht gefunden (ANNAHME "
-                                   "Upstream-Name): %s" % (name, exc))
+            st = steppers.get(name)
+            if st is None:
+                try:
+                    st = self.printer.lookup_object(name)
+                except Exception as exc:
+                    raise RuntimeError(
+                        "Stepper %r nicht gefunden – notfalls stepper_*_oid "
+                        "in [k2_prtouch] setzen: %s" % (name, exc))
             for attr in ("get_oid", "_oid", "oid"):
                 try:
                     v = getattr(st, attr)
@@ -1562,9 +2246,8 @@ class PrinterK2Prtouch:
                     continue
             else:
                 raise RuntimeError(
-                    "Stepper-OID für %r nicht auflösbar (ANNAHME "
-                    "get_oid/_oid) – notfalls stepper_*_oid manuell in "
-                    "[k2_prtouch] setzen." % name)
+                    "Stepper-OID für %r nicht auflösbar – notfalls "
+                    "stepper_*_oid manuell in [k2_prtouch] setzen." % name)
         return tuple(out)
 
     def handle_connect(self):
@@ -1576,13 +2259,16 @@ class PrinterK2Prtouch:
             pres.handle_connect()
             step.handle_connect()
         except Exception as exc:
+            # Ohne Query-Lookup bleibt der Kern ungebunden -> jede Probe-/
+            # Homing-Fahrt bricht VOR der Bewegung mit klarer Meldung ab.
             try:
-                self.gcode.respond_info("[k2_prtouch] Query-Lookup: %s "
-                                        "(ANNAHME lookup_query_command)" % exc)
+                self.gcode.respond_info("[k2_prtouch] Query-Lookup: %s" % exc)
             except Exception:
                 pass
             return
         self.pres_mcu, self.step_mcu = pres, step
+        if self.probe is not None:
+            self.probe.core.attach(pres, step)
         self.controller = K2PrtouchController(
             self.cfg, pres, step, KlippyToolhead(self.printer),
             pause=getattr(self.reactor, "pause", time.sleep),
@@ -1590,19 +2276,19 @@ class PrinterK2Prtouch:
 
     def _ctl(self):
         if self.controller is None:
-            # Noch nicht connected (z.B. direkt nach Restart): Controller
-            # mit Klippy-Adaptern ohne Query-Cache ist trotzdem für
-            # DRY_RUN/Swap brauchbar? Nein – klar melden.
             raise RuntimeError("noch nicht connected (klippy:connect "
                                "abwarten)")
         return self.controller
 
     def get_status(self, eventtime=None):
         _ = eventtime
-        base = {"allow_move": bool(self.cfg.get("allow_move")),
+        base = {"mode": self.cfg.get("mode"),
+                "allow_move": bool(self.cfg.get("allow_move")),
                 "step_mm": self.cfg.get("step_mm"),
                 "last": self.controller.last_result
-                if self.controller else None}
+                if self.controller else None,
+                "probe": self.probe.core.get_status()
+                if self.probe is not None else None}
         return base
 
     # --- G-Code-Helfer ---

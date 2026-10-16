@@ -1,6 +1,267 @@
-> **ENTWURF – Sensor-Lesepfad am Gerät GETESTET (16.10.2026, ohne Bewegung, PRTOUCH-LESETEST-BEFUND-2026-10-16.md); Antasten weiter UNGETESTET.** Klipper-Modul [k2_prtouch] für den eingebauten Kraftsensor. Offline 43/43 + Review-Test. Entwurf durch einen weiteren KI-Agenten, Review durch uns (Fix: max_travel_mm hart ≤ 10 mm). Vor dem ersten echten Test unbedingt die ANNAHMEN-Liste unten am Gerät prüfen, erst mit allow_move: False.
+> **ENTWURF – Stand 16.10.2026 abends.** Sensor-Lesepfad und Swap-Leitung am Gerät GETESTET (ohne Bewegung, PRTOUCH-LESETEST-BEFUND-2026-10-16.md, Fingerdruck-Test 19/19). **Hauptweg ist jetzt eine normale Upstream-Klipper-Probe** auf `!PC7` (wie Stock). Antasten mit Bewegung ist weiterhin **UNGETESTET**. Offline-Tests: 138/138 + Review-Test (davon 21 gegen die echten Upstream-Dateien `probe.py`/`homing.py`/`manual_probe.py`/`gcode.py`/`pins.py`). Vor der ersten echten Fahrt: Abschnitt A.5 (ANNAHMEN P1–P6) und A.6 (Erstlauf) beachten, erst mit `allow_move: False`.
 
-# BERICHT – Klipper-Modul [k2_prtouch] (PrTouch v3, K2 Plus)
+# [k2_prtouch] – Kraftsensor-Düse des K2 Plus unter Upstream-Klipper
+
+## A. Hauptweg: Upstream-Probe (`mode: probe`, Default)
+
+### A.1 Prinzip (BELEGT)
+
+```
+Düse scharf (start_prtouch_pres, Antast-Parameter)
+  → Kontakt: Düsen-MCU zieht PA15 auf 0
+  → Main-MCU sieht PC7 = 0
+  → normaler Upstream-MCU_endstop auf !PC7 + trsync stoppt Z IN DER MCU
+  → danach stop_prtouch_pres sta_swap=1 (PA15/PC7 wieder 1)
+```
+
+Genau so macht es Stock (`PRTouchEndstopWrapper`, `config_endstop pin=PC7 pull_up=0`,
+`step_swap_pin: !PC7`, `probe:z_virtual_endstop`). `[k2_prtouch]` registriert sich
+deshalb als Objekt `probe` (wie `[bltouch]`/`[load_cell_probe]`), und damit
+funktionieren die Standardbefehle: `PROBE`, `QUERY_PROBE`, `PROBE_ACCURACY`,
+`PROBE_CALIBRATE`, `Z_OFFSET_APPLY_PROBE`, `G28 Z` (über
+`endstop_pin: probe:z_virtual_endstop`), `BED_MESH_CALIBRATE`, `Z_TILT_ADJUST`,
+`SCREWS_TILT_CALCULATE` …
+
+Ablauf je Antastung (`K2PrtouchProbeCore.run_probe`), Stock-Reihenfolge laut
+Emulation von `probe_prepare`/`probe_finish`, ergänzt um eigene Prüfungen (*):
+
+1. *Freigabe: `allow_move: True`, sonst Fehler ohne jede Bewegung (schon in
+   `start_probe_session`, also auch vor den XY-Fahrten von `BED_MESH_CALIBRATE`).
+2. *Geschwindigkeit ≤ 5 mm/s (auch `PROBE_SPEED=` und bei `G28` die
+   `homing_speed`/`second_homing_speed` aus `[stepper_z]`), sonst Fehler.
+3. `toolhead.wait_moves()` – scharf geschaltet wird im Stillstand (Schwelle
+   relativ zum Ruhewert beim Scharfschalten, Fingerdruck-Test §6).
+4. *Signalweg-Test über den Stopp-Endstop: `sta_swap=0` → Endstop muss
+   „ausgelöst“ melden, `sta_swap=1` → „frei“ (`swap_check`, Default an).
+5. `cont_prtouch_step` → `start_prtouch_pres` (ack `err != 0` → Abbruch) →
+   `start_prtouch_step` (ack geprüft).
+6. *Wartezeit `arm_settle_s` (Default 0,2 s, ANNAHME P2), Ruhetest
+   (`rest_check`, `dif ≤ rest_max_dif`).
+7. *Endstop darf jetzt NICHT ausgelöst sein, sonst Abbruch („Düse meldet bereits
+   Kontakt VOR der Fahrt“).
+8. Fahrt: Upstream `homing.probing_move()` (HomingMove/trsync). Ziel außerhalb
+   von G28: höchstens `probe_max_travel_mm` (Default 8, max 10) unter der
+   aktuellen Höhe; bei G28 wie Upstream bis `position_min`.
+9. Immer (try/finally, auch bei jeder Ausnahme): `stop_prtouch_step` →
+   `stop_prtouch_pres sta_swap=1`. Optional (`diag_readout: True`) danach der
+   eingefrorene Ring in Stock-Reihenfolge (Status `[oid,2,0,0,0]`, FTR/SRC
+   idx 0…56 mit len 64−idx, step analog) – nur Diagnose, in `K2_PRTOUCH_STATUS`.
+
+Fehler werden als `printer.command_error` gemeldet (kein Klipper-Shutdown).
+
+### A.2 printer.cfg-Beispiel (Upstream-Klipper auf dem Pi)
+
+```ini
+# k2_prtouch.py nach klippy/extras/k2_prtouch.py kopieren.
+# KEIN zusätzliches [probe]/[bltouch] – [k2_prtouch] IST die Probe.
+
+[mcu]
+serial: /dev/serial/by-id/<Main-MCU>        # Platzhalter
+[mcu nozzle_mcu]
+serial: /dev/serial/by-id/<Düsen-MCU>       # Platzhalter (bzw. Stock-Anbindung)
+
+[k2_prtouch]
+mode: probe                 # Hauptweg (Rückfall: steps)
+allow_move: False           # ERST nach TEST_SWAP/READ/QUERY_PROBE auf True
+speed: 5.0                  # Antastgeschwindigkeit, hart <= 5 mm/s (Stock 5)
+lift_speed: 5.0
+z_offset: 0.0               # Stock 0 (Düse = Taster); PROBE_CALIBRATE schreibt hierher
+#position_endstop: 0.0      # Default = z_offset
+samples: 1                  # Upstream-Optionen wie [probe]:
+sample_retract_dist: 2.0
+#samples_result: median
+#samples_tolerance: 0.100
+#samples_tolerance_retries: 0
+probe_max_travel_mm: 8.0    # Weg je Antastung außerhalb G28 (max 10)
+arm_settle_s: 0.2           # ANNAHME P2
+swap_check: True            # Signalweg-Test PA15->PC7 vor jeder Fahrt
+rest_check: True            # Ruhetest nach dem Scharfschalten
+rest_max_dif: 3000
+#diag_readout: False
+
+# Pins/MCUs (Stock):
+main_mcu: mcu
+nozzle_mcu: nozzle_mcu
+step_swap_pin: !PC7         # Endstop-Pin, ausgelöst = PC7 low
+pres_swap_pin: nozzle_mcu:PA15
+pres_cs0_pin: nozzle_mcu:PB13, nozzle_mcu:PB14   # clk=PB13, sdo=PB14 (BELEGT)
+
+# Antast-Parameter im Stock-Stil (BELEGT-Umrechnung, s. A.3):
+pres_cfg_regs: 60
+pres_acq_tkms: 0.78125
+pres_tri_fter: 5, 1, 0.8
+pres_tri_hold: 4000, 10000, 500
+pres_ded_tkms: 128.0
+step_acq_tkms: 0.390625
+
+[stepper_z]
+# … step/dir/enable/rotation wie Stock …
+endstop_pin: probe:z_virtual_endstop
+position_min: -10
+position_max: 360
+homing_speed: 5             # MUSS <= 5 sein (sonst lehnt k2_prtouch G28 ab)
+second_homing_speed: 5      # dito
+homing_retract_dist: 5      # 0 = nur eine Antastung beim G28
+
+[stepper_z1]
+# … wie Stock, aber OHNE endstop_pin (Upstream nutzt den Endstop von
+# stepper_z für alle Z-Stepper; k2_prtouch hängt z und z1 an den Endstop).
+
+[safe_z_home]               # G28 Z in Bettmitte (Upstream-Modul)
+home_xy_position: 175, 175
+z_hop: 5
+z_hop_speed: 5
+
+[bed_mesh]                  # Werte wie Stock
+speed: 100
+horizontal_move_z: 5
+mesh_min: 5, 5
+mesh_max: 345, 345
+probe_count: 9, 9
+mesh_pps: 2, 2
+algorithm: bicubic
+bicubic_tension: 0.2
+fade_start: 5.0
+fade_end: 50.0
+split_delta_z: 0.01
+move_check_distance: 1
+
+[z_tilt]                    # Werte wie Stock
+z_positions:
+    -15, 175
+    375, 175
+points:
+    5, 175
+    345, 175
+speed: 300
+horizontal_move_z: 5
+retries: 10
+retry_tolerance: 0.1
+```
+
+Ablauf danach z. B. `G28` → `Z_TILT_ADJUST` → `G28 Z` → `BED_MESH_CALIBRATE`
+(Temperaturen wie Stock vorher selbst einstellen: Düse 140 °C, Bett 50 °C – das
+Modul heizt nicht).
+
+### A.3 Stock-Konfig → MCU-Parameter (BELEGT per Emulation 16.10.2026)
+
+| MCU-Parameter | Berechnung | Stock |
+|---|---|---|
+| `cfg_regs` | `pres_cfg_regs` | 60 |
+| `acq_tick` | `round(pres_acq_tkms/1000 × 120 MHz)` | 93750 |
+| `ned_tftr` | `pres_tri_fter[0]` | 5 |
+| `ned_hftr` | `round(pres_tri_fter[1] × 1000)` | 1000 |
+| `ned_lftr` | `round(pres_tri_fter[2] × 1000)` | 800 |
+| `min/max/add_hold` | `pres_tri_hold` | 4000/10000/500 |
+| `lmt_dead` | `int(pres_ded_tkms)` (abgeschnitten) | 128 |
+| `aqc_tick` (step) | `round(step_acq_tkms/1000 × 120 MHz)` | 46875 |
+
+`start_prtouch_pres [oid, 60, 93750, 5, 1000, 800, 4000, 10000, 500, 128]`,
+`start_prtouch_step [oid, 46875]` – getestet inkl. Variation
+(7, 3, 0.25 / 4100, 10200, 530 / 96.5 / 0.5 ms → 60000, 7, 3000, 250, 4100,
+10200, 530, 96; aqc 60000). Die alten Annahmen (`ned_lftr_scale` 10,
+`ned_hftr` 1, `lmt_dead` 200, `aqc_tick` 45700) waren FALSCH; `ned_lftr_scale`
+wird jetzt mit Fehlermeldung abgelehnt. Direkte MCU-Optionen (`cfg_regs`,
+`acq_tick`, `aqc_tick`, `ned_*`, `*_hold`, `lmt_dead`) übersteuern einzeln.
+`clock_freq` (Default 120 MHz, BELEGT für beide MCUs) geht in beide Umrechnungen ein.
+Hinweis: `ned_tftr`/`ned_hftr` sind im Dictionary `%c`; Stock sendet trotzdem 1000
+(VLQ), wir senden exakt wie Stock.
+
+### A.4 Geprüfte Upstream-API
+
+Upstream-Klipper lokal, nur gelesen: Commit
+`9cb99754c035b90206ef0a02660f674fc9517e9b` (13.10.2026, „mcu: Report a normal
+CommandError if CommandWrapper fails“). Gegen diese Signaturen gebaut:
+
+| Upstream | Datei:Zeile | Nutzung in k2_prtouch |
+|---|---|---|
+| `ProbeCommandHelper(config, probe, query_endstop=None, can_set_z_offset=True)` | `klippy/extras/probe.py:39-40` | PROBE/QUERY_PROBE/… |
+| `lookup_minimum_z(config)` | `probe.py:188` | Fahrziel G28 |
+| `LookupZSteppers(config, add_stepper_cb)` | `probe.py:196-206` | z/z1 an den Endstop |
+| `HomingViaProbeHelper(config, position_endstop, query_endstop_cb=None)` | `probe.py:209-243` | `probe:z_virtual_endstop` |
+| `DescendToEndstopHelper` (Vorbild, nachgebaut mit Wegbegrenzung) | `probe.py:246-275` | `K2DescendHelper` |
+| `ProbeParameterHelper(config)`, `get_probe_params(gcmd)` | `probe.py:278-315` | speed/samples/… |
+| `SampleAveragingHelper(config, param_helper, start_session_cb)` | `probe.py:318-407` | Mehrfachproben |
+| `ProbeOffsetsHelper` (Vorbild, `z_offset` dort Pflicht) | `probe.py:410-416` | `K2ProbeOffsets` (Default 0) |
+| `ProbeEndstopWrapper` / `PrinterProbe` (Vorbild Session-API) | `probe.py:545-628` | Wrapper/Probe-Objekt |
+| `PrinterBLTouch`: `add_object('probe', …)` | `klippy/extras/bltouch.py:281-306` | Registrierung |
+| `LoadCellPrinterProbe` (Vorbereitung vor der Fahrt) | `klippy/extras/load_cell_probe.py:664-726` | Vorbild |
+| `Homing.home_rails` → `_do_home_z_via_probe` | `klippy/extras/homing.py:251-294` | G28 Z (`PROBE_SPEED`=homing_speed!) |
+| `PrinterHoming.check_probe_first_home(gcmd)`, `probing_move(mcu_probe, pos, speed, check_movement=True)` | `homing.py:320-336` | Fahrt |
+| `create_probe_result(test_pos, offsets)` | `klippy/extras/manual_probe.py:18-22` | Ergebnis |
+| `PrinterPins.setup_pin('endstop', desc)` (`!` = invert) | `klippy/pins.py:114-118`, `67-95` | Endstop `!PC7` |
+| `PinResolver.update_command` (`[ _]pin=NAME`) | `pins.py:16`, `41-53`; `klippy/mcu.py:1022-1025` | Pin-Namen in `config_prtouch_*` |
+| `MCU_endstop` (`home_start/home_wait/query_endstop`, `pin_value ^ invert`) | `mcu.py:345-411` | Stopp + Abfragen |
+| `MCU.lookup_query_command(msgformat, respformat, oid=None, cq=None, is_async=False)` | `mcu.py:1202-1205` | prtouch-Befehle |
+| `MCU.register_config_callback/create_oid/add_config_cmd(cmd, is_init=False, on_restart=False)` | `mcu.py:1183-1188` | Config-Phase |
+| `get_printer_mcu` (`'mcu nozzle_mcu'`) | `mcu.py:1257-1260` | MCU-Lookup |
+| `MCU_stepper.get_oid()` | `klippy/stepper.py:132` | `oid_x/y/zstp` |
+| `toolhead.wait_moves()`, `manual_move()` | `klippy/toolhead.py:410-428` | Stillstand vor Arm |
+| `msgproto` Enumeration `*_pin` | `klippy/msgproto.py:125-135` | Pin-Namen |
+
+Dabei behobene Hüllen-Fehler (alte Version wäre auf Upstream gescheitert):
+MCU-Lookup `nozzle_mcu` → Upstream-Name `mcu nozzle_mcu`; Pins jetzt als Namen
+statt über das nicht existierende `ppins`-Objekt/`get_enumeration`; Stepper-OIDs
+über `toolhead.get_kinematics().get_steppers()` (Upstream legt keine
+`stepper_x`-Objekte an); fehlende Config-Schlüssel (`stepper_*_oid`, `can_brk_*`)
+werden jetzt gelesen; `stop_prtouch_pres` sendet immer `sta_swap=1`.
+
+### A.5 ANNAHMEN des Hauptwegs (offline nicht prüfbar, im Code markiert)
+
+- **P1** Stopp unter Bewegung: PA15 → PC7 → `endstop_home`/trsync reagiert schnell
+  genug (Upstream-Abtastung 4 × 15 µs). Belegt ist nur der Stand (Fingerdruck).
+- **P2** `arm_settle_s` 0,2 s genügt zur Ruhewertübernahme der Düsen-MCU.
+- **P3** Ruhetest per `read_prtouch_pres` auch mit zusätzlich gestartetem
+  `start_prtouch_step` (live belegt nur pres-seitig, Test D).
+- **P4** Signalweg-Test vor jeder Fahrt (sta_swap 0/1 ohne laufende Messung) stört
+  nicht (entspricht Stock-TEST_SWAP).
+- **P5** `start_prtouch_step`/`stop_prtouch_step` antworten mit `ack_prtouch`.
+- **P6** Endstop und `config_prtouch_step` teilen PC7 (wie Stock) – auf Upstream ohne
+  Pin-Konflikt, da `config_prtouch_step` den Pin nur als Namen trägt.
+- Ladepfad: Datei liegt als `klippy/extras/k2_prtouch.py` (Upstream-Module per
+  `from . import probe`); offline über ein `extras`-Paket getestet.
+
+### A.6 Erstlauf (Pflicht-Reihenfolge)
+
+1. `allow_move: False`: `K2_PRTOUCH_TEST_SWAP`, `K2_PRTOUCH_READ`, `QUERY_PROBE`
+   (muss `open` melden), `K2_PRTOUCH_STATUS`.
+2. `PROBE` mit `allow_move: False` → muss mit „allow_move“-Fehler abbrechen, ohne
+   Bewegung.
+3. `allow_move: True`, Z per `SET_KINEMATIC_POSITION Z=10` (nur für den Test!),
+   Düse ~3 mm über dem Bett, Hand am Not-Aus: `PROBE` – Stopp beobachten.
+4. `PROBE_ACCURACY SAMPLES=5` (Streuung), dann `G28 Z`, dann
+   `BED_MESH_CALIBRATE` und gegen Stock-Profil (−0,061 … 0,224) plausibilisieren.
+
+### A.7 Tests (offline, `python3 test_k2_prtouch.py`)
+
+Neu (65 Prüfungen): Stock-Umrechnung inkl. Variation; Kern mit Fakes – Arm vor
+Fahrt/Disarm danach in Stock-Reihenfolge, Disarm bei Ausnahme (auch fremde
+Ausnahmen, Disarm-Fehler), Abbruch bei ack `err≠0`, Abbruch wenn PC7 vor der Fahrt
+schon ausgelöst (mit/ohne Signalweg-Test), Ruhetest-Abbruch, `allow_move: False`
+blockiert ohne jeden MCU-Befehl, Geschwindigkeitsgrenze (Config, `PROBE_SPEED=`,
+G28-homing_speed), Wegbegrenzung; MCU-Adapter (sta_swap=1, eingefrorener Ring in
+Stock-Abfragefolge). Integration gegen die **echten Upstream-Dateien** (wenn
+`arbeitsdateien-lokal/upstream-klipper` vorhanden, sonst SKIP): `PROBE`,
+`QUERY_PROBE`, `PROBE_ACCURACY SAMPLES=3`, `G28 Z` über die echte
+`Homing`-Klasse, Abbruch bei `allow_move: False`/`homing_speed 10`/hängender
+Leitung, `mode: steps`. Gesamt 138/138 + Review-Test; `test_k2_box.py` und
+`test_k2_motor.py` je 9/9.
+
+### Tests gegen echte Upstream-Dateien
+
+`KLIPPER_SRC=/pfad/zu/klipper python3 test_k2_prtouch.py` – ohne die Variable werden die 21 Upstream-Prüfungen übersprungen (geprüft gegen Upstream-Commit 9cb9975).
+
+## B. Rückfall: zeitgesteuerte Schrittfahrt (`mode: steps` / `K2_PRTOUCH_PROBE_STEPS`)
+
+Der bisherige Weg (`K2PrtouchController.probe_point`) bleibt unverändert
+erhalten. `K2_PRTOUCH_PROBE_STEPS` (früher `K2_PRTOUCH_PROBE`) gibt es in beiden
+Modi; `K2_PRTOUCH_HOME_Z` und `K2_PRTOUCH_MESH` nur bei `mode: steps` (dann ohne
+`probe`-Objekt, kein `probe:z_virtual_endstop`). Der folgende Altbericht
+beschreibt diesen Rückfallweg; durch A überholte Punkte sind markiert.
+
+---
+
+# Altbericht – Rückfall-Schrittfahrt (Stand 16.10.2026 mittags)
 
 Stand: 16.10.2026. Ablage: `lokale Arbeitsdateien `
 Ergebnis: `k2_prtouch.py`, `test_k2_prtouch.py`, `BERICHT.md` (dieser).
@@ -14,7 +275,7 @@ UNVERÄNDERTEN Creality-MCU-Firmware genutzt und ersetzt
 `prtouch_v3_wrapper.so`. Kernbefund (BELEGT):
 
 - Die MCU erkennt den Kontakt (Schwellen `min/max/add_hold`, `ned_*`,
-  `tri_chxs`), stoppt aber NICHTS (STOPP-BEWEIS §§2-3: kein
+  `tri_chxs`), stoppt aber über die prtouch-Befehle NICHTS (KORREKTUR: der Stopp entsteht über die Swap-Leitung + normalen Endstop, s. Teil A) (STOPP-BEWEIS §§2-3: kein
   `stepper_stop_on_trigger`/`trsync`/`endstop_home` in den prtouch-Pfaden;
   Swap Düse→Main nur HIGH bei config/start, Main liest einmal).
 - Der Host fährt zeitgesteuert (live 5 mm/s), zeichnet `pres` 64×0,78 ms
@@ -27,7 +288,7 @@ UNVERÄNDERTEN Creality-MCU-Firmware genutzt und ersetzt
   Lüfter 0,6, Hub 5 mm, Mesh 9×9 Spirale 2,9 s/Punkt, 1× `can_brk False`
   mit versetzter Wiederholung (−0,25/+0,25 mm).
 
-Folge: Ein sicheres Ersatzmodul darf NIEMALS eine lange, blinde Tauchfahrt
+Folge (ÜBERHOLT durch Teil A – der Stopp läuft über Endstop/trsync, nicht nur über den Host): Ein sicheres Ersatzmodul darf NIEMALS eine lange, blinde Tauchfahrt
 machen. Es muss in kurzen Schritten fahren, nach jedem Schritt per M400
 synchronisieren, lesen/auswerten und hostseitig abbrechen.
 
@@ -58,7 +319,7 @@ printer.cfg [k2_prtouch]
   `datas` s32-LE (pres roh, step Zähler → mm via `step_dist_mm`
   0,0025, relativ zum Ende). `tri_pose ≈ 0`, `bst_pose` interpoliert,
   `zoft = bst−tri`.
-- G-Codes: `K2_PRTOUCH_PROBE [X Y DRY_RUN]`, `K2_PRTOUCH_HOME_Z`,
+- G-Codes: `K2_PRTOUCH_PROBE_STEPS [X Y DRY_RUN]`, `K2_PRTOUCH_HOME_Z`,
   `K2_PRTOUCH_MESH [COUNT]`, `K2_PRTOUCH_TEST_SWAP`, `K2_PRTOUCH_READ`,
   `K2_PRTOUCH_STATUS`. `get_status()` für Moonraker (allow_move, step,
   letztes Ergebnis – kein Bus-Poll).
@@ -76,7 +337,7 @@ printer.cfg [k2_prtouch]
   `z_lift_mm` (Default 2,0), klare Meldung, kein Weiterprobe (außer
   genau einer `can_brk`-Wiederholung). Tests (b)+(c).
 - **S3 Freigabe:** `allow_move` Default False → nur Swap/Ruhe/Lesen/Plan,
-  keine Z-Bewegung. `K2_PRTOUCH_PROBE DRY_RUN=1` ebenfalls bewegungslos.
+  keine Z-Bewegung. `K2_PRTOUCH_PROBE_STEPS DRY_RUN=1` ebenfalls bewegungslos.
   Test (d).
 - **S4 Vorabtests:** `TEST_SWAP`-Äquivalent (beide MCU-Seiten müssen
   antworten; Fehlertext wie Stock `PR_ERR_CODE_SWAP_PIN_DETECTI`) +
@@ -90,13 +351,14 @@ printer.cfg [k2_prtouch]
   per Schritte auf 0,02 mm begrenzt). Test (g): `min_z ≥ wahr−step_mm`,
   `Z-Fehler < 0,02 mm` (a).
 
-## 3. printer.cfg-Beispiel
+## 3. printer.cfg-Beispiel (Rückfall `mode: steps`)
 
 ```ini
 # Dateien kopieren: k2_prtouch.py → klippy/extras/k2_prtouch.py
 # (Upstream-Klipper auf dem Pi-Host, MCU-FW unverändert lassen).
 
 [k2_prtouch]
+mode: steps
 # Sicherheit: erst DRY_RUN testen, dann True (S3):
 allow_move: False
 step_mm: 0.02            # Maximum 0.05 (S1)
@@ -121,18 +383,13 @@ pres_cs0_pin: nozzle_mcu:PB13, nozzle_mcu:PB14
 # pres_sdo_pin: nozzle_mcu:PB14
 # pres_clk_sdo_swap: False
 
-# Stock-Sampling (BELEGT Werte, ANNAHME Mapping s. §4):
-cfg_regs: 60
-acq_tick: 93750
-aqc_tick: 45700
-ned_tftr: 5
-ned_hftr: 1
-ned_lftr: 0.8
-ned_lftr_scale: 10
-min_hold: 4000
-max_hold: 10000
-add_hold: 500
-lmt_dead: 200
+# Sampling im Stock-Stil (Umrechnung BELEGT, s. Teil A.3):
+pres_cfg_regs: 60
+pres_acq_tkms: 0.78125
+pres_tri_fter: 5, 1, 0.8
+pres_tri_hold: 4000, 10000, 500
+pres_ded_tkms: 128.0
+step_acq_tkms: 0.390625
 
 # Datenformat (ANNAHME, zentral):
 # tick_format: <I
@@ -153,7 +410,7 @@ lmt_dead: 200
 ```
 
 Erstlauf-Reihenfolge: `K2_PRTOUCH_TEST_SWAP` → `K2_PRTOUCH_READ` →
-`K2_PRTOUCH_PROBE DRY_RUN=1` → `allow_move: True` + `K2_PRTOUCH_PROBE` →
+`K2_PRTOUCH_PROBE_STEPS DRY_RUN=1` → `allow_move: True` + `K2_PRTOUCH_PROBE_STEPS` →
 `K2_PRTOUCH_HOME_Z` → `K2_PRTOUCH_MESH COUNT=3`.
 
 ## 4a. Stand nach Gerätetest 16.10.2026 (PRTOUCH-LESETEST-BEFUND)
@@ -166,7 +423,8 @@ Erstlauf-Reihenfolge: `K2_PRTOUCH_TEST_SWAP` → `K2_PRTOUCH_READ` →
 - **14 Stepper-OIDs:** Stock nimmt den letzten Z-Stepper (`stepper_z1`).
 - **Neu:** Stock nutzt zusätzlich einen normalen Endstop auf `PC7` mit trsync (Z-Stopp über Swap-Leitung) – Pi-Weg über Standard-Probe prüfen (Befund §3).
 - **Fingerdruck-Test BELEGT:** Antast-Modus zieht bei Kontakt PA15/PC7 auf 0 (19/19, 0 Fehlauslöser) → Standard-Probe auf `!PC7` als Hauptweg.
-- Offen: 3/4/5 (Antast-Parameter-Abbildung), Main-MCU-Lesepfad, Stopp unter Bewegung.
+- **3/4/5/6 Antast-Parameter: BELEGT** (Emulation abends, Tabelle Teil A.3).
+- Offen: Main-MCU-Lesepfad, Stopp unter Bewegung (Teil A.5 P1).
 
 ## 4. ANNAHMEN (vollständig, vor Gerätetest zu klären)
 
@@ -222,7 +480,7 @@ Erstlauf-Reihenfolge: `K2_PRTOUCH_TEST_SWAP` → `K2_PRTOUCH_READ` →
     get_position`, `heater.get_temp()`, `bed_mesh.get_mesh_limits()`,
     `SET_KINEMATIC_POSITION`, Reactor-`pause`. Vor Gerätetest gegen
     Upstream-Quellen prüfen (s. §5).
-16. **Upstream-Probe-API:** Bewusst NICHT voll implementiert (zu
+16. **Upstream-Probe-API:** ÜBERHOLT – jetzt Hauptweg (Teil A). Alt: Bewusst NICHT voll implementiert (zu
     versionsabhängig). Stattdessen eigener `K2_PRTOUCH_MESH` (ANNAHME
     `bed_mesh`-Übergabe) + `K2_PRTOUCH_HOME_Z` via
     `SET_KINEMATIC_POSITION` (homing_override-Vorschlag oben).
@@ -246,7 +504,7 @@ Erstlauf-Reihenfolge: `K2_PRTOUCH_TEST_SWAP` → `K2_PRTOUCH_READ` →
    (SPEZIFIKATION Offene Punkte). Bis dahin: NUR DRY_RUN + READ +
    TEST_SWAP.
 3. **Trockenlauf ohne Bewegung:** `allow_move: False` lassen;
-   `K2_PRTOUCH_TEST_SWAP`, `K2_PRTOUCH_READ`, `K2_PRTOUCH_PROBE DRY_RUN=1`
+   `K2_PRTOUCH_TEST_SWAP`, `K2_PRTOUCH_READ`, `K2_PRTOUCH_PROBE_STEPS DRY_RUN=1`
    müssen Plan + Ruhewerte liefern, ohne dass sich Z bewegt.
 4. **Erste echte Antastung vorbereitet:** Bett frei, Düse sauber,
    Hand am Notausschalter; `step_mm` 0,02, `max_travel` klein (z.B.
@@ -257,7 +515,7 @@ Erstlauf-Reihenfolge: `K2_PRTOUCH_TEST_SWAP` → `K2_PRTOUCH_READ` →
    Versuch; bei `emergency/max_travel/timeout/can_brk False` sofort
    stoppen, Ursache (ANNAHMEN §4) prüfen, keine Wiederholung mit
    `allow_move` erzwingen.
-6. **Mesh erst nach Einzelpunkten:** Erst mehrere `K2_PRTOUCH_PROBE`
+6. **Mesh erst nach Einzelpunkten:** Erst mehrere `K2_PRTOUCH_PROBE_STEPS`
    an Bettmitte (Streuung < 0,02?), dann `K2_PRTOUCH_MESH COUNT=3`,
    Matrix gegen Stock-Profil (`default` −0,061…0,224) plausibilisieren.
    `can_brk False` → versetzten Wiederholungswert verwenden (wie T59),
@@ -282,4 +540,4 @@ Erstlauf-Reihenfolge: `K2_PRTOUCH_TEST_SWAP` → `K2_PRTOUCH_READ` →
   `waits ≥ downs` (M400 nach jedem Schritt).
 - (x) `can_brk`-Heuristik: T58-Tripel → False, Normal → True.
 
-Stand bei Abgabe: 43/43 bestanden.
+Stand bei Abgabe des Altberichts: 43/43; aktuell 138/138 (s. Teil A.7).

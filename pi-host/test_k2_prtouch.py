@@ -510,6 +510,880 @@ def test_swap_mechanism():
             check("(swap) Versionen 71/71", vers == (71, 71))
 
 
+
+# =====================================================================
+# Stock-Konfig -> MCU-Parameter (BELEGT per Emulation 16.10.2026)
+# =====================================================================
+
+def test_stock_mapping():
+    cfg = K.parse_options({})
+    tup = list(K.build_start_pres_tuple(cfg, 7))
+    check("(map) Default start_prtouch_pres wie Stock",
+          tup == [7, 60, 93750, 5, 1000, 800, 4000, 10000, 500, 128], str(tup))
+    check("(map) Default aqc_tick 46875",
+          list(K.build_start_step_tuple(cfg, 3)) == [3, 46875])
+    cfg2 = K.parse_options({"pres_tri_fter": "7, 3, 0.25",
+                            "pres_tri_hold": "4100, 10200, 530",
+                            "pres_ded_tkms": "96.5",
+                            "pres_acq_tkms": "0.5",
+                            "step_acq_tkms": "0.5"})
+    tup2 = list(K.build_start_pres_tuple(cfg2, 0))
+    check("(map) Variation 7,3,0.25/4100,10200,530/96.5/0.5ms",
+          tup2 == [0, 60, 60000, 7, 3000, 250, 4100, 10200, 530, 96], str(tup2))
+    check("(map) Variation aqc_tick 60000", cfg2["aqc_tick"] == 60000)
+    p = K.stock_to_mcu_params(60, 0.78125, (5, 1, 0.8), (4000, 10000, 500),
+                              128.0, 0.390625)
+    check("(map) lmt_dead abgeschnitten (96.9 -> 96)",
+          K.stock_to_mcu_params(60, 0.78125, (5, 1, 0.8), (1, 2, 3), 96.9,
+                                0.39)["lmt_dead"] == 96)
+    check("(map) stock_to_mcu_params rein", p["acq_tick"] == 93750
+          and p["aqc_tick"] == 46875 and p["ned_hftr"] == 1000)
+    cfg3 = K.parse_options({"lmt_dead": "77", "pres_cfg_regs": "61"})
+    check("(map) direkte MCU-Option übersteuert",
+          cfg3["lmt_dead"] == 77 and cfg3["cfg_regs"] == 61
+          and cfg3["ned_lftr"] == 800)
+    try:
+        K.parse_options({"ned_lftr_scale": "10"})
+        check("(map) ned_lftr_scale abgelehnt", False)
+    except ValueError:
+        check("(map) ned_lftr_scale abgelehnt", True)
+
+
+# =====================================================================
+# Probe-Hauptweg: K2PrtouchProbeCore mit Fakes (kein Klipper)
+# =====================================================================
+
+class ProbeLine:
+    """Simuliert die Swap-Leitung PA15 (Düse) -> PC7 (Main)."""
+
+    def __init__(self):
+        self.level = 1
+        self.armed = False
+        self.stuck_low = False      # Leitung hängt auf 0 (ausgelöst)
+        self.trigger_on_arm = False  # Düse löst sofort beim Scharfschalten aus
+        self.ack_err = 0
+        self.rest_noisy = False
+        self.log = []
+
+    def triggered(self):
+        self.log.append("query")
+        return self.stuck_low or self.level == 0
+
+
+class FakeProbePres:
+    def __init__(self, line):
+        self.line = line
+
+    def set_swap(self, level):
+        self.line.log.append("swap%d" % level)
+        self.line.level = int(level)
+        return {"err": 0, "expar0": 0, "expar1": 71}
+
+    def start_sampling(self):
+        self.line.log.append("start_pres")
+        if self.line.ack_err:
+            return {"err": self.line.ack_err, "expar0": 0, "expar1": 0}
+        self.line.armed = True
+        self.line.level = 0 if self.line.trigger_on_arm else 1
+        return {"err": 0, "expar0": 0, "expar1": 71}
+
+    def read_pres(self):
+        self.line.log.append("read_pres")
+        base = -1428000
+        d = [base + ((5000 if i % 2 else -5000) if self.line.rest_noisy
+                     else det_noise(i, 300)) for i in range(64)]
+        return list(range(64)), d
+
+    def disarm(self):
+        self.line.log.append("stop_pres1")
+        self.line.armed = False
+        self.line.level = 1
+        return {"err": 0, "expar0": 0, "expar1": 71}
+
+
+class FakeProbeStep:
+    def __init__(self, line, fail_disarm=False):
+        self.line = line
+        self.fail_disarm = fail_disarm
+
+    def cont_step(self):
+        self.line.log.append("cont")
+        return {"cnt_x": 0, "cnt_y": 0, "cnt_z": 0}
+
+    def start_sampling(self):
+        self.line.log.append("start_step")
+        return {"err": 0, "expar0": 0, "expar1": 71}
+
+    def disarm(self):
+        self.line.log.append("stop_step")
+        if self.fail_disarm:
+            raise RuntimeError("Timeout")
+        return {"err": 0}
+
+
+class FakeDescend:
+    def __init__(self, line, raise_exc=None, z_true=0.0):
+        self.line = line
+        self.raise_exc = raise_exc
+        self.z_true = z_true
+        self.results = []
+        self.calls = []
+
+    def descend_until_trigger(self, gcmd, params):
+        self.line.log.append("DESCEND")
+        self.calls.append(dict(params))
+        if self.raise_exc is not None:
+            raise self.raise_exc
+        if self.line.armed:
+            self.line.level = 0  # Kontakt zieht PA15/PC7 auf 0
+        self.results.append(self.z_true)
+
+    def pull_trigger_positions(self):
+        r, self.results = self.results, []
+        return r
+
+    def clear_trigger_positions(self):
+        self.results = []
+
+
+class FakeGcmd:
+    def __init__(self, params=None, command="PROBE"):
+        self.params = dict(params or {})
+        self.command = command
+
+    def get_command(self):
+        return self.command
+
+
+def make_core(cfg_over=None, line=None, raise_exc=None, fail_disarm=False):
+    base = {"allow_move": True, "arm_settle_s": 0.0}
+    base.update(cfg_over or {})
+    cfg = K.parse_options(base)
+    line = line or ProbeLine()
+    pauses = []
+    waits = []
+
+    def get_params(gcmd):
+        return {"probe_speed": float(gcmd.params.get("PROBE_SPEED",
+                                                     cfg["speed"])),
+                "lift_speed": cfg["lift_speed"]}
+
+    desc = FakeDescend(line, raise_exc=raise_exc)
+    core = K.K2PrtouchProbeCore(cfg, get_params, desc, line.triggered,
+                                lambda: waits.append(1), pauses.append)
+    core.attach(FakeProbePres(line), FakeProbeStep(line, fail_disarm))
+    return core, line, desc, waits
+
+
+EXPECT_ORDER = ["swap0", "query", "swap1", "query", "cont", "start_pres",
+                "start_step", "read_pres", "query", "DESCEND", "stop_step",
+                "stop_pres1", "query"]
+
+
+def _run(core, gcmd=None):
+    gcmd = gcmd or FakeGcmd()
+    try:
+        sess = core.start_probe_session(gcmd)
+    except K.K2PrtouchError as exc:
+        return None, exc
+    try:
+        sess.run_probe(gcmd)
+        return sess.pull_probed_results(), None
+    except K.K2PrtouchError as exc:
+        return None, exc
+    finally:
+        sess.end_probe_session()
+
+
+def test_probe_arm_disarm_order():
+    core, line, desc, waits = make_core()
+    res, err = _run(core)
+    check("(probe) Antastung ok", err is None and res == [0.0], str(err))
+    check("(probe) Reihenfolge Arm vor Fahrt / Disarm danach (Stock)",
+          line.log == EXPECT_ORDER, str(line.log))
+    check("(probe) wait_moves vor dem Scharfschalten", len(waits) == 1)
+    check("(probe) danach entschärft, PC7 wieder 1",
+          not core.armed and line.level == 1 and core.arm_count == 1
+          and core.disarm_count == 1)
+
+
+def test_probe_disarm_on_exception():
+    core, line, desc, _ = make_core(raise_exc=K.K2PrtouchError(
+        "No trigger on probe after full movement"))
+    res, err = _run(core)
+    check("(probe) Ausnahme in der Fahrt wird weitergereicht",
+          err is not None and "No trigger" in str(err), str(err))
+    check("(probe) bei Ausnahme trotzdem entschärft",
+          line.log[-3:] == ["stop_step", "stop_pres1", "query"]
+          and not core.armed, str(line.log))
+    # Auch fremde Ausnahmen (z.B. KeyboardInterrupt-ähnlich) -> entschärft:
+    core2, line2, _, _ = make_core(raise_exc=ValueError("intern"))
+    try:
+        core2.run_probe(FakeGcmd())
+        ok = False
+    except ValueError:
+        ok = True
+    check("(probe) fremde Ausnahme -> entschärft + weitergereicht",
+          ok and "stop_pres1" in line2.log and not core2.armed)
+    # Disarm-Fehler nach erfolgreicher Fahrt -> Fehler, pres trotzdem versucht
+    core3, line3, _, _ = make_core(fail_disarm=True)
+    res3, err3 = _run(core3)
+    check("(probe) Disarm-Fehler gemeldet, pres-Stop trotzdem gesendet",
+          err3 is not None and "Entschärfen" in str(err3)
+          and "stop_pres1" in line3.log, str(err3))
+
+
+def test_probe_ack_error():
+    line = ProbeLine()
+    line.ack_err = 3
+    core, line, desc, _ = make_core(line=line)
+    res, err = _run(core)
+    check("(probe) ack err!=0 -> Abbruch", err is not None
+          and "err=3" in str(err), str(err))
+    check("(probe) ack err -> keine Fahrt, entschärft",
+          "DESCEND" not in line.log and "stop_pres1" in line.log)
+
+
+def test_probe_pc7_already_triggered():
+    # Ohne Signalweg-Test: Düse löst sofort beim Scharfschalten aus.
+    line = ProbeLine()
+    line.trigger_on_arm = True
+    core, line, desc, _ = make_core({"swap_check": False}, line=line)
+    res, err = _run(core)
+    check("(probe) PC7 vor Fahrt ausgelöst -> Abbruch",
+          err is not None and "VOR der Fahrt" in str(err), str(err))
+    check("(probe) ausgelöst -> keine Fahrt, entschärft",
+          "DESCEND" not in line.log and "stop_pres1" in line.log)
+    # Mit Signalweg-Test: hängende Leitung fällt schon dort auf.
+    line2 = ProbeLine()
+    line2.stuck_low = True
+    core2, line2, _, _ = make_core(line=line2)
+    res2, err2 = _run(core2)
+    check("(probe) hängende Leitung -> Signalweg-Test schlägt fehl",
+          err2 is not None and "Signalweg" in str(err2)
+          and "DESCEND" not in line2.log and "start_pres" not in line2.log,
+          str(err2))
+    # Ruhetest unruhig -> Abbruch vor Fahrt
+    line3 = ProbeLine()
+    line3.rest_noisy = True
+    core3, line3, _, _ = make_core(line=line3)
+    res3, err3 = _run(core3)
+    check("(probe) Ruhetest unruhig -> Abbruch vor Fahrt",
+          err3 is not None and "Ruhetest" in str(err3)
+          and "DESCEND" not in line3.log and "stop_pres1" in line3.log)
+
+
+def test_probe_allow_move_blocks():
+    core, line, desc, waits = make_core({"allow_move": False})
+    res, err = _run(core)
+    check("(probe) allow_move False -> verständlicher Fehler",
+          err is not None and "allow_move" in str(err), str(err))
+    check("(probe) allow_move False -> kein MCU-Befehl, keine Fahrt",
+          line.log == [] and not waits and not desc.calls, str(line.log))
+    try:
+        core.run_probe(FakeGcmd())
+        ok = False
+    except K.K2PrtouchError:
+        ok = True
+    check("(probe) auch run_probe direkt gesperrt", ok and line.log == [])
+    core2, line2, _, _ = make_core()
+    core2.attach(None, None)
+    res2, err2 = _run(core2)
+    check("(probe) ungebunden (vor connect) -> Abbruch ohne Fahrt",
+          err2 is not None and "verbunden" in str(err2)
+          and "DESCEND" not in line2.log)
+
+
+def test_probe_speed_limit():
+    core, line, desc, _ = make_core()
+    res, err = _run(core, FakeGcmd({"PROBE_SPEED": "10"}))
+    check("(probe) PROBE_SPEED=10 abgelehnt", err is not None
+          and "5.0 mm/s" in str(err) and line.log == [], str(err))
+    core2, line2, desc2, _ = make_core()
+    gcmd = FakeGcmd({"PROBE_SPEED": "5"}, command="G28")
+    res2, err2 = _run(core2, gcmd)
+    check("(probe) PROBE_SPEED=5 erlaubt", err2 is None
+          and desc2.calls[0]["probe_speed"] == 5.0, str(err2))
+    for opt in ("speed", "probe_speed"):
+        try:
+            K.parse_options({opt: "5.5"})
+            check("(probe) Config %s 5.5 abgelehnt" % opt, False)
+        except ValueError:
+            check("(probe) Config %s 5.5 abgelehnt" % opt, True)
+    cfg = K.parse_options({"probe_speed": "3"})
+    check("(probe) speed fällt auf probe_speed zurück", cfg["speed"] == 3.0)
+    for v in ("10.5", "0"):
+        try:
+            K.parse_options({"probe_max_travel_mm": v})
+            check("(probe) probe_max_travel_mm=%s abgelehnt" % v, False)
+        except ValueError:
+            check("(probe) probe_max_travel_mm=%s abgelehnt" % v, True)
+
+
+def test_probe_target_z():
+    f = K.compute_probe_target_z
+    check("(probe) Ziel ohne G28 begrenzt auf max_travel",
+          abs(f(5.0, -5.0, 8.0, False) - (-3.0)) < 1e-12)
+    check("(probe) Ziel nie unter position_min",
+          abs(f(2.0, -1.0, 8.0, False) - (-1.0)) < 1e-12)
+    check("(probe) G28: bis position_min (Upstream)",
+          abs(f(300.0, -5.0, 8.0, True) - (-5.0)) < 1e-12)
+    cfg = K.parse_options({})
+    check("(probe) Defaults: mode probe, allow_move False, z_offset 0, "
+          "position_endstop = z_offset",
+          cfg["mode"] == "probe" and cfg["allow_move"] is False
+          and cfg["z_offset"] == 0.0 and cfg["position_endstop"] == 0.0)
+    cfg2 = K.parse_options({"z_offset": "0.1"})
+    check("(probe) position_endstop folgt z_offset",
+          cfg2["position_endstop"] == 0.1)
+    try:
+        K.parse_options({"mode": "magic"})
+        check("(probe) mode ungültig abgelehnt", False)
+    except ValueError:
+        check("(probe) mode ungültig abgelehnt", True)
+
+
+class _Q:
+    """Fake lookup_query_command-Objekt (zeichnet send-Daten auf)."""
+
+    def __init__(self, name, fn):
+        self.name, self.fn, self.sent = name, fn, []
+
+    def send(self, data=(), minclock=0, reqclock=0, retry=True):
+        self.sent.append(list(data))
+        return self.fn(list(data))
+
+
+def test_klippy_adapters_disarm_and_frozen():
+    cfg = K.parse_options({})
+    pres = K.KlippyPresMcu(None, None, cfg, 4, {})
+    pres._q_stop = _Q("stop", lambda d: {"err": 0, "expar0": 0,
+                                         "expar1": 71})
+    pres.stop_sampling(ok=False)
+    pres.disarm()
+    check("(adapter) stop/disarm senden immer sta_swap=1",
+          pres._q_stop.sent == [[4, 1], [4, 1]], str(pres._q_stop.sent))
+    pres._q_start = _Q("start", lambda d: {"err": 2})
+    check("(adapter) start_sampling liefert ack-Dict",
+          pres.start_sampling()["err"] == 2
+          and pres._q_start.sent[0] == [4, 60, 93750, 5, 1000, 800, 4000,
+                                        10000, 500, 128])
+    blk = _RingQuery._pack(list(range(100, 108)))
+    pres._q_read = _Q("read", lambda d: {"ticks": b"" if d[4] == 0 else blk,
+                                         "datas": b"" if d[4] == 0 else blk,
+                                         "tri_chxs": 1})
+    fr = pres.read_frozen()
+    sent = pres._q_read.sent
+    exp = ([[4, 2, 0, 0, 0]]
+           + [[4, 0, 0, i, 64 - i] for i in range(0, 64, 8)]
+           + [[4, 1, 0, i, 64 - i] for i in range(0, 64, 8)])
+    check("(adapter) eingefrorener Ring: Stock-Abfragefolge", sent == exp,
+          str(sent[:3]))
+    check("(adapter) read_frozen dekodiert ftr/src", "ftr" in fr
+          and "src" in fr and fr["status"].get("tri_chxs") == 1)
+    step = K.KlippyStepMcu(None, None, cfg, 9)
+    step._q_read = _Q("read", lambda d: {"ticks": b"" if d[2] == 0 else blk,
+                                         "datas": b"" if d[2] == 0 else blk})
+    step.read_frozen()
+    exp2 = [[9, 0, 0]] + [[9, i, 64 - i] for i in range(0, 64, 8)]
+    check("(adapter) step-Ring: Stock-Abfragefolge",
+          step._q_read.sent == exp2)
+
+
+# =====================================================================
+# Integration gegen ECHTE Upstream-Dateien (optional, nur wenn die lokale
+# Upstream-Kopie vorhanden ist): probe.py, homing.py (Homing-Klasse),
+# manual_probe.py, gcode.py, pins.py – mit Fake-MCU/-Toolhead.
+# =====================================================================
+
+# Pfad zum klippy/-Ordner eines Upstream-Klipper-Checkouts: Umgebungsvariable
+# KLIPPER_SRC (Checkout-Wurzel oder klippy/), sonst lokale Arbeitskopie.
+_ks = os.environ.get("KLIPPER_SRC", "")
+if _ks and os.path.isdir(os.path.join(_ks, "klippy")):
+    _ks = os.path.join(_ks, "klippy")
+UPSTREAM_KLIPPY = os.path.normpath(_ks or os.path.join(
+    _HERE, "..", "arbeitsdateien-lokal", "upstream-klipper", "klippy"))
+
+
+class _Ev:
+    def __init__(self):
+        self.handlers = {}
+
+    def register(self, ev, cb):
+        self.handlers.setdefault(ev, []).append(cb)
+
+    def send(self, ev, *a):
+        return [cb(*a) for cb in self.handlers.get(ev, [])]
+
+
+def _integration_env(cfg_over=None, z_true=0.0, homing_speed=5.0):
+    import collections
+    if UPSTREAM_KLIPPY not in sys.path:
+        sys.path.append(UPSTREAM_KLIPPY)
+    import gcode as ugcode
+    import pins as upins
+    from extras import homing as uhoming
+
+    line = ProbeLine()
+    line.z_true = z_true
+    rec = {"moves": [], "probing": [], "config": [], "homing_start": 0}
+
+    class Reactor:
+        def monotonic(self):
+            return 100.0
+
+        def pause(self, t):
+            return t
+
+    class Toolhead:
+        def __init__(self):
+            self.pos = [100.0, 100.0, 5.0, 0.0]
+            self.homed = "xyz"
+
+        def get_position(self):
+            return list(self.pos)
+
+        def set_position(self, pos, homing_axes=""):
+            self.pos = list(pos)
+            if homing_axes:
+                self.homed = "".join(sorted(set(self.homed + homing_axes)))
+
+        def manual_move(self, coord, speed):
+            for i, v in enumerate(coord):
+                if v is not None:
+                    self.pos[i] = float(v)
+            rec["moves"].append((list(self.pos), speed))
+
+        def move(self, pos, speed):
+            self.pos = list(pos)
+            rec["moves"].append((list(self.pos), speed))
+
+        def wait_moves(self):
+            line.log.append("wait")
+
+        def get_last_move_time(self):
+            return 1.0
+
+        def get_status(self, eventtime):
+            return {"homed_axes": self.homed}
+
+        def get_kinematics(self):
+            return Kin()
+
+    class Stepper:
+        def __init__(self, name, oid):
+            self.name, self.oid = name, oid
+
+        def get_name(self, short=False):
+            return self.name
+
+        def get_oid(self):
+            return self.oid
+
+        def is_active_axis(self, a):
+            return self.name.startswith("stepper_" + a)
+
+    class Kin:
+        def get_steppers(self):
+            return [Stepper("stepper_x", 11), Stepper("stepper_y", 12),
+                    Stepper("stepper_z", 13), Stepper("stepper_z1", 14)]
+
+    class Endstop:
+        def __init__(self, mcu, pin_params):
+            self.mcu, self.pp = mcu, pin_params
+            self.steppers = []
+
+        def get_mcu(self):
+            return self.mcu
+
+        def add_stepper(self, s):
+            self.steppers.append(s.get_name())
+
+        def get_steppers(self):
+            return list(self.steppers)
+
+        def home_start(self, *a, **k):
+            rec["homing_start"] += 1
+            return None
+
+        def home_wait(self, t):
+            if line.armed:
+                line.level = 0
+                return 1.0
+            return 0.0
+
+        def query_endstop(self, print_time):
+            # wie mcu.py:406-411: pin_value ^ invert
+            line.log.append("query")
+            return (0 if line.stuck_low else line.level) ^ self.pp["invert"]
+
+    class Mcu:
+        def __init__(self, name):
+            self.name, self.oid, self.cbs = name, 0, []
+
+        def register_config_callback(self, cb):
+            self.cbs.append(cb)
+
+        def create_oid(self):
+            self.oid += 1
+            return self.oid - 1
+
+        def add_config_cmd(self, cmd, is_init=False, on_restart=False):
+            rec["config"].append((self.name, cmd))
+
+        def setup_pin(self, pin_type, pin_params):
+            assert pin_type == "endstop"
+            rec["endstop_pin"] = dict(pin_params)
+            return Endstop(self, pin_params)
+
+        def estimated_print_time(self, t):
+            return 0.0
+
+        def lookup_query_command(self, msgformat, respformat, oid=None,
+                                 cq=None, is_async=False):
+            name = msgformat.split()[0]
+            pres = FakeProbePres(line)
+            step = FakeProbeStep(line)
+
+            def fn(d):
+                if name == "start_prtouch_pres":
+                    rec["start_pres"] = list(d)
+                    return pres.start_sampling()
+                if name == "stop_prtouch_pres":
+                    rec.setdefault("stop_pres", []).append(list(d))
+                    if d[1] == 1 and line.armed:
+                        return pres.disarm()
+                    return pres.set_swap(d[1])
+                if name == "read_prtouch_pres":
+                    t, v = pres.read_pres()
+                    if d[3] != 0:  # 8 Blockabfragen = 1 Ruhetest im Log
+                        line.log.pop()
+                    return {"ticks": _RingQuery._pack(t[:8]),
+                            "datas": _RingQuery._pack(v[d[3]:d[3] + 8])}
+                if name == "cont_prtouch_step":
+                    return step.cont_step()
+                if name == "start_prtouch_step":
+                    rec["start_step"] = list(d)
+                    return step.start_sampling()
+                if name == "stop_prtouch_step":
+                    step.disarm()
+                    return {"err": 0, "expar0": line.level, "expar1": 71}
+                return {}
+            return _Q(name, fn)
+
+    class Homing:
+        """Fake PrinterHoming: probing_move simuliert HomingMove grob."""
+
+        check_probe_first_home = uhoming.PrinterHoming.check_probe_first_home
+
+        def probing_move(self, mcu_probe, pos, speed, check_movement=True):
+            line.log.append("DESCEND")
+            rec["probing"].append((list(pos), speed, check_movement))
+            mcu_probe.home_start(0., 0., 0, 0.)
+            if mcu_probe.home_wait(1.0) <= 0.:
+                raise ugcode.CommandError("No trigger on probe after full "
+                                          "movement")
+            th.pos[2] = max(pos[2], th.pos[2] - (th.pos[2] - line.z_true))
+            return list(th.pos)
+
+    class Gcode:
+        Coord = ugcode.Coord
+
+        def __init__(self):
+            self.cmds, self.out = {}, []
+
+        def register_command(self, cmd, fn, when_not_ready=False, desc=None):
+            assert cmd not in self.cmds, cmd
+            self.cmds[cmd] = fn
+
+        def respond_info(self, msg, log=True):
+            self.out.append(msg)
+
+        def respond_raw(self, msg):
+            self.out.append(msg)
+
+        def create_gcode_command(self, command, commandline, params):
+            return ugcode.GCodeCommand(self, command, commandline, params,
+                                       False)
+
+    class Printer:
+        command_error = ugcode.CommandError
+        config_error = RuntimeError
+
+        def __init__(self):
+            self.objects, self.ev = {}, _Ev()
+
+        def lookup_object(self, name, default=RuntimeError):
+            if name in self.objects:
+                return self.objects[name]
+            if default is RuntimeError:
+                raise RuntimeError("Unknown config object '%s'" % name)
+            return default
+
+        def add_object(self, name, obj):
+            if name in self.objects:
+                raise RuntimeError("Printer object '%s' already created"
+                                   % name)
+            self.objects[name] = obj
+
+        def register_event_handler(self, ev, cb):
+            self.ev.register(ev, cb)
+
+        def send_event(self, ev, *a):
+            return self.ev.send(ev, *a)
+
+        def get_reactor(self):
+            return reactor
+
+        def get_start_args(self):
+            return {}
+
+        def is_shutdown(self):
+            return False
+
+    class Config:
+        error = ValueError
+
+        def __init__(self, name, opts, sections=None):
+            self.name, self.opts = name, dict(opts)
+            self.sections = sections or {}
+
+        def get_printer(self):
+            return printer
+
+        def get_name(self):
+            return self.name
+
+        def get(self, o, default=None, note_valid=True):
+            return self.opts.get(o, default)
+
+        def getfloat(self, o, default=None, minval=None, maxval=None,
+                     above=None, below=None, note_valid=True):
+            return float(self.opts.get(o, default))
+
+        def getint(self, o, default=None, minval=None, maxval=None,
+                   note_valid=True):
+            return int(self.opts.get(o, default))
+
+        def getboolean(self, o, default=None, note_valid=True):
+            return bool(self.opts.get(o, default))
+
+        def getchoice(self, o, choices, default=None, note_valid=True):
+            return self.opts.get(o, default)
+
+        def has_section(self, s):
+            return s in self.sections
+
+        def getsection(self, s):
+            return self.sections[s]
+
+        def get_prefix_sections(self, p):
+            return []
+
+    reactor = Reactor()
+    printer = Printer()
+    th = Toolhead()
+    gc = Gcode()
+    pins = upins.PrinterPins()
+    mcu, noz = Mcu("mcu"), Mcu("nozzle_mcu")
+    pins.register_chip("mcu", mcu)
+    pins.register_chip("nozzle_mcu", noz)
+    for n, o in (("gcode", gc), ("toolhead", th), ("pins", pins),
+                 ("mcu", mcu), ("mcu nozzle_mcu", noz),
+                 ("homing", Homing())):
+        printer.add_object(n, o)
+    opts = {"allow_move": "True", "arm_settle_s": "0"}
+    opts.update(cfg_over or {})
+    zsec = Config("stepper_z", {"position_min": "-5"})
+    config = Config("k2_prtouch", opts, {"stepper_z": zsec})
+    obj = K.load_config(config)
+    printer.add_object("k2_prtouch", obj)
+    # Config-Phase + identify + connect wie Klipper:
+    for m in (noz, mcu):
+        for cb in m.cbs:
+            cb()
+    printer.send_event("klippy:mcu_identify")
+    printer.send_event("klippy:connect")
+    HomingInfo = collections.namedtuple(
+        "homing_info", ["speed", "position_endstop", "retract_speed",
+                        "retract_dist", "positive_dir",
+                        "second_homing_speed"])
+    hinfo = HomingInfo(homing_speed, 0.0, homing_speed, 0.0, False,
+                       homing_speed / 2.0)
+    return {"printer": printer, "obj": obj, "gcode": gc, "th": th,
+            "line": line, "rec": rec, "pins": pins, "ugcode": ugcode,
+            "uhoming": uhoming, "hinfo": hinfo}
+
+
+def test_upstream_integration():
+    if not os.path.isdir(os.path.join(UPSTREAM_KLIPPY, "extras")):
+        print("SKIP (upstream) lokale Upstream-Kopie fehlt: %s"
+              % UPSTREAM_KLIPPY)
+        return
+    env = _integration_env()
+    gc, rec, line, th = env["gcode"], env["rec"], env["line"], env["th"]
+    printer = env["printer"]
+    check("(upstream) Objekt 'probe' registriert",
+          printer.lookup_object("probe", None) is env["obj"].probe)
+    check("(upstream) Endstop auf !PC7 (mcu, invert=1, pullup=0)",
+          rec["endstop_pin"]["pin"] == "PC7"
+          and rec["endstop_pin"]["invert"] == 1
+          and rec["endstop_pin"]["chip_name"] == "mcu")
+    check("(upstream) Upstream-Befehle registriert",
+          all(c in gc.cmds for c in ("PROBE", "QUERY_PROBE",
+                                     "PROBE_ACCURACY", "PROBE_CALIBRATE",
+                                     "Z_OFFSET_APPLY_PROBE",
+                                     "K2_PRTOUCH_PROBE_STEPS",
+                                     "K2_PRTOUCH_TEST_SWAP"))
+          and "K2_PRTOUCH_HOME_Z" not in gc.cmds
+          and "K2_PRTOUCH_PROBE" not in gc.cmds, str(sorted(gc.cmds)))
+    cfgcmds = [c for _, c in rec["config"]]
+    check("(upstream) config_prtouch_pres mit Pin-Namen wie Stock",
+          "config_prtouch_pres oid=0 idx=0 swp_pin=PA15 clk_pin=PB13 "
+          "sdo_pin=PB14" in cfgcmds, str(cfgcmds))
+    check("(upstream) config_prtouch_step: X/Y/letzter Z-Stepper, PC7",
+          "config_prtouch_step oid=0 oid_xstp=11 oid_ystp=12 oid_zstp=14 "
+          "swp_pin=PC7" in cfgcmds, str(cfgcmds))
+    ep = env["obj"].probe.mcu_endstop
+    check("(upstream) Z-Stepper am Endstop (LookupZSteppers)",
+          ep.get_steppers() == ["stepper_z", "stepper_z1"])
+    # PROBE über die echte ProbeCommandHelper/SampleAveragingHelper-Kette:
+    line.log.clear()
+    g = gc.create_gcode_command("PROBE", "PROBE", {})
+    gc.cmds["PROBE"](g)
+    check("(upstream) PROBE ok + Ergebnis gemeldet",
+          any("estimate contact at z=0.000000" in m for m in gc.out),
+          str(gc.out[-2:]))
+    check("(upstream) PROBE: Stock-Reihenfolge um die Fahrt",
+          line.log == ["wait"] + EXPECT_ORDER, str(line.log))
+    check("(upstream) start_prtouch_pres/step-Parameter wie Stock",
+          rec["start_pres"][1:] == [60, 93750, 5, 1000, 800, 4000, 10000,
+                                    500, 128]
+          and rec["start_step"][1:] == [46875])
+    pos, speed, chk = rec["probing"][-1]
+    check("(upstream) PROBE: Ziel 5.0-8.0 = -3.0, 5 mm/s, check_movement",
+          abs(pos[2] - (-3.0)) < 1e-9 and speed == 5.0 and chk is True,
+          str(rec["probing"][-1]))
+    # QUERY_PROBE: invertiert -> 'open' in Ruhe
+    gc.cmds["QUERY_PROBE"](gc.create_gcode_command("QUERY_PROBE", "", {}))
+    check("(upstream) QUERY_PROBE in Ruhe 'open'", gc.out[-1] == "probe: open")
+    # PROBE_ACCURACY SAMPLES=3 -> 3 x Arm/Disarm
+    n0 = env["obj"].probe.core.arm_count
+    gc.cmds["PROBE_ACCURACY"](gc.create_gcode_command(
+        "PROBE_ACCURACY", "PROBE_ACCURACY SAMPLES=3", {"SAMPLES": "3"}))
+    core = env["obj"].probe.core
+    check("(upstream) PROBE_ACCURACY: 3x scharf/entschärft",
+          core.arm_count - n0 == 3 and core.disarm_count == core.arm_count
+          and any("probe accuracy results" in m for m in gc.out))
+    # PROBE_SPEED=10 -> Fehler, keine Fahrt
+    nprob = len(rec["probing"])
+    try:
+        gc.cmds["PROBE"](gc.create_gcode_command(
+            "PROBE", "PROBE PROBE_SPEED=10", {"PROBE_SPEED": "10"}))
+        ok = False
+    except env["ugcode"].CommandError as exc:
+        ok = "5.0 mm/s" in str(exc)
+    check("(upstream) PROBE PROBE_SPEED=10 -> CommandError, keine Fahrt",
+          ok and len(rec["probing"]) == nprob)
+    # G28 Z über die ECHTE Homing-Klasse (homing.py:265-294):
+    hv = env["pins"].setup_pin("endstop", "probe:z_virtual_endstop")
+    check("(upstream) probe:z_virtual_endstop position_endstop = z_offset",
+          hv.get_position_endstop() == 0.0)
+
+    class Rail:
+        def get_endstops(self):
+            return [(hv, "probe")]
+
+        def get_homing_info(self):
+            return env["hinfo"]
+
+    th.pos = [175.0, 175.0, 120.0, 0.0]
+    hs = env["uhoming"].Homing(printer)
+    line.log.clear()
+    hs.home_rails([Rail()], [None, None, 120.0 * 1.5, None],
+                  [None, None, 0.0, None])
+    pos, speed, chk = rec["probing"][-1]
+    check("(upstream) G28 Z: Fahrt bis position_min, 5 mm/s, ohne "
+          "check_movement (1. Versuch)",
+          abs(pos[2] - (-5.0)) < 1e-9 and speed == 5.0 and chk is False,
+          str(rec["probing"][-1]))
+    check("(upstream) G28 Z: Z danach = 0 (Kontakt)", abs(th.pos[2]) < 1e-9,
+          str(th.pos))
+    check("(upstream) G28 Z: scharf vor / entschärft nach Fahrt",
+          line.log[:2] == ["wait", "swap0"] and "stop_pres1" in line.log
+          and not core.armed, str(line.log))
+
+
+def test_upstream_integration_guards():
+    if not os.path.isdir(os.path.join(UPSTREAM_KLIPPY, "extras")):
+        print("SKIP (upstream) lokale Upstream-Kopie fehlt")
+        return
+    # allow_move False: G28 Z bricht vor jeder Bewegung ab.
+    env = _integration_env({"allow_move": "False"})
+    hv = env["pins"].setup_pin("endstop", "probe:z_virtual_endstop")
+
+    class Rail:
+        def get_endstops(self):
+            return [(hv, "probe")]
+
+        def get_homing_info(self):
+            return env["hinfo"]
+
+    env["th"].pos = [175.0, 175.0, 120.0, 0.0]
+    env["line"].log.clear()
+    try:
+        env["uhoming"].Homing(env["printer"]).home_rails(
+            [Rail()], [None, None, 180.0, None], [None, None, 0.0, None])
+        ok = False
+    except env["ugcode"].CommandError as exc:
+        ok = "allow_move" in str(exc)
+    check("(upstream) G28 Z mit allow_move False -> Fehler, keine Fahrt",
+          ok and env["rec"]["probing"] == [] and env["line"].log == []
+          and env["th"].pos[2] == 120.0, str(env["line"].log))
+    # homing_speed 10 in [stepper_z] -> abgelehnt vor Bewegung
+    env2 = _integration_env(homing_speed=10.0)
+    hv2 = env2["pins"].setup_pin("endstop", "probe:z_virtual_endstop")
+
+    class Rail2(Rail):
+        def get_endstops(self):
+            return [(hv2, "probe")]
+
+        def get_homing_info(self):
+            return env2["hinfo"]
+
+    env2["line"].log.clear()
+    try:
+        env2["uhoming"].Homing(env2["printer"]).home_rails(
+            [Rail2()], [None, None, 180.0, None], [None, None, 0.0, None])
+        ok = False
+    except env2["ugcode"].CommandError as exc:
+        ok = "homing_speed" in str(exc)
+    check("(upstream) G28 mit homing_speed 10 -> abgelehnt, keine Fahrt",
+          ok and env2["rec"]["probing"] == [] and env2["line"].log == [])
+    # Leitung hängt auf 0 -> PROBE bricht ab, Düse entschärft
+    env3 = _integration_env()
+    env3["line"].stuck_low = True
+    env3["line"].log.clear()
+    try:
+        env3["gcode"].cmds["PROBE"](env3["gcode"].create_gcode_command(
+            "PROBE", "PROBE", {}))
+        ok = False
+    except env3["ugcode"].CommandError as exc:
+        ok = "Signalweg" in str(exc)
+    check("(upstream) PROBE bei hängender Leitung -> CommandError, keine "
+          "Fahrt, entschärft",
+          ok and env3["rec"]["probing"] == []
+          and env3["line"].log[-3:] == ["stop_step", "swap1", "query"]
+          and env3["rec"]["stop_pres"][-1][1] == 1, str(env3["line"].log))
+    # mode steps: kein 'probe'-Objekt, Rückfallbefehle registriert
+    env4 = _integration_env({"mode": "steps"})
+    check("(upstream) mode steps: kein 'probe', HOME_Z/MESH/PROBE_STEPS da",
+          env4["printer"].lookup_object("probe", None) is None
+          and all(c in env4["gcode"].cmds for c in (
+              "K2_PRTOUCH_HOME_Z", "K2_PRTOUCH_MESH",
+              "K2_PRTOUCH_PROBE_STEPS"))
+          and "PROBE" not in env4["gcode"].cmds)
+
 def main():
     test_live_ring_read()
     test_swap_mechanism()
@@ -522,6 +1396,17 @@ def main():
     test_f_formatstrings()
     test_g_stop_within_one_step()
     test_extra_can_brk_retry()
+    test_stock_mapping()
+    test_probe_arm_disarm_order()
+    test_probe_disarm_on_exception()
+    test_probe_ack_error()
+    test_probe_pc7_already_triggered()
+    test_probe_allow_move_blocks()
+    test_probe_speed_limit()
+    test_probe_target_z()
+    test_klippy_adapters_disarm_and_frozen()
+    test_upstream_integration()
+    test_upstream_integration_guards()
     print("\n%d bestanden, %d fehlgeschlagen" % (len(PASS), len(FAIL)))
     if FAIL:
         print("FEHLER:", FAIL)

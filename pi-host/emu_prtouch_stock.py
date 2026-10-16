@@ -5,7 +5,8 @@
 Läuft auf dem Drucker mit /usr/share/klippy-env/bin/python, in einem eigenen
 Prozess (das laufende Klipper bleibt unberührt). Alle Klipper-Objekte sind
 Attrappen, die jeden Aufruf protokollieren. Ziel: die exakten MCU-
-Konfigurations-/Startbefehle mitlesen (Pin-Reihenfolge clk/sdo, Skalierungen).
+Konfigurations-/Startbefehle mitlesen (Pin-Reihenfolge clk/sdo, Skalierungen,
+Antastablauf probe_prepare/home_start/probe_finish; s. PRTOUCH-LESETEST-BEFUND §1/§7).
 Kein Zugriff auf Seriell-Ports, MCU oder Bewegung.
 """
 import configparser
@@ -96,6 +97,8 @@ class FakeQuery:
             return {"oid": 1, "buf_len": 64, "idx": 0, "len": n,
                     "ticks": b"".join(_st.pack("<I", 1000 * i) for i in range(n)),
                     "datas": b"".join(_st.pack("<i", i) for i in range(n)), "#name": r}
+        if r == "resault_prtouch_step_cnt":
+            return {"oid": 3, "cnt_x": 0, "cnt_y": 0, "cnt_z": 0, "#name": r}
         if r == "endstop_state":
             return {"oid": 1, "homing": 0, "next_clock": 0, "pin_value": 1, "#name": r}
         if r == "trsync_state":
@@ -181,7 +184,7 @@ class FakeMcu:
         return Rec("cq")
 
     def get_constants(self):
-        return {"CLOCK_FREQ": 72000000 if self.name == "mcu" else 120000000}
+        return {"CLOCK_FREQ": 120000000}
 
     def get_constant_float(self, n):
         return float(self.get_constants().get(n, 0))
@@ -524,14 +527,28 @@ def main():
             o = getattr(obj, an)
             log("== Methoden", an, sorted(a for a in dir(o) if not a.startswith("__")))
         runs = []
-        V = 71
-        for acks in ([(0, 0, V), (0, 0, V), (0, 1, V), (0, 1, V)],
-                     [(0, 0, V), (0, 1, V), (0, 1, V), (0, 0, V)],
-                     [(0, 1, V), (0, 1, V), (0, 0, V), (0, 0, V)],
-                     [(0, 1, V), (0, 0, V), (0, 0, V), (0, 1, V)],
-                     [(0, 0, V), (0, 0, V), (0, 0, V), (0, 0, V)]):
-            runs.append(("obj", "cmd_TEST_SWAP", {}, acks))
-        runs.append(("pres", "cmd_READ_PRES", {}, []))
+        import mcu as _mcu
+        _mcu.MCU_trsync.start = lambda self, *a, **k: log("TRSYNC start", a)
+        _mcu.MCU_trsync.add_stepper = lambda self, *a, **k: log("TRSYNC add_stepper", a)
+        class FakeHmove(Rec):
+            def get_mcu_endstops(self):
+                return [obj]
+        hm = FakeHmove("hmove")
+        ACKS[:] = [(0, 64, 0)] * 20
+        for name, fn in (("multi_probe_begin", lambda: obj.multi_probe_begin()),
+                         ("probe_prepare", lambda: obj.probe_prepare(hm)),
+                         ("home_start", lambda: obj.home_start(1.0, 0.000015, 4, 0.0001, True)),
+                         ("home_wait", lambda: obj.home_wait(2.0)),
+                         ("probe_finish", lambda: obj.probe_finish(hm)),
+                         ("multi_probe_end", lambda: obj.multi_probe_end()),
+                         ("query_endstop", lambda: obj.query_endstop(1.0))):
+            log("== RUN", name)
+            try:
+                r = fn()
+                log("   -> Rueckgabe", repr(r)[:200])
+            except Exception:
+                log("   FEHLER:\n" + traceback.format_exc(limit=6))
+        runs = []
         for target, cmd, params, acks in runs:
             ACKS[:] = list(acks)
             log("== ACKS", acks)

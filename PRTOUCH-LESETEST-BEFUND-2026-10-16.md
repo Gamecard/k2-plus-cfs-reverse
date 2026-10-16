@@ -141,3 +141,48 @@ Z in der MCU, wie Stock). Nach dem Antasten `stop_prtouch_pres sta_swap=1`.
 Damit wird die zeitgesteuerte Schrittfahrt des Entwurfs zum Rückfall; Hauptweg
 für `[k2_prtouch]` sollte ein Upstream-`[probe]` mit Arm-/Disarm-Hook werden.
 
+
+## 7. Stock-Antastlauf emuliert: Parameter-Abbildung (BELEGT)
+
+`pi-host/emu_prtouch_stock.py` ruft jetzt zusätzlich die Endstop-API des Stock-Objekts
+auf (`multi_probe_begin`, `probe_prepare`, `home_start`, `home_wait`, `probe_finish`,
+`multi_probe_end`, `query_endstop`; trsync als Attrappe). Das Stock-Objekt ist ein
+vollwertiger Klipper-Endstop (`home_start(print_time, sample_time, sample_count,
+rest_time, triggered)`, `home_wait`, `query_endstop`, `probe_prepare/finish(hmove)`).
+
+Ablauf beim Antasten (wörtlich mitgelesen, Live-Konfig, beide MCUs 120 MHz):
+
+```
+probe_prepare:  mcu        cont_prtouch_step [3]            -> resault_prtouch_step_cnt
+                nozzle_mcu start_prtouch_pres [1, 60, 93750, 5, 1000, 800, 4000, 10000, 500, 128]
+                mcu        start_prtouch_step [3, 46875]
+home_start:     mcu        endstop_home [1, clock, sample_ticks, 4, rest_ticks, pin_value=0, trsync=2, reason=1]
+home_wait:      mcu        endstop_home [1, 0, …] (Ende), trsync_trigger
+probe_finish:   mcu        stop_prtouch_step [3]
+                nozzle_mcu stop_prtouch_pres [1, sta_swap=1]
+                nozzle_mcu read_prtouch_pres [1, 2, 0, 0, 0]          (Status)
+                nozzle_mcu read_prtouch_pres [1, is_src 0|1, 0, idx, 64-idx]  idx = 0, 8, …, 56
+                mcu        read_prtouch_step [3, 0, 0], dann [3, idx, 64-idx]
+```
+
+Abbildung Konfig → MCU-Parameter (eindeutig durch gezielte Variation:
+`pres_tri_fter 7,3,0.25`, `pres_tri_hold 4100,10200,530`, `pres_ded_tkms 96.5`,
+`pres_acq_tkms 0.5`, `step_acq_tkms 0.5`, `pres_cfg_regs 44` →
+`[44, 60000, 7, 3000, 250, 4100, 10200, 530, 96]`, `aqc 60000`):
+
+| MCU-Parameter | Quelle `[prtouch_v3]` | Stock |
+|---|---|---|
+| `cfg_regs` | `pres_cfg_regs` | 60 |
+| `acq_tick` | `pres_acq_tkms` ms × Düsen-Takt | 0,78125 → 93 750 |
+| `ned_tftr` | `pres_tri_fter[0]` | 5 |
+| `ned_hftr` | `pres_tri_fter[1]` × 1000 | 1 000 |
+| `ned_lftr` | `pres_tri_fter[2]` × 1000 | 800 |
+| `min/max/add_hold` | `pres_tri_hold` | 4000 / 10000 / 500 |
+| `lmt_dead` | `int(pres_ded_tkms)` (abgeschnitten) | 128 |
+| `aqc_tick` | `step_acq_tkms` ms × Main-Takt | 0,390625 → 46 875 |
+
+Damit waren im Entwurf falsch: `ned_hftr` 1 (→ 1000), `ned_lftr` 8 (Skala 10 statt 1000),
+`lmt_dead` 200 (→ 128), `aqc_tick` 45 700 (→ 46 875). Der Fingerdruck-Test (§6) lief noch
+mit den alten Werten und löste trotzdem zuverlässig aus. `is_src`: 0 = FTR, 1 = SRC
+(Stock-Beschriftung bestätigt §2.2). Nach `stop` liest Stock den eingefrorenen Ring
+vollständig aus.
