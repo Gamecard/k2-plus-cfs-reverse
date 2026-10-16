@@ -165,7 +165,8 @@ Erstlauf-Reihenfolge: `K2_PRTOUCH_TEST_SWAP` → `K2_PRTOUCH_READ` →
 - **13 Swap: BELEGT** Ablauf `sta_swap` 0/1 + Rücklesen `expar0` (0, 1) an der Main-MCU; Versionen in `expar1`.
 - **14 Stepper-OIDs:** Stock nimmt den letzten Z-Stepper (`stepper_z1`).
 - **Neu:** Stock nutzt zusätzlich einen normalen Endstop auf `PC7` mit trsync (Z-Stopp über Swap-Leitung) – Pi-Weg über Standard-Probe prüfen (Befund §3).
-- Offen: 3/4/5 (Antast-Parameter-Abbildung), Main-MCU-Lesepfad, PA15-Umschaltung bei Kontakt.
+- **Fingerdruck-Test BELEGT:** Antast-Modus zieht bei Kontakt PA15/PC7 auf 0 (19/19, 0 Fehlauslöser) → Standard-Probe auf `!PC7` als Hauptweg.
+- Offen: 3/4/5 (Antast-Parameter-Abbildung), Main-MCU-Lesepfad, Stopp unter Bewegung.
 
 ## 4. ANNAHMEN (vollständig, vor Gerätetest zu klären)
 

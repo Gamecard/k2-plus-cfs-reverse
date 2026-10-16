@@ -93,9 +93,7 @@ die Z-Stepper in der MCU.
 **Bedeutung für den Pi:** Mit Upstream-Klipper reicht vermutlich ein normaler
 Endstop/Probe auf `!PC7` an der Main-MCU, wenn vorher die Düsen-MCU per
 `start_prtouch_pres` (Antast-Parameter) scharf geschaltet wird. Das ist einfacher
-und sicherer als die zeitgesteuerte Schrittfahrt im Entwurf. **Noch zu belegen:**
-dass die Düsen-MCU bei Kontakt PA15 umschaltet (Vorschlag: Fingerdruck-Test bei
-kalter Düse, Main-MCU liest PC7 per `endstop_query_state`).
+und sicherer als die zeitgesteuerte Schrittfahrt im Entwurf. Die PA15-Umschaltung bei Kontakt ist inzwischen **live belegt** (§6).
 
 ## 4. Änderungen an `pi-host/k2_prtouch.py`
 
@@ -112,5 +110,34 @@ kalter Düse, Main-MCU liest PC7 per `endstop_query_state`).
 
 - Abbildung der Antast-Parameter (`ned_*`, `*_hold`, `lmt_dead`) auf die
   Stock-Werte beim echten Antasten – per Emulation eines Stock-Antastlaufs klärbar.
-- PA15-Umschaltung bei Kontakt (Fingerdruck-Test, s. §3).
 - Main-MCU-Seite (`read_prtouch_step`, Packung, Ring) live.
+- Stopp unter Bewegung (trsync + `stepper_stop_on_trigger`) – erst auf dem Pi
+  bzw. mit Einzelfreigabe.
+
+## 6. Fingerdruck-Test: Düse schaltet die Swap-Leitung (BELEGT)
+
+Werkzeug `pi-host/prtouch_fingertest.py`. Klipper gestoppt, Düse kalt (24 °C).
+Main-MCU: reset, **nur** `config_endstop oid=0 pin=PC7 pull_up=0`, Pegel per
+`endstop_query_state` alle ~50 ms. Düsen-MCU: reset, nur `config_prtouch_pres`
+(wie Stock), Antast-Modus mit unseren Parametern
+`(60, 93750, 5, 1, 8, 4000, 10000, 500, 200)`. Nach jeder Auslösung 2 s später
+`stop_prtouch_pres sta_swap=1` + erneut scharf. 100 s Messfenster, Benutzer drückt
+die Düse von Hand leicht von unten. Keine Bewegung, keine Heizung.
+
+| Beobachtung | Wert |
+|---|---|
+| PC7 in Ruhe (scharf) | 1 |
+| Auslösungen | **19**, jede: PC7 → 0 **und** `tri_chxs = 1` |
+| Kraftausschlag bei Auslösung (Rohwert − Ruhe) | 4 462 … 220 704 (kleinster ≈ `min_hold` 4000) |
+| Fehlauslöser in Ruhe (24 s + 19 s, Drift bis 2 397) | **0** |
+| nach Druckserie Restversatz ≈ 6 000, neu scharf | keine Auslösung → Schwelle relativ zum Ruhewert beim Scharfschalten |
+| `stop … sta_swap=1` | setzt PC7 wieder auf 1 (Re-Arm funktioniert) |
+| unaufgeforderte Pakete im Antast-Modus | 0 |
+
+**Folge für den Pi-Ersatz:** Der Mechanismus ist vollständig Standard-Klipper-
+tauglich: Düsen-MCU per `start_prtouch_pres` scharf schalten → Kontakt zieht
+PA15/PC7 auf 0 → normaler Endstop/Probe auf **`!PC7`** an der Main-MCU (trsync stoppt
+Z in der MCU, wie Stock). Nach dem Antasten `stop_prtouch_pres sta_swap=1`.
+Damit wird die zeitgesteuerte Schrittfahrt des Entwurfs zum Rückfall; Hauptweg
+für `[k2_prtouch]` sollte ein Upstream-`[probe]` mit Arm-/Disarm-Hook werden.
+
