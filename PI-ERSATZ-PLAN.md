@@ -11,7 +11,7 @@ ANNAHME = nicht durch Quellen belegt. Fundstellen in Klammern. Keine Seriennumme
 Quellen (alle nur gelesen): CHECKLISTE.md (Pi-Ersatz, CFS-Bus-Elektrik, offene Punkte),
 PROTOKOLL-485.md (CFS-Bus physisch, Motoren §3.1, Live-Gegenprobe §6), PROTOKOLL-GESAMT.md,
 GPIO-PHASE-BEFUND-2026-10-16.md, MOTOR-INIT-BEFUND-2026-10-16.md, pi-host/README.md ([k2_motor]-Entwurf),
-MCU-Dictionaries oc-gpio-mcu/*.dict.json, live-1.1.7.0-configs/printer-live.cfg + box-live.cfg,
+MCU-Dictionaries lokale MCU-Dictionaries/*.dict.json, live-1.1.7.0-configs/printer-live.cfg + box-live.cfg,
 Werks-Configs config/F008*/ (printer.cfg, motor_control.cfg, box.cfg, gcode_macro.cfg, sensorless.cfg),
 Creality-Klipper-Extras klippy/ und rootfs-live/.
 
@@ -168,7 +168,7 @@ Timeouts, STATUS≠0, `CfsStatusError`).
 
 1. Nur MCU-Verbindung: `[k2_motor] auto_init: False`, CFS/Belt/prtouch auskommentiert.
    Erwartet: `Klipper ready`, `FIRMWARE_RESTART` sauber, Dictionaries melden je 75
-   Befehle/32 Antworten (oc-gpio-mcu). Abbruch bei: kein Connect, falsche MCU-Version,
+   Befehle/32 Antworten (lokale MCU-Dictionaries). Abbruch bei: kein Connect, falsche MCU-Version,
    `gpio_status`-Test fehlgeschlagen → UART-Verdrahtung/Baud prüfen, STOP.
 2. Motor-Init DRY_RUN: `K2_MOTOR_INIT DRY_RUN=1`. Erwartet: Plan P0–P9 mit 167
    Schritten, Strapping X 0x81/Y 0x82/Z 0x83/Z1 0x84 (MOTOR-INIT-BEFUND §10).

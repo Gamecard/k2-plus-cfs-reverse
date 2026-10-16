@@ -253,7 +253,7 @@ Review-Tests).
   (Konfigurationsbefehle gehen vor dem Connect an die MCU).
 - Fix: `KlippyGpio.__init__(printer, main_mcu_name, pin_specs)` legt ALLE
   Strapping-Pins (aus `motor_<m>_dir/_step` für x/y/z/z1 plus Enable `!PA9`,
-  belegt BEFUND-OC §0) SOFORT per `ppins.setup_pin` an; MCU-Fremdpins
+  belegt GPIO-Befund (lokal) §0) SOFORT per `ppins.setup_pin` an; MCU-Fremdpins
   (z.B. `nozzle_mcu:PB12` E-Stall) werden übersprungen. Das alte Lazy-
   `_output_pin` ist entfernt – `set_pin` wirft `KeyError`, wenn der Pin nicht
   in `load_config` angelegt wurde. Zur Laufzeit nur noch setzen.
@@ -272,7 +272,7 @@ Review-Tests).
   `print_time` + M400 – NICHT Variante (b) direkter MCU-Befehl
   `set_digital_out pin=%u value=%c` (obwohl in der Creality-MCU-FW vorhanden,
   Upstream-Befehl, sofort wirksam, ohne oid). Begründung: (a) entspricht dem
-  Stock (BEFUND-OC §1, B: `update_digital_out` via `set_digital` + Lookahead +
+  Stock (GPIO-Befund (lokal) §1, B: `update_digital_out` via `set_digital` + Lookahead +
   `M400`, `set_digital_out` im `.so` negativ belegt ohne einzige Referenz),
   respektiert das `duplicate_pin_override`-Zeitmultiplex mit `config_stepper`
   (M400 synchronisiert Stepper-Queue und Strapping – sofortiges Setzen würde
@@ -290,14 +290,14 @@ Review-Tests).
 ### 3. `query_pin`-Stub – FIX (Review 3)
 
 - Fehler: `query_pin` gab immer None zurück.
-- Dictionary-Prüfung (`../oc-gpio-mcu/mcu-main-F008-GD32F303RET6.dict.json`,
+- Dictionary-Prüfung (`lokale MCU-Dictionaries/mcu-main-F008-GD32F303RET6.dict.json`,
   nur gelesen): Befehle `query_gpio_status oid=%c gpio_pin=%c` (75) und Antwort
   `gpio_status oid=%c status=%c` (-20) vorhanden; `config_digital_out oid=%c
   pin=%u …` (24), `update_digital_out` (21), `set_digital_out pin=%u value=%c`
   (20), `config_transparent` (74), `transparent_send` (73) ebenfalls da. Aber
   KEIN passender `config_*`-Befehl für das Query-oid – daher ANNAHME: kein
   config-Befehl nötig, eigenes Query-OID via `create_oid()` FRÜH (Konstruktor),
-  für alle Pins geteilt. Stock-Log (`oc-run.log` :228ff, :2492ff) zeigt `oid:
+  für alle Pins geteilt. Stock-Log (Agenten-Log (lokal) :228ff, :2492ff) zeigt `oid:
   11` für alle 8 Pins in beiden Phasen – ebenfalls geteilt; ob das das oid
   eines `config_digital_out` oder eines eigenen Objekts ist, bleibt als ANNAHME
   markiert (hier eigenes oid, ebenfalls geteilt – Antwort-`oid` zählt nur als

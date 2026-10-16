@@ -640,7 +640,7 @@ def parse_klipper_config(config):
 # GPIO-Adapter (klein, testbar) – REVIEW 1–3 eingearbeitet (16.10.2026)
 # =====================================================================
 
-# Enable-Pin, fest im Stock-Modul (BEFUND-OC §0: Strings 'enable_pin_pa9',
+# Enable-Pin, fest im Stock-Modul (GPIO-Befund (lokal) §0: Strings 'enable_pin_pa9',
 # '!PA9', 'force stop,set !PA9 value=0'). Wird hier FRÜH mit angelegt
 # (Review 1), vom Controller derzeit nicht aktiv getrieben (nur Doku;
 # künftige Enable-Steuerung nutzt denselben Pfad).
@@ -712,12 +712,12 @@ class KlippyGpio(GpioOps):
     REVIEW 2 (print_time=0 – FIX, Entscheidung begründet): Variante (a)
     gequeue'tes ``digital_out`` mit gültiger print_time + M400 – NICHT Variante
     (b) direkter ``set_digital_out pin=%u value=%c``. Begründung: (a) entspricht
-    dem Stock (BEFUND-OC §1, B: ``update_digital_out`` via ``set_digital`` +
+    dem Stock (GPIO-Befund (lokal) §1, B: ``update_digital_out`` via ``set_digital`` +
     Lookahead + ``M400``), respektiert das ``duplicate_pin_override``-
     Zeitmultiplex mit ``config_stepper`` (M400 synchronisiert Stepper-Queue und
     Strapping – sofortiges ``set_digital_out`` würde die Move-Queue umgehen),
     und ``set_digital_out`` ist im Stock-``.so`` negativ belegt (keine einzige
-    Referenz, BEFUND-OC §1). ``set_pin`` holt daher
+    Referenz, GPIO-Befund (lokal) §1). ``set_pin`` holt daher
     ``toolhead.get_last_move_time()`` (Fallback
     ``mcu.estimated_print_time(reactor.monotonic()) + 0,100 s``) und ruft
     ``pin.set_digital(print_time, level)``; ``sync()`` macht
