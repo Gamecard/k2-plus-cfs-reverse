@@ -9,7 +9,7 @@ Umfang:
   None (unbekannt) – remain 0 belegt KEIN „leer“ (s. has_filament)
 - remain percent: Restmenge in Prozent (Func 0x03)
 
-Belege (alle in /home/pro/k2-fw-live-1.1.7.0/ dokumentiert):
+Belege (alle in <projekt>/ dokumentiert):
 - Func-Codes + ASCII-Format: PROTOKOLL-485.md, PROTOKOLL-GESAMT.md
 - `A:<hex>;` / `B:unknown;` / `C:busy;`: Live-Frames 12.10.2026
 - GET_REMAIN_LEN: Slotmaske im Request, Antwort positional A..D;

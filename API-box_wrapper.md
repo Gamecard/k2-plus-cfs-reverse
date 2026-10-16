@@ -186,7 +186,7 @@ use_ending_material_flag_clear, z_down/move/restore.
 - Live-Introspektion: alle Signaturen live auf dem Drucker verifiziert
   (send_data state=0xff vs motor_send_data state=0x00 – Static-Decode lag daneben)
 - MockConfig-Injection: MultiColorMeterialBoxWrapper instanziiert gegen Mocks
-  (Skript `/home/pro/k2-fw-live-1.1.7.0/mockconfig-box.py`, Fake-Serial /dev/ttyFAKE0,
+  (Skript `<projekt>/mockconfig-box.py`, Fake-Serial /dev/ttyFAKE0,
   keine Seiteneffekte) – ERGEBNIS: 53 Config-Reads mit Defaults (u.a. box_first_clean_length=90,
   box_need_clean_length=80, Tn_retrude=-60, Tn_extrude=140, nozzle_volume=183,
   flush_multiplier=1, max_tube_length=3000) + Event-Handler

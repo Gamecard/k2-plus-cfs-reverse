@@ -37,7 +37,7 @@ Der Wert „alt“ für cfs0 stammt aus einem Vergleichsimport mit derselben Pip
 Rezept, getestet als Frischimport:
 ```
 export GHIDRA_HEADLESS_MAXMEM=4G      # 30 GB RAM, 25 GB frei; pro Lauf reichen 4G (~15 s Analyse)
-S=/home/pro/k2-fw-live-1.1.7.0/ghidra-scripts
+S=<projekt>/ghidra-scripts
 /opt/ghidra/ghidra_12.1.4_PUBLIC/support/analyzeHeadless /tmp/claude-0/ghidra-cfs/verify v0 \
   -import fw/cfs/cfs0_050_G32-cfs0_000_153.bin -loader BinaryLoader -processor "ARM:LE:32:Cortex" \
   -preScript SetCfsBase.java \
@@ -309,7 +309,7 @@ Gesamt: Strings mit XRef 538 → 930, XRefs 812 → 1464, Funktionen 927 → 106
 
 ---
 
-## 8. Skript-Änderungen (`/home/pro/k2-fw-live-1.1.7.0/ghidra-scripts/`, chown pro:pro)
+## 8. Skript-Änderungen (`<projekt>/ghidra-scripts/`, chown pro:pro)
 
 - **SetCfsBase.java** (neu geschrieben, Diff: `/tmp/claude-0/ghidra-cfs/skripte.diff`):
   - Basis per Argument (`0x…`) oder Dateiname (cfs0→0x08003000, cfs6→0x08004000).

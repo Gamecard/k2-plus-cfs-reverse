@@ -1,4 +1,4 @@
-# K2 485-Protokoll (Basis: V1.1.3.13-Dump + Live 1.1.7.0, Doku in `/home/pro/k2-fw-live-1.1.7.0/`)
+# K2 485-Protokoll (Basis: V1.1.3.13-Dump + Live 1.1.7.0, Doku in `<projekt>/`)
 
 Quelle: `klippy/extras/belt_mdl.py` (Klartext, 621 Zeilen, live vom Drucker),
 `fw/cfs/cfs0_050_G32-cfs0_000_153.bin` (Strings, live 1.1.7.0),
@@ -869,16 +869,16 @@ Binary `rootfs-live/usr/share/klipper/klippy/extras/motor_control_wrapper.cpytho
 | 0x07 | flash_param | nie | Stubs `get/set_flash_param` |
 | 0x08 | get | belegt | `read_variable` + Feedback-Helfer |
 | 0x0B | boot | nie (NIE senden) | Sperre `boot()` |
-| 0x0C | protection | belegt | `check_protection` |
+| 0x0C | protection | belegt | `check_protection` (seit NACHTRAG (4) dekodiert) |
 | 0x0D | systemid | nie | Stub `systemid()` |
 | 0x0E | read485_addr / set485_addr | belegt (Lesen) | `read_485_addr` |
 | 0x0F | version | belegt | `query_motor_version` |
 | 0x11 | stall_mode | belegt | `set_mode` / `get_stall_mode` |
 | 0x12 | dev_uuid | belegt | `read_uuid` |
-| 0x13 | err_detail_data | nie | Stub (Format `<I8BfHfiiffffffffi`) |
-| 0x14 | cut_detail_data | nie | Stub (Format wie 0x13 + `f`) |
-| 0x15 | pos_data_sample | nie | Stub |
-| 0x16 | spd_data_sample | nie | Stub |
+| 0x13 | err_detail_data | nie | ~~Stub~~ `read_err_detail()` (FW-statisch, NACHTRAG (4)) |
+| 0x14 | cut_detail_data | nie | ~~Stub~~ `read_stall_detail()` (FW-statisch) |
+| 0x15 | pos_data_sample | nie | ~~Stub~~ `read_pos_samples()` (FW-statisch) |
+| 0x16 | spd_data_sample | nie | ~~Stub~~ `read_spd_samples()` (FW-statisch) |
 
 `Motor_Addr`: NUM-String '0'..'8' → 0x80..0x88, '9' → 0xFF (Broadcast); `MOTOR_NUM_TO_NAME`
 1..5 → x, y, z, z1, e. Frame = `Motor_Addr[NUM]` + Länge + `00` + Cmd + Payload + CRC.
@@ -927,15 +927,16 @@ Phasen-R-Differenz, Sonstige); `motor_warning_dict` Bit 0..2 → key795..797 (Ko
 Unterspannung, MCU-Übertemperatur). `ERR_CODE_TO_UNION` (Bitwert → Detailformat): 1 `<ii`
 lower/upper_encoder_pulse, 4 `<f` peak_overcurrent_A, 8 `<ff` continuous_overcurrent_A/time_s,
 32 speed_over_limit, 64 pos_over_limit_min/max, 128 pos_cmd_mutation_turns, 256 (vermutet)
-tracking_error. **Offen:** welche Bytes der 8-B-Antwort von 0x0C [0b] err_code bzw. warning_code
+tracking_error. ~~**Offen:** welche Bytes der 8-B-Antwort von 0x0C [0b] err_code bzw. warning_code
 tragen → Nachbau nur Bit-Decoder (`decode_error_bits`/`decode_warning_bits`), kein
-`decode_protection(8 B)`.
+`decode_protection(8 B)`.~~ → **BELEGT 16.10.** (Motor-FW + Host-Parser): Byte 0–3 Fehler, Byte 4–7
+Warnung, je u32 LE → `decode_protection`, s. NACHTRAG (4).
 
 **Hypothesen (VERMUTET, nicht gebaut):**
 
 | G-Code / Index | Cmd | Hypothese |
 |---|---|---|
-| idx 9 / 10 | 0x08 | 0.0016113 = 3,3 V/2048, 0.0008057 = 3,3 V/4096 → 2 bzw. 1 LSB eines 12-Bit-ADC (Strommess-Offset ia/ib?) |
+| ~~idx 9 / 10~~ | 0x08 | ~~0.0016113 = 3,3 V/2048, 0.0008057 = 3,3 V/4096 → 2 bzw. 1 LSB eines 12-Bit-ADC (Strommess-Offset ia/ib?)~~ → **BELEGT 16.10.** (Motor-FW): Phasenströme Ia / −Ib in A, Stillstand = 2/1 LSB, s. NACHTRAG (4) |
 | ~~idx 11~~ | 0x08 | ~~1106 = Roh-Encoderwert?~~ → **BELEGT 16.10.** als Single-Turn-Position 0..3199 Counts/Umdrehung, s. NACHTRAG (3) |
 | MOTOR_FLASH_PARAM | 0x07 | `[DATA]` (+`00` bei 3/4, +ID bei 5/6); DATA=5 Schreiben (float `f`, uint16 `<H`, uint32 **`>I` Big-Endian**, int16 `<h`, sonst `>I`; Antwort Status 0 = OK), DATA=6 Lesen |
 | MOTOR_CONTROL | 0x05 | `[DATA]` bis 12, Antwort 3 Statusbytes (Enable/EN-Pin/Controller/PWM); DATA-Bedeutung offen |
@@ -983,6 +984,112 @@ Nachbau: `POS_COUNTS_PER_REV = 3200`, `VARIABLE_NAMES[11] = 'pos_counts'`
 `read_encoder` bleibt gesperrt („Encoder“ = idx 5/11 single-turn). `cfswatch.py` zeigt idx 11
 als `pos_counts`. Selbsttests mit den Live-Werten (690 → 1.35481 rad, 800 Counts = 10 mm,
 3090 → 690 = +800 über den Wrap).
+
+#### NACHTRAG 16.10.2026 (4): Motor-FW-Befund – Variablen-Tabelle, 0x0C-Layout, 0x13–0x16, STATUS-Bitfeld
+
+Quelle: statische Analyse der **Motor-Firmware** selbst (`MOTOR-FW-BEFUND-2026-10-16.md`; kein
+Druckerzugriff) + Live-Werte 16.10. (Fahrt X F600/F1200, DIR-Gegenprobe; `LIVE-ABFRAGEN-2026-10-16.md`).
+
+**Motor-FW:** `fw/F008|F012/mot{0,1,2}_022_C30-mot2_002_081.bin` (116 412 B, untersucht; die
+`motor/mot*_02{1,3}_…`-Varianten haben denselben String-Satz), Kennung `mot2_002_081` @0x200,
+Version über `fireware ver: %d.%d.%d.%d` (live 1.9.7.81). **CPU WCH QingKe RISC-V (CH32V30x-Klasse,
+rv32imafc + Xwchc)**, **Basis 0x00003000** hinter einem 12-KB-Bootloader (303 lui/addi-Treffer auf
+String-Anfänge bei 0x3000, sonst ≤ 7). Text-Konsole (`help` …) + Binärmodus. **Befehlsregistrierung
+@0x6100–0x63d8** `reg(id, cmd, flag, name, handler)`: 00 help, 01 reboot, 02 encoder_calibrate,
+03 encoder_calibrate_official, 04 elec_offset_calibrate, 05 control, 06 sys_param, 07 flash_param,
+08 get, 0b boot, 0c protection, 0e rs485_addr, 0f version, **11 emergency_pin_mode** (Host:
+stall_mode), 12 dev_uuid, 13 err_detail_data, 14 cut_detail_data, 15 pos_data, 16 spd_data
+(`motor.MOTOR_FW_CMD_NAMES`).
+
+**Antwortrahmen** (Builder @0xdd6e): `F7 | addr | len = n+3 | STATUS | cmd | payload[n] | CRC`.
+**STATUS-Byte = Bitfeld** (im Request `00`; live bisher immer `00`):
+
+| Bit | Wert | Bedeutung |
+|---|---|---|
+| 0 | 0x01 | Stall-Flag (obj+0x40 = 0x08 idx 14) |
+| 1 | 0x02 | latched Fehlercode ≠ 0 |
+| 2 | 0x04 | latched Warncode ≠ 0 |
+| 3–7 | – | unbelegt |
+
+Nachbau `decode_motor_status(byte)`; `cfswatch.py` meldet Motor-STATUS ≠ 0 als Warnung mit Klartext.
+
+**0x08 MOTOR_GET – vollständige Variablen-Tabelle** (FW-Sprungtabelle @0x1bce4, idx 0..18;
+`motor.VARIABLE_TABLE`, Namen außer 5–8 = eigene Nachbau-Namen nach FW-Deutung):
+
+| idx | Name (Nachbau) | Einheit | FW-Feld / Deutung | Beleg |
+|---|---|---|---|---|
+| 0 | `const_zero` | – | konstant 0 | FW |
+| 1 | `pos_ref` | rad | Positions-Soll (ctrl+0x118 = target_pos + 0x84, begrenzt), single-turn | FW + live |
+| 2 | `spd_ref` | rad/s | Drehzahl-Soll (Pos-PI-Ausgang + Vorsteuerung); live 1,633 bei 1,571 Soll | FW + live |
+| 3 | `id_ref` | A | d-Strom-Soll; FOC ohne Feldschwächung → live 0 | FW + live |
+| 4 | `iq_ref` | A | q-Strom-Soll; live ≈ iq_fdb | FW + live |
+| 5 | `pos_fdb` (Host) | rad | LESO-Positionsbeobachter `leso_pos`, single-turn = idx11·2π/3200 | Host + FW + live |
+| 6 | `spd_fdb` (Host) | **rad/s** | LESO-Drehzahl `leso_spd` = `spd_fdb_ctrl`; live 1,53–1,57 bei 1,571 Soll | Host + FW + live |
+| 7 / 8 | `id_fdb` / `iq_fdb` (Host) | A | d/q-Strom-Ist (ctrl+0x60c/0x610) | Host + FW |
+| 9 | `ia` | A | Phasenstrom Ia (ADC-Kanal 0 − Offset); Stillstand 0,00161 = 2 LSB | FW + live |
+| 10 | `minus_ib` | A | **−Ib** (ADC-Kanal 1 × −1,0); Stillstand 0,00081 = 1 LSB | FW + live |
+| 11 | `pos_counts` | counts | **Schrittpuls-Zähler** (STEP-Eingang, u32), 3200/Umdr.; ×2π/3200 = Soll-Winkel | FW + live |
+| 12 | `dir_input` | 0/1 | **DIR-Eingangspegel** (Flanke schaltet Zählrichtung); live −X 0 / +X 1, hält im Stillstand | FW + **live bestätigt** |
+| 13 | `en_input` | 0/1 | vermutlich EN-Eingang (1 → Regelung aus) | FW, vermutet |
+| 14 | `stall_flag` | 0/1 | Stall-Flag = STATUS bit0 | FW |
+| 15 / 16 | – | – | obj->[0xc]+0x24 / +0x2c (u32) | **offen** |
+| 17 | `board_detect_temperature_C` | °C | MCU-Temperatursensor (Kalibrierung 0x1FFFF720) | FW |
+| 18 | `board_detect_power_supply_V` | V | Versorgung (ADC × Vref × `power_voltage_sample_gain`) | FW |
+| > 18 | – | – | FW sendet den veralteten Scratch-Wert (kein Fehler, kein Crash) | FW |
+
+Strom-Skala raw·Vref/4096/(Gain·R); **Gain·R = 1 Ω ist vermutet** (prüfbar über die Flash-Parameter
+`driver_board_amp_gain` / `driver_board_R_of_current_sample_ohm`). Eine ud/uq-Spannung gibt es im GET
+nicht. Die Host-Typkette (float 1–10/17/18, int 11–16) passt zu den FW-Feldern.
+**Host-Crash bleibt:** `MOTOR_GET DATA=0/13` über Creality-G-Code → SHUTDOWN (host-seitig). Deshalb bleibt
+`read_variable` bei 1..12; idx 0/13..18 nur über den eigenen Bus-Zugriff `read_variable_raw_fw(idx,
+confirm=True)` (FW-statisch lesend, live für 0/13..18 nie gesendet → ohne `confirm=True`
+`PermissionError`, nichts gesendet).
+
+**0x0C protection – Byte-Layout BELEGT** (FW + Host-Parser `motor_auto_check_protection` @0x56788):
+Antwort auf `[0b]` = **Byte 0–3 Fehler latched (u32 LE), Byte 4–7 Warnung latched (u32 LE)**; Host-Index
+i = 8·Byte + Bit = LE-Bitnummer → Fehlerbit n → key781+n (0..13), Warnbit n → key795+n (0..2;
+Bit 1 Unterspannung, Bit 2 MCU-Übertemperatur). Latched = roh & Maske (Fehler 0x400, Warnung 0x404).
+Sub-Kommando = Payload-Byte 0 (Sprungtabelle @0x1bd30):
+
+| Sub | Wirkung | Antwort | Nachbau |
+|---|---|---|---|
+| 00 | nichts | – | Konstante |
+| 01 / 02 | protect_en = 0 / 1 | – | **nur Konstante** (zustandsändernd) |
+| 03 / 04 | protect_report = 0 / 1 | – | **nur Konstante** |
+| 05 | löscht roh/latched/Vorzyklus (Backups bleiben); live nie beantwortet | – | **nur Konstante** |
+| 06 / 08 | Fehler- / Warn-Backup | 4 B | Konstante |
+| 07 / 09 | Fehler / Warnung latched (*) | 4 B | **nur Konstante** |
+| 0A | Fehler-Backup + Warn-Backup | 8 B | Konstante |
+| 0B | Fehler latched + Warnung latched (*) | 8 B | `check_protection()` (wie Stock) |
+
+(*) Seiteneffekt @0x10616: steht `emergency_pin_mode`/stall_mode auf **2** (Notfall-Ausgang), gibt
+die FW nach der Antwort den Notfall-/Stall-Pin frei (quittiert die Leitung, Codes bleiben). Stock sendet
+`[0b]` trotzdem (Boot, nach Homing). Nachbau: `check_protection()` → `decode_protection()` (dict
+`err_code`, `warning_code`, `errors`, `warnings`, `ok`, `raw`), `check_protection_raw()` → 8 B;
+`check_protection_code` = Alias (Host-Parser @0xd6cbc identisch).
+
+**0x13–0x16 – LESEND, ohne Request-Payload** (FW liest Payload-Byte 0 nicht; Host stellt sie als
+Webhook-Endpoints bereit, kein G-Code). **FW-statisch belegt, live NICHT geprüft.**
+
+| Cmd | FW-Name | Antwort | Inhalt | Nachbau |
+|---|---|---|---|---|
+| 0x13 | err_detail_data | 74 B = `<I8BfHfiiffffffffi` (66 B) + 8 B Union | Snapshot zum **letzten Fehlerereignis**: err_code (= 1<<n), dev_uuid, elec_offset, phase_order_invert, elec_offset_err_deg, encoder_fdb, encoder_fdb_last, pos_fdb_encoder, spd_fdb_encoder, spd_fdb_ctrl, id, iq, V, °C, pos_loop_pid_err, step_increment; Union je Fehlertyp (`ERR_CODE_TO_UNION`) | `read_err_detail()` |
+| 0x14 | cut_detail_data | 74 B, gleiches Layout | Snapshot beim **Stall-Ereignis** (Messpunkt von MOTOR_CHECK_CUT_POS); Host entpackt 70 B (+1 `f`, Name unbelegt → `extra_f`) | `read_stall_detail()` |
+| 0x15 | pos_data | `0A` + 10 × `<ffff` = 161 B | Ring, älteste zuerst: fdb_pos, leso_pos, target_pos, leso_err | `read_pos_samples()` |
+| 0x16 | spd_data | `0A` + 10 × `<ffff` = 161 B | eigener Ring: fdb_spd, leso_spd, target_spd, leso_in_u | `read_spd_samples()` |
+
+Snapshots bleiben bis zum nächsten Ereignis (auch über `protection [05]`); die Ringe werden nur bei
+ctrl+4 == 1 geschrieben, kein Start/Löschen. Feldnamen = Host-Strings; „Namensreihenfolge =
+Byte-Reihenfolge“ ist **vermutet**. Nachbau: Längen- und Zählbyte-Prüfung (`ValueError`), `retries=0`,
+Timeout 1 s (**unbelegt**), Rückgabe inkl. `status` (decode_motor_status, über `transact_full`);
+Host-Namen `err_detail_data`/`cut_detail_data`/`pos_data_sample`/`spd_data_sample` sind Aliase.
+Selbsttests nur mit synthetischen Frames (Platzhalter-UUID).
+
+**Einstufung:** lesend/sicher = 0x08 (alle idx), 0x13–0x16, 0x0C 06/08/0A; 0x0C 07/09/0B lesend mit
+Seiteneffekt (nur stall_mode 2); zustandsändernd = 0x0C 01–05 und 0x11.
+
+**Noch offen:** idx 15/16; 0x13–0x16 live gegenprüfen; Setzer von Fehlerbit 4 (HW-Überstrom) und
+Warnbit 0 (Kommunikation); Gain·R (Stromskala); Fehlerbit 11 ohne FW-Beleg.
 
 ## 4. Update-Werkzeuge
 

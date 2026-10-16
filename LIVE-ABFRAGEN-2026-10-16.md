@@ -85,3 +85,45 @@ Ergebnis (BELEGT): **idx 11 = Single-Turn-Position 0..3199 Counts/Umdrehung** (8
 alle 40 mm über (50-mm-Schritte zeigen daher nur +π/2 = Aliasing). idx 6 spd_fdb im Stillstand ≈ 0 (±0,006).
 Vor G28 (Motor stromlos): idx 5 = 0.0, idx 11 = 1106. Vorgang: G28 X Y → „Must home axis first“ bei G1
 (Creality verlangt auch Z) → G28 komplett → Messfahrt → Park X175 → M84. Klipper durchgehend ready.
+
+## MOTOR_GET idx 1–12 während konstanter X-Fahrt (16.10.2026, nach G28, Bett leer, User-Freigabe)
+
+Motor X (0x81), G1 X40→X300 bei F600 (10 mm/s) bzw. F1200 (20 mm/s); Abfragen nacheinander während der Fahrt
+(Abstand je Abfrage ~0,1–0,3 s → Positionswerte zeitversetzt). Erwartet bei rotation_distance 40:
+10 mm/s = 0,25 U/s = 1,5708 rad/s; 20 mm/s = 3,1416 rad/s.
+
+| idx | F600 | F1200 | Stillstand | Deutung |
+|---|---|---|---|---|
+| 1 | 5.188 | 1.089 | 0 / folgt pos | **pos_ref** (Soll-Winkel rad, single-turn) – vermutet, sehr plausibel |
+| 2 | 1.633 | 3.201 | 0 | **spd_ref** (Soll-Drehzahl rad/s) – vermutet, sehr plausibel |
+| 3 | 0.0 | 0.0 | 0 | **id_ref** (d-Strom-Soll, bei FOC = 0) – vermutet |
+| 4 | 0.0794 | 0.0592 | 0 | **iq_ref** (q-Strom-Soll; ≈ iq_fdb 0.088/0.070) – vermutet |
+| 5 | 5.769 / 2.561 | 2.211 / 2.106 | – | pos_fdb (rad) – belegt |
+| 6 | 1.529 / 1.572 | 3.454 / 3.110 | ≈0 | **spd_fdb = rad/s** (1,57 bzw. 3,14 erwartet) – BELEGT |
+| 7 | -0.0028 | 0.0041 | ≈0 | id_fdb – belegt (Name) |
+| 8 | 0.0880 | 0.0705 | ≈0 | iq_fdb – belegt (Name) |
+| 9 | -0.0725 | -0.0330 | 0.00161 | offen (Regelabweichung? Spannung?) |
+| 10 | -0.0363 | 0.0008 | 0.00081 | offen |
+| 11 | 222 | 2096 | – | pos_counts (0..3199) – belegt |
+| 12 | 1 | 1 | 0 | **Bewegungs-/Regler-aktiv-Flag** (uint) – vermutet |
+
+Schema-Hypothese: idx 1–4 = Sollwerte (pos/spd/id/iq _ref), idx 5–8 = Istwerte (_fdb, Host-Namen belegt) –
+typische FOC-Kaskade (Positions-→Drehzahl-→Stromregler). Klipper durchgehend ready, am Ende M84.
+
+## Gegenprobe idx 12 = DIR-Eingang (16.10.2026, Motor X 0x81, Fahrten ±X)
+
+Anlass: Der Motor-FW-Befund (`MOTOR-FW-BEFUND-2026-10-16.md` §3) deutet idx 12 als Pegel eines
+GPIO-Eingangs, der bei Flanken die Zählrichtung umschaltet (DIR-Eingang) – und **nicht** als
+Bewegungs-/Regler-aktiv-Flag (Hypothese im Abschnitt davor). Vorhersage: Fahrt in Gegenrichtung → 0.
+
+| Zustand | idx 12 | Begleitwert |
+|---|---|---|
+| nach Einschalten, Stillstand (noch keine Fahrt) | 0 | – |
+| Fahrt −X | **0** | spd_fdb (idx 6) −1,81 rad/s |
+| Fahrt +X | **1** | – |
+| Stillstand nach +X | 1 (hält letzte Richtung) | – |
+
+Ergebnis: **idx 12 = DIR-Eingangspegel – BESTÄTIGT.** Der Wert folgt der Fahrtrichtung und bleibt
+im Stillstand auf der zuletzt gefahrenen Richtung stehen; „1 in Fahrt / 0 im Stillstand“ aus dem
+Abschnitt davor war nur die Richtung +X bzw. der Einschaltzustand. Damit ist die Hypothese
+„Bewegungs-/Regler-aktiv-Flag“ widerlegt. Nachbau: `motor.read_dir_input()`, Name `dir_input`.

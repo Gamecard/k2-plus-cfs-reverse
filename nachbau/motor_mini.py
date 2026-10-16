@@ -27,6 +27,15 @@ LIVE-STAND 15.10.2026 (live-logs-2026-10-15/klippy.log*, lokal, nicht im Repo; s
   Name pos_counts abgeleitet); counts_to_mm (80 Counts/mm bei rot.dist. 40).
   Single-Turn, Wrap alle 40 mm -> absolute Position nur Klipper-Schrittzähler
 - read_encoder: GESPERRT (0x06-Altfalle) -> read_position_feedback (idx 5)
+- NACHTRAG 16.10.2026 (MOTOR-FW-BEFUND-2026-10-16.md, Motor-FW WCH RISC-V,
+  statisch + Live-Gegenproben): Namen/Einheiten idx 1..12 (VARIABLE_NAMES,
+  VARIABLE_UNITS; Details/Belegstatus idx 0..18 in motor.VARIABLE_TABLE),
+  read_reference_values (idx 1-4), read_phase_currents (idx 9/10 -> Ia, Ib),
+  read_dir_input (idx 12, DIR-Eingang live bestätigt); spd_fdb = rad/s;
+  check_protection -> decode_protection (Byte 0-3 Fehler, 4-7 Warnung,
+  u32 LE), check_protection_raw -> 8 B; decode_motor_status (STATUS-
+  Bitfeld bit0 Stall, bit1 Fehler, bit2 Warnung). 0x13..0x16 und
+  read_variable_raw_fw (idx 0/13..18) NUR in motor.py.
 - WARNUNG: Creality-Host MOTOR_GET DATA=0/13 -> Klipper-SHUTDOWN (live 16.10.,
   2x reproduziert; Ursache belegt: get_int -> None -> parse_num_to_byte
   TypeError VOR dem Senden) -> read_variable lehnt Index außerhalb 1..12 ab.
@@ -67,17 +76,24 @@ VARIABLE_INDEX_MIN, VARIABLE_INDEX_MAX = 1, 12  # 0/13: Host-Crash (s. oben)
 # 11/12 '<I' (UNSIGNED; 13..16 '<I', 17/18 '<f' per G-Code unerreichbar).
 VARIABLE_TYPES = dict([(i, "float") for i in range(1, 11)]
                       + [(11, "int"), (12, "int")])
-# Indexnamen (REA belegt, Host-Dict NO_ERR_CODE_TO_GET); 1-4/9-12 ohne
-# Host-Namen. 11 = "pos_counts": EIGENER Name (live 16.10. abgeleitet,
-# Host-Name unbekannt) – Single-Turn-Position 0..3199 Counts/Umdrehung.
-VARIABLE_NAMES = {5: "pos_fdb", 6: "spd_fdb", 7: "id_fdb", 8: "iq_fdb",
-                  11: "pos_counts"}
+# Indexnamen 1..12: 5..8 Host-Dict NO_ERR_CODE_TO_GET (REA belegt), übrige
+# = eigene Namen nach Motor-FW-Deutung (MOTOR-FW-BEFUND 16.10., alle 1..12
+# FW + live belegt; Belegstatus/Deutung je Index: motor.VARIABLE_TABLE).
+# 11 = Schrittpuls-Zähler 0..3199/Umdrehung, 12 = DIR-Eingangspegel.
+VARIABLE_NAMES = {1: "pos_ref", 2: "spd_ref", 3: "id_ref", 4: "iq_ref",
+                  5: "pos_fdb", 6: "spd_fdb", 7: "id_fdb", 8: "iq_fdb",
+                  9: "ia", 10: "minus_ib", 11: "pos_counts", 12: "dir_input"}
+# Einheiten (A: Gain*R = 1 Ohm vermutet, s. motor.py)
+VARIABLE_UNITS = {1: "rad", 2: "rad/s", 3: "A", 4: "A", 5: "rad", 6: "rad/s",
+                  7: "A", 8: "A", 9: "A", 10: "A", 11: "counts", 12: "0/1"}
 # Skalierung live 16.10. (Messfahrt X): pos_fdb [rad] = idx11 * 2*pi/3200
 POS_COUNTS_PER_REV = 3200   # 200 Vollschritte x 16 Microsteps
 SUB_SYS_WRITE = 0x01
 SUB_SYS_READ = 0x02
 SUB_SYS_UPDATE = 0x03
-SUB_PROT_CHECK = 0x0B      # [05] nie beantwortet -> wird nie gesendet
+SUB_PROT_CHECK = 0x0B      # einziger gesendeter 0x0C-Sub; 01..05/07/09 nie
+                           # (zustandsändernd bzw. Seiteneffekt, s. motor.py)
+SUB_PROT_CLEAR = 0x05      # löscht Codes, live nie beantwortet -> nie senden
 SUB_STALL_GET = 0x04
 STALL_MODES = (0x01, 0x02, 0x03)
 SUB_GET_VERSION = 0x00
@@ -176,6 +192,32 @@ def _check_variable_index(idx):
                          "laufen; außerhalb 1..12 unbelegt" % (idx,))
 
 
+def decode_protection(data):
+    """8 B 0x0C [0b] -> {'err_code', 'warning_code', 'errors', 'warnings',
+    'ok', 'raw'}: Byte 0-3 Fehler u32 LE (Bit n -> key781+n), Byte 4-7
+    Warnung u32 LE (Bit n -> key795+n); MOTOR-FW + Host-Parser belegt.
+    'errors'/'warnings' = Bitnummern-Listen."""
+    raw = bytes(data)
+    if len(raw) != 8:
+        raise ValueError("0x0C: 8 Bytes erwartet: %r" % (raw,))
+    err, warn = struct.unpack("<II", raw)
+    return {"err_code": err, "warning_code": warn,
+            "errors": [b for b in range(32) if err >> b & 1],
+            "warnings": [b for b in range(32) if warn >> b & 1],
+            "ok": err == 0 and warn == 0, "raw": raw}
+
+
+def decode_motor_status(status):
+    """STATUS-Byte der Motorantwort -> {'stall' (bit0), 'err_latched' (bit1),
+    'warn_latched' (bit2), 'other', 'ok'} (MOTOR-FW, Builder @0xdd6e)."""
+    if isinstance(status, bool) or not isinstance(status, int) \
+            or not 0 <= status <= 0xFF:
+        raise ValueError("STATUS muss int 0..255 sein: %r" % (status,))
+    return {"stall": bool(status & 1), "err_latched": bool(status & 2),
+            "warn_latched": bool(status & 4), "other": status & 0xF8,
+            "ok": status == 0}
+
+
 def counts_to_mm(counts, rotation_distance=40.0, counts_per_rev=POS_COUNTS_PER_REV):
     """Counts (idx 11, oder Count-Differenz) -> mm innerhalb einer Umdrehung.
     Live 16.10.: 800 Counts = 10 mm. Single-Turn (Wrap alle 40 mm)."""
@@ -183,16 +225,17 @@ def counts_to_mm(counts, rotation_distance=40.0, counts_per_rev=POS_COUNTS_PER_R
 
 
 def decode_variable(idx, data):
-    """4 B 0x08-Antwort -> {'index','name','raw','float' (<f),'int' (<I wie
-    Host),'type' (feste Host-Kette),'value'}. Namen 5..8 (Host) + 11
-    (abgeleitet); Skalierung nur pos_fdb/idx 11 belegt (motor.py)."""
+    """4 B 0x08-Antwort -> {'index','name','unit','raw','float' (<f),'int'
+    (<I wie Host),'type' (feste Host-Kette),'value'}. Namen/Einheiten s.
+    VARIABLE_NAMES/VARIABLE_UNITS (FW-Deutung 16.10.)."""
     _check_variable_index(idx)
     raw = bytes(data)
     if len(raw) != 4:
         raise ValueError("0x08 idx %d: 4 Bytes erwartet: %r" % (idx, raw))
     f, i = struct.unpack("<f", raw)[0], struct.unpack("<I", raw)[0]
     typ = VARIABLE_TYPES[idx]
-    return {"index": idx, "name": VARIABLE_NAMES.get(idx), "raw": raw,
+    return {"index": idx, "name": VARIABLE_NAMES.get(idx),
+            "unit": VARIABLE_UNITS.get(idx), "raw": raw,
             "float": f, "int": i, "type": typ,
             "value": f if typ == "float" else i}
 
@@ -255,13 +298,18 @@ class MotorMini:
             raise RuntimeError("0x06 [03]: Antwort %s statt 01" % ans.hex())
         return True
 
-    def check_protection(self):
+    def check_protection_raw(self):
         """0x0C [0b] -> 8 B Schutzstatus (live immer 8×00; klippy.log:2441/2447).
-        [05] wird nie gesendet (nie beantwortet)."""
+        [05] wird nie gesendet (nie beantwortet). FW-Seiteneffekt bei
+        stall_mode 2: Notfall-Pin wird nach der Antwort freigegeben."""
         ans = self._tx(FUNC_PROTECTION, [SUB_PROT_CHECK], TIMEOUT_PROTECTION)
         if len(ans) != 8:
             raise ValueError("0x0C: 8 Bytes erwartet: %r" % (ans,))
         return ans
+
+    def check_protection(self):
+        """0x0C [0b] -> decode_protection (live 8×00 -> ok=True)."""
+        return decode_protection(self.check_protection_raw())
 
     def set_mode(self, mode, *extra):
         """Stall-Mode setzen (0x11 [01]/[02]/[03]), Antwort = Echo.
@@ -325,13 +373,28 @@ class MotorMini:
         return self.read_variable(11)["value"]
 
     def read_speed_feedback(self):
-        """spd_fdb (0x08 idx 6) -> float; Einheit offen."""
+        """spd_fdb (0x08 idx 6) -> float [rad/s] (FW + live 16.10. belegt)."""
         return self.read_variable(6)["value"]
 
     def read_current_feedback(self):
         """id_fdb/iq_fdb (idx 7, 8) -> {'id','iq','abs'=hypot} wie Host-Stats."""
         i_d, i_q = self.read_variable(7)["value"], self.read_variable(8)["value"]
         return {"id": i_d, "iq": i_q, "abs": math.hypot(i_d, i_q)}
+
+    def read_reference_values(self):
+        """Sollwerte idx 1..4 -> {'pos_ref' rad, 'spd_ref' rad/s, 'id_ref' A,
+        'iq_ref' A} (4 Frames)."""
+        return dict((VARIABLE_NAMES[i], self.read_variable(i)["value"])
+                    for i in (1, 2, 3, 4))
+
+    def read_phase_currents(self):
+        """idx 9/10 -> {'ia', 'ib', 'minus_ib'} [A]; idx 10 = -Ib (FW)."""
+        ia, mib = self.read_variable(9)["value"], self.read_variable(10)["value"]
+        return {"ia": ia, "ib": -mib, "minus_ib": mib}
+
+    def read_dir_input(self):
+        """idx 12 -> Pegel DIR-Eingang 0/1 (live 16.10.: -X 0, +X 1)."""
+        return self.read_variable(12)["value"]
 
     def read_encoder(self, *args, **kwargs):
         """GESPERRT – sendet KEINEN Frame (0x06-Altfalle: 0x06 = Sys-Param).
@@ -422,7 +485,9 @@ def selftest():
           and bus.calls[0][3] == {"timeout": 1.0, "retries": 0})
     check("ID 10 (2 B) -> ValueError", raises(ValueError, mm.read_sys_param, 10))
     check("ID 226 (0 B) -> None", mm.read_sys_param(226) is None)
-    check("check_protection 8x00", mm.check_protection() == bytes(8)
+    pr = mm.check_protection()
+    check("check_protection 8x00 -> ok", pr["ok"] and pr["raw"] == bytes(8)
+          and pr["errors"] == [] == pr["warnings"]
           and bus.calls[3][3] == {"timeout": 0.05, "retries": 0})
     check("get_stall_mode -> 2", mm.get_stall_mode() == 2)
     check("set_mode 3 Echo", mm.set_mode(3) == 3)
@@ -489,7 +554,7 @@ def selftest():
     check("0x08 idx 12 = 0 (int)", r12["value"] == 0 and r12["type"] == "int")
     check("0x0F/0x08 Script verbraucht", not bus.script)
     check("0x08 Namen 5..8 + '<I' unsigned",
-          decode_variable(5, bytes(4))["name"] == "pos_fdb" and r1["name"] is None
+          decode_variable(5, bytes(4))["name"] == "pos_fdb" and r1["name"] == "pos_ref"
           and decode_variable(8, bytes(4))["name"] == "iq_fdb"
           and decode_variable(11, b"\xff\xff\xff\xff")["value"] == 0xFFFFFFFF)
     def _vrx(v):
@@ -502,6 +567,29 @@ def selftest():
           (mf.read_position_feedback(), mf.read_speed_feedback(),
            mf.read_current_feedback()) == (0.5, 1.0, {"id": 3.0, "iq": -4.0, "abs": 5.0})
           and not bus.script)
+    # MOTOR-FW 16.10.: Namen/Einheiten, Helfer (Live-Werte F600, DIR-Gegenprobe)
+    check("Namen/Einheiten 1..12 vollständig",
+          sorted(VARIABLE_NAMES) == sorted(VARIABLE_UNITS) == list(range(1, 13))
+          and VARIABLE_UNITS[6] == "rad/s" and VARIABLE_NAMES[12] == "dir_input"
+          and decode_variable(9, bytes(4))["unit"] == "A")
+    vals = {1: 5.188, 2: 1.633, 3: 0.0, 4: 0.0794, 9: -0.0725, 10: -0.0363}
+    bus = _Bus([("81 04 00 08 %02x" % i, _vrx(vals[i])) for i in (1, 2, 3, 4, 9, 10)]
+               + [("81 04 00 08 0c", "f7 81 07 00 08 %s %02x" % (
+                   (bytes([7, 0, 8]) + struct.pack("<I", v))[3:].hex(" "),
+                   _crc8(bytes([7, 0, 8]) + struct.pack("<I", v)))) for v in (0, 1)])
+    mh = MotorMini(bus, 0x81)
+    ref, ph = mh.read_reference_values(), mh.read_phase_currents()
+    check("read_reference_values / read_phase_currents / read_dir_input",
+          abs(ref["spd_ref"] - 1.633) < 1e-5 and ref["id_ref"] == 0.0
+          and abs(ph["ib"] - 0.0363) < 1e-6 and abs(ph["ia"] + 0.0725) < 1e-6
+          and [mh.read_dir_input(), mh.read_dir_input()] == [0, 1] and not bus.script)
+    dp = decode_protection(bytes.fromhex("05 01 00 00 06 00 00 00"))
+    check("decode_protection u32 LE / decode_motor_status",
+          dp["errors"] == [0, 2, 8] and dp["warnings"] == [1, 2] and not dp["ok"]
+          and decode_motor_status(0)["ok"] and decode_motor_status(5)["stall"]
+          and decode_motor_status(5)["warn_latched"]
+          and not decode_motor_status(5)["err_latched"]
+          and raises(ValueError, decode_protection, bytes(9)))
     for bad in (0, 13, -1, True, 1.0, None):
         check("0x08 idx-guard %r" % (bad,),
               raises(ValueError, MotorMini(nobus, 0x81).read_variable, bad))

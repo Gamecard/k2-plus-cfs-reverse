@@ -23,7 +23,24 @@ Single-Turn-Position 0..3199 Counts/Umdrehung (POS_COUNTS_PER_REV = 3200 =
 200 Vollschritte x 16 Microsteps; 80 Counts/mm bei rotation_distance 40),
 idx 5 pos_fdb = idx11 * 2*pi/3200 [rad]. Beide wrappen alle 40 mm (eine
 Umdrehung) -> KEINE absolute Achsposition (die hat nur Klipper über den
-Schrittzähler). idx 6 spd_fdb im Stillstand ~0 (+-0,006, Einheit offen).
+Schrittzähler). idx 6 spd_fdb im Stillstand ~0 (+-0,006; Einheit seit
+FW-Befund 16.10.: rad/s).
+NACHTRAG 16.10.2026 (MOTOR-FW-BEFUND-2026-10-16.md, statische Analyse der
+Motor-FW fw/F008|F012/mot*_022_C30-mot2_002_081.bin: WCH RISC-V
+CH32V30x-Klasse, Basis 0x3000 hinter 12-KB-Bootloader, Befehlsregistrierung
+@0x6100-0x63d8) + Live 16.10. (Fahrt X F600/F1200, DIR-Gegenprobe):
+- 0x08-Tabelle der FW idx 0..18 komplett (VARIABLE_TABLE: Name, Einheit,
+  Belegstatus); idx 1-4 = pos/spd/id/iq_ref, 5/6 = LESO-Beobachter (Host-
+  Namen pos_fdb/spd_fdb), 9/10 = Ia/-Ib [A], 11 = Schrittpuls-Zähler,
+  12 = DIR-Eingang (live bestätigt), 17/18 = °C/V; spd_fdb = rad/s belegt.
+  idx > 18: FW sendet einen veralteten Wert (kein Crash).
+- 0x0C [0b]: Byte 0-3 Fehler u32 LE, Byte 4-7 Warnung u32 LE -> decode_
+  protection(); Sub-Codes 00..0B als Konstanten (SUB_PROT_*).
+- STATUS-Byte der Motorantwort = Bitfeld (bit0 Stall, bit1 Fehler latched,
+  bit2 Warnung latched) -> decode_motor_status().
+- 0x13..0x16 lesend ohne Request-Payload (FW-statisch, live NICHT geprüft):
+  read_err_detail, read_stall_detail, read_pos_samples, read_spd_samples.
+- 0x11 heißt in der FW emergency_pin_mode (Host: stall_mode).
 
 Umfang:
 - LESEND (live belegt, senden erlaubt):
@@ -34,7 +51,7 @@ Umfang:
   read_variable (0x08 [idx], NUR idx 1..12 -> 4 B, live 16.10.),
   read_position_feedback / read_speed_feedback / read_current_feedback
   (0x08 idx 5 / 6 / 7+8, Namen REA-belegt; pos_fdb = rad single-turn,
-  live 16.10. belegt; spd/id/iq Einheit OFFEN), read_position_counts
+  live 16.10. belegt; spd_fdb rad/s belegt, id/iq A), read_position_counts
   (0x08 idx 11 = Counts 0..3199/Umdrehung, live 16.10. belegt)
 - Umrechnung ohne Bus: pos_rad_to_counts, counts_to_rad, counts_to_mm,
   counts_delta (wrap-korrigierte Differenz, nur |Weg| < 1/2 Umdrehung)
@@ -48,9 +65,17 @@ Umfang:
 - decode_sys_param_float: Dekodier-Hilfe (<f, ohne Bus)
 - read_encoder: GESPERRT (0x06-Altfalle) – "Encoder" = 0x08 idx 5/11
   (Single-Turn) -> read_position_feedback(with_counts=True)
-- Detail-/Sample-Kommandos 0x13..0x16 (err_detail_data, cut_detail_data,
-  pos_data_sample, spd_data_sample) und 0x01/0x03/0x04/0x07/0x0B/0x0D:
-  nur Konstanten + NotImplementedError-Stubs (senden NICHTS)
+- 0x08-Helfer (FW-Tabelle 16.10.): read_reference_values (idx 1-4),
+  read_phase_currents (idx 9/10 -> Ia, Ib), read_dir_input (idx 12);
+  read_variable_raw_fw (idx 0..18, NUR confirm=True, eigener Bus-Zugriff,
+  live für 0/13..18 NICHT geprüft)
+- check_protection (0x0C [0b]) -> dekodiert (decode_protection),
+  check_protection_raw -> 8 B; decode_motor_status (STATUS-Bitfeld)
+- Detail-/Sample-Kommandos 0x13..0x16 LESEND (FW-statisch belegt, live
+  NICHT geprüft, retries 0, Timeout 1 s unbelegt): read_err_detail,
+  read_stall_detail, read_pos_samples, read_spd_samples (+ Decoder)
+- 0x01/0x03/0x04/0x07/0x0B/0x0D: nur Konstanten + NotImplementedError-
+  Stubs (senden NICHTS); 0x0C-Subs 01..05/07/09 nur Konstanten
 - WARNUNG Host-Bug (live 16.10., zweimal reproduziert, Ursache BELEGT):
   Creality `MOTOR_GET … DATA=0` und `DATA=13` -> Klipper-SHUTDOWN.
   Traceback (klippy.log 16.10. 13:12:27): motor_control_wrapper.py:1982
@@ -94,7 +119,8 @@ Stock wiederholt nur beim E-Motor (0x85) auf Anwendungsebene (IDs 9/10/25
 je 3x) – nicht nachgebaut (0x85 gesperrt).
 
 Nie beobachtet (bleiben Stubs bzw. unverändert): 0x01, 0x03, 0x04, 0x07,
-0x0B, 0x0D, 0x13-0x16, 0xF0 (0x08/0x0F seit 16.10. live belegt, s. oben;
+0x0B, 0x0D, 0xF0; 0x13-0x16 seit 16.10. FW-statisch belegt und lesend
+gebaut, live aber nie gesehen (0x08/0x0F seit 16.10. live belegt, s. oben;
 Bedeutung der Cmd-Bytes seit 16.10. aus der Host-Tabelle Motor_cmd belegt). 0x05 ([01]/[02] an X/Y bei BELT_TENSION)
 wurde nie beantwortet (klippy.log.2026-10-12:28621-28636) -> nicht gebaut.
 
@@ -149,10 +175,21 @@ FUNC_FLASH_PARAM = 0x07            # MOTOR_FLASH_PARAM (Payload-Logik vermutet)
 FUNC_GET = FUNC_VARIABLE           # Host-Name "get"
 FUNC_BOOT = 0x0B                   # MOTOR_BOOT – NIE senden (Bootloader)
 FUNC_SYSTEMID = 0x0D
-FUNC_ERR_DETAIL_DATA = 0x13        # Fehlerdetails (Format s. ERR_DETAIL_FORMAT)
-FUNC_CUT_DETAIL_DATA = 0x14        # wie 0x13 + 1 float
-FUNC_POS_DATA_SAMPLE = 0x15        # Positions-Sample (Inhalt unbelegt)
-FUNC_SPD_DATA_SAMPLE = 0x16        # Drehzahl-Sample (Inhalt unbelegt)
+FUNC_ERR_DETAIL_DATA = 0x13        # Snapshot letztes Fehlerereignis (74 B)
+FUNC_CUT_DETAIL_DATA = 0x14        # Snapshot Stall-Ereignis (FW cut_detail, 74 B)
+FUNC_POS_DATA_SAMPLE = 0x15        # Ring 10 x pos-Probe (FW pos_data, 161 B)
+FUNC_SPD_DATA_SAMPLE = 0x16        # Ring 10 x spd-Probe (FW spd_data, 161 B)
+# Motor-FW-Namen (Registrierung @0x6100-0x63d8, MOTOR-FW-BEFUND §0), wo sie
+# vom Host-Namen abweichen: 0x11 emergency_pin_mode, 0x14 cut_detail_data,
+# 0x15 pos_data, 0x16 spd_data, 0x0E rs485_addr, 0x02 encoder_calibrate.
+MOTOR_FW_CMD_NAMES = {
+    0x00: "help", 0x01: "reboot", 0x02: "encoder_calibrate",
+    0x03: "encoder_calibrate_official", 0x04: "elec_offset_calibrate",
+    0x05: "control", 0x06: "sys_param", 0x07: "flash_param", 0x08: "get",
+    0x0B: "boot", 0x0C: "protection", 0x0E: "rs485_addr", 0x0F: "version",
+    0x11: "emergency_pin_mode", 0x12: "dev_uuid", 0x13: "err_detail_data",
+    0x14: "cut_detail_data", 0x15: "pos_data", 0x16: "spd_data",
+}
 MOTOR_CMD = {
     "reboot": FUNC_REBOOT, "encoder_calibrate_official": FUNC_ENCODER_CALIBRATE,
     "elec_offset_calibrate": FUNC_ELEC_OFFSET_CALIBRATE, "control": FUNC_CONTROL,
@@ -173,22 +210,50 @@ MOTOR_ADDR_BY_NUM = dict([(str(n), 0x80 + n) for n in range(9)] + [("9", 0xFF)])
 MOTOR_NUM_TO_NAME = {1: "x", 2: "y", 3: "z", 4: "z1", 5: "e"}
 
 # 0x13 err_detail_data: Host-Unpack-Format @0x3a3f0 (BELEGT als Host-
-# Format; Request-Payload und Frame-Offset UNBELEGT, live nie gesehen).
-# 0x14 cut_detail_data: dasselbe + 1 float (Feldname unbelegt).
+# Format). MOTOR-FW 16.10. (statisch, live NICHT geprüft): Request OHNE
+# Payload (FW liest 0x6cc nicht), Antwort 74 B = 66 B Grundformat + 8 B
+# Union (Inhalt je Fehlertyp, ERR_CODE_TO_UNION). Snapshot des LETZTEN
+# Fehlerereignisses (erfasst @0xc172 bei jedem in Maske 0x400 freigegebenen
+# Fehlerbit), bleibt bis zum nächsten Ereignis, auch über protection [05].
+# 0x14 cut_detail_data: gleiche 74 B, Snapshot beim STALL-Ereignis (Stall-
+# Callback @0xbf44); der Host entpackt 70 B (= Grundformat + 1 float, Name
+# im Host unbelegt -> hier "extra_f" = erste 4 B der Union).
 ERR_DETAIL_FORMAT = "<I8BfHfiiffffffffi"
 CUT_DETAIL_FORMAT = ERR_DETAIL_FORMAT + "f"
+ERR_DETAIL_BASE_LEN = 66
+DETAIL_UNION_LEN = 8
+DETAIL_LEN = ERR_DETAIL_BASE_LEN + DETAIL_UNION_LEN   # 74 B (FW, 0x13 und 0x14)
 ERR_DETAIL_FIELDS = (
     "err_code", "dev_uuid", "elec_offset", "phase_order_invert",
     "elec_offset_err_deg", "encoder_fdb", "encoder_fdb_last",
     "pos_fdb_encoder", "spd_fdb_encoder", "spd_fdb_ctrl", "id", "iq",
     "board_detect_power_supply_V", "board_detect_temperature_C",
     "pos_loop_pid_err", "step_increment")  # dev_uuid = 8 B
+CUT_DETAIL_EXTRA_FIELD = "extra_f"   # eigener Name, Host-Name unbelegt
+
+# 0x15 pos_data / 0x16 spd_data (MOTOR-FW 16.10., statisch, live NICHT
+# geprüft): Request OHNE Payload; Antwort = Zählbyte 0x0A + 10 Proben je
+# '<ffff' (16 B) = 161 B, älteste zuerst (Ringkopf obj+0x88c gemeinsam).
+# Geschrieben nur bei ctrl+4 == 1 (@0xb91c); kein Start, kein Löschen.
+# Feldnamen = Host-Strings (belegt); Zuordnung Name-Reihenfolge = FW-Byte-
+# Reihenfolge VERMUTET (zip/unpack-Reihenfolge des Hosts).
+SAMPLE_COUNT = 10
+SAMPLE_FORMAT = "<ffff"
+SAMPLE_LEN = 1 + SAMPLE_COUNT * 16   # 161 B
+POS_SAMPLE_FIELDS = ("fdb_pos", "leso_pos", "target_pos", "leso_err")
+SPD_SAMPLE_FIELDS = ("fdb_spd", "leso_spd", "target_spd", "leso_in_u")
+TIMEOUT_DETAIL = 1.0       # 0x13..0x16: unbelegt (nie live gesendet)
 
 # Fehler-/Warnbits (Host-Dicts motor_error_dict / motor_warning_dict,
 # Modul-Init, BELEGT als Bit -> key-Zuordnung; Kurztexte = Übersetzung der
-# key-Bedeutung laut REA-Befund). WELCHE Bytes der 8-B-Antwort von 0x0C [0b]
-# err_code bzw. warning_code tragen, ist UNBELEGT (live nur 8x 00) – daher
-# kein decode_protection(8 B), nur Bit-Decoder auf bereits bekannte Codes.
+# key-Bedeutung laut REA-Befund). Byte-Layout der 8-B-Antwort von 0x0C [0b]
+# seit MOTOR-FW-Befund 16.10. BELEGT (FW + Host-Parser): Byte 0-3 = Fehler
+# latched u32 LE, Byte 4-7 = Warnung latched u32 LE; Bit n -> key781+n bzw.
+# key795+n (Host-Index i = 8*Byte + Bit = LE-Bitnummer) -> decode_protection.
+# FW-Setzer (0xde18-0xe0ae): Bit 0..3, 5..10, 12, 13 belegt, Bit 4 (HW-
+# Überstrom) Setzer nicht lokalisiert, Bit 11 im Befund ohne Beleg;
+# Warnung Bit 1 Unterspannung (0x480 < min), Bit 2 MCU-Übertemperatur
+# (0x484 > max), Bit 0 Setzer nicht lokalisiert. Live nur 8x 00.
 MOTOR_ERROR_BITS = {
     0: ("key781", "Encoder-Sprung"), 1: ("key782", "Encoder-Lesefehler"),
     2: ("key783", "SW-Spitzenüberstrom"), 3: ("key784", "SW-Dauerüberstrom"),
@@ -202,6 +267,15 @@ MOTOR_WARNING_BITS = {
     0: ("key795", "Kommunikation"), 1: ("key796", "Unterspannung"),
     2: ("key797", "MCU-Übertemperatur"),
 }
+ERROR_CODE_BITS = 32       # u32, genutzt Bit 0..13
+WARNING_CODE_BITS = 32     # u32, genutzt Bit 0..2
+
+# STATUS-Byte (Byte 3) der Motorantwort = Bitfeld (MOTOR-FW, Antwort-
+# Builder @0xdd6e, BELEGT statisch; live bisher immer 00). Im Request 00.
+MOTOR_STATUS_STALL = 0x01        # bit0: Stall-Flag (obj+0x40 = 0x08 idx 14)
+MOTOR_STATUS_ERR_LATCHED = 0x02  # bit1: latched Fehlercode != 0
+MOTOR_STATUS_WARN_LATCHED = 0x04  # bit2: latched Warncode != 0
+MOTOR_STATUS_KNOWN = 0x07
 # ERR_CODE_TO_UNION (Host): Fehlerbit-WERT -> (Format, Felder) der Detail-
 # daten. 256 -> tracking_error: Schlüssel VERMUTET (letztes Element).
 ERR_CODE_TO_UNION = {
@@ -237,22 +311,72 @@ VERSION_FIELDS = (("fireware_ver", 4), ("cmd_system_ver", 2),
 VARIABLE_LEN = 4
 VARIABLE_INDEX_MIN = 1
 VARIABLE_INDEX_MAX = 12   # G-Code-Grenze des Hosts (maxval=12)
-# Indexnamen (REA BELEGT: Modul-Dict NO_ERR_CODE_TO_GET @0x10cf8-0x10d60,
-# genutzt von _motor_no_cut_detail_data). Index 1-4 und 9-12: KEIN Name im
-# Host (bounded negativ). Vermutet (nur Kommentar, keine Host-Belege):
-#   idx 9  = 0.0016113 = 3,3 V/2048 -> 2 LSB eines 12-Bit-ADC bei 3,3 V
-#   idx 10 = 0.0008057 = 3,3 V/4096 -> 1 LSB (z. B. Strommess-Offset ia/ib)
-# idx 11: BELEGT live 16.10. (Messfahrt X, LIVE-ABFRAGEN-2026-10-16.md):
-#   Single-Turn-Position 0..3199 Counts/Umdrehung (690 @ X50, 1490 @ X100,
-#   3090 @ X160, 690 @ X170 -> 80 Counts/mm, Wrap alle 40 mm). Name
-#   "pos_counts" = EIGENER Name (live 16.10. abgeleitet, Host-Name
-#   UNBEKANNT – nicht im Host-Dict NO_ERR_CODE_TO_GET).
+# Indexnamen. Quellen: (H) Host-Dict NO_ERR_CODE_TO_GET @0x10cf8-0x10d60
+# (REA, BELEGT: 5..8); (F) Motor-FW-GET-Sprungtabelle @0x1bce4, idx 0..18
+# (MOTOR-FW-BEFUND 16.10., statisch BELEGT, Feld-Adressen dort); (L) live
+# 16.10. (Standby-Scan, Messfahrt X, Fahrt F600/F1200, DIR-Gegenprobe).
+# Belegstatus je Index in VARIABLE_TABLE[idx][2]:
+#   "belegt"   = FW-Code und Live-Werte passen
+#   "fw"       = nur FW-statisch belegt (live nicht erreichbar/geprüft)
+#   "vermutet" = Deutung aus FW-Code abgeleitet, nicht zwingend
+#   "offen"    = Feld unbekannt
+# Einheit: rad / rad/s / A / counts / °C / V, "0/1" = Pegel/Flag, None = -.
+# Strom-Einheit A: FW rechnet raw*Vref/4096/(Gain*R) (@0x5ef2); dass
+# Gain*R = 1 Ohm ist (0,806 mA/LSB), ist VERMUTET (Flash-Parameter
+# driver_board_amp_gain / R_of_current_sample_ohm lesend prüfbar).
+# Namen 1..4/9/10/12..18 sind EIGENE Nachbau-Namen nach FW-Deutung (der
+# Host hat dafür keine), 17/18 = FW-Strings board_detect_*.
+VARIABLE_TABLE = {
+    0: ("const_zero", None, "fw", "FW sendet konstant 0"),
+    1: ("pos_ref", "rad", "belegt",
+        "Positions-Sollwert (ctrl+0x118 = target_pos + 0x84, begrenzt), single-turn"),
+    2: ("spd_ref", "rad/s", "belegt",
+        "Drehzahl-Sollwert (ctrl+0x1e4 = Pos-PI-Ausgang + Vorsteuerung); live 1,633 @ 1,571 Soll"),
+    3: ("id_ref", "A", "belegt",
+        "d-Strom-Sollwert (ctrl+0x2b0); FOC ohne Feldschwächung -> live 0"),
+    4: ("iq_ref", "A", "belegt",
+        "q-Strom-Sollwert (ctrl+0x37c); live ~ iq_fdb"),
+    5: ("pos_fdb", "rad", "belegt",
+        "Host-Name; FW = LESO-Positionsbeobachter leso_pos (ctrl+0xbc), "
+        "single-turn = idx11*2pi/3200"),
+    6: ("spd_fdb", "rad/s", "belegt",
+        "Host-Name; FW = LESO-Drehzahl leso_spd = spd_fdb_ctrl (ctrl+0xc0); "
+        "live 1,53-1,57 @ 1,571 Soll"),
+    7: ("id_fdb", "A", "belegt", "d-Strom-Istwert (ctrl+0x60c), Host-Name"),
+    8: ("iq_fdb", "A", "belegt", "q-Strom-Istwert (ctrl+0x610), Host-Name"),
+    9: ("ia", "A", "belegt",
+        "Phasenstrom Ia (ADC-Kanal 0 - Offset); Stillstand 0,00161 = 2 LSB"),
+    10: ("minus_ib", "A", "belegt",
+         "Phasenstrom -Ib (ADC-Kanal 1, x -1.0); Stillstand 0,00081 = 1 LSB"),
+    11: ("pos_counts", "counts", "belegt",
+         "Schrittpuls-Zählerstand (obj+0x7bc u32, STEP-Eingang), 0..3199 = "
+         "3200/Umdrehung; x2pi/3200 = Soll-Winkel"),
+    12: ("dir_input", "0/1", "belegt",
+         "Pegel DIR-Eingang (pins+0x110); live -X = 0, +X = 1, Stillstand "
+         "hält letzte Richtung (Gegenprobe 16.10.)"),
+    13: ("en_input", "0/1", "vermutet",
+         "Pegel EN-Eingang (pins+0x118): 1 -> Regelung aus"),
+    14: ("stall_flag", "0/1", "fw",
+         "Stall-Flag (obj+0x40) = STATUS bit0 (|iq_ref| bzw. |pos-PID-Fehler| > Schwelle)"),
+    15: (None, None, "offen", "obj->[0xc]+0x24 (u32), Bedeutung offen"),
+    16: (None, None, "offen", "obj->[0xc]+0x2c (u32), Bedeutung offen"),
+    17: ("board_detect_temperature_C", "°C", "fw",
+         "MCU-Temperatursensor (Kalibrierung 0x1FFFF720)"),
+    18: ("board_detect_power_supply_V", "V", "fw",
+         "Versorgungsspannung (ADC x Vref x power_voltage_sample_gain)"),
+}
+VARIABLE_FW_INDEX_MIN = 0
+VARIABLE_FW_INDEX_MAX = 18   # > 18: FW sendet veralteten Scratch-Wert (gp-0x7b4)
 VARIABLE_NAMES_HOST = {5: "pos_fdb", 6: "spd_fdb", 7: "id_fdb", 8: "iq_fdb"}
-VARIABLE_NAMES_DERIVED = {11: "pos_counts"}   # live 16.10. abgeleitet
-VARIABLE_NAMES = dict(list(VARIABLE_NAMES_HOST.items())
-                      + list(VARIABLE_NAMES_DERIVED.items()))
+VARIABLE_NAMES_DERIVED = {11: "pos_counts"}   # live 16.10. abgeleitet (Alt-Name)
+# idx -> Name für alle Indizes mit Namen (0..14, 17, 18; 15/16 offen)
+VARIABLE_NAMES = dict((i, v[0]) for i, v in VARIABLE_TABLE.items() if v[0])
+VARIABLE_UNITS = dict((i, v[1]) for i, v in VARIABLE_TABLE.items())
+VARIABLE_STATUS = dict((i, v[2]) for i, v in VARIABLE_TABLE.items())
 IDX_POS_FDB, IDX_SPD_FDB, IDX_ID_FDB, IDX_IQ_FDB = 5, 6, 7, 8
 IDX_POS_COUNTS = 11
+IDX_POS_REF, IDX_SPD_REF, IDX_ID_REF, IDX_IQ_REF = 1, 2, 3, 4
+IDX_IA, IDX_MINUS_IB, IDX_DIR_INPUT = 9, 10, 12
 # Skalierung (BELEGT live 16.10.): idx 5 pos_fdb [rad] = idx11 * 2*pi/3200.
 # 3200 = 200 Vollschritte x 16 Microsteps ([stepper_x] microsteps 16);
 # rotation_distance 40 -> 80 Counts/mm. Live-Rest pos_fdb - idx11*2pi/3200
@@ -273,6 +397,10 @@ VARIABLE_HOST_FORMATS = dict([(i, "<f") for i in list(range(1, 11)) + [17, 18]]
 # (UNSIGNED laut Host; bis 16.10. fälschlich '<i').
 VARIABLE_TYPES = dict((i, "float" if VARIABLE_HOST_FORMATS[i] == "<f" else "int")
                       for i in range(VARIABLE_INDEX_MIN, VARIABLE_INDEX_MAX + 1))
+# FW-seitige Formate idx 0..18 (für read_variable_raw_fw): Host-Kette, die
+# laut MOTOR-FW-Befund zu den FW-Feldern passt (float 1..10/17/18, Ganzzahl
+# 11..16); idx 0 = konstant 0, Typ ohne Bedeutung -> '<I'.
+VARIABLE_FW_FORMATS = dict([(0, "<I")] + list(VARIABLE_HOST_FORMATS.items()))
 
 # Sub-Codes 0x06 (live)
 SUB_SYS_WRITE = 0x01       # "sys参数操作-写入成功" (klippy.log.2026-10-12:10707)
@@ -280,10 +408,42 @@ SUB_SYS_READ = 0x02        # "sys参数操作-读取" (klippy.log:2511-2517)
 SUB_SYS_UPDATE = 0x03      # "Updata param / sys参数操作-更新" (klippy.log:2869-2875)
 SYS_UPDATE_OK = 0x01       # Antwort auf [03]
 
-# Sub-Codes 0x0C (live)
-SUB_PROT_CHECK = 0x0B      # MOTOR_CHECK_PROTECTION_AFTER_HOME DATA=11 (klippy.log:201)
-SUB_PROT_UNKNOWN_05 = 0x05  # nie beantwortet (klippy.log:2470-2491) -> nie senden
+# Sub-Codes 0x0C (Payload-Byte 0; MOTOR-FW Sprungtabelle @0x1bd30, 12
+# Einträge, statisch BELEGT; live nur [0b] beantwortet, [05] nie).
+# FW-Felder: Fehler roh 0x428 / latched 0x42c (= roh & Maske 0x400),
+# Warnung roh 0x438 / latched 0x43c (& Maske 0x404), Backup 0x434/0x444
+# (vermutlich Flash-Param protect_err/warning_code_backup). Byteweise ab
+# niedrigster Adresse gesendet = u32 Little-Endian.
+# NUR [0b] wird über eine öffentliche Methode gesendet (check_protection,
+# = Stock MOTOR_CHECK_PROTECTION_AFTER_HOME DATA=11). Die übrigen Subs sind
+# NUR Konstanten:
+#   01..05 zustandsändernd (protect_en, protect_report, Codes löschen),
+#   07/09/0B: Seiteneffekt @0x10616 – steht emergency_pin_mode/stall_mode
+#   (obj+0x32) auf 2 (Notfall-Ausgang), gibt die FW nach der Antwort den
+#   Notfall-/Stall-Pin frei (quittiert die Notfall-Leitung, Codes bleiben).
+#   Das gilt auch für [0b] – Stock sendet [0b] trotzdem (Boot, nach Homing).
+#   06/08/0A lesen nur die Backups (ohne Seiteneffekt, live nie gesendet).
+SUB_PROT_NOP = 0x00             # nichts, keine Antwortdaten
+SUB_PROT_EN_OFF = 0x01          # protect_en = 0 (obj+0x3f4)        – NICHT senden
+SUB_PROT_EN_ON = 0x02           # protect_en = 1                     – NICHT senden
+SUB_PROT_REPORT_OFF = 0x03      # protect_report = 0 (obj+0x3f6)     – NICHT senden
+SUB_PROT_REPORT_ON = 0x04       # protect_report = 1                 – NICHT senden
+SUB_PROT_CLEAR = 0x05           # löscht roh/latched/Vorzyklus (Backups bleiben)
+SUB_PROT_ERR_BACKUP = 0x06      # -> 4 B Fehler-Backup
+SUB_PROT_ERR_LATCHED = 0x07     # -> 4 B Fehler latched (*Seiteneffekt)
+SUB_PROT_WARN_BACKUP = 0x08     # -> 4 B Warn-Backup
+SUB_PROT_WARN_LATCHED = 0x09    # -> 4 B Warn latched (*Seiteneffekt)
+SUB_PROT_BACKUPS = 0x0A         # -> 8 B Fehler-Backup + Warn-Backup
+SUB_PROT_CHECK = 0x0B      # -> 8 B Fehler latched + Warn latched (*Seiteneffekt);
+                           # MOTOR_CHECK_PROTECTION_AFTER_HOME DATA=11 (klippy.log:201)
+SUB_PROT_LATCHED = SUB_PROT_CHECK
+SUB_PROT_UNKNOWN_05 = SUB_PROT_CLEAR  # Alt-Name; live nie beantwortet
+                                      # (klippy.log:2470-2491) -> nie senden
+SUB_PROT_SIDE_EFFECT = (SUB_PROT_ERR_LATCHED, SUB_PROT_WARN_LATCHED, SUB_PROT_CHECK)
+SUB_PROT_STATE_CHANGING = (SUB_PROT_EN_OFF, SUB_PROT_EN_ON, SUB_PROT_REPORT_OFF,
+                           SUB_PROT_REPORT_ON, SUB_PROT_CLEAR)
 PROTECTION_LEN = 8         # Antwort 8 B (live immer 8x 00 = kein Fehler)
+STALL_MODE_EMERGENCY = 2   # 0x11-Modus 2 = Notfall-Ausgang (Seiteneffekt s. oben)
 
 # Sub-Codes 0x11 (live)
 STALL_MODES = (0x01, 0x02, 0x03)  # setzen, Antwort = Echo
@@ -680,33 +840,146 @@ def build_variable_payload(idx):
     return [idx]
 
 
-def decode_variable(idx, data):
-    """4 B 0x08-Antwort -> {'index', 'name', 'raw', 'fmt', 'float', 'int',
-    'type', 'value'}. KEIN Bus-Zugriff.
-
-    'float' = <f, 'int' = <I (UNSIGNED wie der Host, REA 16.10.),
-    'fmt'/'type' = feste Host-Typkette (VARIABLE_HOST_FORMATS), 'value' =
-    Wert in diesem Typ, 'name' = VARIABLE_NAMES (5..8 Host, 11 abgeleitet)
-    oder None. Skalierung: pos_fdb/idx 11 belegt (counts_to_rad), spd/id/iq
-    OFFEN.
-    Live: 33 33 d3 3a -> 0.0016113 (idx 9), 52 04 00 00 -> 1106 (idx 11).
-    """
-    _check_variable_index(idx)
+def _decode_variable_any(idx, data, fmt):
     raw = bytes(data)
     if len(raw) != VARIABLE_LEN:
         raise ValueError("0x08 idx %d: %d statt 4 Bytes: %r" % (idx, len(raw), raw))
     f = struct.unpack("<f", raw)[0]
     i = struct.unpack("<I", raw)[0]
-    typ = VARIABLE_TYPES[idx]
-    return {"index": idx, "name": VARIABLE_NAMES.get(idx), "raw": raw,
-            "fmt": VARIABLE_HOST_FORMATS[idx], "float": f, "int": i,
+    typ = "float" if fmt == "<f" else "int"
+    info = VARIABLE_TABLE.get(idx, (None, None, "offen", ""))
+    return {"index": idx, "name": info[0], "unit": info[1], "status": info[2],
+            "raw": raw, "fmt": fmt, "float": f, "int": i,
             "type": typ, "value": f if typ == "float" else i}
+
+
+def decode_variable(idx, data):
+    """4 B 0x08-Antwort -> {'index', 'name', 'unit', 'status', 'raw', 'fmt',
+    'float', 'int', 'type', 'value'}. KEIN Bus-Zugriff. NUR idx 1..12.
+
+    'float' = <f, 'int' = <I (UNSIGNED wie der Host, REA 16.10.),
+    'fmt'/'type' = feste Host-Typkette (VARIABLE_HOST_FORMATS), 'value' =
+    Wert in diesem Typ, 'name'/'unit'/'status' = VARIABLE_TABLE (FW-Deutung
+    16.10., Belegstatus "belegt"/"fw"/"vermutet"/"offen").
+    Live: 33 33 d3 3a -> 0.0016113 (idx 9 = Ia [A]), 52 04 00 00 -> 1106
+    (idx 11 pos_counts).
+    """
+    _check_variable_index(idx)
+    return _decode_variable_any(idx, data, VARIABLE_HOST_FORMATS[idx])
+
+
+def decode_variable_fw(idx, data):
+    """Wie decode_variable, aber für den FW-Bereich idx 0..18 (MOTOR-FW-
+    Befund: Sprungtabelle @0x1bce4, 19 Einträge). KEIN Bus-Zugriff."""
+    _check_variable_fw_index(idx)
+    return _decode_variable_any(idx, data, VARIABLE_FW_FORMATS[idx])
+
+
+def _check_variable_fw_index(idx):
+    if isinstance(idx, bool) or not isinstance(idx, int) \
+            or not VARIABLE_FW_INDEX_MIN <= idx <= VARIABLE_FW_INDEX_MAX:
+        raise ValueError("0x08-FW-Index muss int %d..%d sein: %r (> 18 sendet die "
+                         "FW nur einen veralteten Wert)"
+                         % (VARIABLE_FW_INDEX_MIN, VARIABLE_FW_INDEX_MAX, idx))
+
+
+def decode_motor_status(status):
+    """STATUS-Byte (Byte 3) einer Motorantwort -> dict. KEIN Bus-Zugriff.
+
+    MOTOR-FW (Antwort-Builder @0xdd6e, statisch BELEGT): bit0 = Stall-Flag
+    (= 0x08 idx 14), bit1 = latched Fehlercode != 0, bit2 = latched Warncode
+    != 0; 'other' = übrige Bits (unbelegt, erwartet 0). Live bisher immer 00.
+    Gilt NUR für Motor-Boards (CFS 0x01 nutzt das Byte anders)."""
+    if isinstance(status, bool) or not isinstance(status, int) \
+            or not 0 <= status <= 0xFF:
+        raise ValueError("STATUS muss int 0..255 sein: %r" % (status,))
+    return {"raw": status,
+            "stall": bool(status & MOTOR_STATUS_STALL),
+            "err_latched": bool(status & MOTOR_STATUS_ERR_LATCHED),
+            "warn_latched": bool(status & MOTOR_STATUS_WARN_LATCHED),
+            "other": status & ~MOTOR_STATUS_KNOWN & 0xFF,
+            "ok": status == 0}
+
+
+def decode_protection(data):
+    """8 B Antwort von 0x0C [0b] (bzw. [0a]) -> dict. KEIN Bus-Zugriff.
+
+    Layout BELEGT (MOTOR-FW + Host-Parser motor_auto_check_protection
+    @0x56788): Byte 0-3 = Fehlercode u32 LE, Byte 4-7 = Warncode u32 LE.
+    Der Host baut den Bitstring per bin(b).zfill(8)[::-1] je Byte -> Index
+    i = 8*Byte + Bit = LE-Bitnummer -> motor_error_dict[i] (key781+i) bzw.
+    motor_warning_dict[i] (key795+i). Rückgabe: 'err_code', 'warning_code',
+    'errors'/'warnings' (Listen (bit, key, text), s. decode_error_bits),
+    'ok' (beide 0), 'raw'. Live nur 8x 00 (-> ok)."""
+    raw = bytes(data)
+    if len(raw) != PROTECTION_LEN:
+        raise ValueError("0x0C: %d statt 8 Bytes: %r" % (len(raw), raw))
+    err, warn = struct.unpack("<II", raw)
+    return {"err_code": err, "warning_code": warn,
+            "errors": decode_error_bits(err), "warnings": decode_warning_bits(warn),
+            "ok": err == 0 and warn == 0, "raw": raw}
+
+
+def decode_detail_union(err_code, union):
+    """8-B-Union der Detaildaten (0x13/0x14) -> dict nach ERR_CODE_TO_UNION.
+
+    err_code ist im Snapshot GENAU EIN Bit (FW: err_code = 1 << n). Format
+    bekannt (Host) nur für 1/4/8; 32/64/128/256 nur Feldnamen -> Werte None.
+    Unbekannt/0 -> {}. Rohbytes stehen immer unter 'union_raw' (Aufrufer)."""
+    union = bytes(union)
+    ent = ERR_CODE_TO_UNION.get(err_code)
+    if not ent:
+        return {}
+    fmt, names = ent
+    if fmt is None:
+        return dict((n, None) for n in names)
+    return dict(zip(names, struct.unpack(fmt, union[:struct.calcsize(fmt)])))
+
+
+def decode_err_detail(data, cut=False):
+    """74 B Antwort von 0x13 (cut=False) bzw. 0x14 (cut=True) -> dict.
+    KEIN Bus-Zugriff. Format FW-statisch belegt, live NICHT geprüft.
+
+    Felder ERR_DETAIL_FIELDS aus ERR_DETAIL_FORMAT (66 B; dev_uuid = 8 B
+    als bytes), 'union_raw' = Byte 66..73, 'union' = decode_detail_union,
+    bei cut=True zusätzlich CUT_DETAIL_EXTRA_FIELD ('<f' aus Byte 66..69,
+    wie der Host mit CUT_DETAIL_FORMAT), 'errors' = decode_error_bits."""
+    raw = bytes(data)
+    if len(raw) != DETAIL_LEN:
+        raise ValueError("0x%02x: %d statt %d Bytes: %r"
+                         % (FUNC_CUT_DETAIL_DATA if cut else FUNC_ERR_DETAIL_DATA,
+                            len(raw), DETAIL_LEN, raw))
+    vals = struct.unpack(ERR_DETAIL_FORMAT, raw[:ERR_DETAIL_BASE_LEN])
+    out = {"err_code": vals[0], "dev_uuid": bytes(vals[1:9])}
+    for name, v in zip(ERR_DETAIL_FIELDS[2:], vals[9:]):
+        out[name] = v
+    out["union_raw"] = raw[ERR_DETAIL_BASE_LEN:]
+    out["union"] = decode_detail_union(out["err_code"], out["union_raw"])
+    out["errors"] = decode_error_bits(out["err_code"])
+    if cut:
+        out[CUT_DETAIL_EXTRA_FIELD] = struct.unpack(
+            "<f", raw[ERR_DETAIL_BASE_LEN:ERR_DETAIL_BASE_LEN + 4])[0]
+    out["raw"] = raw
+    return out
+
+
+def decode_samples(data, fields):
+    """161 B Antwort von 0x15/0x16 -> Liste von 10 dicts (älteste zuerst).
+    KEIN Bus-Zugriff. Byte 0 = Anzahl (FW fest 0x0A), dann je Probe '<ffff'
+    mit den Feldnamen fields (POS_/SPD_SAMPLE_FIELDS; Zuordnung Reihenfolge
+    VERMUTET). Länge/Zählbyte falsch -> ValueError."""
+    raw = bytes(data)
+    if len(raw) != SAMPLE_LEN or raw[0] != SAMPLE_COUNT:
+        raise ValueError("Sample-Antwort: %d B / Zählbyte %r statt %d B / %d"
+                         % (len(raw), raw[:1], SAMPLE_LEN, SAMPLE_COUNT))
+    return [dict(zip(fields, struct.unpack_from(SAMPLE_FORMAT, raw, 1 + 16 * k)))
+            for k in range(SAMPLE_COUNT)]
 
 
 def decode_error_bits(code):
     """err_code (int-Bitmaske) -> Liste (bit, key, text). KEIN Bus-Zugriff.
-    Bit-Zuordnung BELEGT (motor_error_dict); woher der Code im 0x0C-Frame
-    kommt, ist UNBELEGT. Unbekannte Bits -> (bit, None, 'unbekannt')."""
+    Bit-Zuordnung BELEGT (motor_error_dict); im 0x0C-Frame = u32 LE aus
+    Byte 0-3 (decode_protection). Unbekannte Bits -> (bit, None, 'unbekannt')."""
     return _decode_bits(code, MOTOR_ERROR_BITS)
 
 
@@ -855,6 +1128,17 @@ class Motor:
         return bytes(self.bus.transact(self.addr, fun, payload, timeout=timeout,
                                        retries=MOTOR_RETRIES))
 
+    def _tx_status(self, fun, payload, timeout):
+        """Wie _tx, liefert aber (STATUS-Byte oder None, daten). Nutzt
+        bus.transact_full (serial485, Review M2), sonst transact (Status
+        dann None = nicht verfügbar)."""
+        full = getattr(self.bus, "transact_full", None)
+        if full is None:
+            return None, self._tx(fun, payload, timeout)
+        _addr, st, _fun, data, _raw = full(self.addr, fun, payload,
+                                           timeout=timeout, retries=MOTOR_RETRIES)
+        return st, bytes(data)
+
     # --- 0x06 Sys-Param ---
 
     def read_sys_param_raw(self, param_id):
@@ -956,37 +1240,44 @@ class Motor:
 
     # --- 0x0C Schutzstatus ---
 
-    def check_protection(self):
+    def check_protection_raw(self):
         """Schutzstatus abfragen (0x0C [0b]) -> 8 Byte (bytes). LESEND.
 
         = Stock MOTOR_CHECK_PROTECTION_AFTER_HOME DATA=11 (klippy.log:201).
         Live: klippy.log:2441 `81 04 00 0c 0b` -> 2447
-        `f7 81 0b 00 0c 00×8 fb` (alle Motoren immer 8×00 = kein Fehler;
-        Bedeutung einzelner Bytes != 0 UNBELEGT). retries=0, Timeout 0.05 s.
-        Sub [05] wird NIE gesendet (nie beantwortet, klippy.log:2470-2491).
+        `f7 81 0b 00 0c 00×8 fb` (alle Motoren immer 8×00 = kein Fehler).
+        Layout: decode_protection (Byte 0-3 Fehler, 4-7 Warnung, u32 LE).
+        SEITENEFFEKT (MOTOR-FW @0x10616, statisch): steht stall_mode/
+        emergency_pin_mode auf 2, gibt die FW nach der Antwort den Notfall-
+        Pin frei (Codes bleiben) – wie beim Stock, der [0b] genauso sendet.
+        retries=0, Timeout 0.05 s. Die Subs 01..05/07/09 werden NIE gesendet
+        (Konstanten SUB_PROT_*; [05] live nie beantwortet, klippy.log:2470-2491).
         """
         ans = self._tx(FUNC_PROTECTION, [SUB_PROT_CHECK], TIMEOUT_PROTECTION)
         if len(ans) != PROTECTION_LEN:
             raise ValueError("0x0C: %d statt 8 Bytes: %r" % (len(ans), ans))
         return ans
 
+    def check_protection(self):
+        """Schutzstatus (0x0C [0b]) -> dekodiert (decode_protection):
+        {'err_code', 'warning_code', 'errors', 'warnings', 'ok', 'raw'}.
+        LESEND (Seiteneffekt Notfall-Pin bei stall_mode 2, s.
+        check_protection_raw). Live 8×00 -> ok=True, keine Bits."""
+        return decode_protection(self.check_protection_raw())
+
+    check_protection_code = check_protection  # Host-Name (gleicher Parser @0xd6cbc)
+
     def write_params_raw(self, data8=None):
         """VERALTET – frühere Deutung "8 Byte Parameter senden" WIDERLEGT.
 
         Live ist 0x0C ein 1-Byte-Request [0b] mit 8-Byte-Antwort (die 8×00
-        waren die ANTWORT). Ohne Argument = Alias auf check_protection();
-        mit Argument -> ValueError (es werden nie 8 Byte gesendet).
+        waren die ANTWORT). Ohne Argument = Alias auf check_protection_raw()
+        (8 B); mit Argument -> ValueError (es werden nie 8 Byte gesendet).
         """
         if data8 is not None:
             raise ValueError("write_params_raw: 8-Byte-0x0C-Senden widerlegt "
                              "(0x0C = Schutzabfrage [0b]); check_protection() nutzen")
-        return self.check_protection()
-
-    def check_protection_code(self):
-        """TODO: Code-Tabelle der 8 Schutzstatus-Bytes UNBELEGT (live nur 8×00).
-        Rohdaten: check_protection()."""
-        raise NotImplementedError("TODO check_protection_code: Code-Tabelle "
-                                  "unbelegt (live nur 8x 00), s. check_protection()")
+        return self.check_protection_raw()
 
     # --- 0x11 Stall-Mode ---
 
@@ -1098,6 +1389,51 @@ class Motor:
 
     motor_get = read_variable  # Host-Name
 
+    def read_variable_raw_fw(self, idx, confirm=False):
+        """0x08 [idx] für den FW-Bereich idx 0..18 – GESCHÜTZT (confirm=True).
+
+        Entscheidung 16.10.2026: Die Grenze 1..12 von read_variable stammt
+        aus dem Creality-HOST (G-Code maxval=12, Crash bei DATA=0/13 VOR dem
+        Senden). Ein eigener Bus-Zugriff umgeht den Host; die Motor-FW
+        behandelt idx 0..18 in der GET-Sprungtabelle (@0x1bce4) rein lesend
+        (MOTOR-FW-BEFUND §3) – deshalb sauber baubar. Trotzdem gesperrt, weil
+        0 und 13..18 am Motor LIVE NIE gesendet wurden: ohne confirm=True
+        PermissionError, nichts gesendet. idx > 18 -> ValueError (FW sendet
+        dann nur einen veralteten Scratch-Wert). Rückgabe decode_variable_fw.
+        NICHT über Creality-G-Code nachbilden (MOTOR_GET DATA=0/13 ->
+        Klipper-SHUTDOWN). retries=0, Timeout 1.0 s (unbelegt).
+        """
+        _check_variable_fw_index(idx)
+        if confirm is not True:
+            raise PermissionError(
+                "read_variable_raw_fw(idx %d) gesperrt: FW-statisch lesend, live "
+                "für 0/13..18 nie geprüft – nur mit confirm=True" % idx)
+        return decode_variable_fw(idx, self._tx(FUNC_VARIABLE, [idx],
+                                                TIMEOUT_VARIABLE))
+
+    def read_reference_values(self):
+        """Sollwerte der FOC-Kaskade (0x08 idx 1..4, 4 Frames) -> dict
+        {'pos_ref' [rad], 'spd_ref' [rad/s], 'id_ref' [A], 'iq_ref' [A]}.
+        LESEND. FW-Deutung belegt (MOTOR-FW §3), live 16.10. passend
+        (F600: spd_ref 1,633 @ 1,571 Soll, id_ref 0, iq_ref ~ iq_fdb)."""
+        return dict((VARIABLE_NAMES[i], self.read_variable(i)["value"])
+                    for i in (IDX_POS_REF, IDX_SPD_REF, IDX_ID_REF, IDX_IQ_REF))
+
+    def read_phase_currents(self):
+        """Phasenströme (0x08 idx 9, 10; 2 Frames) -> {'ia', 'ib', 'minus_ib'}
+        in A. LESEND. idx 10 liefert die FW als -Ib (x -1.0) -> 'ib' =
+        -Wert. Skala raw*Vref/4096/(Gain*R); Gain*R = 1 Ohm VERMUTET."""
+        ia = self.read_variable(IDX_IA)["value"]
+        mib = self.read_variable(IDX_MINUS_IB)["value"]
+        return {"ia": ia, "ib": -mib, "minus_ib": mib}
+
+    def read_dir_input(self):
+        """Pegel des DIR-Eingangs (0x08 idx 12) -> int 0/1. LESEND.
+        FW: GPIO pins+0x110, bei Flanke Zählrichtung umgeschaltet; live
+        16.10. bestätigt (Fahrt -X = 0, +X = 1, Stillstand hält die letzte
+        Richtung, nach Einschalten 0)."""
+        return self.read_variable(IDX_DIR_INPUT)["value"]
+
     def read_position_feedback(self, with_counts=False):
         """pos_fdb (0x08 idx 5) -> float [rad]. LESEND.
         Name REA-belegt (NO_ERR_CODE_TO_GET); Skalierung live 16.10. BELEGT:
@@ -1122,14 +1458,16 @@ class Motor:
         return self.read_variable(IDX_POS_COUNTS)["value"]
 
     def read_speed_feedback(self):
-        """spd_fdb (0x08 idx 6) -> float. LESEND. Einheit OFFEN (vermutlich
-        rad/s, vgl. protection_param_prt_over_speed_rad_s)."""
+        """spd_fdb (0x08 idx 6) -> float [rad/s]. LESEND. Einheit BELEGT
+        16.10. (FW: LESO-Drehzahl spd_fdb_ctrl, Parameter *_rad_s; live
+        1,53-1,57 rad/s bei 10 mm/s = 1,571 rad/s Soll)."""
         return self.read_variable(IDX_SPD_FDB)["value"]
 
     def read_current_feedback(self):
         """id_fdb/iq_fdb (0x08 idx 7, 8) -> {'id', 'iq', 'abs'}. LESEND,
         2 Frames. 'abs' = hypot(id, iq) wie der Host-Stats-Hook
-        (Motor_Control.stats, overcurrent=|I|). Einheit vermutlich A."""
+        (Motor_Control.stats, overcurrent=|I|). Einheit A (FW: aus den
+        Phasenströmen idx 9/10; Gain*R = 1 Ohm vermutet)."""
         i_d = self.read_variable(IDX_ID_FDB)["value"]
         i_q = self.read_variable(IDX_IQ_FDB)["value"]
         return {"id": i_d, "iq": i_q, "abs": math.hypot(i_d, i_q)}
@@ -1148,28 +1486,64 @@ class Motor:
             "read_position_feedback(with_counts=True) (0x08 idx 5 pos_fdb rad / "
             "idx 11 Counts, single-turn 3200/Umdrehung)")
 
+    # --- 0x13..0x16 Detail-/Sample-Daten (MOTOR-FW 16.10.: LESEND, ohne
+    # Request-Payload; FW-statisch belegt, live NICHT geprüft) ---
+
+    def _read_detail(self, fun, length):
+        st, ans = self._tx_status(fun, [], TIMEOUT_DETAIL)
+        if len(ans) != length:
+            raise ValueError("0x%02x: %d statt %d Bytes: %r"
+                             % (fun, len(ans), length, ans))
+        return st, ans
+
+    def read_err_detail(self):
+        """0x13 err_detail_data -> dict (decode_err_detail) + 'status'.
+        FW-statisch belegt, live NICHT geprüft. Request ohne Payload
+        (`81 03 00 13`), Antwort 74 B = Snapshot des LETZTEN Fehlerereignisses
+        (bleibt bis zum nächsten, auch über protection [05]); der Handler
+        kopiert nur statische Felder nach (idempotent). 'status' =
+        decode_motor_status oder None. retries=0, Timeout 1 s (unbelegt)."""
+        st, ans = self._read_detail(FUNC_ERR_DETAIL_DATA, DETAIL_LEN)
+        out = decode_err_detail(ans)
+        out["status"] = None if st is None else decode_motor_status(st)
+        return out
+
+    def read_stall_detail(self):
+        """0x14 cut_detail_data -> dict (decode_err_detail(cut=True)) +
+        'status'. FW-statisch belegt, live NICHT geprüft. Request ohne
+        Payload, Antwort 74 B = Snapshot beim STALL-Ereignis (Messpunkt von
+        MOTOR_CHECK_CUT_POS). retries=0, Timeout 1 s (unbelegt)."""
+        st, ans = self._read_detail(FUNC_CUT_DETAIL_DATA, DETAIL_LEN)
+        out = decode_err_detail(ans, cut=True)
+        out["status"] = None if st is None else decode_motor_status(st)
+        return out
+
+    def read_pos_samples(self):
+        """0x15 pos_data -> {'samples': 10 x {fdb_pos, leso_pos, target_pos,
+        leso_err}, 'status'}. FW-statisch belegt, live NICHT geprüft.
+        Request ohne Payload, Antwort 161 B (Zählbyte 0x0A + 10 x '<ffff',
+        älteste zuerst); Ring wird nur bei ctrl+4 == 1 geschrieben, kein
+        Start/Löschen. retries=0, Timeout 1 s (unbelegt)."""
+        st, ans = self._read_detail(FUNC_POS_DATA_SAMPLE, SAMPLE_LEN)
+        return {"samples": decode_samples(ans, POS_SAMPLE_FIELDS),
+                "status": None if st is None else decode_motor_status(st)}
+
+    def read_spd_samples(self):
+        """0x16 spd_data -> {'samples': 10 x {fdb_spd, leso_spd, target_spd,
+        leso_in_u}, 'status'}. FW-statisch belegt, live NICHT geprüft.
+        Wie read_pos_samples (eigener Ring). retries=0, Timeout 1 s."""
+        st, ans = self._read_detail(FUNC_SPD_DATA_SAMPLE, SAMPLE_LEN)
+        return {"samples": decode_samples(ans, SPD_SAMPLE_FIELDS),
+                "status": None if st is None else decode_motor_status(st)}
+
+    # Host-Namen (Motor_cmd) -> lesende Methoden
+    err_detail_data = read_err_detail
+    cut_detail_data = read_stall_detail
+    pos_data_sample = read_pos_samples
+    spd_data_sample = read_spd_samples
+
     # --- Stubs aus der Host-Tabelle Motor_cmd (REA 16.10., live nie
     # gesehen) – senden NICHTS ---
-
-    def err_detail_data(self, *args):
-        """TODO 0x13 err_detail_data: Host entpackt '<I8BfHfiiffffffffi'
-        (ERR_DETAIL_FIELDS, @0x3a3f0); Request-Payload unbelegt."""
-        raise NotImplementedError("TODO 0x13 err_detail_data: Request unbelegt, "
-                                  "live nie gesehen")
-
-    def cut_detail_data(self, *args):
-        """TODO 0x14 cut_detail_data: Format wie 0x13 + 1 float
-        (CUT_DETAIL_FORMAT); Request-Payload unbelegt."""
-        raise NotImplementedError("TODO 0x14 cut_detail_data: Request unbelegt, "
-                                  "live nie gesehen")
-
-    def pos_data_sample(self, *args):
-        """TODO 0x15 pos_data_sample (Host-Tabelle Motor_cmd); Inhalt unbelegt."""
-        raise NotImplementedError("TODO 0x15 pos_data_sample: unbelegt")
-
-    def spd_data_sample(self, *args):
-        """TODO 0x16 spd_data_sample (Host-Tabelle Motor_cmd); Inhalt unbelegt."""
-        raise NotImplementedError("TODO 0x16 spd_data_sample: unbelegt")
 
     def reboot(self, *args):
         """TODO 0x01 reboot (Host-Tabelle) – live nie gesehen, nicht senden."""
@@ -1322,6 +1696,10 @@ class _FakeBus:
         self.calls = []
 
     def transact(self, addr, fun, data=(), **kwargs):
+        return self.transact_full(addr, fun, data, **kwargs)[3]
+
+    def transact_full(self, addr, fun, data=(), **kwargs):
+        """Wie serial485.transact_full: (addr, status, fun, daten, roh)."""
         self.calls.append((addr, fun, list(data), dict(kwargs)))
         assert self.script, "FakeBus: unerwarteter Sendeversuch"
         want_tx, rx = self.script.pop(0)
@@ -1334,7 +1712,7 @@ class _FakeBus:
         raw = bytes.fromhex(rx)
         rfun, rdata = parse_frame(raw)  # prüft Geräte-CRC
         assert raw[1] == addr and rfun == fun, (raw[1], rfun, addr, fun)
-        return rdata
+        return raw[1], raw[3], rfun, rdata, raw
 
 
 def selftest():
@@ -1492,12 +1870,15 @@ def selftest():
         ("f7 81 04 00 0c 0b 95", "f7 81 0b 00 0c 00 00 00 00 00 00 00 00 fb"),
         ("84 04 00 0c 0b", "f7 84 0b 00 0c 00 00 00 00 00 00 00 00 fb"),
     ])
-    check("protection X 8x00 (klippy.log:2441/2447)",
-          Motor(bus, 0x81).check_protection() == bytes(8)
+    p0 = Motor(bus, 0x81).check_protection()
+    check("protection X 8x00 dekodiert ok (klippy.log:2441/2447)",
+          p0["ok"] is True and p0["err_code"] == 0 == p0["warning_code"]
+          and p0["errors"] == [] == p0["warnings"] and p0["raw"] == bytes(8)
           and bus.calls[0][3] == {"timeout": TIMEOUT_PROTECTION, "retries": 0})
-    check("write_params_raw() = Alias (transparent-Frame klippy.log:2469)",
+    check("write_params_raw() = Alias raw (transparent-Frame klippy.log:2469)",
           Motor(bus, 0x81).write_params_raw() == bytes(8))
-    check("protection Z1", Motor(bus, 0x84).check_protection() == bytes(8))
+    check("protection Z1 raw", Motor(bus, 0x84).check_protection_raw() == bytes(8)
+          and Motor.check_protection_code is Motor.check_protection)
     check("write_params_raw(8B) abgelehnt",
           raises(ValueError, Motor(nobus, 0x82).write_params_raw, [0] * 8))
     check("[05] nirgends sendbar", nobus.calls == [] and SUB_PROT_UNKNOWN_05 == 5
@@ -1546,12 +1927,11 @@ def selftest():
     check("addr-guard 0x05", raises(ValueError, Motor, None, 0x05))
     mm = Motor(nobus, 0x84)
     stub_ok = all(raises(NotImplementedError, f) for f in [
-        mm.encoder_calibrate, mm.elec_offset_calibrate, mm.check_protection_code,
+        mm.encoder_calibrate, mm.elec_offset_calibrate,
         mm.pin_io,
         lambda: mm.set_e_stall_mode(1), lambda: mm.set_z_stall_mode(1),
         lambda: mm.get_flash_param(0), lambda: mm.set_flash_param(0, 1),
-        mm.err_detail_data, mm.cut_detail_data, mm.pos_data_sample,
-        mm.spd_data_sample, mm.reboot, mm.boot, mm.systemid])
+        mm.reboot, mm.boot, mm.systemid])
     check("stubs not-implemented", stub_ok)
     check("stubs/Sperren senden nichts", nobus.calls == [])
     check("kurz-frame", raises(ValueError, parse_frame, bytes.fromhex("f7 81")))
@@ -1608,11 +1988,12 @@ def selftest():
           sorted(VARIABLE_HOST_FORMATS) == list(range(1, 19))
           and all(VARIABLE_HOST_FORMATS[i] == "<f" for i in list(range(1, 11)) + [17, 18])
           and all(VARIABLE_HOST_FORMATS[i] == "<I" for i in range(11, 17)))
-    check("0x08 Namen 5..8 (Host) + 11 (abgeleitet)",
+    check("0x08 Namen: Host 5..8 + abgeleitet 11 in VARIABLE_TABLE enthalten",
           VARIABLE_NAMES_HOST == {5: "pos_fdb", 6: "spd_fdb", 7: "id_fdb", 8: "iq_fdb"}
-          and VARIABLE_NAMES == dict(list(VARIABLE_NAMES_HOST.items()) + [(11, "pos_counts")])
-          and res[5]["name"] == "pos_fdb" and res[1]["name"] is None
-          and res[11]["name"] == "pos_counts" and res[9]["name"] is None
+          and all(VARIABLE_NAMES[i] == n for i, n in
+                  list(VARIABLE_NAMES_HOST.items()) + list(VARIABLE_NAMES_DERIVED.items()))
+          and res[5]["name"] == "pos_fdb" and res[1]["name"] == "pos_ref"
+          and res[11]["name"] == "pos_counts" and res[9]["name"] == "ia"
           and res[11]["fmt"] == "<I" and res[9]["fmt"] == "<f")
     check("0x08 int unsigned '<I' (ff ff ff ff -> 4294967295)",
           decode_variable(11, b"\xff\xff\xff\xff")["value"] == 0xFFFFFFFF
@@ -1691,6 +2072,11 @@ def selftest():
     check("decode_warning_bits 0x6", [b[1] for b in decode_warning_bits(6)] == ["key796", "key797"]
           and raises(ValueError, decode_warning_bits, -1)
           and raises(ValueError, decode_error_bits, True))
+    check("decode_detail_union Encoder-Puls <ii / unbekannt {}",
+          decode_detail_union(1, struct.pack("<ii", -5, 6))
+          == {"lower_encoder_pulse": -5, "upper_encoder_pulse": 6}
+          and decode_detail_union(0, bytes(8)) == {}
+          and decode_detail_union(0x2000, bytes(8)) == {})
     check("ERR_CODE_TO_UNION Bitwerte", sorted(ERR_CODE_TO_UNION) == [1, 4, 8, 32, 64, 128, 256]
           and all(struct.calcsize(v[0]) == 4 * len(v[1])
                   for v in ERR_CODE_TO_UNION.values() if v[0]))
@@ -1699,6 +2085,193 @@ def selftest():
               raises(ValueError, Motor(nobus, 0x81).read_variable, bad))
     check("0x08 Längen-Guard", raises(ValueError, decode_variable, 9, bytes(3)))
     check("0x08 Guards senden nichts", nobus.calls == [])
+
+    # 7c. MOTOR-FW-Befund 16.10.: Variablentabelle, Helfer, DIR-Gegenprobe
+    check("VARIABLE_TABLE idx 0..18 vollständig, Status/Einheiten gültig",
+          sorted(VARIABLE_TABLE) == list(range(19))
+          and set(VARIABLE_STATUS.values()) <= {"belegt", "fw", "vermutet", "offen"}
+          and set(u for u in VARIABLE_UNITS.values() if u)
+          <= {"rad", "rad/s", "A", "counts", "°C", "V", "0/1"}
+          and sorted(i for i in VARIABLE_TABLE if VARIABLE_NAMES.get(i) is None) == [15, 16])
+    check("VARIABLE_TABLE Kernnamen/Einheiten",
+          [VARIABLE_NAMES[i] for i in (1, 2, 3, 4, 9, 10, 12)]
+          == ["pos_ref", "spd_ref", "id_ref", "iq_ref", "ia", "minus_ib", "dir_input"]
+          and VARIABLE_UNITS[6] == "rad/s" and VARIABLE_UNITS[5] == "rad"
+          and VARIABLE_UNITS[9] == "A" and VARIABLE_UNITS[11] == "counts"
+          and VARIABLE_UNITS[17] == "°C" and VARIABLE_UNITS[18] == "V"
+          and VARIABLE_STATUS[12] == "belegt" and VARIABLE_STATUS[13] == "vermutet"
+          and VARIABLE_STATUS[15] == "offen")
+    check("decode_variable liefert unit/status",
+          decode_variable(6, struct.pack("<f", 1.572))["unit"] == "rad/s"
+          and decode_variable(12, bytes(4))["status"] == "belegt")
+    # Live-Werte Fahrt X F600 (LIVE-ABFRAGEN 16.10., Bytes = struct.pack)
+    f600 = {1: 5.188, 2: 1.633, 3: 0.0, 4: 0.0794, 9: -0.0725, 10: -0.0363}
+    bus = _FakeBus([_vrxb(i, struct.pack("<f", f600[i])) for i in (1, 2, 3, 4, 9, 10)]
+                   + [_vrxb(12, struct.pack("<I", v)) for v in (0, 1, 1)])
+    mr = Motor(bus, 0x81)
+    ref = mr.read_reference_values()
+    check("read_reference_values idx 1..4 (live F600)",
+          sorted(ref) == ["id_ref", "iq_ref", "pos_ref", "spd_ref"]
+          and abs(ref["pos_ref"] - 5.188) < 1e-5 and abs(ref["spd_ref"] - 1.633) < 1e-5
+          and ref["id_ref"] == 0.0 and abs(ref["iq_ref"] - 0.0794) < 1e-6
+          and [c[2] for c in bus.calls] == [[1], [2], [3], [4]])
+    ph = mr.read_phase_currents()
+    check("read_phase_currents idx 9/10 -> Ia, Ib = -idx10 (live F600)",
+          abs(ph["ia"] + 0.0725) < 1e-6 and abs(ph["minus_ib"] + 0.0363) < 1e-6
+          and abs(ph["ib"] - 0.0363) < 1e-6
+          and [c[2] for c in bus.calls[4:6]] == [[9], [10]])
+    # DIR-Gegenprobe 16.10.: Fahrt -X = 0, Fahrt +X = 1, Stillstand danach = 1
+    check("read_dir_input idx 12: -X 0 / +X 1 / Stillstand hält 1",
+          [mr.read_dir_input() for _ in range(3)] == [0, 1, 1] and not bus.script)
+    # read_variable_raw_fw: Sperre + FW-Bereich (synthetisch, nie live)
+    check("read_variable_raw_fw ohne confirm gesperrt, nichts gesendet",
+          raises(PermissionError, Motor(nobus, 0x81).read_variable_raw_fw, 17)
+          and raises(PermissionError, Motor(nobus, 0x81).read_variable_raw_fw, 13,
+                     confirm="yes")
+          and nobus.calls == [])
+    for bad in (19, -1, 255, True, 1.0):
+        check("read_variable_raw_fw idx-guard %r" % (bad,),
+              raises(ValueError, Motor(nobus, 0x81).read_variable_raw_fw, bad,
+                     confirm=True))
+    bus = _FakeBus([_vrxb(17, struct.pack("<f", 31.5)), _vrxb(18, struct.pack("<f", 24.1)),
+                    _vrxb(0, bytes(4)), _vrxb(13, struct.pack("<I", 1))])
+    mfw = Motor(bus, 0x81)
+    t17, t18, t0, t13 = [mfw.read_variable_raw_fw(i, confirm=True) for i in (17, 18, 0, 13)]
+    check("read_variable_raw_fw 17 °C / 18 V / 0 / 13 (SYNTHETISCH)",
+          abs(t17["value"] - 31.5) < 1e-6 and t17["unit"] == "°C"
+          and abs(t18["value"] - 24.1) < 1e-5 and t18["unit"] == "V"
+          and t0["value"] == 0 and t0["name"] == "const_zero"
+          and t13["value"] == 1 and t13["type"] == "int" and t13["name"] == "en_input"
+          and all(c[3] == {"timeout": TIMEOUT_VARIABLE, "retries": 0} for c in bus.calls)
+          and not bus.script)
+    check("read_variable bleibt 1..12 (Host-Crash), decode_variable_fw 0..18",
+          raises(ValueError, Motor(nobus, 0x81).read_variable, 17)
+          and decode_variable_fw(18, bytes(4))["fmt"] == "<f"
+          and raises(ValueError, decode_variable_fw, 19, bytes(4)))
+
+    # 7d. STATUS-Bitfeld + 0x0C-Layout (MOTOR-FW + Host-Parser)
+    st0, st7 = decode_motor_status(0x00), decode_motor_status(0x07)
+    check("decode_motor_status 00 (live) / 07 / 0x0a",
+          st0["ok"] and not (st0["stall"] or st0["err_latched"] or st0["warn_latched"])
+          and st7["stall"] and st7["err_latched"] and st7["warn_latched"]
+          and st7["other"] == 0 and decode_motor_status(0x0A)["other"] == 0x08
+          and decode_motor_status(0x0A)["err_latched"]
+          and raises(ValueError, decode_motor_status, 256)
+          and raises(ValueError, decode_motor_status, True))
+    pr = decode_protection(bytes.fromhex("05 01 00 00 06 00 00 00"))
+    check("decode_protection Fehler 0x105 / Warnung 0x6 (u32 LE)",
+          pr["err_code"] == 0x105 and pr["warning_code"] == 6 and not pr["ok"]
+          and [b[1] for b in pr["errors"]] == ["key781", "key783", "key789"]
+          and [b[1] for b in pr["warnings"]] == ["key796", "key797"])
+    check("decode_protection Byte 3 Bit 7 = Fehlerbit 31, Byte 4 = Warnbit 0",
+          decode_protection(bytes.fromhex("00 00 00 80 01 00 00 00"))["errors"]
+          == [(31, None, "unbekannt")]
+          and decode_protection(bytes.fromhex("00 00 00 80 01 00 00 00"))["warnings"][0][1]
+          == "key795"
+          and raises(ValueError, decode_protection, bytes(7)))
+
+    def _host_protection(data):
+        # Host-Parser motor_auto_check_protection @0x56788 (MOTOR-FW-BEFUND §1)
+        s_ = "".join(bin(b)[2:].zfill(8)[::-1] for b in data)
+        return ([i for i, c in enumerate(s_[:32]) if c == "1"],
+                [i for i, c in enumerate(s_[32:]) if c == "1"])
+    import random
+    rnd = random.Random(1016)
+    same = True
+    for _ in range(300):
+        d = bytes(rnd.randrange(256) for _ in range(8))
+        p_ = decode_protection(d)
+        same &= _host_protection(d) == ([b[0] for b in p_["errors"]],
+                                        [b[0] for b in p_["warnings"]])
+    check("decode_protection = Host-Bitstring-Parser (300 Zufallsframes)", same)
+    check("0x0C Sub-Konstanten (FW-Sprungtabelle 00..0B)",
+          [SUB_PROT_NOP, SUB_PROT_EN_OFF, SUB_PROT_EN_ON, SUB_PROT_REPORT_OFF,
+           SUB_PROT_REPORT_ON, SUB_PROT_CLEAR, SUB_PROT_ERR_BACKUP, SUB_PROT_ERR_LATCHED,
+           SUB_PROT_WARN_BACKUP, SUB_PROT_WARN_LATCHED, SUB_PROT_BACKUPS, SUB_PROT_CHECK]
+          == list(range(12)) and SUB_PROT_UNKNOWN_05 == SUB_PROT_CLEAR
+          and SUB_PROT_CHECK in SUB_PROT_SIDE_EFFECT
+          and MOTOR_FW_CMD_NAMES[0x11] == "emergency_pin_mode")
+    # check_protection mit SYNTHETISCHEM Fehlerframe (CRC neu)
+    def _prx(addr, status, data):
+        body = bytes([len(data) + 3, status, FUNC_PROTECTION]) + bytes(data)
+        return "f7 %02x %s %02x" % (addr, body.hex(" "), crc8_cal(body))
+    bus = _FakeBus([("82 04 00 0c 0b", _prx(0x82, 0x06,
+                                            bytes.fromhex("00 01 00 00 02 00 00 00")))])
+    pc = Motor(bus, 0x82).check_protection()
+    check("check_protection dekodiert Schleppfehler + Unterspannung (SYNTHETISCH)",
+          pc["err_code"] == 0x100 and pc["errors"][0][:2] == (8, "key789")
+          and pc["warnings"][0][:2] == (1, "key796") and not bus.script)
+
+    # 7e. 0x13..0x16 (FW-statisch, Frames SYNTHETISCH; UUID = Platzhalter)
+    def _drx(addr, fun, status, data):
+        body = bytes([len(data) + 3, status, fun]) + bytes(data)
+        return "f7 %02x %s %02x" % (addr, body.hex(" "), crc8_cal(body))
+    uuid0 = bytes.fromhex("cd ab 00 00 00 00 00 00")   # PLATZHALTER
+    base = struct.pack(ERR_DETAIL_FORMAT, 0x100, *(list(uuid0) + [
+        123.5, 0, 1.25, 1000, 999, 1.0, 2.0, 3.0, 0.1, 0.2, 24.0, 30.0, 0.5, 7]))
+    det = base + struct.pack("<ff", 0.75, 0.0)
+    cut = struct.pack(ERR_DETAIL_FORMAT, 0x4, *(list(uuid0) + [
+        123.5, 1, 1.25, 10, 20, 1.0, 2.0, 3.0, 0.1, 0.2, 24.0, 30.0, 0.5, 7])) \
+        + struct.pack("<ff", 2.5, 0.0)
+    pos = bytes([10]) + b"".join(struct.pack("<ffff", k, k + 0.5, k + 1, -k)
+                                 for k in range(10))
+    spd = bytes([10]) + b"".join(struct.pack("<ffff", k, k, 2 * k, 0.25)
+                                 for k in range(10))
+    bus = _FakeBus([("81 03 00 13", _drx(0x81, 0x13, 0x02, det)),
+                    ("81 03 00 14", _drx(0x81, 0x14, 0x01, cut)),
+                    ("81 03 00 15", _drx(0x81, 0x15, 0x00, pos)),
+                    ("81 03 00 16", _drx(0x81, 0x16, 0x00, spd))])
+    md = Motor(bus, 0x81)
+    e = md.read_err_detail()
+    check("read_err_detail 74 B (Request ohne Payload, retries 0, 1 s)",
+          len(det) == DETAIL_LEN == 74 and e["err_code"] == 0x100
+          and e["dev_uuid"] == uuid0 and e["phase_order_invert"] == 0
+          and abs(e["elec_offset"] - 123.5) < 1e-6 and e["encoder_fdb"] == 1000
+          and e["board_detect_power_supply_V"] == 24.0
+          and e["board_detect_temperature_C"] == 30.0 and e["step_increment"] == 7
+          and e["errors"][0][1] == "key789" and e["union"] == {"tracking_error": None}
+          and e["union_raw"] == struct.pack("<ff", 0.75, 0.0)
+          and e["status"]["err_latched"] and not e["status"]["stall"]
+          and bus.calls[0][2] == [] and bus.calls[0][3] == {"timeout": TIMEOUT_DETAIL,
+                                                            "retries": 0})
+    c = md.read_stall_detail()
+    check("read_stall_detail 0x14: Union Spitzenstrom + extra_f (Host 70 B)",
+          c["err_code"] == 4 and c["union"] == {"peak_overcurrent_A": 2.5}
+          and c[CUT_DETAIL_EXTRA_FIELD] == 2.5 and c["errors"][0][1] == "key783"
+          and c["status"]["stall"]
+          and struct.unpack(CUT_DETAIL_FORMAT, cut[:70])[-1] == c[CUT_DETAIL_EXTRA_FIELD])
+    ps = md.read_pos_samples()
+    check("read_pos_samples 0x15: 161 B, 10 x fdb/leso/target/leso_err",
+          len(pos) == SAMPLE_LEN == 161 and len(ps["samples"]) == 10
+          and ps["samples"][3] == {"fdb_pos": 3.0, "leso_pos": 3.5,
+                                   "target_pos": 4.0, "leso_err": -3.0}
+          and ps["status"]["ok"])
+    ss = md.read_spd_samples()
+    check("read_spd_samples 0x16: Felder fdb/leso/target_spd, leso_in_u",
+          ss["samples"][9] == {"fdb_spd": 9.0, "leso_spd": 9.0, "target_spd": 18.0,
+                               "leso_in_u": 0.25}
+          and [c_[1] for c_ in bus.calls] == [0x13, 0x14, 0x15, 0x16]
+          and all(c_[2] == [] for c_ in bus.calls) and not bus.script)
+    check("Host-Aliase 0x13..0x16 = lesende Methoden",
+          Motor.err_detail_data is Motor.read_err_detail
+          and Motor.cut_detail_data is Motor.read_stall_detail
+          and Motor.pos_data_sample is Motor.read_pos_samples
+          and Motor.spd_data_sample is Motor.read_spd_samples)
+    bus = _FakeBus([("81 03 00 13", _drx(0x81, 0x13, 0x00, det[:66])),
+                    ("81 03 00 15", _drx(0x81, 0x15, 0x00, bytes([9]) + pos[1:]))])
+    check("0x13/0x15 Längen-/Zählbyte-Guard",
+          raises(ValueError, Motor(bus, 0x81).read_err_detail)
+          and raises(ValueError, Motor(bus, 0x81).read_pos_samples) and not bus.script
+          and raises(ValueError, decode_samples, pos[:-1], POS_SAMPLE_FIELDS))
+    class _NoFull:
+        def __init__(self):
+            self.calls = []
+        def transact(self, addr, fun, data=(), **kw):
+            self.calls.append((addr, fun, list(data), kw))
+            return pos
+    nf = _NoFull()
+    check("ohne transact_full: status None, Daten trotzdem",
+          Motor(nf, 0x83).read_pos_samples()["status"] is None and nf.calls[0][2] == [])
 
     # 8. Update-Pfad (Doku 1.7 + Disassembly, live nie beobachtet)
     bus = _FakeBus([

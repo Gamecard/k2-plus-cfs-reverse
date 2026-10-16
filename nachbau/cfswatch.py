@@ -95,6 +95,8 @@ MOTOR_FUN_NAMES = {
     motor.FUNC_SET_MODE: "Stall-Mode", motor.FUNC_UUID: "UUID",
     motor.FUNC_FW_UPDATE: "FW-Update", motor.FUNC_VERSION: "Version",
     motor.FUNC_VARIABLE: "Variable",
+    motor.FUNC_ERR_DETAIL_DATA: "Fehlerdetail", motor.FUNC_CUT_DETAIL_DATA: "Stalldetail",
+    motor.FUNC_POS_DATA_SAMPLE: "Pos-Proben", motor.FUNC_SPD_DATA_SAMPLE: "Spd-Proben",
 }
 AUTO_ADDR_FUNS = (0xA0, 0xA1, 0xA2, 0xA3)
 DEDUP_FUNS = (box.FUNC_GET_BOX_STATE, box.FUNC_MEASURING_WHEEL,
@@ -320,8 +322,18 @@ class Decoder:
             return ("ungültiger Frame (%s)" % e, SEV_ERR, None, None)
         st, addr = frame[3], frame[1]
         if addr != box.BOX_ADDR or fun in AUTO_ADDR_FUNS:
-            return (self._other_resp(addr, fun, data, req_data), SEV_INFO,
-                    None, None)
+            txt, sev = self._other_resp(addr, fun, data, req_data), SEV_INFO
+            if addr in motor.MOTOR_ADDRS and st:
+                # MOTOR-FW 16.10.: STATUS = Bitfeld (bit0 Stall, bit1/2 Codes)
+                ms = motor.decode_motor_status(st)
+                flags = [n for k, n in (("stall", "Stall"),
+                                        ("err_latched", "Fehler latched"),
+                                        ("warn_latched", "Warnung latched")) if ms[k]]
+                if ms["other"]:
+                    flags.append("Bits 0x%02x unbelegt" % ms["other"])
+                txt += "; Motor-STATUS 0x%02x: %s" % (st, ", ".join(flags))
+                sev = SEV_WARN
+            return (txt, sev, None, None)
         sev = SEV_INFO
         slots = None
         parts = []
@@ -500,10 +512,11 @@ class Decoder:
                 and len(data) == motor.VARIABLE_LEN and len(req_data) == 1 \
                 and req_data[0] in motor.VARIABLE_TYPES:
             r = motor.decode_variable(req_data[0], data)
-            return "Variable idx %d%s = %s (%s; float %g / int %d)" % (
+            return "Variable idx %d%s = %s%s (%s; float %g / int %d)" % (
                 r["index"], " %s" % r["name"] if r["name"] else "",
                 ("%g" % r["value"]) if r["type"] == "float"
-                else r["value"], r["type"], r["float"], r["int"])
+                else r["value"], " %s" % r["unit"] if r["unit"] else "",
+                r["type"], r["float"], r["int"])
         if fun in AUTO_ADDR_FUNS:
             return "Auto-Addr-Antwort [%s]" % mask_bytes(data, 2, self.unmask)
         if fun == motor.FUNC_UUID and len(data) == motor.UUID_LEN:
@@ -511,7 +524,22 @@ class Decoder:
         if fun == motor.FUNC_SYS_PARAM and len(data) == 4:
             return "Wert %g" % struct.unpack("<f", bytes(data))[0]
         if fun == motor.FUNC_PROTECTION and len(data) == motor.PROTECTION_LEN:
-            return "Schutzstatus %s" % ("ok (8x00)" if not any(data) else hexs(data))
+            if not any(data):
+                return "Schutzstatus ok (8x00)"
+            p = motor.decode_protection(data)
+            return "Schutzstatus Fehler 0x%08x [%s], Warnung 0x%08x [%s]" % (
+                p["err_code"], ", ".join("%d %s" % (b, t) for b, _k, t in p["errors"]),
+                p["warning_code"],
+                ", ".join("%d %s" % (b, t) for b, _k, t in p["warnings"]))
+        if addr in motor.MOTOR_ADDRS and fun in (motor.FUNC_ERR_DETAIL_DATA,
+                                                 motor.FUNC_CUT_DETAIL_DATA) \
+                and len(data) == motor.DETAIL_LEN:
+            d = motor.decode_err_detail(data, cut=fun == motor.FUNC_CUT_DETAIL_DATA)
+            return "%s err_code 0x%x [%s], %g V, %g °C, pos-PID-Fehler %g" % (
+                "Stalldetail" if fun == motor.FUNC_CUT_DETAIL_DATA else "Fehlerdetail",
+                d["err_code"], ", ".join(t for _b, _k, t in d["errors"]),
+                d["board_detect_power_supply_V"], d["board_detect_temperature_C"],
+                d["pos_loop_pid_err"])
         return "[%s]" % hexs(data) if data else "ok"
 
 
@@ -913,12 +941,12 @@ def selftest():
                      hx("f7 81 07 00 08 33 33 d3 3a e6"))[0]
     t11 = dm.response(0x81, motor.FUNC_VARIABLE, b"\x0b",
                       hx("f7 81 07 00 08 52 04 00 00 71"))[0]
-    check(t9.startswith("Variable idx 9 = 0.00161133 (float") and
-          t11.startswith("Variable idx 11 pos_counts = 1106 (int"),
+    check(t9.startswith("Variable idx 9 ia = 0.00161133 A (float") and
+          t11.startswith("Variable idx 11 pos_counts = 1106 counts (int"),
           "Motor 0x08: %s | %s" % (t9, t11))
     t5 = dm.response(0x81, motor.FUNC_VARIABLE, b"\x05",
                      hx("f7 81 07 00 08 00 00 00 00 0a"))[0]
-    check(t5.startswith("Variable idx 5 pos_fdb = 0 (float")
+    check(t5.startswith("Variable idx 5 pos_fdb = 0 rad (float")
           and dm.request(0x81, motor.FUNC_VARIABLE, b"\x08")[0]
           == "Motor X(0x81) Variable lesen idx 8 (iq_fdb)", "Motor 0x08 Namen: " + t5)
     tq = dm.request(0x81, motor.FUNC_VARIABLE, b"\x0b")[0]
@@ -926,6 +954,30 @@ def selftest():
     check(tq == "Motor X(0x81) Variable lesen idx 11 (pos_counts)" and "Host-Crash" in tq0
           and dm.request(0x81, motor.FUNC_VERSION, b"\x00")[0]
           == "Motor X(0x81) Version abfragen", "Motor 0x08/0x0F-Request")
+    # MOTOR-FW 16.10.: Einheit spd_fdb, DIR-Eingang, 0x0C dekodiert, STATUS-Bits
+    from serial485 import build_frame as _bf
+
+    def build_frame_m(addr, fun, data, status):
+        return _bf(addr, fun, data, status=status)
+    t6 = dm.response(0x81, motor.FUNC_VARIABLE, b"\x06", build_frame_m(
+        0x81, motor.FUNC_VARIABLE, list(struct.pack("<f", 1.5)), 0))[0]
+    t12 = dm.response(0x81, motor.FUNC_VARIABLE, b"\x0c", build_frame_m(
+        0x81, motor.FUNC_VARIABLE, [1, 0, 0, 0], 0))[0]
+    check(t6.startswith("Variable idx 6 spd_fdb = 1.5 rad/s (float")
+          and t12.startswith("Variable idx 12 dir_input = 1 0/1 (int")
+          and dm.request(0x81, motor.FUNC_VARIABLE, b"\x0c")[0]
+          == "Motor X(0x81) Variable lesen idx 12 (dir_input)",
+          "Motor 0x08 Einheiten: %s | %s" % (t6, t12))
+    tp, sp = dm.response(0x82, motor.FUNC_PROTECTION, b"\x0b", build_frame_m(
+        0x82, motor.FUNC_PROTECTION, [0, 1, 0, 0, 2, 0, 0, 0], 0x06))[:2]
+    check("Fehler 0x00000100 [8 Schleppfehler], Warnung 0x00000002 [1 Unterspannung]"
+          in tp and "Motor-STATUS 0x06: Fehler latched, Warnung latched" in tp
+          and sp == SEV_WARN, "Motor 0x0C dekodiert: " + tp)
+    t0c = dm.response(0x81, motor.FUNC_PROTECTION, b"\x0b", hx(
+        "f7 81 0b 00 0c 00 00 00 00 00 00 00 00 fb"))
+    check(t0c[0] == "Schutzstatus ok (8x00)" and t0c[1] == SEV_INFO, "Motor 0x0C ok")
+    check(dm.request(0x83, motor.FUNC_ERR_DETAIL_DATA, b"")[0]
+          == "Motor Z(0x83) Fehlerdetail", "Motor 0x13-Request")
     # Flags 0x91 (BEFUND2 §8) + 0x15-Fehlerfall direkt am Decoder
     dec = Decoder()
     t91 = dec.response(0x01, box.FUNC_GET_BOX_STATE, b"",

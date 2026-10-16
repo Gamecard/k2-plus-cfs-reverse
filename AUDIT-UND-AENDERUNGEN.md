@@ -126,7 +126,7 @@ Die fünf offenen Pi-Aufbaupunkte bleiben in `./CHECKLISTE.md`.
 Die Nachbau-Bausteine liegen vollständig unter:
 
 ```text
-/home/pro/k2-fw-live-1.1.7.0/nachbau/
+<projekt>/nachbau/
 ```
 
 ## Nachaudit
@@ -625,9 +625,69 @@ selbst gegengeprüft; bei der Einarbeitung zusätzlich nachgeprüft (Abschnitt �
 - **Doku:** PROTOKOLL-485.md §3.1 „NACHTRAG 16.10.2026 (3)“ (Tabelle, Hypothese idx 11
   gestrichen), PROTOKOLL-GESAMT.md (§1.5 0x08, Pi-Ersatz: Position-Feedback single-turn
   3200/rev, Offen-Liste), CHECKLISTE.md (Skalierung pos_fdb + idx 11 erledigt; offen
-  idx 1–4/9/10/12 und spd_fdb-Einheit; G1-Referenzierungs-Hinweis), UEBERGABE.md.
+  idx 1–4/9/10/12 und spd_fdb-Einheit; G1-Referenzierungs-Hinweis), lokale Übergabenotiz (nicht im Repo).
 - Selbsttests danach alle grün: serial485 93/93 · box 179 · boxmini 17 · cfsseq 28 ·
   motor 174 · motor_mini 61 · auto_addr 33 · cfswatch `--selftest` OK.
+
+## 16.10.2026 Motor-FW-Befund (statisch) + DIR-Gegenprobe
+
+- **Quelle:** statische Analyse der Motor-Firmware `fw/F008|F012/mot*_022_C30-mot2_002_081.bin`
+  (REA/llvm-objdump, kein Druckerzugriff) → `MOTOR-FW-BEFUND-2026-10-16.md` (Arbeitsdateien lokal);
+  Live-Werte 16.10. (Fahrt X F600/F1200 sowie neue Gegenprobe idx 12, `LIVE-ABFRAGEN-2026-10-16.md`).
+- **Befunde:** CPU WCH QingKe RISC-V (CH32V30x-Klasse), Basis 0x3000 hinter 12-KB-Bootloader,
+  Befehlsregistrierung @0x6100–0x63d8 (0x11 heißt in der FW `emergency_pin_mode`); STATUS-Byte jeder
+  Motorantwort = Bitfeld (bit0 Stall, bit1 Fehler latched, bit2 Warnung latched); 0x08-Tabelle
+  idx 0..18 komplett (1–4 Sollwerte, 5/6 LESO, 9/10 Ia/−Ib, 11 Schrittpuls-Zähler, 12 DIR-Eingang,
+  13 EN vermutet, 14 Stall-Flag, 17 °C, 18 V; 15/16 offen; > 18 veralteter Wert); spd_fdb = rad/s;
+  0x0C [0b] = Byte 0–3 Fehler u32 LE, Byte 4–7 Warnung u32 LE (FW + Host-Parser), Sub-Codes 00..0B
+  inkl. Seiteneffekt 07/09/0B (Notfall-Pin-Freigabe bei stall_mode 2); 0x13–0x16 lesend ohne
+  Request-Payload (74 B Snapshots bzw. `0A` + 10 × `<ffff`).
+- **Live-Gegenprobe idx 12:** Fahrt −X = 0 (spd_fdb −1,81 rad/s), +X = 1, Stillstand hält die letzte
+  Richtung (0 nach Einschalten) → DIR-Eingang bestätigt; die Hypothese „Bewegungs-/Regler-aktiv-Flag“
+  (LIVE-ABFRAGEN, Abschnitt Fahrt) ist widerlegt.
+- **Korrekturen früherer Aussagen:** „Byte-Layout 0x0C unbelegt / kein `decode_protection`“ (REA-Eintrag)
+  → belegt und gebaut; „idx 9/10 = ADC-LSB-Offset“ (Hypothese) → Phasenströme Ia/−Ib, die Stillstands-
+  werte sind 2/1 LSB Rauschen/Offset; „idx 11 Name/Bedeutung abgeleitet“ → FW: Schrittpuls-Zähler
+  (Name `pos_counts` beibehalten); „0x13–0x16 Request unbelegt“ → ohne Payload.
+- **Entscheidung idx 0/13..18:** `read_variable` bleibt bei 1..12 (Creality-Host-Crash bei DATA=0/13
+  bleibt relevant für alle, die über G-Code gehen). Neu `read_variable_raw_fw(idx, confirm=False)` für
+  idx 0..18: sauber baubar, weil der eigene Bus-Zugriff den Host umgeht und die FW diese Indizes rein
+  lesend behandelt; trotzdem `confirm=True`-Pflicht (sonst `PermissionError`, nichts gesendet), weil
+  0/13..18 am Motor live nie gesendet wurden; idx > 18 → `ValueError`. In keinem Selbsttest am Bus.
+- **Code:**
+  - `nachbau/motor.py`: `VARIABLE_TABLE` (idx 0..18: Name, Einheit, Belegstatus, Deutung) →
+    `VARIABLE_NAMES` (jetzt 0..14/17/18), `VARIABLE_UNITS`, `VARIABLE_STATUS`, `VARIABLE_FW_FORMATS`;
+    `decode_variable` liefert zusätzlich `unit`/`status`; `decode_variable_fw`; Helfer
+    `read_reference_values()` (idx 1–4), `read_phase_currents()` (9/10 → ia, ib = −idx10, minus_ib),
+    `read_dir_input()` (12), `read_variable_raw_fw()`. 0x0C: `decode_protection()` (u32 LE + Bitnamen),
+    `check_protection()` gibt jetzt das **dekodierte dict** zurück, `check_protection_raw()` die 8 B
+    (`write_params_raw()` = raw-Alias), `check_protection_code` = Alias (vorher Stub); Konstanten
+    `SUB_PROT_NOP … SUB_PROT_CHECK` (00..0B), `SUB_PROT_SIDE_EFFECT`, `SUB_PROT_STATE_CHANGING` –
+    01..05/07/09 werden über keine öffentliche Methode gesendet, [0b] nur über `check_protection`
+    (wie Stock, Seiteneffekt im Docstring). `decode_motor_status()` + `MOTOR_STATUS_*`.
+    0x13–0x16: `decode_err_detail()` (74 B, `cut=True` für 0x14 inkl. `extra_f`),
+    `decode_detail_union()`, `decode_samples()` (161 B, Zählbyte 10), Methoden `read_err_detail()`,
+    `read_stall_detail()`, `read_pos_samples()`, `read_spd_samples()` (Request ohne Payload,
+    retries 0, Timeout 1 s unbelegt, `status` über `transact_full`, Fallback None); Host-Namen
+    `err_detail_data`/`cut_detail_data`/`pos_data_sample`/`spd_data_sample` jetzt Aliase statt Stubs.
+    `MOTOR_FW_CMD_NAMES`. FakeBus kann `transact_full`.
+    Neue Selbsttests: Tabelle/Einheiten, Helfer mit Live-Werten F600 + DIR-Gegenprobe (0/1/1),
+    raw_fw-Sperre/Guards + synthetische 0/13/17/18, STATUS-Bits, `decode_protection` gegen eine
+    Nachbildung des Host-Bitstring-Parsers (300 Zufallsframes), synthetische 0x0C-/0x13–0x16-Frames
+    (Platzhalter-UUID), Längen-/Zählbyte-Guards.
+  - `nachbau/motor_mini.py` (knapp): `VARIABLE_NAMES` 1..12 + `VARIABLE_UNITS`, `unit` in
+    `decode_variable`, `read_reference_values`/`read_phase_currents`/`read_dir_input`,
+    `decode_protection` (Bitnummern), `decode_motor_status`, `check_protection()` dekodiert +
+    `check_protection_raw()`; 0x13–0x16 und raw_fw nur in motor.py.
+  - `nachbau/cfswatch.py`: 0x08-Antworten mit Namen **und Einheit** („Variable idx 6 spd_fdb = 1.5
+    rad/s …“), Request-Namen 0x13–0x16, 0x0C-Antwort ≠ 0 mit Fehler-/Warnbits im Klartext,
+    0x13/0x14-Antworten kurz dekodiert, Motor-STATUS ≠ 0 als Warnung mit Bit-Klartext.
+- **Doku:** PROTOKOLL-485.md §3.1 „NACHTRAG 16.10.2026 (4)“ (Motor-FW, STATUS-Bitfeld, vollständige
+  Variablen-Tabelle, 0x0C-Layout + Subs, 0x13–0x16; Altstellen in NACHTRAG (2) gestrichen/verwiesen),
+  PROTOKOLL-GESAMT.md (§1.5, §1.9 Pi-Ersatz, §4 Board-FW), CHECKLISTE.md, LIVE-ABFRAGEN-2026-10-16.md
+  (Abschnitt Gegenprobe), neu `MOTOR-FW-BEFUND-2026-10-16.md`, lokale Übergabenotiz (nicht im Repo).
+- Selbsttests danach alle grün: serial485 93/93 · box 179 · boxmini 17 · cfsseq 28 ·
+  motor 202 · motor_mini 64 · auto_addr 33 · cfswatch `--selftest` OK.
 
 ## Anonymisierung (Repo-Fassung)
 

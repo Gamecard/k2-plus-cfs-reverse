@@ -1,6 +1,6 @@
 # K2-Protokoll-Checkliste
 
-Audit und Änderungsbegründungen: `/home/pro/k2-fw-live-1.1.7.0/AUDIT-UND-AENDERUNGEN.md`.
+Audit und Änderungsbegründungen: `<projekt>/AUDIT-UND-AENDERUNGEN.md`.
 
 ## Erledigt
 - [x] OTA-Image 1.1.3.13 entpackt (CPIO + Squashfs) – Dump-Verzeichnis gelöscht (486M),
@@ -18,8 +18,8 @@ Audit und Änderungsbegründungen: `/home/pro/k2-fw-live-1.1.7.0/AUDIT-UND-AENDE
 - [x] SSH aktiv, IP 192.168.1.100 (root, K2Plus-XXXX), Moonraker-API 7125 offen
 - [x] `ls /dev/ttyS*` + `/proc/cmdline` ausgewertet
 - [x] `klippy.log`-Auswertung laufend (alle 485-Frames werden selbst geloggt)
-- [x] `printer-live.cfg` + `box-live.cfg` gesichert in `/home/pro/k2-fw-live-1.1.7.0/live-1.1.7.0-configs/`
-- [x] Live-FW 1.1.7.0-Dump nach `/home/pro/k2-fw-live-1.1.7.0/` (`fw/`, `config/`,
+- [x] `printer-live.cfg` + `box-live.cfg` gesichert in `<projekt>/live-1.1.7.0-configs/`
+- [x] Live-FW 1.1.7.0-Dump nach `<projekt>/` (`fw/`, `config/`,
   `klippy/extras/belt_mdl.py`, `rootfs-live/`-Subset)
 
 ## Offen – Mitschnitt
@@ -63,7 +63,7 @@ Audit und Änderungsbegründungen: `/home/pro/k2-fw-live-1.1.7.0/AUDIT-UND-AENDE
   durchführen – läuft nicht über RS485; Steckertyp am Gerät verifizieren (extern
   „guesswork“, Micro-Fit 3.0 vermutet). Transparent-Pfad s. Review-Punkt unten.
 
-## Offen – Nachbau VOLLUMFANG (alle Funktionen; Module in `/home/pro/k2-fw-live-1.1.7.0/nachbau/`)
+## Offen – Nachbau VOLLUMFANG (alle Funktionen; Module in `<projekt>/nachbau/`)
 - [x] `serial485.py`: Frame-Bau, CRC-8/ATM, Retry, Timeouts – ~~Selbsttest 11/11 Live-Frames ok~~
   Selbsttest alle grün (~~Stand 15.10.2026: 70/70~~ **Stand 15.10.2026 nach Review: 81/81**
   inkl. ref-hi-Kreuzvalidierung, 16 CRC-Vektoren + 12 Nachrichten)
@@ -193,8 +193,11 @@ motor 98 · motor_mini 30 · auto_addr 31 – alle grün.
   `VARIABLE_NAMES`, `read_position_feedback`/`read_speed_feedback`/`read_current_feedback`.
   **idx 11 ERLEDIGT 16.10.2026 (live, Messfahrt X nach G28):** Single-Turn-Position
   0..3199 Counts/Umdrehung (80 Counts/mm bei rot.dist. 40; Nachbau-Name `pos_counts`,
-  Host-Name unbekannt; `read_position_counts`). **Offen bleiben:** idx 1–4, 9, 10, 12 (keine
-  Host-Namen; Hypothese 9/10 = ADC-LSB) sowie die Einheit von `spd_fdb` (idx 6).
+  Host-Name unbekannt; `read_position_counts`). ~~**Offen bleiben:** idx 1–4, 9, 10, 12 (keine
+  Host-Namen; Hypothese 9/10 = ADC-LSB) sowie die Einheit von `spd_fdb` (idx 6).~~
+  **ERLEDIGT 16.10.2026 (Motor-FW-Befund + Live):** 1–4 pos/spd/id/iq_ref, 9 Ia, 10 −Ib [A],
+  11 Schrittpuls-Zähler, 12 DIR-Eingang (Gegenprobe −X 0 / +X 1), spd_fdb rad/s – s. Punkt
+  „Motor-FW-Befund“ unten. Offen nur noch idx 15/16.
   `read_encoder` bleibt gesperrt (0x06-Altfalle, Ersatz = `read_position_feedback(with_counts=True)`).
   NIE `MOTOR_GET DATA=0` oder `DATA=13` senden (Host-Crash)
 - [x] **NEU 16.10.2026 (REA):** Skalierung von `pos_fdb` (idx 5) klären – **ERLEDIGT 16.10.2026
@@ -203,18 +206,34 @@ motor 98 · motor_mini 30 · auto_addr 31 – alle grün.
   `counts_to_mm`/`counts_delta`, `read_position_feedback(with_counts=True)`. Absolute Position
   nur über Klipper-Schrittzähler. Hinweis für künftige Messfahrten: Creality-Klipper verlangt
   für `G1` **alle** Achsen referenziert (`G28 X Y` reicht nicht → „Must home axis first“).
-- [ ] **NEU 16.10.2026 (REA):** Einheit von `spd_fdb` (idx 6) klären (rad/s vermutet; im
-  Stillstand live ≈ 0 ±0,006) – braucht Abfrage **während** einer Fahrt mit bekannter
-  Geschwindigkeit
-- [ ] **NEU 16.10.2026 (REA):** Detail-/Sample-Kommandos 0x13 `err_detail_data`
-  (Host-Format `<I8BfHfiiffffffffi`), 0x14 `cut_detail_data`, 0x15 `pos_data_sample`,
-  0x16 `spd_data_sample` – Request-Formen unbelegt, live nie gesehen; im Nachbau nur Stubs
-  (NotImplementedError). Dazu: Byte-Layout der 8-B-Antwort von 0x0C [0b] (err_code/
-  warning_code → `motor_error_dict` key781..794 / `motor_warning_dict` key795..797)
+- [x] **NEU 16.10.2026 (REA):** Einheit von `spd_fdb` (idx 6) klären – **ERLEDIGT 16.10.2026:**
+  **rad/s** (FW: LESO-Drehzahl `spd_fdb_ctrl`, Parameter `*_rad_s`; live 1,53–1,57 bei
+  10 mm/s = 1,571 rad/s Soll, −1,81 bei Fahrt −X)
+- [x] **NEU 16.10.2026 (REA):** Detail-/Sample-Kommandos 0x13–0x16 und 0x0C-Byte-Layout –
+  **ERLEDIGT (statisch) 16.10.2026, Motor-FW-Befund:** 0x13–0x16 lesend **ohne** Request-Payload
+  (0x13/0x14 je 74 B Snapshot Fehler/Stall, 0x15/0x16 `0A` + 10 × `<ffff`); Nachbau
+  `read_err_detail`/`read_stall_detail`/`read_pos_samples`/`read_spd_samples` (live NICHT geprüft).
+  0x0C [0b]: Byte 0–3 Fehler u32 LE (key781+n), Byte 4–7 Warnung u32 LE (key795+n) →
+  `decode_protection`, `check_protection()` dekodiert
+- [x] **Motor-FW-Befund 16.10.2026** (`MOTOR-FW-BEFUND-2026-10-16.md`, PROTOKOLL-485.md §3.1
+  NACHTRAG (4)): Motor-FW `fw/F008|F012/mot*_022_C30-mot2_002_081.bin` = WCH RISC-V (CH32V30x-
+  Klasse), Basis 0x3000 (12-KB-Bootloader), Befehlsregistrierung 0x6100–0x63d8. Erledigt:
+  idx 1–4 (Sollwerte), 9/10 (Ia/−Ib), 12 (DIR-Eingang, live bestätigt), spd_fdb-Einheit,
+  0x0C-Layout + Sub-Codes (01–05/07/09 nur Konstanten), STATUS-Bitfeld (`decode_motor_status`),
+  0x13–0x16 statisch; Nachbau `VARIABLE_TABLE` (idx 0..18, Einheiten, Belegstatus),
+  `read_reference_values`, `read_phase_currents`, `read_dir_input`, `read_variable_raw_fw`
+  (idx 0..18, nur `confirm=True`), cfswatch zeigt Namen/Einheiten, 0x0C-Bits und Motor-STATUS
+- [ ] **Offen aus dem Motor-FW-Befund:** idx 15/16 (obj->[0xc]+0x24/+0x2c); 0x13–0x16 live
+  gegenprüfen (Längen 74/161 B, Feldreihenfolge der Proben vermutet); Setzer von Fehlerbit 4
+  (HW-Überstrom) und Warnbit 0 (Kommunikation) nicht lokalisiert (Fehlerbit 11 ohne Beleg);
+  Gain·R der Strommessung (1 Ω vermutet → Flash-Parameter `driver_board_amp_gain` /
+  `driver_board_R_of_current_sample_ohm` lesen); idx 13 (EN) live gegenprüfen
 - [ ] **NEU 16.10.2026:** Offen, ob der Motor selbst 0x08 mit idx ≥ 13 verträgt – ~~(Crash bei
   DATA=13 liegt im Host; nicht geprüft, ob ein Frame rausging)~~ Host kennt 13–18 (Typkette),
   Crash ist belegt host-seitig ohne Frame (s. unten); am Motor weiter ungeprüft – nur mit
-  eigenem Sender, nicht über Stock-G-Code
+  eigenem Sender, nicht über Stock-G-Code. **16.10. statisch geklärt (Motor-FW):** FW behandelt
+  idx 0..18 lesend, > 18 → veralteter Wert, kein Crash; Nachbau `read_variable_raw_fw(idx,
+  confirm=True)`. Live-Gegenprobe bleibt offen
 - [x] Motor 0x0C: Protection-Semantik (grant0013/k2-vanilla) gegen Plus-Frame `00*8` prüfen
   – **ERLEDIGT 15.10.2026:** Request `[0b]` → 8 B Status (00 = ok), `[05]` ohne Antwort;
   „8-Byte-Parameter“ WIDERLEGT (`motor.check_protection`)
@@ -296,7 +315,7 @@ Details: `GHIDRA-CFS-BEFUND-2026-10-15.md` §9/§10.
   im Live-`mcu_util` bei 0x10e84 – Versatz +0x30, s. PROTOKOLL-GESAMT.md 2.2)
 - [x] `box_wrapper.so` importiert (2,3 MB); `get_rfid`-Generator dekompiliert (Cython-Glue, echte Logik in Generator-Bodies)
 - [x] `serial_485_wrapper.so` importiert (141K); Symbole liegen in Cython-`__pyx_mstate`-Tabellen → keine direkten String-XRefs
-- [x] Live-`.so` von FW 1.1.7.0 gesichert: `/home/pro/k2-fw-live-1.1.7.0/rootfs-live/` (box 2,3M / motor 1,1M / prtouch_v3 1,3M / serial_485 141K / libcrealitycloud 222K / mcu_util* )
+- [x] Live-`.so` von FW 1.1.7.0 gesichert: `<projekt>/rootfs-live/` (box 2,3M / motor 1,1M / prtouch_v3 1,3M / serial_485 141K / libcrealitycloud 222K / mcu_util* )
 - [x] `mcu_util_485` dekompiliert: Auto-Addr (0xa1: 0xfd/0xfc/0xfb/0xfe + 0xa0-Zuweisung) + 485-Update (Func 0xf0-Subs)
 - [x] CFS-FW `cfs6_222_000.bin` geladen (Basis ~~0x08000000~~ – KORRIGIERT 15.10.2026: richtig 0x08004000, cfs0-App 0x08003000; 798 Funktionen, Rezept in PROTOKOLL-GESAMT.md)
 - [x] CFS-FW R153 analysiert (942 Funktionen, RT-Thread/MS3791/at8236/AHT30, Details in PROTOKOLL-GESAMT.md)

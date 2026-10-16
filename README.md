@@ -18,6 +18,7 @@ Lizenz: GPL-3.0-or-later (siehe `LICENSE`), Herkunft Dritter in `NOTICES.md`.
 | `CHECKLISTE.md` | Projektstatus (erledigt/offen) |
 | `LIVE-ABFRAGEN-2026-10-16.md` | Live-Abfragen Motor X 16.10.2026: 0x0F Version, 0x08 Variablen-Scan, Pin-IO, Host-Crash-Warnung, Skalierung pos_fdb/idx 11 (Messfahrt) |
 | `REA-MOTOR-BEFUND-2026-10-16.md` | Statische Analyse `motor_control_wrapper.so`: Motor_cmd-Tabelle, 0x08-Indexnamen, Typkette, Crash-Ursache, Fehlerbits |
+| `MOTOR-FW-BEFUND-2026-10-16.md` | Statische Analyse der Motor-Firmware (WCH RISC-V): Befehlsregistrierung, STATUS-Bitfeld, 0x08-Tabelle idx 0..18, 0x0C-Layout, 0x13–0x16 |
 | `GHIDRA-CFS-BEFUND-2026-10-15.md` | Ghidra-Neuanalyse der CFS-FW R153: Dispatcher, Func-/Status-Tabelle, 0x0a-Layout |
 | `GHIDRA-CFS-BEFUND2-2026-10-16.md` | Zweite Ghidra-Runde: Temp/Feuchte, 0x15, Statuscodes 0x50–0x52, Motorblock-Flags, Auto-Addr-Box-Seite, Sensor-Pins |
 | `nachbau/` | Python-Module: `serial485`, `boxmini`, `box`, `motor_mini`, `motor`, `cfsseq`, `auto_addr` – alle mit Selbsttests; `cfswatch` = nur lesender Live-Monitor für `klippy.log` |
@@ -45,9 +46,9 @@ ssh root@<drucker> 'tail -F /mnt/UDISK/printer_data/logs/klippy.log' | python3 n
 Echte Hardware braucht `pyserial`; der Import erfolgt erst bei Benutzung
 (`Serial485(port, baud)`), die Tests laufen ohne.
 
-Stand der Selbsttests (16.10.2026 nach der Skalierungs-Messfahrt, `ok`-Zeilen, 0 FAIL):
+Stand der Selbsttests (16.10.2026 nach dem Motor-FW-Befund, `ok`-Zeilen, 0 FAIL):
 `serial485` 93/93 (inkl. ref-hi: 16 CRC-Vektoren + 12 Nachrichten), `box` 179,
-`boxmini` 17, `cfsseq` 28, `motor` 174, `motor_mini` 61, `auto_addr` 33,
+`boxmini` 17, `cfsseq` 28, `motor` 202, `motor_mini` 64, `auto_addr` 33,
 `cfswatch --selftest` OK.
 
 > **WARNUNG – Creality-Host-Bug:** `MOTOR_GET … DATA=0` und `MOTOR_GET … DATA=13` lassen
@@ -69,18 +70,40 @@ Details: `LIVE-ABFRAGEN-2026-10-16.md`, `PROTOKOLL-485.md` §3.1 „NACHTRAG (3)
 - idx 5 `pos_fdb` = idx11 · 2π/3200 **rad**. Beide wrappen alle 40 mm (eine Umdrehung) – eine
   absolute Achsposition liefert nur Klipper (Homing + Schrittzähler). Helfer `counts_to_mm`,
   `counts_delta` (wrap-korrigiert), `read_position_feedback(with_counts=True)`.
-- `spd_fdb` (idx 6) im Stillstand ≈ 0; Einheit weiter offen. Hinweis: Creality-Klipper verlangt
+- `spd_fdb` (idx 6) im Stillstand ≈ 0; Einheit rad/s (seit Motor-FW-Befund). Hinweis: Creality-Klipper verlangt
   für `G1` alle Achsen referenziert (`G28 X Y` reicht nicht).
+
+Motor-FW-Befund 16.10.2026 (statische Analyse der Motor-Firmware selbst, Details:
+`MOTOR-FW-BEFUND-2026-10-16.md`, `PROTOKOLL-485.md` §3.1 „NACHTRAG (4)“):
+
+- Motor-FW `fw/F008|F012/mot*_022_C30-mot2_002_081.bin` gefunden: **WCH RISC-V (CH32V30x-Klasse)**,
+  App-Basis 0x3000 hinter 12-KB-Bootloader, Befehlsregistrierung @0x6100–0x63d8 (0x11 heißt dort
+  `emergency_pin_mode`). Das STATUS-Byte jeder Motorantwort ist ein Bitfeld: bit0 Stall, bit1
+  Fehler latched, bit2 Warnung latched → `decode_motor_status()`.
+- **0x08-Variablen-Tabelle idx 0..18** komplett (`motor.VARIABLE_TABLE` mit Einheit und Belegstatus):
+  1–4 `pos_ref`/`spd_ref`/`id_ref`/`iq_ref`, 5/6 LESO-Beobachter (`pos_fdb` rad, `spd_fdb` **rad/s**),
+  7/8 `id_fdb`/`iq_fdb`, 9/10 Phasenströme Ia/−Ib [A], 11 Schrittpuls-Zähler, 12 DIR-Eingang,
+  13 EN (vermutet), 14 Stall-Flag, 17 °C, 18 V; 15/16 offen. Helfer `read_reference_values()`,
+  `read_phase_currents()`, `read_dir_input()`. `read_variable` bleibt 1..12 (Host-Crash);
+  0/13..18 nur `read_variable_raw_fw(idx, confirm=True)`.
+- **DIR-Eingang live bestätigt:** idx 12 = 0 bei Fahrt −X, 1 bei +X, hält im Stillstand die
+  letzte Richtung.
+- **0x0C [0b]:** Byte 0–3 Fehler, Byte 4–7 Warnung, je u32 Little-Endian → `check_protection()`
+  liefert jetzt Fehler-/Warnbits im Klartext. Sub-Codes 01–05/07/09 (zustandsändernd bzw.
+  Seiteneffekt Notfall-Pin) nur als Konstanten.
+- **0x13–0x16** lesend ohne Request-Payload: Fehler-/Stall-Snapshot (74 B) und Probenringe
+  (`0A` + 10 × 4 float) → `read_err_detail()`, `read_stall_detail()`, `read_pos_samples()`,
+  `read_spd_samples()` – FW-statisch belegt, **live noch nicht geprüft**.
 
 REA-Motor-Befund 16.10.2026 (statische Analyse `motor_control_wrapper.so`, Details:
 `REA-MOTOR-BEFUND-2026-10-16.md`, `PROTOKOLL-485.md` §3.1 „NACHTRAG (2)“):
 
 - `0x08`-Indizes 5–8 = `pos_fdb`, `spd_fdb`, `id_fdb`, `iq_fdb` (Positions-, Drehzahl-, d-/q-Strom-
   Rückmeldung) → `read_position_feedback()`, `read_speed_feedback()`, `read_current_feedback()`;
-  1–4/9–12 ohne Host-Namen (Skalierung pos_fdb/idx 11 seit der Messfahrt belegt, s. oben).
+  1–4/9–12 ohne Host-Namen (Deutung seit dem Motor-FW-Befund belegt, s. oben).
   Typ fest im Host: 1–10 float, 11/12 `uint32`.
-- Vollständige Host-Tabelle `Motor_cmd` (0x01–0x16) als Konstanten; neue Kommandos
-  (0x13–0x16 Detail-/Sample-Daten u. a.) nur als Stubs, die nichts senden.
+- Vollständige Host-Tabelle `Motor_cmd` (0x01–0x16) als Konstanten; ungeprüfte Kommandos
+  (0x01, 0x0B, 0x0D u. a.) nur als Stubs, die nichts senden (0x13–0x16 s. Motor-FW-Befund).
 - `MOTOR_GET … DATA=7/8 EXTRUDER=1` im Stock = Extruder-Überstrom-Monitoring (|I| = hypot(id, iq)).
 
 Live-Abfragen 16.10.2026 (Motor X 0x81, Standby, nur lesende Creality-G-Codes über Moonraker;
@@ -89,7 +112,7 @@ Details: `LIVE-ABFRAGEN-2026-10-16.md`, `PROTOKOLL-485.md` §3.1):
 - `0x0F [00]` = Motor-Version, 12 B: fireware 1.9.7.81, cmd_system 1.3, protection 1.3,
   flash_param 2.75, logger 1.0 → `query_motor_version()`.
 - `0x08 [idx]` = Variablen-Lesepfad, 4 B LE, idx 1..12 (Host: 1–10 float, 11/12 int;
-  Bedeutung je Index offen) → `read_variable(idx)` lehnt alles außerhalb 1..12 ohne Senden ab;
+  Deutung je Index s. Motor-FW-Befund) → `read_variable(idx)` lehnt alles außerhalb 1..12 ohne Senden ab;
   `read_encoder` bleibt gesperrt. `cfswatch` dekodiert beide und warnt bei idx außerhalb 1..12.
 - `MOTOR_READ_ALL_PIN_IO` läuft **nicht** über RS485, sondern als GPIO-Abfrage an der
   Main-MCU (PB9, PB10, !PB7, PB8, PB5, PB6, PA1, PB15) – ein Pi-Ersatz braucht dafür weiter
@@ -159,8 +182,25 @@ RS485 protocol between the Creality K2 Plus host board and its lower boards
 by live captures and Ghidra analysis. License: GPL-3.0-or-later.
 
 Status 16.10.2026: all self-tests green (serial485 93/93 incl. Hi reference
-vectors, box 179, boxmini 17, cfsseq 28, motor 174, motor_mini 61, auto_addr 33,
+vectors, box 179, boxmini 17, cfsseq 28, motor 202, motor_mini 64, auto_addr 33,
 `cfswatch.py --selftest` OK).
+
+Motor firmware found and analysed statically (16.10.2026, `MOTOR-FW-BEFUND-2026-10-16.md`,
+German): `fw/F008|F012/mot*_022_C30-mot2_002_081.bin` is a **WCH RISC-V (CH32V30x-class)**
+image, app base 0x3000 behind a 12 KB bootloader, command registration at 0x6100–0x63d8. The
+STATUS byte of every motor reply is a bit field (bit0 stall, bit1 latched error, bit2 latched
+warning; `decode_motor_status()`). The full `0x08` variable table idx 0..18 is now known
+(`motor.VARIABLE_TABLE` with units and evidence level): 1–4 position/speed/id/iq references,
+5/6 LESO observer (`pos_fdb` rad, `spd_fdb` **rad/s**), 7/8 id/iq feedback, 9/10 phase currents
+Ia/−Ib [A], 11 step-pulse counter, 12 DIR input level, 13 EN (assumed), 14 stall flag, 17 °C,
+18 V; 15/16 unknown. **DIR input confirmed live:** idx 12 reads 0 when moving −X, 1 when moving
++X and keeps the last direction at standstill. `0x0C [0b]` returns the latched error code
+(bytes 0–3) and warning code (bytes 4–7), each u32 little-endian; `check_protection()` now
+decodes them. `0x13`–`0x16` are read-only without request payload (74-byte error/stall
+snapshots, 10-sample position/speed rings) → `read_err_detail()`, `read_stall_detail()`,
+`read_pos_samples()`, `read_spd_samples()` – statically derived, **not yet verified live**.
+`read_variable()` stays limited to 1..12 (host crash); idx 0/13..18 only via
+`read_variable_raw_fw(idx, confirm=True)`.
 
 **WARNING – Creality host bug:** `MOTOR_GET … DATA=0` and `MOTOR_GET … DATA=13` make
 `motor_control_wrapper.so` fail internally (`key60`) and put **Klipper into SHUTDOWN**
@@ -177,21 +217,23 @@ Position feedback scaling, measured live 16.10.2026 (axis X move after `G28`, em
 rotation_distance 40; our name `pos_counts`, the host name is unknown) and idx 5 `pos_fdb` =
 idx11 · 2π/3200 **rad**. Both wrap every 40 mm, so the absolute axis position still comes only
 from Klipper's step counter. Helpers: `read_position_counts()`, `counts_to_mm()`,
-`counts_delta()`, `read_position_feedback(with_counts=True)`. The unit of `spd_fdb` is still open.
+`counts_delta()`, `read_position_feedback(with_counts=True)`. The unit of `spd_fdb` is rad/s
+(motor firmware analysis, see above).
 
 Static analysis of `motor_control_wrapper.so` (16.10.2026, `REA-MOTOR-BEFUND-2026-10-16.md`,
 German): `0x08` indices 5–8 are `pos_fdb`, `spd_fdb`, `id_fdb`, `iq_fdb` (FOC position, speed and
 d/q current feedback; position scaling now measured, see above) → `read_position_feedback()`, `read_speed_feedback()`,
 `read_current_feedback()`. The host decodes indices 1–10/17/18 as float and 11–16 as uint32.
 The full host command table `Motor_cmd` (0x01–0x16) is included as constants; unverified
-commands (0x13–0x16 detail/sample data etc.) are stubs that never transmit. The stock
+commands (0x01, 0x0B, 0x0D etc.) are stubs that never transmit (0x13–0x16: see the motor
+firmware analysis above). The stock
 `MOTOR_GET … DATA=7/8 EXTRUDER=1` calls are extruder over-current monitoring.
 
 Live queries 16.10.2026 (motor X 0x81, idle, read-only stock G-codes via Moonraker;
 `LIVE-ABFRAGEN-2026-10-16.md`, German): `0x0F [00]` returns the 12-byte motor version
 block (firmware 1.9.7.81, cmd_system 1.3, protection 1.3, flash_param 2.75, logger 1.0,
 `query_motor_version()`); `0x08 [idx]` reads a 4-byte LE system variable for idx 1..12
-(meaning per index still open; `read_variable()` rejects other indices without sending,
+(meaning per index: see the motor firmware analysis; `read_variable()` rejects other indices without sending,
 `read_encoder` stays disabled); `MOTOR_READ_ALL_PIN_IO` is a GPIO query on the main MCU,
 not an RS485 command.
 

@@ -35,7 +35,7 @@ EVENT_* für 0x30-Ereignisse, Selbsttests mit echten Live-Frames
 Bus-Anbindung: serial485.Serial485-Instanz wird übergeben (echte Hardware,
 pyserial). Der Selbsttest läuft OHNE Hardware (FakeBus + Live-Frames).
 
-Belege (alle in /home/pro/k2-fw-live-1.1.7.0/):
+Belege (alle in <projekt>/):
 - Func-Codes + Frame-Format + CRC-8/SMBUS poly 0x07 über [len..daten]:
   PROTOKOLL-485.md, PROTOKOLL-GESAMT.md, API-box_wrapper.md.
 - Operational-Requests: STATUS 0xFF, Timeout 2,0 s (Live-Introspektion

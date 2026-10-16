@@ -1,6 +1,6 @@
-# K2 Plus – Gesamt-Protokoll-Inventar (Stand 13.10.2026, Live-Log-Abgleich 15.10.2026, BEFUND2 + REA-Motor 16.10.2026)
+# K2 Plus – Gesamt-Protokoll-Inventar (Stand 13.10.2026, Live-Log-Abgleich 15.10.2026, BEFUND2 + REA-Motor + Motor-FW 16.10.2026)
 
-Audit/Korrekturen der Nachbau-Module: `/home/pro/k2-fw-live-1.1.7.0/AUDIT-UND-AENDERUNGEN.md`.
+Audit/Korrekturen der Nachbau-Module: `<projekt>/AUDIT-UND-AENDERUNGEN.md`.
 
 Drucker: Creality K2 Plus (`K2Plus-XXXX`), Upper-Board T113 (Tina/OpenWrt 21.02, Kernel 5.4.61 armv7l)
 FW live: **1.1.7.0** · Image-Dump 1.1.3.13 (entpackt, Verzeichnis gelöscht; Original in `~/Downloads/`)
@@ -160,6 +160,16 @@ NEU 15.10.2026 (Ghidra, R153): 0x01 LED-Refresh, 0x06 Feeder (FW-Bug: immer Stat
        LIVE 16.10. (Messfahrt X nach G28): idx 11 = Single-Turn-Position 0..3199 Counts/Umdr.
        (Nachbau-Name pos_counts, Host-Name unbekannt; 80 Counts/mm bei rot.dist. 40),
        idx 5 pos_fdb = idx11·2π/3200 rad; beide Wrap alle 40 mm
+       MOTOR-FW 16.10. (statisch, MOTOR-FW-BEFUND-2026-10-16.md): FW-Tabelle idx 0..18 komplett –
+       1–4 pos/spd/id/iq_ref, 5/6 LESO pos/spd, 9 Ia, 10 −Ib [A], 11 Schrittpuls-Zähler,
+       12 DIR-Eingang (live bestätigt), 13 EN (vermutet), 14 Stall-Flag, 17 °C, 18 V, 15/16 offen;
+       spd_fdb = rad/s (belegt); idx > 18 → veralteter Wert (kein Crash)
+0x0c = (MOTOR-FW 16.10.) [0b] → Byte 0–3 Fehler latched u32 LE (Bit n → key781+n),
+       Byte 4–7 Warnung latched u32 LE (Bit n → key795+n); Subs 01–05 zustandsändernd,
+       06/08/0A Backups, 07/09/0B latched (Seiteneffekt bei stall_mode 2: Notfall-Pin frei)
+0x13–0x16 = (MOTOR-FW 16.10., live NICHT geprüft) lesend ohne Payload: 0x13 err_detail 74 B,
+       0x14 cut_detail 74 B (Stall-Snapshot), 0x15 pos_data / 0x16 spd_data je 0A + 10×<ffff
+STATUS-Byte der Motorantwort = Bitfeld: bit0 Stall, bit1 Fehler latched, bit2 Warnung latched
 Host-Tabelle Motor_cmd (REA 16.10., BELEGT): 01 reboot, 03 encoder_calibrate_official,
        04 elec_offset_calibrate, 05 control, 06 sys_param, 07 flash_param, 08 get, 0b boot,
        0c protection, 0d systemid, 0e read/set485_addr, 0f version, 11 stall_mode, 12 dev_uuid,
@@ -349,6 +359,18 @@ Details siehe Subagenten-Bericht in der Session-Historie.
   Schrittverlust-Kontrolle per `counts_delta`), die **absolute** Achsposition muss er weiter
   selbst über Homing + Schrittzähler führen (`read_position_feedback(with_counts=True)`,
   `read_position_counts()`, `counts_to_mm()`).
+  **NACHTRAG 16.10.2026 (Motor-FW-Befund, `MOTOR-FW-BEFUND-2026-10-16.md`):** Die Motorboards
+  sind eigenständige Regler (WCH RISC-V CH32V30x-Klasse, FOC mit LESO-Beobachter) und werden
+  über **STEP/DIR-Eingänge** (EN vermutet) von der Main-MCU kommandiert – idx 11 ist der **Schrittpuls-Zähler**
+  (= Soll-Winkel), idx 12 der **DIR-Eingangspegel** (live bestätigt), idx 13 vermutlich EN. Für
+  den Pi-Ersatz heißt das: die Bewegung bleibt Klipper-Sache (STEP/DIR über die Main-MCU), der
+  RS485-Bus ist nur Diagnose/Parametrierung. Nutzbar ohne Bewegungsrisiko: Soll-/Istwerte
+  (idx 1–8), Phasenströme Ia/Ib (idx 9/10, `read_phase_currents`), Schutzstatus dekodiert
+  (`check_protection` → Fehler/Warnbits u32 LE), STATUS-Bitfeld jeder Antwort (Stall/Fehler/
+  Warnung, `decode_motor_status`) und die Fehler-/Stall-Snapshots + Probenringe 0x13–0x16
+  (`read_err_detail`, `read_stall_detail`, `read_pos_samples`, `read_spd_samples`; FW-statisch,
+  live noch nicht geprüft). Vorsicht: `0x0C [0b]` gibt bei stall_mode 2 den Notfall-Pin frei
+  (wie beim Stock); 0x0C 01–05 sind zustandsändernd und im Nachbau nur Konstanten.
 
 **Kreuzvergleich: fake-name/cfs-reverse-engineering (CFS-Hardware, 15.10.2026 gesichtet)**
 
@@ -456,12 +478,23 @@ ein FW-File pro Board. Noch nicht dekompiliert.
   Überstrom-Monitoring über transparent, nicht ttyS5); `DATA=1` = nur Hilfetext. Crash
   DATA=0/13 belegt (Traceback, `parse_num_to_byte(None)`, kein Frame). Fehlerbits
   `motor_error_dict` (key781..794), `motor_warning_dict` (key795..797), `ERR_CODE_TO_UNION`.
-  Offen: Bedeutung idx 1–4/9/10/12, ~~Skalierung pos_fdb~~ (live 16.10. belegt: idx 11 =
-  Counts 0..3199/Umdr., pos_fdb = idx11·2π/3200 rad, single-turn), Einheit spd_fdb,
-  Byte-Layout der 0x0C-Antwort, Request-Formen 0x13–0x16.
+  Offen: ~~Bedeutung idx 1–4/9/10/12~~, ~~Skalierung pos_fdb~~ (live 16.10. belegt: idx 11 =
+  Counts 0..3199/Umdr., pos_fdb = idx11·2π/3200 rad, single-turn), ~~Einheit spd_fdb~~,
+  ~~Byte-Layout der 0x0C-Antwort~~, ~~Request-Formen 0x13–0x16~~ → **16.10. per Motor-FW-Befund
+  geklärt** (s. Board-FW unten; idx 12 live bestätigt). Weiter offen: idx 15/16, 0x13–0x16 live
+  gegenprüfen, Setzer Fehlerbit 4/Warnbit 0, Gain·R der Strommessung.
 - Config: `motor_closed_loop: x,y,z,z1,e`, LESO/PID-Parameter je Achse
   (Pos-/Spd-/Cur-Loop), Stall-Pins je Achse
 - Board-FW: `fw/F008/mot*_022_C30-mot2_002_081.bin` (123K, Klartext-Strings)
+  → **ANALYSIERT 16.10.2026** (`MOTOR-FW-BEFUND-2026-10-16.md`): `fw/F008|F012/mot{0,1,2}_022_…`
+  (116 412 B, identisch) bzw. `motor/mot*_02{1,3}_…` (116 396 B, gleicher String-Satz); Kennung
+  `mot2_002_081` @0x200. **CPU WCH QingKe RISC-V (CH32V30x-Klasse, rv32imafc + Xwchc)**, Startup
+  `j reset; 12×nop; ebreak`; **App-Basis 0x00003000** hinter **12-KB-Bootloader** (lui/addi-Treffer
+  auf Strings: 303 bei 0x3000, ≤ 7 sonst). Text-Konsole + Binärmodus; **Befehlsregistrierung
+  @0x6100–0x63d8** (`reg(id, cmd, flag, name, handler)`, 19 Befehle, 0x11 = `emergency_pin_mode`).
+  Antwort-Builder @0xdd6e (STATUS-Bitfeld), GET-Sprungtabelle @0x1bce4 (idx 0..18),
+  protection-Sprungtabelle @0x1bd30 (Subs 00..0B). Details/Variablentabelle: PROTOKOLL-485.md §3.1
+  NACHTRAG (4).
 
 ---
 
@@ -484,7 +517,7 @@ ein FW-File pro Board. Noch nicht dekompiliert.
 ```
 /opt/ghidra/ghidra_12.1.4_PUBLIC/support/analyzeHeadless <proj-dir> cfs6proj \
   -import cfs6_100_G31-cfs6_222_000.bin -processor "ARM:LE:32:Cortex" \
-  -postScript SetCfsBase.java -scriptPath /home/pro/k2-fw-live-1.1.7.0/ghidra-scripts -deleteProject
+  -postScript SetCfsBase.java -scriptPath <projekt>/ghidra-scripts -deleteProject
 ```
 
 Skript `SetCfsBase.java`: BinaryLoader legt Raw-Bin als Block `ram` @0x0 an →
@@ -495,7 +528,7 @@ String-Zeiger-Test 179 vs. 1 bzw. 55 vs. 0, s. PROTOKOLL-485.md „CFS-Firmware:
 markiert Reset, ruft `analyzeAll()`. Ergebnis: 798 Funktionen.
 Für Detail-Analysen: Ghidra-GUI öffnen (`ghidraRun`) mit Projekt, oder REA-Seeds
 (`REA_GHIDRA_SEED_FILE`) für gezielte Adressen.
-Skripte gesichert: `/home/pro/k2-fw-live-1.1.7.0/ghidra-scripts/` (SetCfsBase, CfsDetail,
+Skripte gesichert: `<projekt>/ghidra-scripts/` (SetCfsBase, CfsDetail,
 ListFuncs, FindCrc6, SlotFuncs, SlotLoad – plus FindXor/FindNum/FindCrc2-5, CountIns,
 DumpIns nur in der Session-Historie, nicht gesichert).
 

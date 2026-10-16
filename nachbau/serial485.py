@@ -3,7 +3,7 @@
 
 Ersetzt: serial_485_wrapper.cpython-39.so (armhf, CPython 3.9, proprietär).
 
-Belege (alle in /home/pro/k2-fw-live-1.1.7.0/ dokumentiert):
+Belege (alle in <projekt>/ dokumentiert):
 - Frame-Format + Func-Codes: PROTOKOLL-485.md, PROTOKOLL-GESAMT.md
 - CRC-Algorithmus: auto_addr_wrapper.py (Quelle, POLY=0x07)
   (Klartextquelle auto_addr_wrapper.py, crc8_cal/cal_pack_crc)
