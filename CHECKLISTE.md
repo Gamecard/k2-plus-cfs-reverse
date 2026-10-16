@@ -474,3 +474,10 @@ box 179 · boxmini 17 · cfsseq 28 · motor 134 · motor_mini 43 · auto_addr 33
   Modus 6 ok, Modus 7 Extruder-Check ok, Box-Modus PRINT. Kein Fehlercode.
 - [x] PI-ERSATZ-PLAN.md erstellt (Bestandsaufnahme, Hardware, Verkabelung, Inbetriebnahme, offene Punkte;
   größter Blocker: PrTouch-Ersatz)
+
+### PrTouch v3 (16.10.2026, PRTOUCH-BEFUND-2026-10-16.md)
+- [x] Architektur: MCU zeichnet nur auf (pres Düse, step Main), kein Hardwarestopp; Host berechnet Kontakt
+- [x] Live-Mitschnitt Auto-Nivellierung ausgewertet (99 Tastungen, Mesh 9×9, Rechenweg zoft belegt)
+- [x] Cut-Kalibrierung live (Stall-Mode 3 für Suche, Kp 300/100) – LIVE-ABFRAGEN-2026-10-16.md
+- [ ] Entscheidung Pi-Weg: PrTouch-Ersatz (eigenes Probe-Modul) oder Eddy-Sensor
+- [ ] (für A) MCU-Bit-Ebene der prtouch-Frames: Schwellen/Filter/Register

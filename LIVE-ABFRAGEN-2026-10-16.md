@@ -171,3 +171,14 @@ bestätigt; Payload `[02]` des Hosts wird von der FW ignoriert (FW-Befund), der 
 trotzdem byte-gleich. Feldname des 0x14-Zusatzfloats = `param_peak_overcurrent_A` (vorher `extra_f`).
 Offen: Union-Inhalte bei err_code ≠ 0, Bedeutung von `param_peak_overcurrent_A` (0,012 trotz err_code 0).
 Einarbeitung: PROTOKOLL-485.md §3.1 NACHTRAG (5), `nachbau/motor.py` (Selbsttest 7e mit Live-Frames).
+
+## Schneidpositions-Kalibrierung (Display) – live 16.10.2026 22:02–22:04 (Log-Uhr UTC+8)
+
+Ablauf (klippy.log-Mitschnitt, Rohdaten lokal, nicht im Repo):
+1. Filament-Rückzug/Cutter-Sensor („[box] cut sensor detected“, „cut to return OK“).
+2. Kp Positionsregler X auf 300: `81 09 00 06 01 46 00 00 96 43` → Echo `f7 81 07 00 06 00 00 96 43 09`.
+3. Stall-Mode lesen `81 04 00 11 04` → `[02 00]`; **Stall-Mode 3 setzen** `81 04 00 11 03` → Echo (Hypothese „Mode 4“ WIDERLEGT – 4 ist Lesen).
+4. Suchfahrt ~60 s gegen den Cutter-Anschlag, 2× `check_protection_code` an X.
+5. Ergebnis: `x:-8.2 cut_pos_offset:0.4 cut_pos:-7.8` (vorher -7.6) → `SAVE_CONFIG` `[box] cut_pos_x = -7.80` (mit Backup der printer.cfg).
+6. Stall-Mode zurück 2 (`81 04 00 11 02`), Kp zurück 100 (`81 09 00 06 01 46 00 00 c8 42`).
+Folgerung Pi-Ersatz: Cut-Kalibrierung = Kp 300 → Stall 3 → Anschlagfahrt → Position + 0,4 → speichern → Stall 2 → Kp 100; mit [k2_motor]-Primitiven nachbaubar.

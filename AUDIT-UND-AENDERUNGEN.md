@@ -804,6 +804,12 @@ selbst gegengeprüft; bei der Einarbeitung zusätzlich nachgeprüft (Abschnitt �
   Extrude 1313 mm, Extruder-Check ok). Drucker-Zugriff dabei nur lesend (Log-Mitschnitt).
 - `PI-ERSATZ-PLAN.md` neu (Zweitanalyse durch weiteren KI-Agenten, von uns durchgesehen).
 
+## 16.10.2026 – PrTouch v3 und Cut-Kalibrierung
+
+- PRTOUCH-BEFUND-2026-10-16.md neu (zwei statische Zweitanalysen + Gegenprüfung am Live-Mitschnitt der
+  Auto-Nivellierung; Kernwerte von uns nachgeprüft). Cut-Kalibrierung live in LIVE-ABFRAGEN-2026-10-16.md.
+  Drucker-Zugriff dabei nur lesend (Log-Mitschnitt); die Kalibrierungen hat der User am Display gestartet.
+
 ## Anonymisierung (Repo-Fassung)
 
 Gegenüber der lokalen Forschungsablage sind im Repo folgende Werte durch syntaktisch
