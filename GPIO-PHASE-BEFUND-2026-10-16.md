@@ -48,3 +48,15 @@ Adressformel (Motor-FW): Adresse = 0x81 + 2·STEP + DIR (siehe MOTOR-INIT-BEFUND
 
 Offen: Extraktion des Dictionaries von `mcu0_130` zeigte kein `transparent_*` – vermutlich Extraktionslücke,
 nicht geprüft.
+
+## KORREKTUR 16.10.2026 abends – Basisadresse der Klipper-MCUs (Main + Düse)
+
+Die Main-MCU- und Düsen-MCU-Images (`mcu0_140…`, `noz0_130…`) liegen ab **0x08003000** (davor Bootloader), NICHT ab 0x08000000.
+Belege (eigene Prüfung): Reset-Handler bei 0x080033F8 ist nur mit Basis 0x08003000 ein gültiger Prolog (`cpsid i`, SP setzen, Sprung);
+158 von 233 Thumb-Zeigern im Image treffen mit 0x08003000 einen Funktionsprolog, mit 0x08000000 nur 6. Klipper-Befehlstabelle
+(Main) bei 0x0800743C, 12-Byte-Einträge [Handler | Info (Byte0 = msgid) | param_types].
+Folge: **Adressangaben** der früheren MCU-Analysen (PrTouch-MCU, Bit-Spezifikation, Stopp-Analyse) sind ungültig; Data-Dictionaries
+(zlib) sind nicht betroffen. Die Kernaussage „prtouch-Code stoppt die Stepper nicht selbst“ wurde mit korrekter Basis bestätigt:
+kein Aufruf des Stopp-Helfers von `stepper_stop_on_trigger`; die einzige gemeinsame Pin-Funktion setzt im prtouch-Lesepfad den
+Swap-Pin (Synchronisation). Plausibler Stopp-Weg (ANNAHME): Host hängt die Z-Stepper per `stepper_stop_on_trigger` an ein trsync
+und löst bei erkanntem Kontakt `trsync_trigger` aus.

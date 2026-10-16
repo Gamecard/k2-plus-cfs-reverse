@@ -810,6 +810,13 @@ selbst gegengeprüft; bei der Einarbeitung zusätzlich nachgeprüft (Abschnitt �
   Auto-Nivellierung; Kernwerte von uns nachgeprüft). Cut-Kalibrierung live in LIVE-ABFRAGEN-2026-10-16.md.
   Drucker-Zugriff dabei nur lesend (Log-Mitschnitt); die Kalibrierungen hat der User am Display gestartet.
 
+## 16.10.2026 abends – serial485-Fixes, [k2_box]-Entwurf, MCU-Basis-Korrektur
+
+- `nachbau/serial485.py`: zwei Fixes (Patch eines weiteren KI-Agenten, von uns geprüft: alle Module + ref-hi grün, 100/100).
+  Vorversion lokal gesichert.
+- `pi-host/k2_box.py` + `test_k2_box.py` + `README-k2_box.md` neu (Entwurf).
+- MCU-Basis 0x08003000 korrigiert (Nachträge in PRTOUCH- und GPIO-PHASE-BEFUND); RE-RESTE-BEFUND neu.
+
 ## Anonymisierung (Repo-Fassung)
 
 Gegenüber der lokalen Forschungsablage sind im Repo folgende Werte durch syntaktisch

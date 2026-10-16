@@ -481,3 +481,12 @@ box 179 · boxmini 17 · cfsseq 28 · motor 134 · motor_mini 43 · auto_addr 33
 - [x] Cut-Kalibrierung live (Stall-Mode 3 für Suche, Kp 300/100) – LIVE-ABFRAGEN-2026-10-16.md
 - [x] Entscheidung Pi-Weg: PrTouch-Ersatz (eigenes Probe-Modul) oder Eddy-Sensor  **ENTSCHIEDEN 16.10.2026: eigenes Modul für den eingebauten Kraftsensor (Weg A); Eddy optional später**
 - [ ] (für A) MCU-Bit-Ebene der prtouch-Frames: Schwellen/Filter/Register
+
+### 16.10.2026 abends
+- [x] `serial485.py`: `_done` begrenzt (MAX 128 + cleanup) und erwartete Antworten werden vom Hintergrund-Thread geparkt statt
+  dispatcht (get_response findet sie) – Selbsttest 100/100 (93 + 7 neu)
+- [x] Entwurf `pi-host/k2_box.py` ([k2_box]: Auto-Addr, Poll, Preload, Load/Unload, Moonraker-Status, gemeinsamer Bus-Lock
+  mit [k2_motor]) – offline 9/9, Gerätetest offen
+- [x] KORREKTUR: Klipper-MCU-Basis 0x08003000 (Main + Düse); PrTouch „stoppt nicht selbst“ mit korrekter Basis bestätigt
+- [ ] PrTouch-Stopp-Weg über Host-trsync am Gerät/Log bestätigen; dann PrTouch-Modul schreiben
+- [x] RE-Reste-Sammelbefund (RE-RESTE-BEFUND-2026-10-16.md): überwiegend TEILWEISE geklärt, Restpunkte brauchen Live-Tests

@@ -74,6 +74,21 @@ MAX_BUS_HOLD_S = 1200.0
 # Ab dieser Haltedauer wird der lange Lock im Log vermerkt (INFO).
 LONG_HOLD_LOG_S = 5.0
 
+# Serial_485_Wrapper._done-Begrenzung (Fix Teil B.1, 16.10.2026): nie abgeholte
+# Antworten ließen _done unbegrenzt wachsen (Speicherleck bei langlebigen
+# Sessions). MAX = harte Obergrenze (älteste IDs fliegen zuerst raus),
+# TTL = Verfallszeit für verwaiste Einträge (Threads die nie abholen).
+WRAPPER_DONE_MAX = 128
+WRAPPER_DONE_TTL_S = 60.0
+# Serial485 Bg-Race-Fix (Teil B.2, 16.10.2026): raw_send registriert eine
+# erwartete Antwort, die der Hintergrund-Thread NICHT dispatcht, sondern in
+# _resp_queue parkt; get_response holt dort zuerst ab. So kann der bg-Thread
+# keine get_response-Antwort mehr in der Lücke zwischen raw_send und
+# get_response wegschnappen. TTLs gegen Verwaisten bei Crashs.
+BG_EXPECT_TTL_S = 2.0
+RESP_QUEUE_TTL_S = 5.0
+RESP_QUEUE_MAX = 32
+
 # Plausibilitätsgrenzen für das Längenfeld (len = status+fun+daten... inkl. crc,
 # vgl. build_frame: len = len(data)+3). Minimum 3 = Frame ohne Daten.
 # Ein kleineres Maximum als das Byte-Maximum 255 ist nicht belegt (weder
@@ -212,6 +227,10 @@ class Serial485:
         self._bg_stop = threading.Event()
         self._bg_thread_obj = None
         self._rest_buf = b""
+        # Fix B.2: Antwort-Warteschlange + Erwartungs-Registry (alles unter
+        # _lock verwaltet – kein extra Lock nötig, alle Zugriffe halten _lock).
+        self._resp_queue = deque()      # [(addr,status,fun,data,raw,ts)]
+        self._pending_expect = deque()  # [(addr|None, fun|None, deadline)]
         if ser is not None:
             self.ser = ser            # injiziert (Tests), kein pyserial nötig
             self._connected = True
@@ -250,6 +269,36 @@ class Serial485:
         except Exception:
             _log.exception("Bus-Handler für addr 0x%02x fun 0x%02x fehlgeschlagen",
                            addr, fun)
+
+    # --- Fix B.2-Helfer (alles NUR unter gehaltenem _lock aufrufen) --------
+    @staticmethod
+    def _match_expect(exp_addr, exp_fun, addr, fun):
+        if exp_fun is not None and fun != exp_fun:
+            return False
+        if exp_addr is not None and addr != exp_addr:
+            return False
+        return True
+
+    def _prune_expect_queue_locked(self, now):
+        """Abgelaufene Erwartungen + alte Queue-Einträge verwerfen (unter _lock)."""
+        while self._pending_expect and self._pending_expect[0][2] < now:
+            self._pending_expect.popleft()
+        # Nicht von vorne (deadlines monoton, aber sicherheitshalber filtern):
+        self._pending_expect = deque(
+            e for e in self._pending_expect if e[2] >= now)
+        while len(self._resp_queue) > RESP_QUEUE_MAX:
+            self._resp_queue.popleft()
+        cutoff = now - RESP_QUEUE_TTL_S
+        self._resp_queue = deque(
+            e for e in self._resp_queue if e[5] >= cutoff)
+
+    def _take_queued_locked(self, expect_fun, expect_addr):
+        """Ersten passenden Queue-Eintrag entnehmen oder None (unter _lock)."""
+        for i, (a, s, f, d, r, _ts) in enumerate(self._resp_queue):
+            if self._match_expect(expect_addr, expect_fun, a, f):
+                del self._resp_queue[i]
+                return a, s, f, d, r
+        return None
 
     def _recv_frame_locked(self, deadline, expect_fun=None, expect_addr=None):
         """EIN gültiger Frame unter gehaltenem _lock. Gibt
@@ -454,6 +503,10 @@ class Serial485:
         status 0x30/0x16) und dispatchet sie an die Registry. Synchronous
         transact-Verkehr läuft weiter über _lock (Halbduplex-Serialisierung).
         Nur aktiv nach _start_session(start_bg=True); disconnect() stoppt.
+
+        Fix B.2: Passt ein Frame zu einer per raw_send registrierten
+        Erwartung, wird er NICHT dispatcht, sondern in _resp_queue geparkt –
+        get_response holt ihn dort ab (kein Wegschnappen mehr).
         """
         while not self._bg_stop.wait(0.02):
             if not getattr(self, "_connected", False):
@@ -462,22 +515,66 @@ class Serial485:
                 with self._lock:
                     deadline = time.monotonic() + timeout
                     try:
-                        raddr, rstatus, rfun, rdata, _ = self._recv_frame_locked(deadline)
+                        raddr, rstatus, rfun, rdata, rraw = \
+                            self._recv_frame_locked(deadline)
                     except TimeoutError:
                         continue
                     self._inc("received")
+                    now = time.monotonic()
+                    self._prune_expect_queue_locked(now)
+                    parked = False
+                    for exp_addr, exp_fun, _dl in list(self._pending_expect):
+                        if self._match_expect(exp_addr, exp_fun,
+                                              raddr, rfun):
+                            self._pending_expect.remove(
+                                (exp_addr, exp_fun, _dl))
+                            self._resp_queue.append(
+                                (raddr, rstatus, rfun, rdata, rraw, now))
+                            parked = True
+                            break
+                    if parked:
+                        continue
                 # außerhalb von _lock (Handler dürfen Bus-Funktionen rufen)
                 self._dispatch_safe(raddr, rstatus, rfun, rdata)
             except Exception:
                 _log.exception("_bg_thread: Fehler beim Empfang")
                 continue
 
-    def raw_send(self, addr, fun, data=(), status=STATUS_OK):
-        """Fire-and-forget-Senden (Beleg: Serialhdl_485.raw_send)."""
+    def raw_send(self, addr, fun, data=(), status=STATUS_OK,
+                 expect_response=True, expect_timeout=None, expect_fun=None,
+                 expect_addr=_AUTO):
+        """Fire-and-forget-Senden (Beleg: Serialhdl_485.raw_send).
+
+        Fix B.2: Mit expect_response=True (Default) wird atomar mit dem
+        Schreiben eine erwartete Antwort registriert – der Hintergrund-Thread
+        parkt sie dann in _resp_queue statt sie zu dispatchen, sodass ein
+        anschließendes get_response sie auch bei Lücke sicher findet.
+        Wer wirklich ohne Antwort sendet, übergibt expect_response=False
+        (dann Verhalten wie bisher). expect_fun/expect_addr schränken die
+        Erwartung ein (Default: gleicher fun, Absender wie Ziel bzw.
+        beliebig bei Broadcast-Zielen).
+        """
         frame = build_frame(addr, fun, data, status=status)
         with self._lock:
             self.ser.write(frame)
             self._inc("sent")
+            if expect_response:
+                efun = fun if expect_fun is None else expect_fun
+                if expect_addr is _AUTO:
+                    eaddr = reply_addr_for(addr)
+                else:
+                    eaddr = expect_addr
+                ttl = (self.default_timeout if expect_timeout is None
+                       else expect_timeout)
+                try:
+                    ttl = float(ttl)
+                except Exception:
+                    ttl = BG_EXPECT_TTL_S
+                if ttl <= 0:
+                    ttl = BG_EXPECT_TTL_S
+                now = time.monotonic()
+                self._prune_expect_queue_locked(now)
+                self._pending_expect.append((eaddr, efun, now + ttl))
         return frame
 
     def raw_send_wait_ack(self, addr, fun, data=(), timeout=None,
@@ -563,17 +660,26 @@ class Serial485:
         Gibt (addr, status, fun, daten) zurück (daten als bytes).
         Rohframe = build_frame(addr, fun, daten, status=status).
         Wirft TimeoutError nach timeout, zählt crc_errors/received.
+
+        Fix B.2: Zuerst wird _resp_queue geprüft (vom Hintergrund-Thread
+        geparkte erwartete Antworten aus der raw_send/get_response-Lücke) –
+        erst danach vom seriellen Port gelesen.
         """
         timeout = self.default_timeout if timeout is None else timeout
         with self._lock:
-            deadline = time.monotonic() + timeout
-            try:
-                raddr, rstatus, rfun, rdata, _ = self._recv_frame_locked(
-                    deadline, expect_fun=expect_fun, expect_addr=expect_addr)
-            except TimeoutError:
-                self._inc("timeouts")
-                raise
-            self._inc("received")
+            self._prune_expect_queue_locked(time.monotonic())
+            queued = self._take_queued_locked(expect_fun, expect_addr)
+            if queued is not None:
+                raddr, rstatus, rfun, rdata, _rraw = queued
+            else:
+                deadline = time.monotonic() + timeout
+                try:
+                    raddr, rstatus, rfun, rdata, _ = self._recv_frame_locked(
+                        deadline, expect_fun=expect_fun, expect_addr=expect_addr)
+                except TimeoutError:
+                    self._inc("timeouts")
+                    raise
+                self._inc("received")
         self._dispatch_safe(raddr, rstatus, rfun, rdata)  # ohne _lock
         return raddr, rstatus, rfun, rdata
 
@@ -669,7 +775,54 @@ class Serial_485_Wrapper:
         self._handlers = {}          # (addr, fun) -> callback(data_send, msg)
         self._default_handler = None
         self._done = {}              # Eintrags-ID -> Antwort (für Neben-Threads)
+        self._done_time = {}         # Eintrags-ID -> monotonic-ts (Fix B.1)
         self._seq = 0
+
+    # --- Fix B.1-Helfer (NUR unter gehaltenem _qlock aufrufen) --------------
+    def _store_done_locked(self, eid, resp):
+        """Antwort ablegen + verwaiste/überzählige Einträge aufräumen."""
+        now = time.monotonic()
+        self._done[eid] = resp
+        self._done_time[eid] = now
+        cutoff = now - WRAPPER_DONE_TTL_S
+        for old in [k for k, t in list(self._done_time.items())
+                    if t < cutoff]:
+            self._done.pop(old, None)
+            self._done_time.pop(old, None)
+        while len(self._done) > WRAPPER_DONE_MAX:
+            oldest = min(self._done)
+            self._done.pop(oldest, None)
+            self._done_time.pop(oldest, None)
+
+    def _take_done_locked(self, eid, default=None):
+        """Antwort abholen (verfallene gilt als fehlend)."""
+        now = time.monotonic()
+        t = self._done_time.get(eid)
+        if t is not None and now - t > WRAPPER_DONE_TTL_S:
+            self._done.pop(eid, None)
+            self._done_time.pop(eid, None)
+            return default
+        self._done_time.pop(eid, None)
+        return self._done.pop(eid, default)
+
+    def cleanup_done(self):
+        """Verwaiste _done-Einträge aufräumen (öffentlich, z.B. zyklisch).
+
+        Gibt (entfernt, übrig) zurück.
+        """
+        with self._qlock:
+            now = time.monotonic()
+            cutoff = now - WRAPPER_DONE_TTL_S
+            old = [k for k, t in list(self._done_time.items()) if t < cutoff]
+            for k in old:
+                self._done.pop(k, None)
+                self._done_time.pop(k, None)
+            while len(self._done) > WRAPPER_DONE_MAX:
+                oldest = min(self._done)
+                self._done.pop(oldest, None)
+                self._done_time.pop(oldest, None)
+                old.append(oldest)
+            return len(old), len(self._done)
 
     # --- Queue (Belegnamen) ---
     def add_send_data(self, data, timeout=TIMEOUT_LONG, retransmit=True):
@@ -755,7 +908,7 @@ class Serial_485_Wrapper:
                     entry = self._queue.popleft()
                 resp = self._send_entry(entry, deferred)
                 with self._qlock:
-                    self._done[entry["id"]] = resp
+                    self._store_done_locked(entry["id"], resp)
                 results.append((entry["id"], resp))
         # Handler erst nach Freigabe von _send_lock (dürfen selbst senden)
         self._run_deferred(deferred)
@@ -777,18 +930,18 @@ class Serial_485_Wrapper:
             with self._qlock:
                 done = eid in self._done  # Neben-Thread hat ihn schon erledigt
                 if done:
-                    result = self._done.pop(eid)
+                    result = self._take_done_locked(eid)
             while not done:
                 with self._qlock:
                     if not self._queue:
-                        result = self._done.pop(eid, None)
+                        result = self._take_done_locked(eid, None)
                         break
                     entry = self._queue.popleft()
                 resp = self._send_entry(entry, deferred)
                 with self._qlock:
-                    self._done[entry["id"]] = resp
+                    self._store_done_locked(entry["id"], resp)
                     if entry["id"] == eid:
-                        result = self._done.pop(eid)
+                        result = self._take_done_locked(eid)
                         break
                     # fremde Antworten liegen für deren Threads in _done
         # Handler erst nach Freigabe von _send_lock (dürfen selbst senden)
@@ -799,7 +952,8 @@ class Serial_485_Wrapper:
         """Fire-and-forget (Beleg: Serial_485_Wrapper.cmd_485_send_data).
         Gibt den gesendeten Frame zurück."""
         addr, _length, status, fun, payload = self._split_wire(data)
-        return self.bus.raw_send(addr, fun, list(payload), status=status)
+        return self.bus.raw_send(addr, fun, list(payload), status=status,
+                                 expect_response=False)
 
     # --- Registry/Dispatch (Belegnamen) ---
     def register_response(self, addr, fun, callback):
@@ -849,10 +1003,11 @@ class Serial_485_Wrapper:
         return self.bus.disconnect()
 
     def stats(self):
-        """Bus-Zähler + queue_len (vgl. serial_485_queue_get_stats)."""
+        """Bus-Zähler + queue_len/done_len (vgl. serial_485_queue_get_stats)."""
         d = self.bus.stats()
         with self._qlock:
             d["queue_len"] = len(self._queue)
+            d["done_len"] = len(self._done)
         return d
 
 
@@ -1384,6 +1539,73 @@ def selftest():
             check2("ref-hi msg #%d %s" % (i, msg.get("description", "")),
                    build_frame(msg["addr"], func, data, status=status) == raw
                    and parsed == (func, data))
+
+    # 12. Fix B.1: _done wächst nicht unbegrenzt (MAX + TTL + cleanup)
+    wbus12 = Serial485("/dev/ttyFAKE1", ser=FakeSerial(
+        [build_frame(0x01, 0x03, [0x00])] * 300))
+    wbus12._start_session()
+    wrap12 = Serial_485_Wrapper(bus=wbus12)
+    wire12 = bytes([0x01, 4, STATUS_OK, 0x03, 0x0F])
+    for _ in range(WRAPPER_DONE_MAX + 22):
+        wrap12.add_send_data(wire12, timeout=0.05)
+    res12 = wrap12.send_queue_process()
+    check2("B.1 _done begrenzt (MAX %d)" % WRAPPER_DONE_MAX,
+           len(res12) == WRAPPER_DONE_MAX + 22
+           and len(wrap12._done) <= WRAPPER_DONE_MAX
+           and wrap12.stats()["done_len"] <= WRAPPER_DONE_MAX)
+    check2("B.1 älteste verdrängt, neueste da",
+           min(wrap12._done) > 1 and max(wrap12._done) == wrap12._seq)
+    # TTL: künstlich altern lassen -> cleanup räumt ab
+    for k in list(wrap12._done_time):
+        wrap12._done_time[k] -= (WRAPPER_DONE_TTL_S + 1.0)
+    removed, left = wrap12.cleanup_done()
+    check2("B.1 cleanup_done räumt Verfallene",
+           removed >= 1 and left == 0 and len(wrap12._done) == 0)
+    # Normalbetrieb nach Cleanup ungestört:
+    wbus12b = Serial485("/dev/ttyFAKE1", ser=FakeSerial(
+        [build_frame(0x01, 0x03, [0x07])]))
+    wbus12b._start_session()
+    wrap12b = Serial_485_Wrapper(bus=wbus12b)
+    check2("B.1 Einzel-Call nach Cleanup",
+           wrap12b.cmd_send_data_with_response(wire12, 0.2, False)
+           == build_frame(0x01, 0x03, [0x07]))
+
+    # 13. Fix B.2: bg-Thread schnappt get_response nichts mehr weg
+    resp13 = build_frame(0x01, 0x08, [0x07])
+    bus13 = Serial485("/dev/ttyFAKE1", ser=FakeSerial([]))
+    bus13._start_session(start_bg=True, bg_timeout=0.05)
+    hits13 = []
+    bus13.register_response(0x01, 0x08,
+                            lambda a, s, f, d: hits13.append(bytes(d)))
+    bus13.raw_send(0x01, 0x08, [0x00])  # registriert Erwartung (Default)
+    time.sleep(0.12)  # Lücke: bg hätte früher die Antwort kassiert
+    bus13.ser._read_buf += bytearray(resp13)  # Antwort trifft EIN
+    time.sleep(0.12)  # bg liest zuerst – parkt statt zu dispatchen
+    try:
+        ga, gs, gf, gd = bus13.get_response(timeout=0.5, expect_fun=0x08)
+        ok13 = (ga, gs, gf, gd) == (0x01, 0x00, 0x08, bytes([0x07]))
+    except TimeoutError:
+        ok13 = False
+    check2("B.2 get_response findet geparkte Antwort (kein Timeout)", ok13)
+    check2("B.2 geparkte Antwort NICHT doppelt dispatcht", hits13 == [bytes([0x07])])
+    bus13.disconnect()
+    # Ohne Erwartung: Verhalten wie bisher (Dispatch, kein Parken)
+    resp13b = build_frame(0x01, 0x08, [0x05])
+    bus13b = Serial485("/dev/ttyFAKE1", ser=FakeSerial([]))
+    bus13b._start_session(start_bg=True, bg_timeout=0.05)
+    hits13b = []
+    bus13b.register_response(0x01, 0x08,
+                             lambda a, s, f, d: hits13b.append(bytes(d)))
+    bus13b.raw_send(0x01, 0x08, [0x00], expect_response=False)
+    bus13b.ser._read_buf += bytearray(resp13b)
+    time.sleep(0.25)
+    try:
+        bus13b.get_response(timeout=0.05, expect_fun=0x08)
+        ok13b = False  # dürfte nichts mehr finden (bg hat dispatcht)
+    except TimeoutError:
+        ok13b = True
+    check2("B.2 ohne Erwartung: bg dispatcht wie bisher", ok13b and hits13b == [bytes([0x05])])
+    bus13b.disconnect()
 
     print("SELBSTTEST: %d/%d ok" % (total - fails, total))
     return fails
