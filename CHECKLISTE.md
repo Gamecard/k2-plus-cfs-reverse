@@ -487,6 +487,11 @@ box 179 · boxmini 17 · cfsseq 28 · motor 134 · motor_mini 43 · auto_addr 33
   dispatcht (get_response findet sie) – Selbsttest 100/100 (93 + 7 neu)
 - [x] Entwurf `pi-host/k2_box.py` ([k2_box]: Auto-Addr, Poll, Preload, Load/Unload, Moonraker-Status, gemeinsamer Bus-Lock
   mit [k2_motor]) – offline 9/9, Gerätetest offen
+- [x] **Bustest lesend am echten Gerät (16.10.2026, BUSTEST-BEFUND-2026-10-16.md):** unser serial485 + K2BoxController +
+  K2MotorController.motor_status als alleiniger ttyS5-Besitzer (Stock-Klipper gestoppt) – 78/78 Frames, 0 Timeouts/
+  Retries/CRC; Box-Lesebefehle + Motoren X/Y/Z/Z1 (Version, Schutz, idx 1–12) bestätigt, Counts = pos_fdb/2π·3200 exakt.
+  Nebenbefund: Dienst-Neustart ohne MCU-Reset → Extruder stumm (key798), FIRMWARE_RESTART behebt es.
+- [ ] Bustest Teil 2 (schreibend/MCU): Motor-Init mit Strapping, Extruder transparent, Box-Preload – braucht Klipper bzw. Pi
 - [x] KORREKTUR: Klipper-MCU-Basis 0x08003000 (Main + Düse); PrTouch „stoppt nicht selbst“ mit korrekter Basis bestätigt
 - [x] PrTouch-Stopp-Weg BEWIESEN (statisch): Host bricht ab, Swap-Leitung nur Synchronisation, kein trsync/Endstop – PRTOUCH-STOPP-BEWEIS-2026-10-16.md
 - [ ] PrTouch-Modul schreiben (kurze Schritte + Abbruch nach jedem Schritt)
