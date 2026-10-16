@@ -98,9 +98,21 @@ Alle schreibenden Varianten NUR mit ``allow_write: True`` in der Config
 (kein G-Code-Override), vorher ``toolhead.wait_moves()``; Fehler = G-Code-
 Fehler, nie Shutdown. Status für Makros: ``printer.k2_motor`` mit
 ``allow_write``, ``homing_active``, ``stall_mode``, ``homing_pos_kp``,
-``last_error``.
+``last_error``, ``cut_cal``.
+
+Schnittpositions-Kalibrierung (16.10.2026 Nacht, config-pi/NOTIZ-cutcal.md;
+Frames live belegt, s. Konstanten CUT_CAL_*):
+- ``KTWO_MOTOR_CUT_CAL [DRY_RUN=1]`` – Ersatz für Stock ``MOTOR_CHECK_CUT_POS``
+  samt Kp-Rahmen des Stock-Makros ``CALIBRATE_CUT_POS``: ID 70 = 300 an x,
+  0x11 [04] lesen, 0x11 [03] an x, Anstoß-Folge gegen den Schneidhebel
+  (X-Endstop PB11 = Stall-Pin von Motor x), ``cut_pos_x`` = 2. Treffer +
+  ``cut_pos_offset`` -> ``configfile.set('k2_box', 'cut_pos_x')`` (nur
+  vorgemerkt, SAVE_CONFIG macht der Nutzer bzw. das Makro), 0x11 [02], Kp
+  zurück. Nur mit ``allow_write: True`` UND ``_PI_FREIGABE allow_move``;
+  Rückbau (Mode 2, Kp, Beschleunigung, Kopf weg vom Hebel) IMMER.
 """
 
+import logging
 import math
 import struct
 import time
@@ -195,6 +207,80 @@ HOMING_POS_KP_RESTORE_DEFAULT = 100.0  # Stock PARAMS=100, sonst Config-Wert
 # Schreibbar per KTWO_MOTOR_SYS_PARAM: nur die IDs, die Stock per
 # [motor_control] setzt (SYS_PARAM_STOCK_CONFIGURED ohne Host-ID 226).
 SYS_PARAM_WRITABLE_IDS = (70, 86, 87, 102, 103, 116, 118, 119, 120, 121, 187, 188)
+
+# --- Schnittpositions-Kalibrierung (Ersatz Stock CALIBRATE_CUT_POS) ----------
+# Live-Beleg: Display-Kalibrierung 16.10.2026 22:03:17–22:04:24 (Log-Uhr),
+# Mitschnitt arbeitsdateien-lokal/cutpos-live-20261016-1601.log (lokal, nicht
+# im Repo; Zusammenfassung LIVE-ABFRAGEN-2026-10-16.md):
+#   Z.945  81 09 00 06 01 46 00 00 96 43 -> f7 81 07 00 06 00 00 96 43 09 (ID 70 = 300,
+#          Stock-Makro MOTOR_SYS_PARAM ... PARAMS=300 vor MOTOR_CHECK_CUT_POS)
+#   Z.957  81 04 00 11 04 -> f7 81 05 00 11 02 00 0e  (Stall-Mode lesen: 2)
+#   Z.981  81 04 00 11 03 -> f7 81 04 00 11 03 13     (Stall-Mode 3 an x)
+#   22:03:18,6–22:04:22,4 Suchfahrt: KEIN Frame an 0x81; Treffer nur als Host-
+#          Meldung "motor_x 81 check_protection_code" (22:04:18,404 + 22:04:20,246)
+#          = Stall-Pin-Ereignis (motor_x_stall PB11), kein Bus-Polling
+#   Z.1471 "final pos:[200.0, 200.0, 175.0, 86.19] x:-8.2 cut_pos_offset:0.4
+#          cut_pos:-8.2+0.4=-7.79…" (Ausgangsposition X 200 / Y 200 = cut_pos_y)
+#   Z.1472 save_config: set [box] cut_pos_x = -7.80   (Format %.2f), Z.1474 SAVE_CONFIG
+#   Z.1476 81 04 00 11 02 -> f7 81 04 00 11 02 14     (zurück auf den gelesenen Wert 2)
+#   Z.1489 81 09 00 06 01 46 00 00 c8 42 -> … c8 42 d4 (ID 70 = 100, Stock-Makro)
+# Zeitbild der Suchfahrt (belegt): 2 Treffer 1,84 s auseinander, ~60 s für
+# X -5,0 … -8,2 = 33 Positionen à 1,84 s -> Anstoßen in 0,1-mm-Schritten ab
+# box.cfg pre_cut_cal_pos_x (-5), Ergebnis = 2. Treffer (-8,2) + 0,4. Deckt
+# sich mit der Vanilla-Rekonstruktion (motor_control.py MotorCutCalibration:
+# Park X 50 / Anstoß F10000 / Park F12000 / Ausgang X 200 – Werte dort
+# ANNAHME, nur X 200 live belegt). REA (motor_check_cut_pos @0xe270c):
+# SET_VELOCITY_LIMIT ACCEL=25000; "Mode 4" dort = 0x11 [04] LESEN (live).
+CUT_CAL_MODE = 0x03                # 0x11 [03] an x (live Z.981)
+CUT_CAL_MOTOR = "x"                # nur 0x81 (Stall-Pin PB11 = X-Endstop)
+CUT_CAL_SECTION = "k2_box"         # configfile.set-Ziel (Stock: [box])
+CUT_CAL_OPTION = "cut_pos_x"
+CUT_CAL_FORMAT = "%.2f"            # live "cut_pos_x = -7.80"
+CUT_CAL_EPS = 1e-6
+# Stock-Werte (box.cfg / motor_control.cfg / gcode_macro.cfg:796 / Vanilla)
+CUT_CAL_DEFAULTS = {
+    "start_x": -5.0,        # box.cfg pre_cut_cal_pos_x
+    "step": 0.1,            # Zeitbild live (s. oben)
+    "x_min": -9.5,          # box.cfg check_cut_pos_x_min (Vorrang: [k2_box])
+    "x_max": -5.5,          # box.cfg check_cut_pos_x_max (Vorrang: [k2_box])
+    "y": 200.0,             # box.cfg cut_pos_y (Vorrang: [k2_box]); live Y 200
+    "offset": 0.4,          # motor_control.cfg cut_pos_offset
+    "park_x": 50.0,         # Vanilla CUT_CAL_PARK_X (ANNAHME)
+    "exit_x": 200.0,        # live final pos X 200
+    "probe_speed": 10000.0 / 60.0,  # Vanilla F10000 (ANNAHME)
+    "park_speed": 12000.0 / 60.0,   # Vanilla F12000 (ANNAHME)
+    "accel": 25000.0,       # REA SET_VELOCITY_LIMIT ACCEL=25000
+    "settle": 0.1,          # Nachlauf-Prüfung Stall-Pin (ANNAHME)
+    "pos_kp": 300.0,        # gcode_macro.cfg:796 PARAMS=300
+}
+# HARTE Grenzen (nicht per Config aufweichbar). X: nie tiefer als die Stock-
+# position_min -10 und nie über 0 (Hebel liegt bei negativem X).
+CUT_CAL_X_HARD_MIN = -10.0
+CUT_CAL_X_HARD_MAX = 0.0
+CUT_CAL_LIMITS = {          # key: (min, max)
+    "start_x": (CUT_CAL_X_HARD_MIN, CUT_CAL_X_HARD_MAX),
+    "step": (0.05, 0.5),
+    "x_min": (CUT_CAL_X_HARD_MIN, CUT_CAL_X_HARD_MAX),
+    "x_max": (CUT_CAL_X_HARD_MIN, CUT_CAL_X_HARD_MAX),
+    "y": (50.0, 350.0),
+    "offset": (0.0, 2.0),
+    "park_x": (0.0, 100.0),
+    "exit_x": (0.0, 340.0),
+    "probe_speed": (5.0, 200.0),   # Anstoß: max 200 mm/s (Stock ~167)
+    "park_speed": (5.0, 250.0),
+    "accel": (500.0, 25000.0),     # nie über Stock 25000 (und nie über max_accel)
+    "settle": (0.0, 0.5),
+    "pos_kp": (1.0, 10000.0),
+}
+CUT_CAL_MAX_PROBES = 100       # harte Obergrenze Anstöße (Stock: 46)
+CUT_CAL_MIN_PARK_GAP = 5.0     # park_x mind. 5 mm vor start_x
+CUT_CAL_OPTIONS = {            # [k2_motor]-Option -> Parameter
+    "cut_cal_start_x": "start_x", "cut_cal_step": "step",
+    "cut_cal_park_x": "park_x", "cut_cal_exit_x": "exit_x",
+    "cut_cal_probe_speed": "probe_speed", "cut_cal_park_speed": "park_speed",
+    "cut_cal_accel": "accel", "cut_cal_settle": "settle",
+    "cut_cal_pos_kp": "pos_kp", "cut_pos_offset": "offset",
+}
 
 TIMEOUT_ADDR = 0.05
 TIMEOUT_STALL = 1.0
@@ -571,6 +657,19 @@ def parse_options(opts):
         if not math.isfinite(hk) or not 0.0 < hk <= 10000.0:
             raise ValueError("homing_pos_kp muss 0 < Wert <= 10000 sein: %r" % (hk,))
         cfg["homing_pos_kp"] = hk
+    # Schnittpositions-Kalibrierung: Optionen mit Stock-Default, harte Grenzen
+    cfg["cut_cal"] = {}
+    for opt, key in CUT_CAL_OPTIONS.items():
+        val = CUT_CAL_DEFAULTS[key]
+        if o.get(opt) not in (None, ""):
+            try:
+                val = float(str(o[opt]).strip())
+            except ValueError:
+                raise ValueError("%s muss Zahl sein: %r" % (opt, o[opt]))
+        lo, hi = CUT_CAL_LIMITS[key]
+        if not math.isfinite(val) or not lo <= val <= hi:
+            raise ValueError("%s muss %g..%g sein: %r" % (opt, lo, hi, val))
+        cfg["cut_cal"][key] = val
     for m in VERIFY_ORDER:
         cfg["pins"][m] = {
             "dir": parse_pin_level(o.get("motor_%s_dir" % m)),
@@ -582,6 +681,7 @@ def parse_options(opts):
     known = {"switch", "motor_closed_loop", "retries", "allow_write",
              "shutdown_on_failure", "auto_init", "nozzle_mcu", "main_mcu",
              "overcurrent_switch", "cut_pos_offset", "homing_pos_kp"}
+    known.update(CUT_CAL_OPTIONS)
     import re as _re
     by_name = {p["name"]: p for p in default_param_table()}
     for key, val in o.items():
@@ -660,7 +760,8 @@ def parse_klipper_config(config):
     # Falls get_options leer war (manche Wrapper), Fix-Keys direkt holen:
     for k in ("switch", "motor_closed_loop", "retries", "allow_write",
               "shutdown_on_failure", "auto_init", "nozzle_mcu", "main_mcu",
-              "overcurrent_switch", "cut_pos_offset", "homing_pos_kp"):
+              "overcurrent_switch", "cut_pos_offset", "homing_pos_kp") \
+            + tuple(sorted(CUT_CAL_OPTIONS)):
         if k not in opts:
             v = _g(k, None)
             if v is not None:
@@ -697,6 +798,106 @@ def parse_klipper_config(config):
             pass
     _ = _gi; _ = _gb
     return parse_options(opts)
+
+
+# =====================================================================
+# Schnittpositions-Kalibrierung – Parameter (rein, testbar)
+# =====================================================================
+
+def build_cut_cal_params(cut_cfg, box_cfg=None):
+    """[k2_motor]-cut_cal-Werte + Prüfbereich/Y aus [k2_box] -> Parameter.
+
+    ``box_cfg`` = ``printer.lookup_object('k2_box').cfg`` (dict) oder None.
+    Vorrang für x_min/x_max/y: [k2_box] check_cut_pos_x_min/_max, cut_pos_y
+    (dieselben Grenzen prüft k2_box beim Laden von cut_pos_x – ein Ergebnis
+    außerhalb würde den Neustart nach SAVE_CONFIG verhindern)."""
+    p = dict(CUT_CAL_DEFAULTS)
+    p.update(dict(cut_cfg or {}))
+    bc = dict(box_cfg or {})
+    for key, bkey in (("x_min", "check_cut_pos_x_min"),
+                      ("x_max", "check_cut_pos_x_max"), ("y", "cut_pos_y")):
+        if bc.get(bkey) is not None:
+            try:
+                p[key] = float(bc[bkey])
+            except (TypeError, ValueError):
+                raise K2MotorError("[k2_box] %s keine Zahl: %r" % (bkey, bc[bkey]))
+    validate_cut_cal_params(p)
+    return p
+
+
+def validate_cut_cal_params(p):
+    """Harte Grenzen + Zusammenhänge; K2MotorError bei Verstoß."""
+    for key, (lo, hi) in CUT_CAL_LIMITS.items():
+        v = p.get(key)
+        if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                or not math.isfinite(v) or not lo <= v <= hi:
+            raise K2MotorError("Cut-Kalibrierung: %s=%r außerhalb %g..%g"
+                               % (key, v, lo, hi))
+    if not p["x_min"] < p["x_max"]:
+        raise K2MotorError("Cut-Kalibrierung: x_min %.2f muss < x_max %.2f sein"
+                           % (p["x_min"], p["x_max"]))
+    if not p["start_x"] > p["x_min"]:
+        raise K2MotorError("Cut-Kalibrierung: start_x %.2f muss > x_min %.2f sein"
+                           % (p["start_x"], p["x_min"]))
+    if p["park_x"] < p["start_x"] + CUT_CAL_MIN_PARK_GAP:
+        raise K2MotorError("Cut-Kalibrierung: park_x %.1f muss >= start_x + %g sein"
+                           % (p["park_x"], CUT_CAL_MIN_PARK_GAP))
+    if p["exit_x"] < p["park_x"]:
+        raise K2MotorError("Cut-Kalibrierung: exit_x %.1f muss >= park_x %.1f sein"
+                           % (p["exit_x"], p["park_x"]))
+    n = len(cut_cal_positions(p, check=False))
+    if n > CUT_CAL_MAX_PROBES:
+        raise K2MotorError("Cut-Kalibrierung: %d Anstöße > Obergrenze %d (step/start_x/"
+                           "x_min prüfen)" % (n, CUT_CAL_MAX_PROBES))
+    return p
+
+
+def cut_cal_positions(p, check=True):
+    """Anstoß-Ziele start_x, start_x-step, … bis einschließlich x_min (nie tiefer)."""
+    if check:
+        validate_cut_cal_params(p)
+    out = []
+    i = 0
+    while True:
+        x = round(p["start_x"] - i * p["step"], 4)
+        if x < p["x_min"] - CUT_CAL_EPS or i > 10 * CUT_CAL_MAX_PROBES:
+            break
+        out.append(max(x, p["x_min"]))
+        i += 1
+    return out
+
+
+def _req_hex(addr, fun, data):
+    """Request wie im Stock-Log ("retries = 0, cmd = …"): addr len 00 fun data."""
+    d = list(data)
+    return " ".join("%02x" % b for b in [addr, len(d) + 3, 0x00, fun] + d)
+
+
+def describe_cut_cal(p, restore_kp):
+    """Plan-Text für DRY_RUN (nichts gesendet, nichts bewegt)."""
+    xs = cut_cal_positions(p)
+    kp = _req_hex(0x81, FUNC_SYS_PARAM, [SUB_SYS_WRITE, HOMING_PARAM_ID]
+                  + list(_float_to_bytes(p["pos_kp"])))
+    kb = _req_hex(0x81, FUNC_SYS_PARAM, [SUB_SYS_WRITE, HOMING_PARAM_ID]
+                  + list(_float_to_bytes(restore_kp)))
+    return "\n".join([
+        "Cut-Kalibrierung Plan (Trockenlauf, nichts gesendet, keine Bewegung)",
+        "1. Beschleunigung <= %g mm/s^2 (Stock SET_LIMITS / ACCEL=25000)" % p["accel"],
+        "2. Kp x ID 70 = %g: %s" % (p["pos_kp"], kp),
+        "3. Park X%.2f Y%.2f mit %.1f mm/s" % (p["park_x"], p["y"], p["park_speed"]),
+        "4. Stall-Mode x lesen: %s, setzen 3: %s" % (
+            _req_hex(0x81, FUNC_SET_MODE, [SUB_STALL_GET]),
+            _req_hex(0x81, FUNC_SET_MODE, [CUT_CAL_MODE])),
+        "5. %d Anstöße X%.2f…X%.2f (Schritt %.2f, %.1f mm/s, Endstop PB11, "
+        "Nachlauf %.2f s), je zurück auf Park; Treffer zählen ab X<=%.2f" % (
+            len(xs), xs[0], xs[-1], p["step"], p["probe_speed"], p["settle"], p["x_max"]),
+        "6. cut_pos_x = 2. Treffer + %.2f, gültig %.2f..%.2f -> configfile.set "
+        "[%s] %s (SAVE_CONFIG separat)" % (p["offset"], p["x_min"], p["x_max"],
+                                          CUT_CAL_SECTION, CUT_CAL_OPTION),
+        "7. Ausgang X%.2f Y%.2f, Stall-Mode 2: %s, Kp %g: %s, Beschleunigung zurück" % (
+            p["exit_x"], p["y"], _req_hex(0x81, FUNC_SET_MODE, [STALL_MODE_EMERGENCY]),
+            restore_kp, kb),
+    ])
 
 
 # =====================================================================
@@ -1033,6 +1234,9 @@ class K2MotorController:
         self.stall_mode = {m: None for m in STALL_READ_MOTORS}
         self.homing_active = False  # BEGIN ok, END noch nicht gelaufen
         self.last_error = None
+        # Schnittpositions-Kalibrierung (KTWO_MOTOR_CUT_CAL)
+        self.cut_cal_active = False
+        self.cut_cal_last = None  # dict des letzten Laufs (Status/Makro)
         self._table = default_param_table()
         self._by_name = {p["name"]: p for p in self._table}
 
@@ -1770,6 +1974,190 @@ class K2MotorController:
         self.last_error = "; ".join(errors) if errors else None
         return log, errors
 
+    # --- Schnittpositions-Kalibrierung (Stock MOTOR_CHECK_CUT_POS) --------
+    def _set_cut_mode(self, mode):
+        """0x11 [mode] NUR an x – intern für die Cut-Kalibrierung (Mode 3 ist
+        über KTWO_MOTOR_STALL_MODE bewusst nicht erreichbar). Echo-Prüfung
+        wie set_stall_mode (live ``f7 81 04 00 11 03 13``)."""
+        self._require_write("Stall-Mode %d (Cut-Kalibrierung)" % mode)
+        m = CUT_CAL_MOTOR
+        _tr, addr = self._transport_for(m)
+        try:
+            _st, _fn, data = self._bus_call(
+                m, FUNC_SET_MODE, [mode], TIMEOUT_STALL,
+                "Stall-Mode %s (0x%02X) 0x11 [%02x]" % (m, addr, mode))
+        except K2MotorError:
+            self.stall_mode[m] = None
+            raise
+        if bytes(data) != bytes([mode]):
+            self.stall_mode[m] = None
+            raise K2MotorError("Stall-Mode %s (0x%02X): Echo %s statt %02x"
+                               % (m, addr, bytes(data).hex() or "leer", mode))
+        self.stall_mode[m] = mode
+        return "set_stall_mode motor_%02x: send:%02x recv:%02x" % (addr, mode, mode)
+
+    def cut_calibrate(self, motion, p, save):
+        """Stock-Folge CALIBRATE_CUT_POS/MOTOR_CHECK_CUT_POS (Belege s. CUT_CAL_*).
+
+        ``motion``: Adapter (KlippyCutMotion bzw. Test-Fake) mit homed_axes(),
+        x_range(), get_position(), get_limits(), set_limits(v, a),
+        wait_moves(), move(x, y, speed), probe_x(x, speed) -> dict
+        (triggered, late, trig_x, no_movement), stall_pin_active().
+        ``save(wert)``: merkt cut_pos_x vor (Hülle: configfile.set).
+
+        Ablauf: Sperren -> Beschleunigung begrenzen -> Kp (ID 70) = pos_kp ->
+        Park (X park_x, Y y) -> 0x11 [04] lesen -> 0x11 [03] -> Stall-Pin
+        muss frei sein -> Anstöße start_x, start_x-step, … bis x_min (je
+        Endstop-überwachte Fahrt + Nachlauf-Prüfung, danach zurück auf Park);
+        Treffer zählen erst ab x <= x_max; Ergebnis = 2. Treffer + offset, muss
+        in [x_min, x_max] liegen -> Ausgang X exit_x -> save() -> Rückbau.
+        Rückbau IMMER (auch bei Fehler): Kopf auf Park (nur bei Fehler),
+        0x11 [02], Kp = Config-Wert (100), Beschleunigung zurück. Fehler ->
+        K2MotorError (Hülle: G-Code-Fehler, kein Shutdown)."""
+        self._require_write("Cut-Kalibrierung (Stall-Mode 3 + Kp)")
+        if self.homing_active:
+            raise K2MotorError("Cut-Kalibrierung gesperrt: X/Y-Homing aktiv "
+                               "(KTWO_MOTOR_HOMING PHASE=END fehlt) – nichts gesendet")
+        if self.cut_cal_active:
+            raise K2MotorError("Cut-Kalibrierung läuft bereits")
+        validate_cut_cal_params(p)
+        homed = str(motion.homed_axes()).lower()
+        if "x" not in homed or "y" not in homed:
+            raise K2MotorError("Cut-Kalibrierung gesperrt: X/Y nicht referenziert "
+                               "(homed_axes=%r) – nichts gesendet, keine Bewegung" % homed)
+        rmin, rmax = motion.x_range()
+        if p["x_min"] < rmin - CUT_CAL_EPS or p["exit_x"] > rmax + CUT_CAL_EPS:
+            raise K2MotorError("Cut-Kalibrierung: X %.2f..%.2f außerhalb [stepper_x] "
+                               "%.2f..%.2f – nichts gesendet" % (
+                                   p["x_min"], p["exit_x"], rmin, rmax))
+        xs = cut_cal_positions(p)
+        restore_kp = self._restore_kp_value()
+        log = []
+        res = {"result": None, "first_hit": None, "second_hit": None,
+               "trig_x": [], "ignored": [], "probes": 0, "orig_mode": None,
+               "saved": False, "error": None}
+        state = {"limits": None, "kp": False, "mode": False}
+        error = None
+        self.cut_cal_active = True
+        try:
+            motion.wait_moves()
+            lim = motion.get_limits()
+            state["limits"] = (float(lim[0]), float(lim[1]))
+            accel = min(float(p["accel"]), state["limits"][1])
+            motion.set_limits(None, accel)
+            log.append("Beschleunigung %g mm/s^2 (vorher %g)" % (accel, state["limits"][1]))
+            state["kp"] = True
+            v = self.write_sys_param(CUT_CAL_MOTOR, HOMING_PARAM_ID, p["pos_kp"])
+            log.append("sys param x ID %d (pos_kp) = %g (Echo ok)" % (HOMING_PARAM_ID, v))
+            motion.move(x=p["park_x"], y=p["y"], speed=p["park_speed"])
+            motion.wait_moves()
+            orig = self.get_stall_mode(CUT_CAL_MOTOR)
+            res["orig_mode"] = orig
+            log.append("get_stall_mode motor_x: %02x" % orig)
+            state["mode"] = True
+            log.append(self._set_cut_mode(CUT_CAL_MODE))
+            if motion.stall_pin_active():
+                raise K2MotorError("Stall-Pin X (PB11) schon VOR der ersten Fahrt aktiv "
+                                   "(Mode 3) – Polarität/Verdrahtung prüfen, keine Anstöße")
+            first = second = None
+            for x in xs:
+                r = motion.probe_x(x, p["probe_speed"])
+                res["probes"] += 1
+                if r.get("no_movement"):
+                    raise K2MotorError("Stall-Pin X bei X=%.2f schon vor der Bewegung "
+                                       "aktiv – Abbruch" % x)
+                hit = bool(r.get("triggered") or r.get("late"))
+                motion.move(x=p["park_x"], speed=p["park_speed"])
+                if not hit:
+                    continue
+                how = "Endstop" if r.get("triggered") else "Nachlauf"
+                if r.get("trig_x") is not None:
+                    res["trig_x"].append(round(float(r["trig_x"]), 4))
+                if x > p["x_max"] + CUT_CAL_EPS:
+                    res["ignored"].append(x)
+                    log.append("Stall bei X=%.2f (%s) über x_max %.2f – ignoriert"
+                               % (x, how, p["x_max"]))
+                    continue
+                if first is None:
+                    first = x
+                    log.append("1. Treffer X=%.2f (%s)" % (x, how))
+                else:
+                    second = x
+                    log.append("2. Treffer X=%.2f (%s)" % (x, how))
+                    break
+            res["first_hit"], res["second_hit"] = first, second
+            if second is None:
+                raise K2MotorError(
+                    "%s bis X=%.2f (%d Anstöße) – Abbruch nach max. Weg, kein Ergebnis" % (
+                        "kein Stall" if first is None else
+                        "nur ein Stall (X=%.2f)" % first, xs[-1], res["probes"]))
+            result = round(second + p["offset"], 2)
+            log.append("cut_pos: %.2f+%.2f=%.2f" % (second, p["offset"], result))
+            if not p["x_min"] - CUT_CAL_EPS <= result <= p["x_max"] + CUT_CAL_EPS:
+                raise K2MotorError("Ergebnis cut_pos_x %.2f außerhalb check_cut_pos_x "
+                                   "%.2f..%.2f – nicht gespeichert" % (
+                                       result, p["x_min"], p["x_max"]))
+            res["result"] = result
+            motion.move(x=p["exit_x"], y=p["y"], speed=p["park_speed"])
+            motion.wait_moves()
+            save(result)
+            res["saved"] = True
+            log.append("save_config: set [%s] %s = %s (SAVE_CONFIG ausstehend)" % (
+                CUT_CAL_SECTION, CUT_CAL_OPTION, CUT_CAL_FORMAT % result))
+        except K2MotorError as exc:
+            error = str(exc)
+        except Exception as exc:  # Bewegungs-/Bus-Fehler der Adapter
+            error = "%s: %s" % (type(exc).__name__, exc)
+        # --- Rückbau: IMMER ---------------------------------------------
+        rb_err, rb_log = [], []
+        if error is not None:
+            try:  # Kopf weg vom Schneidhebel
+                pos = motion.get_position()
+                if pos[0] < p["park_x"] - 0.5:
+                    motion.move(x=p["park_x"], speed=p["park_speed"])
+                    motion.wait_moves()
+                    rb_log.append("Kopf auf Park X%.1f" % p["park_x"])
+            except Exception as exc:
+                rb_err.append("Kopf auf Park: %s" % exc)
+        if state["mode"]:
+            try:
+                line = self._set_cut_mode(STALL_MODE_EMERGENCY)
+                log.append(line)
+                rb_log.append("Stall-Mode 2 ok")
+            except Exception as exc:
+                rb_err.append("Stall-Mode 2: %s" % exc)
+        if state["kp"]:
+            try:
+                v = self.write_sys_param(CUT_CAL_MOTOR, HOMING_PARAM_ID, restore_kp)
+                log.append("sys param x ID %d (pos_kp) = %g (Echo ok)" % (HOMING_PARAM_ID, v))
+                rb_log.append("Kp %g ok" % v)
+            except Exception as exc:
+                rb_err.append("Kp zurück: %s" % exc)
+        if state["limits"] is not None:
+            try:
+                motion.set_limits(state["limits"][0], state["limits"][1])
+                rb_log.append("Beschleunigung %g" % state["limits"][1])
+            except Exception as exc:
+                rb_err.append("Beschleunigung zurück: %s" % exc)
+        self.cut_cal_active = False
+        res["log"] = log
+        res["error"] = error or ("; ".join(rb_err) if rb_err else None)
+        self.cut_cal_last = dict(res)
+        for line in log:
+            logging.info("k2_motor cut_cal: %s", line)
+        if error is not None:
+            self.last_error = "Cut-Kalibrierung: %s" % error
+            raise K2MotorError("Cut-Kalibrierung fehlgeschlagen: %s | Rückbau: %s%s – "
+                               "nichts gespeichert" % (
+                                   error, "; ".join(rb_log) or "nichts nötig",
+                                   (" | Rückbau-FEHLER: " + "; ".join(rb_err)) if rb_err else ""))
+        if rb_err:
+            self.last_error = "Cut-Kalibrierung Rückbau: %s" % "; ".join(rb_err)
+            raise K2MotorError("Cut-Kalibrierung: cut_pos_x=%s vorgemerkt, aber Rückbau "
+                               "fehlerhaft: %s" % (CUT_CAL_FORMAT % res["result"],
+                                                   "; ".join(rb_err)))
+        return res
+
 
 class K2MotorError(RuntimeError):
     """Fehler der Homing-/Stall-/Param-Befehle (-> G-Code-Fehler, kein Shutdown)."""
@@ -1778,6 +2166,123 @@ class K2MotorError(RuntimeError):
 # =====================================================================
 # Klipper-Hülle [k2_motor] (ANNAHMEN zur Upstream-API, s. BERICHT.md)
 # =====================================================================
+
+class _TriggerRecorder(object):
+    """Hülle um den X-Endstop: merkt sich das Ergebnis von home_wait()
+    (> 0 = ausgelöst), sonst reine Weiterleitung (HomingMove ruft
+    get_steppers/home_start/home_wait)."""
+
+    def __init__(self, mcu_endstop):
+        self._es = mcu_endstop
+        self.trigger_time = None
+
+    def __getattr__(self, name):
+        return getattr(self._es, name)
+
+    def home_wait(self, home_end_time):
+        t = self._es.home_wait(home_end_time)
+        self.trigger_time = t
+        return t
+
+
+class KlippyCutMotion(object):
+    """Bewegungs-Adapter der Cut-Kalibrierung für Upstream-Klipper.
+
+    Stall-Erkennung: Stock latcht das Stall-Pin-Ereignis von Motor x (PB11,
+    ``motor_x_stall``) host-seitig ("motor_x 81 check_protection_code").
+    Hier: dieselbe Leitung über den vorhandenen X-Endstop (``[stepper_x]
+    endstop_pin: PB11``) – jeder Anstoß ist eine Upstream-``HomingMove``
+    mit ``probe_pos=True``/``check_triggered=False``: die MCU tastet PB11 ab
+    (trsync) und stoppt X/Y sofort beim Auslösen; danach kurzer Nachlauf
+    (``settle``) mit Pegel-Abfrage (QUERY_ENDSTOPS-Weg), falls der Stall erst
+    nach dem letzten Schritt kommt. Kein neues MCU-Objekt, keine Config-
+    Änderung. Fehler -> K2MotorError."""
+
+    def __init__(self, printer, settle=0.0, homing_module=None):
+        self.printer = printer
+        self.toolhead = printer.lookup_object("toolhead")
+        self.settle = float(settle)
+        self._homing = homing_module
+
+    def _call(self, what, fn, *a, **kw):
+        try:
+            return fn(*a, **kw)
+        except K2MotorError:
+            raise
+        except Exception as exc:
+            raise K2MotorError("%s: %s" % (what, exc))
+
+    def _homing_mod(self):
+        if self._homing is None:
+            try:
+                from . import homing as _h  # klippy/extras/homing.py
+            except ImportError:  # pragma: no cover
+                import homing as _h
+            self._homing = _h
+        return self._homing
+
+    def _rail_x(self):
+        kin = self.toolhead.get_kinematics()
+        rails = getattr(kin, "rails", None)
+        if not rails:
+            raise K2MotorError("Kinematik ohne rails – [stepper_x] nicht gefunden")
+        return rails[0]
+
+    def _x_endstop(self):
+        es = self._rail_x().get_endstops()
+        if not es:
+            raise K2MotorError("[stepper_x] ohne Endstop (PB11) – keine Stall-Erkennung")
+        return es[0]
+
+    def homed_axes(self):
+        st = self.toolhead.get_status(self.printer.get_reactor().monotonic())
+        return str(st.get("homed_axes", ""))
+
+    def x_range(self):
+        lo, hi = self._rail_x().get_range()
+        return float(lo), float(hi)
+
+    def get_position(self):
+        return list(self.toolhead.get_position())
+
+    def get_limits(self):
+        v, a = self.toolhead.get_max_velocity()
+        return float(v), float(a)
+
+    def set_limits(self, velocity, accel):
+        self._call("Beschleunigung setzen", self.toolhead.set_max_velocities,
+                   velocity, accel, None, None)
+
+    def wait_moves(self):
+        self._call("M400", self.toolhead.wait_moves)
+
+    def move(self, x=None, y=None, speed=50.0):
+        self._call("Fahrt X%s Y%s" % (x, y), self.toolhead.manual_move,
+                   [x, y, None], float(speed))
+
+    def stall_pin_active(self):
+        mcu_es, _name = self._x_endstop()
+        pt = self.toolhead.get_last_move_time()
+        return bool(self._call("Stall-Pin abfragen", mcu_es.query_endstop, pt))
+
+    def probe_x(self, x, speed):
+        h = self._homing_mod()
+        mcu_es, name = self._x_endstop()
+        rec = _TriggerRecorder(mcu_es)
+        hmove = h.HomingMove(self.printer, [(rec, name)], self.toolhead)
+        pos = list(self.toolhead.get_position())
+        pos[0] = float(x)
+        trig = self._call("Anstoß X%.2f" % x, hmove.homing_move, pos, float(speed),
+                          probe_pos=True, triggered=True, check_triggered=False)
+        triggered = bool(rec.trigger_time is not None and rec.trigger_time > 0.)
+        no_move = bool(triggered and hmove.check_no_movement() is not None)
+        late = False
+        if not triggered and self.settle > 0.:
+            self._call("Nachlauf", self.toolhead.dwell, self.settle)
+            late = self.stall_pin_active()
+        return {"triggered": triggered, "late": late, "no_movement": no_move,
+                "trig_x": float(trig[0]) if triggered else None}
+
 
 class PrinterK2Motor:
     """Klipper-Objekt [k2_motor] – verdrahtet Controller mit Klipper."""
@@ -1844,6 +2349,10 @@ class PrinterK2Motor:
                                     desc="Schutzabfrage 0C [0b] an alle Motoren")
         self.gcode.register_command("KTWO_MOTOR_HOMING", self.cmd_homing,
                                     desc="Stock-Folge vor/nach X/Y-Homing (PHASE=BEGIN|END)")
+        # Schnittpositions-Kalibrierung (Stock MOTOR_CHECK_CUT_POS + Kp-Rahmen
+        # des Makros CALIBRATE_CUT_POS; Makro dazu: config-pi/cutcal.cfg)
+        self.gcode.register_command("KTWO_MOTOR_CUT_CAL", self.cmd_cut_cal,
+                                    desc="Schnittposition kalibrieren (DRY_RUN=1 nur Plan)")
         # Auto-Rückbau: bricht ein G-Code (z.B. G28 Y "No trigger") nach
         # PHASE=BEGIN ab, setzt das Modul X/Y zurück (Stall-Mode 2, Kp).
         self.printer.register_event_handler("gcode:command_error",
@@ -1939,6 +2448,7 @@ class PrinterK2Motor:
         if old is not None:  # Homing-/Stall-Zustand nicht verlieren
             self.controller.stall_mode.update(old.stall_mode)
             self.controller.homing_active = old.homing_active
+            self.controller.cut_cal_last = old.cut_cal_last
         res = self.controller.run_init()
         for _lvl, msg in res.get("log", []):
             try:
@@ -2121,8 +2631,73 @@ class PrinterK2Motor:
         except Exception:
             pass
 
+    # --- Schnittpositions-Kalibrierung -----------------------------------
+    def _cut_cal_params(self):
+        """[k2_motor]-Optionen + Prüfbereich/Y aus [k2_box] (falls geladen)."""
+        box = self.printer.lookup_object(CUT_CAL_SECTION, None)
+        box_cfg = getattr(box, "cfg", None) if box is not None else None
+        return build_cut_cal_params(self.cfg.get("cut_cal"),
+                                    box_cfg if isinstance(box_cfg, dict) else None)
+
+    def _freigabe(self):
+        """(ok, text): Bewegungs-Freigabe aus Makro _PI_FREIGABE (homing.cfg).
+        Fehlt das Makro, gilt die Bewegung als NICHT freigegeben."""
+        obj = self.printer.lookup_object("gcode_macro _PI_FREIGABE", None)
+        if obj is None:
+            return False, "Makro _PI_FREIGABE fehlt (homing.cfg)"
+        try:
+            vs = obj.get_status(self.reactor.monotonic())
+        except Exception:
+            vs = getattr(obj, "variables", {}) or {}
+        if vs.get("allow_move") is not True:
+            return False, "_PI_FREIGABE allow_move=%s" % (vs.get("allow_move"),)
+        return True, "allow_move=True"
+
+    def _make_cut_motion(self, p):
+        return KlippyCutMotion(self.printer, settle=p["settle"])
+
+    def cmd_cut_cal(self, gcmd):
+        """KTWO_MOTOR_CUT_CAL [DRY_RUN=1] – Schnittposition kalibrieren."""
+        try:
+            p = self._cut_cal_params()
+        except K2MotorError as exc:
+            raise gcmd.error("[k2_motor] %s" % exc)
+        restore_kp = float(self.cfg["params"].get("x", {}).get(
+            "controller_pos_loop_pid_param_kp", HOMING_POS_KP_RESTORE_DEFAULT))
+        if gcmd.get_int("DRY_RUN", 0):
+            gcmd.respond_info(describe_cut_cal(p, restore_kp))
+            return
+        if not self.cfg.get("allow_write"):
+            raise gcmd.error("[k2_motor] Cut-Kalibrierung gesperrt: allow_write=False – "
+                             "nichts gesendet, keine Bewegung")
+        ok, why = self._freigabe()
+        if not ok:
+            raise gcmd.error("[k2_motor] Cut-Kalibrierung gesperrt: %s – nichts "
+                             "gesendet, keine Bewegung" % why)
+        ctl = self._ctl_or_error(gcmd)
+        configfile = self.printer.lookup_object("configfile")
+
+        def _save(value):
+            configfile.set(CUT_CAL_SECTION, CUT_CAL_OPTION, CUT_CAL_FORMAT % value)
+
+        try:
+            res = ctl.cut_calibrate(self._make_cut_motion(p), p, _save)
+        except K2MotorError as exc:
+            last = ctl.cut_cal_last or {}
+            for line in last.get("log", []):
+                gcmd.respond_info("[k2_motor] %s" % line)
+            raise gcmd.error("[k2_motor] %s" % exc)
+        for line in res["log"]:
+            gcmd.respond_info("[k2_motor] %s" % line)
+        gcmd.respond_info(
+            "[k2_motor] Cut-Kalibrierung ok: Treffer X=%.2f/X=%.2f (%d Anstöße), "
+            "cut_pos_x = %s -> SAVE_CONFIG ausführen (übernimmt [%s] %s)" % (
+                res["first_hit"], res["second_hit"], res["probes"],
+                CUT_CAL_FORMAT % res["result"], CUT_CAL_SECTION, CUT_CAL_OPTION))
+
     def get_status(self, eventtime=None):
         ctl = self.controller
+        last = (ctl.cut_cal_last if ctl is not None else None) or {}
         return {
             "allow_write": bool(self.cfg.get("allow_write")),
             "homing_pos_kp": float(self.cfg.get("homing_pos_kp", HOMING_POS_KP_DEFAULT)),
@@ -2130,6 +2705,15 @@ class PrinterK2Motor:
             "stall_mode": dict(ctl.stall_mode) if ctl is not None
             else {m: None for m in STALL_READ_MOTORS},
             "last_error": ctl.last_error if ctl is not None else None,
+            "cut_cal": {
+                "active": bool(ctl.cut_cal_active) if ctl is not None else False,
+                "result": last.get("result"),
+                "first_hit": last.get("first_hit"),
+                "second_hit": last.get("second_hit"),
+                "probes": last.get("probes", 0),
+                "saved": bool(last.get("saved", False)),
+                "error": last.get("error"),
+            },
         }
 
 

@@ -99,5 +99,6 @@ mit echtem Port, `KTWO_BOX_STATUS` liefert Zustand/Hub/Temp.
   bzw. auf dem Weg zum Schacht Kollisionsgefahr wie im Stock.
 - **Reactor:** lange Box-Antworten laufen über `ReactorBusProxy` in einem
   Hilfs-Thread; am Gerät prüfen, dass Heizung/MCU dabei stabil bleiben.
-- **Mehrere Boxen**, WASTE-Prüfung, Auto-Nachladen (Stock
-  `BOX_CHECK_MATERIAL_REFILL`), RFID-basierte Spülmengen: nicht umgesetzt.
+- **Mehrere Boxen**, WASTE-Prüfung, RFID-basierte Spülmengen: nicht umgesetzt.
+- **Auto-Nachladen** (Stock `BOX_CHECK_MATERIAL_REFILL`): **umgesetzt 16.10.2026** als
+  `KTWO_BOX_RUNOUT` (Default aus, `runout_refill`), siehe `NOTIZ-runout.md`.

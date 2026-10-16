@@ -26,7 +26,9 @@ Filamentwechsel (Ergänzung 16.10.2026, Belege README-k2_box.md §8):
 16. Fehler im Druck -> Pause, Quittung, RESUME_FIX.
 17. Fehler ohne Druck -> G-Code-Fehler; Box 2/Hub belegt/kein Bus.
 18. ReactorBusProxy.  19. Makros T0-T15/M8200/RESUME (Jinja2).
-20. Python-3.9-Syntax.
+20.-24. Auto-Nachladen bei Runout (A7): Slot-Wahl, Ablauf, Pausenpfade,
+    Befehle AUTO_REFILL/SAME_MATERIAL, Config (printer.cfg/k2-module.cfg).
+25. Python-3.9-Syntax.
 
 Fakes:
 - FakeBoxBus: simuliert Box-Zustände (IDLE/PRELOAD/PRINT/ERROR), Hub-Maske,
@@ -126,6 +128,7 @@ class FakeBoxBus:
         self.need_extruder_for_mode7 = False
         self.extruder_mm = 0.0
         self.preload_polls = 0  # so viele 0x0a-Polls noch PRELOAD melden
+        self.print_frame_status = 0x00  # 0x0a im PRINT: 0x50 = Runout (A7)
 
     # -- Bus-API (BoxAction-kompatibel) ---------------------------------
     def transact_full(self, addr, fun, data=(), timeout=None, retries=0,
@@ -181,7 +184,8 @@ class FakeBoxBus:
                 return A, 0x00, 0x0A, data
             data = bytes([t, self.rh & 0xFF, 0x00, self.state,
                           self.hub_mask & 0xFF, 0x00])
-            st = self.stored_error if self.state == 4 else 0x00
+            st = self.stored_error if self.state == 4 else (
+                self.print_frame_status if self.state == 2 else 0x00)
             return A, st, 0x0A, data
         if fun == 0x02:  # RFID [Maske] -> ASCII
             mask = payload[0] if payload else 0x0F
@@ -383,6 +387,16 @@ class FakeGcode:
             if not line:
                 continue
             self.scripts.append(line)
+            name = line.split()[0]
+            if name in self.commands:  # z. B. KTWO_BOX_* aus KTWO_BOX_RUNOUT
+                params = dict(t.split("=", 1) for t in line.split()[1:]
+                              if "=" in t)
+                g = FakeGcmd(params)
+                try:
+                    self.commands[name](g)
+                finally:
+                    self.infos.extend(g.infos)
+                continue
             if self.printer is not None:
                 self.printer.sim(line)
 
@@ -510,6 +524,9 @@ class FakePrinter:
         elif cmd == "PAUSE":
             self.paused = True
             self.print_state = "paused"
+        elif cmd == "RESUME":
+            self.paused = False
+            self.print_state = "printing"
         self._refresh()
 
     def set_printing(self, on=True):
@@ -1474,6 +1491,317 @@ def test_makros_cfg():
 
 
 # =====================================================================
+# Auto-Nachladen bei Runout (A7)
+# =====================================================================
+
+# Synthetische 40-Zeichen-vender (Feldlayout box.RFID_VENDOR_FIELDS, KEINE
+# echten Seriennummern): mat 101001 (Hyper PLA) + Farbe weiß/schwarz.
+V_WEISS = "10126000000" + "101001" + "0FFFFFF" + "0330000000000000"
+V_SCHWARZ = V_WEISS.replace("0FFFFFF", "0000000")
+V_PETG = V_WEISS.replace("101001", "102001")
+
+
+def test_runout_slotwahl():
+    sel = K.select_runout_slot
+    rf = {"A": V_WEISS, "B": V_SCHWARZ, "C": V_WEISS, "D": V_WEISS}
+    assert K.rfid_material(V_WEISS) == ("101001", "0FFFFFF")
+    for bad in ("unknown", "busy", "", None, V_WEISS[:-1],
+                "10126000000" + "000000" + "0FFFFFF" + "0330000000000000"):
+        assert K.rfid_material(bad) is None, bad
+    # gleiches Material + Farbe, Reihenfolge ab dem Slot NACH dem leeren
+    assert sel("A", 0x0E, rf)[0] == "C"          # B schwarz übersprungen
+    assert sel("C", 0x0B, rf)[0] == "D"          # zyklisch C -> D
+    assert sel("D", 0x07, rf)[0] == "A"          # D -> A
+    assert sel("A", 0x0A, rf)[0] == "D"          # C leer -> D (weiß)
+    assert sel("A", 0x03, rf)[0] is None         # C/D ohne Filament am Einlauf
+    assert sel("A", 0x02, rf)[0] is None         # nur schwarz belegt
+    assert sel("A", 0x02, rf, require_color=False)[0] == "B"
+    t, why = sel("A", 0x0E, {"A": V_WEISS, "B": V_PETG, "C": "unknown",
+                             "D": V_PETG}, require_color=False)
+    assert t is None and "no tray" in why, why  # anderes Material / kein Tag
+    t, why = sel("A", 0x0E, {"A": "unknown", "C": V_WEISS})
+    assert t is None and "unbekannt" in why, why
+    assert sel("A", 0x0F, rf)[0] != "A"           # nie der leere Slot
+    # Gleich-Material-Gruppen (Stock same_material, manuell)
+    g = K.parse_same_material("T1A,T1C/T1B,T1D")
+    assert g == [["A", "C"], ["B", "D"]], g
+    assert sel("A", 0x0F, {}, g)[0] == "C" and sel("D", 0x0F, {}, g)[0] == "B"
+    assert sel("A", 0x0B, {}, g)[0] is None       # C leer
+    assert sel("A", 0x0F, {}, [["B", "D"]])[0] is None
+    assert K.parse_same_material("T1D,T1A,T1B") == [["D", "A", "B"]]
+    assert sel("A", 0x0F, {}, [["D", "A", "B"]])[0] == "B"  # Listenfolge
+    for bad in ("T1A", "T1A,T2B", "T1A,T1B/T1B,T1C", "", "T1A,T1E"):
+        try:
+            K.parse_same_material(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("LIST %r hätte abgelehnt werden müssen" % bad)
+    # Optionen: Default AUS, Grenzen
+    c = K.parse_options(test_options())
+    assert c["runout_refill"] is False and c["runout_require_color"] is True \
+        and c["runout_resume"] is True and c["runout_tail_length"] == 30.0 \
+        and c["runout_tail_velocity"] == 600.0, c
+    for bad in ({"runout_tail_length": "-1"}, {"runout_tail_length": "150"},
+                {"runout_tail_velocity": "0"}, {"runout_refill": "vielleicht"}):
+        try:
+            K.parse_options(test_options(**bad))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("Option %r hätte abgelehnt werden müssen" % bad)
+    return "RFID mat+Farbe zyklisch ab Nachbar, Einlauf Pflicht, Gruppen-Liste, Optionen Default AUS"
+
+
+def build_runout(**opt_over):
+    """Druck läuft mit T1A, Spule A leer: Hub/Kopf leer, Box PRINT + 0x50,
+    Etikett A beim Laden gemerkt, B schwarz, C weiß (Ersatz), D weiß leer."""
+    opts = dict(allow_write="True", runout_refill="True")
+    opts.update(opt_over)
+    bus, printer, mod = build_hull(**opts)
+    for letter, tag in zip("ABCD", (V_WEISS, V_SCHWARZ, V_WEISS, V_WEISS)):
+        bus.slots[letter]["rfid"] = tag
+    ctl = mod._ensure_controller()
+    ctl.get_rfid("A")                      # wie nach KTWO_BOX_EXTRUDE T1A
+    ctl.loaded_slot = "A"
+    bus.slots["A"]["filament"] = False     # Spule leer -> RFID "unknown"
+    bus.slots["D"]["filament"] = False
+    bus.state, bus.print_frame_status = 2, 0x50
+    bus.hub_mask, bus.head = 0x00, False
+    bus.head_at_mm = 100.0
+    bus.need_extruder_for_mode7 = True
+    printer.objects["gcode_macro _PI_PARAM"] = _Obj({"hotend_temp": 235.0})
+    printer.set_printing(True)
+    printer.gcode.run_script_from_command("PAUSE")  # pause_on_runout: True
+    bus.calls[:] = []
+    bus.trace = []
+    return bus, printer, mod
+
+
+def _mech(bus):
+    return [c for c in bus.calls if c[1] in (0x04, 0x0D, 0x0F, 0x10, 0x11)]
+
+
+def test_runout_ablauf():
+    bus, printer, mod = build_runout()
+    n0 = len(printer.gcode.scripts)
+    g = FakeGcmd({})
+    mod.cmd_runout(g)
+    t = bus.trace
+    i0 = _idx(t, _b(0x0A, ()))                              # Zustand PRINT/0x50
+    i1 = _idx(t, _b(0x08, (0x01,)), i0)                     # Hub leer
+    i2 = _idx(t, _b(0x08, (0x00,)), i1)                     # Einlauf
+    i3 = _idx(t, _b(0x02, (0x0F,)), i2)                     # RFID alle
+    i4 = _idx(t, _g("SET_FILAMENT_SENSOR SENSOR=filament_sensor ENABLE=0"), i3)
+    i5 = _idx(t, _g("G0 X133 F12000"), i4)                  # Schacht
+    i6 = _idx(t, _g("M109 S235"), i5)                       # Drucktemperatur
+    i7 = _idx(t, _g("G1 E30 F600"), i6)                     # Stock E30 F600
+    i8 = _idx(t, _b(0x10, (0x04, 0x00, 0x00)), i7)          # Einzug Slot C
+    i9 = _idx(t, _b(0x10, (0x04, 0x06, 0x00)), i8)
+    i10 = _idx(t, _g("G1 E30 F360"), i9)                    # Stage 7
+    i11 = _idx(t, _b(0x10, (0x04, 0x07, 0x03)), i10)
+    i12 = _idx(t, _b(0x04, (0x04, 0x00)), i11)              # PRINT Slot C
+    i13 = _idx(t, _g("G1 E18 F360"), i12)                   # Spülen 90 + 70
+    i14 = _idx(t, _g("G1 E56 F360"), i13)
+    i15 = _idx(t, _g("G0 Y345 F12000"), i14)                # Schacht raus
+    _idx(t, _g("SET_FILAMENT_SENSOR SENSOR=filament_sensor ENABLE=1"), i15)
+    sc = printer.gcode.scripts[n0:]
+    assert sc[-1] == "RESUME", sc[-5:]
+    assert "KTWO_BOX_PRE_OPT TNN=T1C Z_HOP=0" in sc, sc[:3]
+    assert not [l for l in sc if l.startswith("G1 Z")], "kein Z-Hop (PAUSE hob)"
+    assert "G0 X-7.8 Y200 F30000" not in sc, "kein Schnitt (Kopf leer)"
+    assert not [c for c in bus.calls if c[1] == 0x11], "kein Rückzug (Hub leer)"
+    st = mod.get_status()
+    assert st["loaded_tnn"] == "T1C" and st["chain_error"] == "" \
+        and not st["chain_active"] and st["auto_refill"] == 1, st
+    assert "T1A leer -> T1C nachgeladen" in st["runout_last"], st
+    assert not printer.paused and printer.print_state == "printing"
+    assert not [m for m in printer.gcode.raw if m.startswith("!!")], printer.gcode.raw
+    # Rückfahrt zum Parkpunkt der PAUSE vor dem RESUME (start_pos)
+    _idx(t, _g("G0 X200 Y200 F12000"), i15)
+    # Box im ERROR 0x51 (Folge des Runouts) -> erst 0x04 [00 01], dann Kette
+    bus, printer, mod = build_runout()
+    bus.state, bus.stored_error = 4, 0x51
+    mod.cmd_runout(FakeGcmd({}))
+    k = [i for i, c in enumerate(bus.calls) if c[1] == 0x04]
+    assert tuple(bus.calls[k[0]][2]) == (0x00, 0x01), bus.calls[k[0]]
+    assert mod.get_status()["loaded_tnn"] == "T1C" and not printer.paused
+    # runout_resume False: nachgeladen, Druck bleibt pausiert
+    bus, printer, mod = build_runout(runout_resume="False")
+    mod.cmd_runout(FakeGcmd({}))
+    assert printer.paused and "RESUME" not in printer.gcode.scripts
+    assert mod.get_status()["loaded_tnn"] == "T1C"
+    return "T1A leer: Analyse 0a/08/08/02 -> Schacht, M109 235, E30 F600 -> Einzug C, E30 F360, mode7, PRINT -> Spülen -> Park -> RESUME; ERROR 0x51 quittiert"
+
+
+def _assert_runout_pause(bus, printer, mod, text, n_scripts=None, bus_ok=True):
+    st = mod.get_status()
+    assert text in st["runout_last"], (text, st["runout_last"])
+    assert printer.paused, "Druck muss pausiert bleiben"
+    sc = printer.gcode.scripts[n_scripts or 0:]
+    assert not [l for l in sc if l.split()[0] in ("G0", "G1", "M109", "RESUME")
+                or l.startswith("KTWO_")], sc
+    assert _mech(bus) == [], _mech(bus)
+    if not bus_ok:
+        assert bus.calls == [], bus.calls
+    assert any(m.startswith("!!") and "PAUSIERT" in m for m in printer.gcode.raw)
+    assert st["chain_error"] == "", "Vorprüfung sperrt RESUME nicht"
+
+
+def test_runout_pausenpfade():
+    # 1) Auslieferung: Auto-Nachladen aus -> nur Pause, kein Bus
+    bus, printer, mod = build_runout(runout_refill="False")
+    n = len(printer.gcode.scripts)
+    mod.cmd_runout(FakeGcmd({}))
+    _assert_runout_pause(bus, printer, mod, "Auto-Nachladen aus", n, bus_ok=False)
+    # 2) Freigabe fehlt -> Pause, kein Bus
+    bus, printer, mod = build_runout(allow_write="False")
+    n = len(printer.gcode.scripts)
+    mod.cmd_runout(FakeGcmd({}))
+    _assert_runout_pause(bus, printer, mod, "nicht freigegeben", n, bus_ok=False)
+    # 3) pause_on_runout False (Druck läuft noch): k2_box pausiert selbst
+    bus, printer, mod = build_runout(allow_move="False")
+    printer.paused, printer.print_state = False, "printing"
+    printer._refresh()
+    n = len(printer.gcode.scripts)
+    mod.cmd_runout(FakeGcmd({}))
+    assert printer.gcode.scripts[n:] == ["PAUSE"], printer.gcode.scripts[n:]
+    _assert_runout_pause(bus, printer, mod, "nicht freigegeben", n + 1)
+    # 4) Lesende Fälle: je eine Störung -> Pause mit Klartext
+    cases = (
+        ("Kopf", lambda b, m: setattr(b, "head", True), "Fehlauslösung"),
+        ("IDLE", lambda b, m: setattr(b, "state", 0), "CFS druckt nicht"),
+        ("Fehler", lambda b, m: (setattr(b, "state", 4),
+                                 setattr(b, "stored_error", 0x0C)),
+         "ERROR (0x0c"),
+        ("Slot", lambda b, m: setattr(m.controller, "loaded_slot", None),
+         "Slot unbekannt"),
+        ("Hub", lambda b, m: setattr(b, "hub_mask", 0x01), "Hub meldet noch"),
+        ("Einlauf", lambda b, m: b.slots["A"].update(filament=True),
+         "Einlauf von Slot A"),
+        ("kein Ersatz", lambda b, m: b.slots["C"].update(rfid=V_SCHWARZ),
+         "no tray"),
+        ("kein Etikett", lambda b, m: m.controller.tag_cache.clear(),
+         "unbekannt (kein lesbares RFID"),
+    )
+    for name, setup, text in cases:
+        bus, printer, mod = build_runout()
+        setup(bus, mod)
+        bus.calls[:] = []
+        n = len(printer.gcode.scripts)
+        mod.cmd_runout(FakeGcmd({}))
+        try:
+            _assert_runout_pause(bus, printer, mod, text, n)
+        except AssertionError as exc:
+            raise AssertionError("%s: %s" % (name, exc))
+    # 5) Farbe egal -> B (schwarz) wird genommen (DRY_RUN: nichts bewegt)
+    bus, printer, mod = build_runout(runout_require_color="False")
+    bus.slots["C"]["rfid"] = V_SCHWARZ
+    n = len(printer.gcode.scripts)
+    g = FakeGcmd({"DRY_RUN": "1"})
+    mod.cmd_runout(g)
+    assert any("Ersatz T1B" in m and "DRY_RUN" in m for m in g.infos), g.infos
+    assert printer.gcode.scripts[n:] == [] and _mech(bus) == []
+    # 6) Kein RS485-Bus -> klare Meldung, Pause
+    bus, printer, mod = build_runout()
+    mod.controller, mod._bus = None, None
+    del printer.objects["k2_485"]
+    n = len(printer.gcode.scripts)
+    mod.cmd_runout(FakeGcmd({}))
+    _assert_runout_pause(bus, printer, mod, "k2_485", n, bus_ok=False)
+    # 7) Fehler IN der Kette (Ersatz A läuft auf 0x0c) -> Pause, RESUME gesperrt
+    bus, printer, mod = build_runout()
+    ctl = mod.controller
+    bus.slots["A"]["filament"] = True
+    ctl.get_rfid("B")
+    bus.slots["B"]["rfid"] = V_WEISS
+    ctl.loaded_slot = "B"
+    ctl.tag_cache["B"] = V_WEISS
+    bus.slots["B"]["filament"] = False
+    bus.slots["C"]["filament"] = False
+    bus.fail_after_mm = 50.0
+    mod.cmd_runout(FakeGcmd({}))
+    st = mod.get_status()
+    assert "0x0c" in st["chain_error"] and printer.paused, st
+    assert "fehlgeschlagen" in st["runout_last"] and "T1A" in st["runout_last"]
+    assert "RESUME" not in printer.gcode.scripts and printer.sensor.enabled
+    # 8) Ohne Druck (Handaufruf) -> G-Code-Fehler statt Pause
+    bus, printer, mod = build_runout(runout_refill="False")
+    printer.paused, printer.print_state = False, "standby"
+    printer._refresh()
+    try:
+        mod.cmd_runout(FakeGcmd({}))
+    except ValueError as exc:
+        assert "Auto-Nachladen aus" in str(exc), exc
+    else:
+        raise AssertionError("ohne Druck hätte ein G-Code-Fehler kommen müssen")
+    return "aus/ohne Freigabe/Kopf/IDLE/0x0c/Slot/Hub/Einlauf/kein Ersatz/kein Etikett/kein Bus -> Pause ohne Bewegung; Kettenfehler -> Pause+RESUME gesperrt; ohne Druck -> Fehler"
+
+
+def test_runout_befehle():
+    bus, printer, mod = build_runout(runout_refill="False")
+    for name in ("KTWO_BOX_RUNOUT", "KTWO_BOX_AUTO_REFILL",
+                 "KTWO_BOX_SAME_MATERIAL"):
+        assert name in printer.gcode.commands and upstream_gcode_name_ok(name)
+    printer.gcode.run_script_from_command("KTWO_BOX_AUTO_REFILL ENABLE=1")
+    assert mod.get_status()["auto_refill"] == 1
+    printer.gcode.run_script_from_command("KTWO_BOX_SAME_MATERIAL LIST=T1A,T1D")
+    assert mod.get_status()["same_material"] == [["T1A", "T1D"]]
+    try:
+        printer.gcode.run_script_from_command("KTWO_BOX_SAME_MATERIAL LIST=T1A,T2A")
+    except ValueError as exc:
+        assert "Box 2" in str(exc), exc
+    else:
+        raise AssertionError("T2A hätte abgelehnt werden müssen")
+    # Gruppe A+D: D ohne Filament -> kein Ersatz, obwohl C per RFID passt
+    g = FakeGcmd({"DRY_RUN": "1"})
+    mod.cmd_runout(g)
+    assert any("Gruppe A+D" in m for m in g.infos), g.infos
+    bus.slots["D"]["filament"] = True
+    bus.slots["D"]["rfid"] = "unknown"   # Gruppe gilt auch ohne Etikett
+    g = FakeGcmd({"DRY_RUN": "1"})
+    mod.cmd_runout(g)
+    assert any("Ersatz T1D" in m for m in g.infos), g.infos
+    printer.gcode.run_script_from_command("KTWO_BOX_SAME_MATERIAL CLEAR=1")
+    printer.gcode.run_script_from_command("KTWO_BOX_AUTO_REFILL ENABLE=0")
+    st = mod.get_status()
+    assert st["same_material"] == [] and st["auto_refill"] == 0, st
+    # print_slot aus dem 0x0a-Poll im PRINT (Hub-Maske) als Fallback
+    bus2, printer2, mod2 = build_hull()
+    ctl = mod2._ensure_controller()
+    bus2.state, bus2.hub_mask = 2, 0x02
+    ctl.poll_status()
+    assert ctl.print_slot == "B", ctl.print_slot
+    return "AUTO_REFILL/SAME_MATERIAL setzen Status, Gruppen ersetzen RFID-Regel, print_slot aus 0x0a"
+
+
+def test_runout_config():
+    """printer.cfg/k2-module.cfg (Auslieferung): runout_gcode = KTWO_BOX_RUNOUT,
+    pause_on_runout True (Upstream pausiert VOR runout_gcode), Auto-Nachladen
+    AUS, kein cut_pos_x in [k2_box] (SAVE_CONFIG-Konflikt, A6)."""
+    import configparser
+    base = os.path.join(_HERE, "config-pi")
+
+    def section(fn, name):
+        cp = configparser.RawConfigParser(strict=False,
+                                          inline_comment_prefixes=("#",))
+        txt = open(os.path.join(base, fn), encoding="utf-8").read()
+        txt = txt.split("#*# <---------------------- SAVE_CONFIG")[0]
+        cp.read_string(txt)
+        return dict(cp.items(name))
+
+    fs = section("printer.cfg", "filament_switch_sensor filament_sensor")
+    assert fs["pause_on_runout"].strip() == "True", fs
+    assert fs["runout_gcode"].strip() == "KTWO_BOX_RUNOUT", fs
+    kb = section("k2-module.cfg", "k2_box")
+    assert "cut_pos_x" not in kb, "cut_pos_x in [k2_box] -> SAVE_CONFIG-Konflikt"
+    c = K.parse_options(kb)
+    assert c["cut_pos_x"] == -7.8 and c["runout_refill"] is False \
+        and c["allow_write"] is False and c["allow_move"] is False, c
+    return "pause_on_runout True + runout_gcode KTWO_BOX_RUNOUT, runout_refill False, cut_pos_x nur Default -7.80"
+
+
+# =====================================================================
 # Runner
 # =====================================================================
 
@@ -1499,6 +1827,11 @@ TESTS = [
     ("Wechsel-Fehler ohne Druck -> G-Code-Fehler", test_wechsel_fehler_ohne_druck),
     ("ReactorBusProxy (kein Reactor-Blockieren)", test_reactor_bus_proxy),
     ("Makros T0-T15/M8200/RESUME (macros.cfg)", test_makros_cfg),
+    ("Runout: Slot-Wahl-Regel + Optionen", test_runout_slotwahl),
+    ("Runout: Nachladen T1A -> T1C + RESUME", test_runout_ablauf),
+    ("Runout: Pausenpfade + Sperren", test_runout_pausenpfade),
+    ("Runout: AUTO_REFILL/SAME_MATERIAL", test_runout_befehle),
+    ("Runout: printer.cfg/k2-module.cfg", test_runout_config),
     ("Python-3.9-Syntax", test_python39),
 ]
 

@@ -441,10 +441,51 @@ allow_write und Lauf ohne Port brechen ohne Schritt-Befehle ab (EXIT 255,
 klare Meldung); mit Test-Fake-Bus läuft `G28 X Y` komplett (10 RS485-Frames in
 Stock-Reihenfolge, FORCE_MOVE, EXIT 0).
 
+## 10. Schnittpositions-Kalibrierung (16.10.2026 Nacht)
+
+Ersatz für Stock `CALIBRATE_CUT_POS`/`MOTOR_CHECK_CUT_POS`. Ausführlich
+(Belege, Zeitbild, Annahmen): `config-pi/NOTIZ-cutcal.md`. Makro:
+`config-pi/cutcal.cfg` (per `[include cutcal.cfg]` einbinden).
+
+**Live-Folge** (Display-Kalibrierung 16.10.2026 22:03–22:04,
+`arbeitsdateien-lokal/cutpos-live-20261016-1601.log` Z. 945/957/981/1476/1489):
+`81 09 00 06 01 46 00 00 96 43` (Kp 300) → `81 04 00 11 04` (lesen → 2) →
+`81 04 00 11 03` (Mode 3) → ~60 s Suchfahrt ohne Bus-Frame, Treffer nur über
+den Stall-Pin PB11 („motor_x 81 check_protection_code“, 2× im Abstand 1,84 s) →
+„x:-8.2 cut_pos_offset:0.4“ → `save_config: set [box] cut_pos_x = -7.80` →
+`81 04 00 11 02` → `81 09 00 06 01 46 00 00 c8 42` (Kp 100). Zeitbild: 0,1-mm-
+Anstöße ab `pre_cut_cal_pos_x` −5,0, Ergebnis = 2. Treffer + 0,4.
+
+| G-Code | Wirkung |
+|---|---|
+| `KTWO_MOTOR_CUT_CAL DRY_RUN=1` | Plan (Parameter, Frames, Anstöße) – nichts gesendet, keine Bewegung |
+| `KTWO_MOTOR_CUT_CAL` | komplette Folge (Beschleunigung ≤ 25000, Kp 300, Park X50/Y200, Mode 3, Anstöße am X-Endstop PB11 per `HomingMove` + Nachlauf-Pegelabfrage, Ergebnis-Prüfung, Ausgang X200, `configfile.set('k2_box','cut_pos_x')`, Mode 2, Kp 100); Rückbau IMMER |
+| `CALIBRATE_CUT_POS [SAVE=1]` (cutcal.cfg) | Sperren (allow_move, allow_write, Homing, Filament), ggf. `G28 X Y`, `KTWO_MOTOR_CUT_CAL`, Meldung, optional `SAVE_CONFIG` |
+
+**Sicherheit:** nur mit `allow_write: True` UND `_PI_FREIGABE allow_move`
+(prüft auch das Modul selbst); harte Grenzen X ≥ `check_cut_pos_x_min` (−9,5)
+und ≥ −10/`position_min`, ≤ 100 Anstöße, Anstoß ≤ 200 mm/s, Beschleunigung ≤
+25000/`max_accel`; ohne zwei Stalls bis `x_min` Abbruch; Ergebnis muss in
+`check_cut_pos_x_min/max` liegen; Fehler → G-Code-Fehler mit Rückbau (Kopf weg
+vom Hebel, Mode 2, Kp 100, Beschleunigung), nie Shutdown. Status:
+`printer.k2_motor.cut_cal.{active, result, first_hit, second_hit, probes,
+saved, error}`. Neue optionale Optionen `cut_cal_*` (Defaults = Stock), s. NOTIZ §2.
+
+**Achtung SAVE_CONFIG:** solange `k2-module.cfg` `[k2_box] cut_pos_x:` enthält,
+verweigert Upstream das Speichern („conflicts with included value“) –
+Zeile entfernen (NOTIZ-cutcal.md §5).
+
+**Tests:** `test_k2_motor.py` 23/23 (neu 6: Frames = Live inkl. Echo-CRCs und
+Ablauf Bus↔Bewegung, 9 Fehlerfälle mit Rückbau, harte Grenzen, Sperren,
+Hülle, Klipper-Adapter). **Batch:** `arbeitsdateien-lokal/upstream-test-cutcal/`
+(`lauf-cutcal.sh`, LIESMICH.txt): Sperren ohne Frame/Schritt, Fake-Bus-Erfolg
+mit Live-Frame-Folge, Grenzfall mit Rückbau, SAVE_CONFIG-Konflikt/-Erfolg.
+
 ## 7. Quellen (alle nur gelesen)
 
 - `MOTOR-INIT-BEFUND-2026-10-16.md`, `GPIO-PHASE-BEFUND-2026-10-16.md`
 - `nachbau/motor_init.py`, `nachbau/motor.py`, `nachbau/serial485.py`
 - `live-logs-2026-10-15/klippy.log` (Boot ab Zeile 2259)
 - `live-logs-2026-10-16/klippy.log` (Homing 14:06/14:09/14:21), `live-logs-2026-10-16/config-aktuell/sensorless.cfg`
+- `arbeitsdateien-lokal/cutpos-live-20261016-1601.log` (Cut-Kalibrierung 22:03–22:04), `live-logs-2026-10-16/config-aktuell/{gcode_macro,box,motor_control}.cfg`, Vergleich `lokale Analyse-Dateien`
 - `config/F008_CR0CN240319C13/motor_control.cfg` (Pins + F008-Params)

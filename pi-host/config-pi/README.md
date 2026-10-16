@@ -235,6 +235,9 @@ RS485-Port und alles darüber (`[k2_485]` öffnet im Batch-Modus bewusst nie; Mo
 | Sensorless X/Y-Homing | `NOTIZ-stall.md`, `homing.cfg`, `k2-motor.cfg` | Stock-Frame-Folge (Stall-Mode 1/2 an X/Y, Kp ID 70 300↔100, Schutzabfrage) über `KTWO_MOTOR_HOMING PHASE=BEGIN/END`; `FORCE_MOVE stepper_y -3` wie Stock |
 | Beschleunigungssensor | `NOTIZ-accel.md`, `../README-k2_lis2dw.md` | `[k2_lis2dw]` spricht das alte Creality-Protokoll, liefert Upstream-Datenstruktur; Erstlauf im Stand (`ACCELEROMETER_DEBUG_READ REG=0x0f` → 0x44) |
 | CFS-Farbwechsel | `NOTIZ-cfs.md`, `macros.cfg`, `k2-module.cfg`, `../README-k2_box.md` §8 | T0–T15 + M8200 P/C/R/L/W/F/O als `KTWO_BOX_*`-Kette, nur Box 1, ohne Freigaben nur Plan, Fehler im Druck → PAUSE |
+| Düsenreinigung + RESUME | `NOTIZ-reinigung-resume.md`, `macros.cfg`, `homing.cfg` | `_PI_NOZZLE_CLEAN` (Silikonstreifen wie Stock `BOX_NOZZLE_CLEAN`) vor dem ersten Z-Antasten, in START_PRINT und G29; RESUME: Schacht → Aufheizen → Vorextrusion → Reinigung → Rückfahrt erst X/Y, dann Z (nie unter Pausen-Z) |
+| Schneidposition kalibrieren | `NOTIZ-cutcal.md`, `cutcal.cfg`, `../README.md` §10 | `CALIBRATE_CUT_POS [SAVE=1]` → `KTWO_MOTOR_CUT_CAL` (Stock-Folge Kp 300, Stall-Mode 3, Anstöße an PB11, +0,4, Mode 2, Kp 100); Wert über SAVE_CONFIG in `[k2_box] cut_pos_x` |
+| CFS-Nachladen bei leerer Spule | `NOTIZ-runout.md`, `k2-module.cfg`, `printer.cfg` (Filamentsensor), `../README-k2_box.md` §9 | `runout_gcode: KTWO_BOX_RUNOUT`, Ersatz-Slot gleiches Material + Farbe (RFID) oder eigene Gruppe; Default aus (`runout_refill: False`), sonst PAUSE |
 
 Gemeinsame Batch-Prüfung aller Module mit dieser Config (Upstream 9cb9975, Live-Dictionaries): **EXIT 0**,
 MCU-Ausgabe u. a. `config_endstop pin=PC7`, `config_prtouch_pres … clk_pin=PB13 sdo_pin=PB14`,

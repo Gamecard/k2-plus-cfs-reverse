@@ -996,8 +996,9 @@ def test_huelle_upstream():
     printer = FakePrinter(bus=bus)
     obj = K.load_config(FakeKConfig(printer, _huelle_opts(), sections=("k2_485",)))
     assert sorted(printer.gcode.commands) == [
-        "KTWO_MOTOR_HOMING", "KTWO_MOTOR_INIT", "KTWO_MOTOR_PROTECTION",
-        "KTWO_MOTOR_STALL_MODE", "KTWO_MOTOR_STATUS", "KTWO_MOTOR_SYS_PARAM"], \
+        "KTWO_MOTOR_CUT_CAL", "KTWO_MOTOR_HOMING", "KTWO_MOTOR_INIT",
+        "KTWO_MOTOR_PROTECTION", "KTWO_MOTOR_STALL_MODE", "KTWO_MOTOR_STATUS",
+        "KTWO_MOTOR_SYS_PARAM"], \
         sorted(printer.gcode.commands)
     assert all(upstream_gcode_name_ok(c) for c in printer.gcode.commands)
     assert not upstream_gcode_name_ok("K2_MOTOR_INIT"), "Regel-Nachbau defekt"
@@ -1302,6 +1303,528 @@ def test_huelle_homing():
 
 
 # =====================================================================
+# Schnittpositions-Kalibrierung (KTWO_MOTOR_CUT_CAL / CALIBRATE_CUT_POS)
+# =====================================================================
+
+# Live-Beleg arbeitsdateien-lokal/cutpos-live-20261016-1601.log (Display-
+# Kalibrierung 16.10.2026 22:03:17–22:04:24): Requests "retries = 0, cmd = …"
+LIVE_CUTCAL = [
+    "81 09 00 06 01 46 00 00 96 43",   # Z.945  Kp 300 (Stock-Makro)
+    "81 04 00 11 04",                  # Z.957  Stall-Mode lesen
+    "81 04 00 11 03",                  # Z.981  Stall-Mode 3
+    "81 04 00 11 02",                  # Z.1476 zurück auf 2
+    "81 09 00 06 01 46 00 00 c8 42",   # Z.1489 Kp 100 (Stock-Makro)
+]
+LIVE_CUTCAL_ECHOS = [  # (addr, fun, payload, Live-Antwort-Vollframe)
+    (0x81, 0x06, [0x00, 0x00, 0x96, 0x43], "f7 81 07 00 06 00 00 96 43 09"),  # Z.950
+    (0x81, 0x11, [0x02, 0x00], "f7 81 05 00 11 02 00 0e"),                   # Z.959
+    (0x81, 0x11, [0x03], "f7 81 04 00 11 03 13"),                            # Z.983
+    (0x81, 0x11, [0x02], "f7 81 04 00 11 02 14"),                            # Z.1478
+    (0x81, 0x06, [0x00, 0x00, 0xc8, 0x42], "f7 81 07 00 06 00 00 c8 42 d4"),  # Z.1492
+]
+
+
+class FakeCutMotion:
+    """Bewegungs-Fake: Schneidhebel-Anschlag bei ``stop_x`` – ein Anstoß
+    unter stop_x löst den Stall aus (Endstop bzw. erst im Nachlauf)."""
+
+    def __init__(self, bus=None, stop_x=-8.05, homed="xyz", rail=(-10.0, 352.5),
+                 max_accel=30000.0, late=False, pin_active=False, fail_at=None,
+                 no_move_at=None, stop_list=None):
+        self.bus = bus
+        self.stop_x = stop_x
+        self.stop_list = stop_list  # explizite Trefferliste (überstimmt stop_x)
+        self.homed = homed
+        self.rail = rail
+        self.limits = (800.0, float(max_accel))
+        self.late = late
+        self.pin_active = pin_active
+        self.fail_at = fail_at
+        self.no_move_at = no_move_at
+        self.pos = [100.0, 100.0, 10.0, 0.0]
+        self.calls = []  # (art, …, n_bus_frames)
+
+    def _n(self):
+        return len(self.bus.calls) if self.bus is not None else 0
+
+    def homed_axes(self):
+        return self.homed
+
+    def x_range(self):
+        return self.rail
+
+    def get_position(self):
+        return list(self.pos)
+
+    def get_limits(self):
+        return self.limits
+
+    def set_limits(self, v, a):
+        self.calls.append(("limits", v, a, self._n()))
+        self.limits = (self.limits[0] if v is None else v, self.limits[1] if a is None else a)
+
+    def wait_moves(self):
+        self.calls.append(("wait", self._n()))
+
+    def move(self, x=None, y=None, speed=None):
+        self.calls.append(("move", x, y, speed, self._n()))
+        if x is not None:
+            self.pos[0] = x
+        if y is not None:
+            self.pos[1] = y
+
+    def stall_pin_active(self):
+        return self.pin_active
+
+    def probe_x(self, x, speed):
+        self.calls.append(("probe", x, speed, self._n()))
+        if self.fail_at is not None and abs(x - self.fail_at) < 1e-9:
+            self.pos[0] = x + 0.3
+            raise RuntimeError("Move out of range: %.3f" % x)
+        if self.no_move_at is not None and abs(x - self.no_move_at) < 1e-9:
+            return {"triggered": True, "late": False, "no_movement": True, "trig_x": self.pos[0]}
+        if self.stop_list is not None:
+            trig = any(abs(x - s) < 1e-9 for s in self.stop_list)
+        else:
+            trig = x < self.stop_x
+        self.pos[0] = (self.stop_x if self.stop_list is None else x) if trig else x
+        return {"triggered": trig and not self.late, "late": trig and self.late,
+                "no_movement": False, "trig_x": self.pos[0] if trig and not self.late else None}
+
+    def probes(self):
+        return [c[1] for c in self.calls if c[0] == "probe"]
+
+
+def _cutcal_params(**over):
+    p = K.build_cut_cal_params(K.parse_options(test_options())["cut_cal"])
+    p.update(over)
+    return p
+
+
+def _cutcal_run(motion_kw=None, p_over=None, opts=None, bad_echo=(), **bus_kw):
+    cfg, gpio, bus, mcu, rs485, transp, ctl, events = build_system(
+        opts=opts if opts is not None else _homing_opts(), **bus_kw)
+    bus.bad_echo.update(bad_echo)
+    motion = FakeCutMotion(bus=bus, **(motion_kw or {}))
+    saved = []
+    p = _cutcal_params(**(p_over or {}))
+    try:
+        res = ctl.cut_calibrate(motion, p, saved.append)
+        err = None
+    except K.K2MotorError as exc:
+        res, err = None, str(exc)
+    return ctl, bus, mcu, motion, saved, res, err
+
+
+def test_cutcal_frames_live():
+    """Erfolg: Frames = Live 22:03/22:04 (inkl. Echo-CRCs), Ablauf/Bewegung,
+    Ergebnis -8,2 + 0,4 = -7,80, configfile-Wert "-7.80"."""
+    for addr, fun, payload, live in LIVE_CUTCAL_ECHOS:
+        got = T.build_frame(addr, fun, payload).hex(" ")
+        assert got == live, (live, got)
+    ctl, bus, mcu, motion, saved, res, err = _cutcal_run()
+    assert err is None, err
+    got = [_wire(a, f, d) for a, f, d, _k in bus.calls]
+    assert got == LIVE_CUTCAL, got
+    assert all(k["retries"] == 0 for _a, _f, _d, k in bus.calls), "Stock: retries=0"
+    assert mcu.writes == [], "nichts an E (transparent)"
+    assert res["first_hit"] == -8.1 and res["second_hit"] == -8.2, res
+    assert res["result"] == -7.8 and saved == [-7.8], (res, saved)
+    assert K.CUT_CAL_FORMAT % saved[0] == "-7.80"
+    assert res["orig_mode"] == 2 and res["probes"] == 33, res   # -5.0 … -8.2 (live 33)
+    xs = motion.probes()
+    assert xs[0] == -5.0 and xs[-1] == -8.2 and len(xs) == 33, xs
+    assert all(abs((xs[i] - xs[i + 1]) - 0.1) < 1e-9 for i in range(len(xs) - 1))
+    assert all(c[2] == K.CUT_CAL_DEFAULTS["probe_speed"] for c in motion.calls if c[0] == "probe")
+    # Reihenfolge Bus <-> Bewegung (n = Anzahl Frames zum Zeitpunkt)
+    c = motion.calls
+    assert c[0] == ("wait", 0) and c[1] == ("limits", None, 25000.0, 0), c[:2]
+    park = [x for x in c if x[0] == "move" and x[2] == 200.0]
+    assert park[0][1:] == (50.0, 200.0, 200.0, 1), park[0]      # nach Kp, vor 11 [04]
+    assert all(x[3] == 3 for x in c if x[0] == "probe"), "Anstöße nur in Mode 3"
+    # jeder Anstoß -> zurück auf Park X50
+    for i, x in enumerate(c):
+        if x[0] == "probe":
+            assert c[i + 1][0] == "move" and c[i + 1][1] == 50.0, c[i + 1]
+    assert park[-1][1:] == (200.0, 200.0, 200.0, 3), park[-1]   # Ausgang X200/Y200 (live)
+    assert c[-1] == ("limits", 800.0, 30000.0, 5), c[-1]        # Beschleunigung zurück
+    assert ctl.stall_mode["x"] == 2 and bus.values[(0x81, 70)] == 100.0
+    assert not ctl.cut_cal_active and ctl.cut_cal_last["saved"]
+    # Nachlauf-Treffer (Stall erst nach dem letzten Schritt) zählt genauso
+    ctl, bus, mcu, motion, saved, res, err = _cutcal_run({"late": True})
+    assert err is None and saved == [-7.8], (err, saved)
+    assert any("(Nachlauf)" in l for l in res["log"]), res["log"]
+    return "5 Frames = Live Z.945/957/981/1476/1489, 33 Anstöße -5.0…-8.2, cut_pos_x -7.80"
+
+
+def test_cutcal_rueckbau():
+    """Fehler an jeder Stelle -> Kopf weg, Mode 2, Kp 100, Beschleunigung
+    zurück, NICHTS gespeichert, K2MotorError (kein Shutdown)."""
+    rb = ["81 04 00 11 02", "81 09 00 06 01 46 00 00 c8 42"]
+    head = LIVE_CUTCAL[:3]
+    cases = []
+    # 1. kein Stall bis x_min (Abbruch nach max. Weg)
+    ctl, bus, mcu, motion, saved, res, err = _cutcal_run({"stop_x": -20.0})
+    assert err and "kein Stall bis X=-9.50" in err and "Abbruch nach max. Weg" in err, err
+    assert len(motion.probes()) == 46 and min(motion.probes()) == -9.5
+    assert [_wire(a, f, d) for a, f, d, _k in bus.calls] == head + rb and saved == []
+    cases.append("kein Stall")
+    # 2. nur ein Stall (auf dem letzten Anstoß)
+    ctl, bus, mcu, motion, saved, res, err = _cutcal_run({"stop_list": [-9.5]})
+    assert err and "nur ein Stall (X=-9.50)" in err and saved == [], err
+    cases.append("ein Stall")
+    # 3. Ergebnis außerhalb: Treffer -5.5/-5.6 -> -5.2 > x_max -5.5
+    ctl, bus, mcu, motion, saved, res, err = _cutcal_run({"stop_x": 0.0})
+    assert err and "außerhalb check_cut_pos_x" in err and saved == [], err
+    assert ctl.cut_cal_last["ignored"] == [-5.0, -5.1, -5.2, -5.3, -5.4], ctl.cut_cal_last
+    assert [_wire(a, f, d) for a, f, d, _k in bus.calls] == head + rb
+    cases.append("Ergebnis -5.2 außerhalb")
+    # 4. Bewegungsfehler mitten im Anstoß -> Kopf zurück auf Park, dann Rückbau
+    ctl, bus, mcu, motion, saved, res, err = _cutcal_run({"fail_at": -6.0})
+    assert err and "Move out of range" in err and "Kopf auf Park X50.0" in err, err
+    i = [k for k, c in enumerate(motion.calls) if c[0] == "probe" and c[1] == -6.0][0]
+    assert motion.calls[i + 1][:2] == ("move", 50.0) and motion.calls[i + 1][4] == 3, \
+        "Kopf weg vom Hebel VOR Mode 2"
+    assert [_wire(a, f, d) for a, f, d, _k in bus.calls] == head + rb and saved == []
+    assert motion.limits == (800.0, 30000.0)
+    cases.append("Bewegungsfehler")
+    # 5. Stall-Pin schon vor der ersten Fahrt aktiv -> keine Anstöße
+    ctl, bus, mcu, motion, saved, res, err = _cutcal_run({"pin_active": True})
+    assert err and "VOR der ersten Fahrt" in err and motion.probes() == [], err
+    assert [_wire(a, f, d) for a, f, d, _k in bus.calls] == head + rb
+    cases.append("Pin aktiv")
+    # 6. no_movement bei einem Anstoß
+    ctl, bus, mcu, motion, saved, res, err = _cutcal_run({"no_move_at": -5.3})
+    assert err and "schon vor der Bewegung" in err and max(motion.probes()) == -5.0
+    cases.append("no_movement")
+    # 7. Echo falsch bei 0x11 [03] -> Rückbau (Mode 2 + Kp), keine Bewegung zum Hebel
+    ctl, bus, mcu, motion, saved, res, err = _cutcal_run(bad_echo={0x81})
+    assert err and "Echo 07 statt 03" in err and motion.probes() == [], err
+    assert [_wire(a, f, d) for a, f, d, _k in bus.calls] == head + rb, bus.calls
+    cases.append("Echo 0x11")
+    # 8. Bus tot -> Kp-Write scheitert, Rückbau versucht Kp, kein Mode-Frame, keine Fahrt
+    ctl, bus, mcu, motion, saved, res, err = _cutcal_run(dead={0x81})
+    got = [_wire(a, f, d) for a, f, d, _k in bus.calls]
+    assert got == [LIVE_CUTCAL[0], LIVE_CUTCAL[4]], got
+    assert err and "Rückbau-FEHLER" in err and not any(c[0] == "move" for c in motion.calls), err
+    assert motion.limits == (800.0, 30000.0) and not ctl.cut_cal_active
+    cases.append("Bus tot")
+    # 9. gelesener Mode 3 (Rest eines Abbruchs) -> trotzdem auf 2 zurück
+    cfg, gpio, bus, mcu, rs485, transp, ctl, events = build_system(opts=_homing_opts())
+    bus.modes[0x81] = 3
+    motion = FakeCutMotion(bus=bus)
+    res = ctl.cut_calibrate(motion, _cutcal_params(), lambda v: None)
+    assert res["orig_mode"] == 3 and bus.modes[0x81] == 2 and ctl.stall_mode["x"] == 2
+    cases.append("orig 3 -> 2")
+    return "%d Fehlerfälle: %s" % (len(cases), ", ".join(cases))
+
+
+def test_cutcal_grenzen():
+    """Harte Grenzen: Optionen, [k2_box]-Vorrang, nie tiefer als x_min/-10,
+    max. 100 Anstöße, Geschwindigkeit <= 200 mm/s, Beschleunigung <= max_accel."""
+    d = K.parse_options(test_options())["cut_cal"]
+    assert d == {k: K.CUT_CAL_DEFAULTS[k] for k in d} and len(d) == 10, d
+    bad = [("cut_cal_probe_speed", "250"), ("cut_cal_probe_speed", "201"),
+           ("cut_cal_probe_speed", "abc"), ("cut_cal_step", "0"), ("cut_cal_step", "0.01"),
+           ("cut_cal_step", "1"), ("cut_cal_accel", "30000"), ("cut_cal_start_x", "-11"),
+           ("cut_cal_start_x", "1"), ("cut_pos_offset", "-0.1"), ("cut_pos_offset", "3"),
+           ("cut_cal_park_x", "150"), ("cut_cal_settle", "1"), ("cut_cal_pos_kp", "0"),
+           ("cut_cal_exit_x", "350"), ("cut_cal_park_speed", "nan")]
+    n_bad = 0
+    for k, v in bad:
+        o = test_options()
+        o[k] = v
+        try:
+            K.parse_options(o)
+        except ValueError:
+            n_bad += 1
+            continue
+        raise AssertionError("%s=%s akzeptiert" % (k, v))
+    o = test_options()
+    o.update({"cut_cal_start_x": "-7.9", "cut_cal_probe_speed": "50", "cut_pos_offset": "0.5"})
+    c = K.parse_options(o)["cut_cal"]
+    assert c["start_x"] == -7.9 and c["probe_speed"] == 50.0 and c["offset"] == 0.5
+    # [k2_box] hat Vorrang für Prüfbereich und Y
+    p = K.build_cut_cal_params(c, {"check_cut_pos_x_min": -9.0, "check_cut_pos_x_max": -6.0,
+                                   "cut_pos_y": 210.0, "cut_pos_x": -7.8})
+    assert (p["x_min"], p["x_max"], p["y"]) == (-9.0, -6.0, 210.0), p
+    xs = K.cut_cal_positions(p)
+    assert xs[0] == -7.9 and xs[-1] == -9.0 and min(xs) >= -9.0, xs
+    for box in ({"check_cut_pos_x_min": -10.5}, {"check_cut_pos_x_min": -5.0},
+                {"cut_pos_y": 20.0}, {"check_cut_pos_x_max": "x"}):
+        try:
+            K.build_cut_cal_params(None, box)
+        except K.K2MotorError:
+            continue
+        raise AssertionError("k2_box %r akzeptiert" % box)
+    for over in ({"step": 0.05, "x_min": -10.0},          # 101 Anstöße > 100
+                 {"park_x": -1.0}, {"exit_x": 10.0}, {"start_x": -9.6},
+                 {"probe_speed": 200.1}, {"accel": 25001.0}, {"x_min": -10.01}):
+        p = _cutcal_params()
+        p.update(over)
+        try:
+            K.validate_cut_cal_params(p)
+        except K.K2MotorError:
+            continue
+        raise AssertionError("Parameter %r akzeptiert" % over)
+    assert len(K.cut_cal_positions(_cutcal_params())) == 46       # Stock -5.0…-9.5
+    # Beschleunigung nie über max_accel des Druckers
+    ctl, bus, mcu, motion, saved, res, err = _cutcal_run({"max_accel": 8000.0})
+    assert err is None and ("limits", None, 8000.0, 0) in motion.calls, motion.calls[:3]
+    # [stepper_x] position_min tiefer als x_min nötig -> Abbruch ohne Frame
+    ctl, bus, mcu, motion, saved, res, err = _cutcal_run({"rail": (-9.0, 352.5)})
+    assert err and "außerhalb [stepper_x]" in err and bus.calls == [] and motion.calls == [], err
+    return "%d ungültige Optionen, k2_box-Vorrang, 46 Anstöße Stock, accel<=max_accel" % n_bad
+
+
+def test_cutcal_sperren():
+    """Ohne allow_write / bei aktivem Homing / ohne X/Y-Referenz: Fehler OHNE
+    Frame und OHNE Bewegung."""
+    ctl, bus, mcu, motion, saved, res, err = _cutcal_run(opts=_homing_opts(False))
+    assert err and "allow_write=False" in err, err
+    assert bus.calls == [] and motion.calls == [] and saved == []
+    for homed in ("", "z", "x", "xz"):
+        ctl, bus, mcu, motion, saved, res, err = _cutcal_run({"homed": homed})
+        assert err and "nicht referenziert" in err and bus.calls == [] and motion.calls == [], err
+    cfg, gpio, bus, mcu, rs485, transp, ctl, events = build_system(opts=_homing_opts())
+    ctl.homing_begin()
+    n0 = len(bus.calls)
+    motion = FakeCutMotion(bus=bus)
+    try:
+        ctl.cut_calibrate(motion, _cutcal_params(), lambda v: None)
+    except K.K2MotorError as exc:
+        assert "Homing aktiv" in str(exc), exc
+    else:
+        raise AssertionError("Cut-Kalibrierung trotz aktivem Homing")
+    assert len(bus.calls) == n0 and motion.calls == []
+    # Mode 3 bleibt über die öffentlichen Wege gesperrt
+    try:
+        ctl.set_stall_mode(["x"], 3)
+    except K.K2MotorError:
+        pass
+    else:
+        raise AssertionError("KTWO_MOTOR_STALL_MODE DATA=3 akzeptiert")
+    return "allow_write/Homing/4x homed_axes gesperrt, kein Frame, keine Bewegung"
+
+
+class FakeConfigfile:
+    def __init__(self):
+        self.sets = []
+
+    def set(self, section, option, value):
+        self.sets.append((section, option, value))
+
+
+class FakeMacro:
+    def __init__(self, **variables):
+        self.variables = dict(variables)
+
+    def get_status(self, eventtime=None):
+        return dict(self.variables)
+
+
+class FakeBox:
+    def __init__(self, cfg):
+        self.cfg = dict(cfg)
+
+
+def test_huelle_cutcal():
+    """KTWO_MOTOR_CUT_CAL über die Hülle: DRY_RUN, Sperren (allow_write,
+    _PI_FREIGABE fehlt/False), Erfolg mit configfile.set, Fehler = G-Code-
+    Fehler, Status printer.k2_motor.cut_cal."""
+    printer, obj, bus = _huelle(allow=True)
+    cf = FakeConfigfile()
+    printer.objects["configfile"] = cf
+    printer.objects["k2_box"] = FakeBox({"check_cut_pos_x_min": -9.5,
+                                         "check_cut_pos_x_max": -5.5, "cut_pos_y": 200.0})
+    motions = []
+
+    def _mk(p):
+        m = FakeCutMotion(bus=bus)
+        motions.append(m)
+        return m
+    obj._make_cut_motion = _mk
+    # DRY_RUN: Plan, kein Frame, keine Bewegung (auch ohne Freigabe)
+    g = FakeKGcmd({"DRY_RUN": 1})
+    obj.cmd_cut_cal(g)
+    plan = g.infos[0]
+    for needle in ("81 09 00 06 01 46 00 00 96 43", "81 04 00 11 04", "81 04 00 11 03",
+                   "81 04 00 11 02", "81 09 00 06 01 46 00 00 c8 42", "46 Anstöße",
+                   "X-5.00…X-9.50", "configfile.set"):
+        assert needle in plan, (needle, plan)
+    assert bus.calls == [] and motions == []
+    # Freigabe-Makro fehlt -> gesperrt
+    _expect_cmd_error(obj.cmd_cut_cal, {}, "_PI_FREIGABE fehlt", "keine Bewegung")
+    printer.objects["gcode_macro _PI_FREIGABE"] = FakeMacro(allow_move=False)
+    _expect_cmd_error(obj.cmd_cut_cal, {}, "allow_move=False", "nichts gesendet")
+    assert bus.calls == [] and motions == [] and cf.sets == []
+    # Erfolg
+    printer.objects["gcode_macro _PI_FREIGABE"].variables["allow_move"] = True
+    g = FakeKGcmd({})
+    obj.cmd_cut_cal(g)
+    assert cf.sets == [("k2_box", "cut_pos_x", "-7.80")], cf.sets
+    assert [_wire(a, f, d) for a, f, d, _k in bus.calls] == LIVE_CUTCAL
+    assert any("cut_pos_x = -7.80 -> SAVE_CONFIG" in i for i in g.infos), g.infos
+    st = obj.get_status()["cut_cal"]
+    assert st["result"] == -7.8 and st["saved"] and st["probes"] == 33 and not st["active"], st
+    # Fehler -> G-Code-Fehler mit Rückbau, Status zeigt Fehler, kein set
+    obj._make_cut_motion = lambda p: FakeCutMotion(bus=bus, stop_x=-20.0)
+    n0 = len(bus.calls)
+    msg, g = _expect_cmd_error(obj.cmd_cut_cal, {}, "kein Stall", "Rückbau", "nichts gespeichert")
+    assert [_wire(a, f, d) for a, f, d, _k in bus.calls[n0:]] == LIVE_CUTCAL, bus.calls[n0:]
+    assert len(cf.sets) == 1 and obj.get_status()["cut_cal"]["error"]
+    assert any("get_stall_mode" in i for i in g.infos), g.infos
+    # allow_write=False -> gesperrt, auch mit Freigabe
+    printer, obj, bus = _huelle(allow=False)
+    printer.objects["gcode_macro _PI_FREIGABE"] = FakeMacro(allow_move=True)
+    obj._make_cut_motion = _mk
+    n_m = len(motions)
+    _expect_cmd_error(obj.cmd_cut_cal, {}, "allow_write=False", "keine Bewegung")
+    assert bus.calls == [] and len(motions) == n_m
+    # Batch ohne Port -> Kp-Write scheitert, klare Meldung, kein Absturz
+    printer, obj, bus = _huelle(allow=True, bus=FakeBatchBus())
+    printer.objects["gcode_macro _PI_FREIGABE"] = FakeMacro(allow_move=True)
+    printer.objects["configfile"] = FakeConfigfile()
+    obj._make_cut_motion = lambda p: FakeCutMotion()
+    _expect_cmd_error(obj.cmd_cut_cal, {}, "Batch-Modus", "nichts gespeichert")
+    assert not obj.get_status()["cut_cal"]["active"]
+    return "DRY_RUN/2 Freigabe-Sperren/Erfolg configfile -7.80/Fehler-Rückbau/allow_write/Batch"
+
+
+class _FakeEs:
+    def __init__(self, trig_time, pin=0):
+        self.trig_time = trig_time
+        self.pin = pin
+        self.queries = []
+
+    def get_steppers(self):
+        return ["s"]
+
+    def home_start(self, *a, **kw):
+        return None
+
+    def home_wait(self, t):
+        return self.trig_time
+
+    def query_endstop(self, pt):
+        self.queries.append(pt)
+        return self.pin
+
+
+class _FakeHomingModule:
+    """Ersatz für klippy/extras/homing.py (HomingMove-Schnittstelle)."""
+
+    def __init__(self):
+        self.moves = []
+        self.no_move = None
+
+    def HomingMove(self, printer, endstops, toolhead):
+        mod = self
+
+        class _HM:
+            def homing_move(self_, pos, speed, probe_pos=False, triggered=True,
+                            check_triggered=True):
+                es, name = endstops[0]
+                mod.moves.append((list(pos), speed, probe_pos, triggered, check_triggered, name))
+                es.home_start(0.0, 0.000015, 4, 0.001, triggered=triggered)
+                t = es.home_wait(1.0)
+                return [pos[0] + (0.3 if t > 0 else 0.0)] + list(pos[1:])
+
+            def check_no_movement(self_):
+                return mod.no_move
+        return _HM()
+
+
+class _FakeRail:
+    def __init__(self, es):
+        self.es = es
+
+    def get_endstops(self):
+        return [(self.es, "stepper_x")]
+
+    def get_range(self):
+        return (-10.0, 352.5)
+
+
+class _FakeKinToolhead:
+    def __init__(self, es):
+        self.kin = type("K", (), {"rails": [_FakeRail(es)]})()
+        self.pos = [50.0, 200.0, 10.0, 0.0]
+        self.dwells = []
+        self.manual = []
+        self.maxv = (800.0, 30000.0)
+
+    def get_kinematics(self):
+        return self.kin
+
+    def get_position(self):
+        return list(self.pos)
+
+    def get_last_move_time(self):
+        return 12.5
+
+    def dwell(self, s):
+        self.dwells.append(s)
+
+    def manual_move(self, coord, speed):
+        self.manual.append((list(coord), speed))
+
+    def get_status(self, eventtime):
+        return {"homed_axes": "xy"}
+
+    def get_max_velocity(self):
+        return self.maxv
+
+    def set_max_velocities(self, v, a, scv, mcr):
+        self.maxv = (self.maxv[0] if v is None else v, self.maxv[1] if a is None else a)
+
+    def wait_moves(self):
+        pass
+
+
+def test_cutcal_klippy_adapter():
+    """KlippyCutMotion: HomingMove mit probe_pos/check_triggered=False am
+    X-Endstop, Trigger aus home_wait, Nachlauf = dwell + query_endstop."""
+    hm = _FakeHomingModule()
+    es = _FakeEs(trig_time=0.0, pin=0)
+    th = _FakeKinToolhead(es)
+    printer = FakePrinter()
+    printer.objects["toolhead"] = th
+    m = K.KlippyCutMotion(printer, settle=0.1, homing_module=hm)
+    r = m.probe_x(-6.0, 166.0)
+    assert r == {"triggered": False, "late": False, "no_movement": False, "trig_x": None}, r
+    pos, speed, probe_pos, trig, check, name = hm.moves[0]
+    assert pos[0] == -6.0 and pos[1] == 200.0 and speed == 166.0 and probe_pos is True \
+        and trig is True and check is False and name == "stepper_x", hm.moves[0]
+    assert th.dwells == [0.1] and es.queries == [12.5]
+    es.pin = 1          # Stall erst im Nachlauf
+    assert m.probe_x(-6.1, 166.0)["late"] is True
+    es.trig_time = 3.2  # Endstop löst während der Fahrt aus
+    r = m.probe_x(-8.1, 166.0)
+    assert r["triggered"] and r["trig_x"] == -7.8 and not r["late"] and len(th.dwells) == 2, r
+    hm.no_move = "stepper_x"
+    assert m.probe_x(-8.2, 166.0)["no_movement"] is True
+    assert m.homed_axes() == "xy" and m.x_range() == (-10.0, 352.5)
+    m.set_limits(None, 25000.0)
+    assert th.maxv == (800.0, 25000.0)
+    m.move(x=50.0, speed=200.0)
+    assert th.manual[-1] == ([50.0, None, None], 200.0)
+    es.pin = 0
+    assert m.stall_pin_active() is False
+
+    def _boom(*a, **kw):
+        raise RuntimeError("Must home axis first")
+    th.manual_move = _boom
+    try:
+        m.move(x=1.0, speed=10.0)
+    except K.K2MotorError as exc:
+        assert "Must home axis first" in str(exc)
+    else:
+        raise AssertionError("Bewegungsfehler nicht als K2MotorError")
+    return "probe_pos+check_triggered=False an stepper_x, Nachlauf dwell+query, Fehler->K2MotorError"
+
+
+# =====================================================================
 # Runner
 # =====================================================================
 
@@ -1323,6 +1846,12 @@ TESTS = [
     ("Homing: Rückbau bei BEGIN-Fehler", test_homing_rueckbau),
     ("Homing: END best effort", test_homing_end_fehler),
     ("Hülle: KTWO_MOTOR_HOMING/_STALL_MODE/_SYS_PARAM", test_huelle_homing),
+    ("Cut-Kal.: Frames = Live-Log, Ablauf, -7.80", test_cutcal_frames_live),
+    ("Cut-Kal.: Rückbau bei Fehlern", test_cutcal_rueckbau),
+    ("Cut-Kal.: harte Grenzen", test_cutcal_grenzen),
+    ("Cut-Kal.: Sperren ohne Frame/Bewegung", test_cutcal_sperren),
+    ("Cut-Kal.: Hülle KTWO_MOTOR_CUT_CAL", test_huelle_cutcal),
+    ("Cut-Kal.: Klipper-Adapter (HomingMove/Endstop)", test_cutcal_klippy_adapter),
 ]
 
 

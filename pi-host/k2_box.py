@@ -111,6 +111,19 @@ Glied der Makrokette (config-pi/macros.cfg: T0–T15, M8200):
   (Box-Zustand abwarten, Stock BOX_MODE_WAIT), ``KTWO_BOX_ERROR_CLEAR``,
   ``KTWO_BOX_RESUME_FIX`` (aus RESUME, Z nach Abbruch im Wechsel).
 
+Auto-Nachladen bei Runout (A7, 17.10.2026 – Belege/ANNAHMEN in
+config-pi/NOTIZ-runout.md, README-k2_box.md §9):
+
+- ``KTWO_BOX_RUNOUT [SLOT=A..D] [TEMP=] [DRY_RUN=1]`` (= Stock
+  BOX_CHECK_MATERIAL_REFILL aus printer.cfg runout_gcode): leerer Slot ->
+  Ersatz-Slot (Gleich-Material-Gruppe oder RFID gleiches Material + Farbe,
+  Filament am Einlauf) -> Kette PRE_OPT/E30/EXTRUDE/FLUSH/END_OPT -> RESUME.
+  Nur mit ``runout_refill`` (Default AUS) UND beiden Freigaben; sonst bzw.
+  bei jedem Fehler bleibt der Druck pausiert (Meldung, nie Shutdown).
+- ``KTWO_BOX_AUTO_REFILL [ENABLE=0|1]`` (= Stock BOX_ENABLE_AUTO_REFILL),
+  ``KTWO_BOX_SAME_MATERIAL [LIST=T1A,T1C/T1B,T1D] [CLEAR=1]`` (= Stock
+  BOX_UPDATE_SAME_MATERIAL_LIST, Format ANNAHME).
+
 Freigaben: Box-Frames nur mit ``allow_write``, Kopf-/Extruder-Bewegung und
 Heizen nur mit ``allow_move`` (beide Default False → nur Plan). Im Druck
 (print_stats printing/paused) braucht ein Wechsel BEIDE Freigaben, sonst
@@ -275,8 +288,22 @@ CHANGE_DEFAULTS = {
     "stage7_delay": 2.0,             # ANNAHME (live 3,7-3,8 s bis mode 7)
     "box_wait_timeout": 200.0,       # ANNAHME (Preload <= ~3 min/Slot)
     "box_wait_interval": 1.0,
+    # Auto-Nachladen bei Runout (A7, config-pi/NOTIZ-runout.md): Stock-
+    # printer.cfg runout_gcode "G91 / G0 E30 F600 / G90" (nur wenn heiß) –
+    # Restfilament durch die Zahnräder (= buffer_empty_len 30), hier im
+    # Abfallschacht statt am Parkpunkt.
+    "runout_tail_length": 30.0,
+    "runout_tail_velocity": 600.0,
 }
 CHANGE_INT_KEYS = ("wipe_shakes",)
+
+# Box-Fehler, die nach einem Runout erwartet und vor dem Nachladen per
+# 0x04 [00 01] (IDLE, löscht ERROR – live belegt) quittiert werden dürfen:
+# 0x50 Runout im Druck-Slot, 0x51 Buffer-Nachschub zu langsam, 0x52 kein
+# Vorschub (BEFUND2 §4: print_check-Thread, „außer es lag schon ein Runout
+# (0x50) vor“). ANNAHME: Stock quittiert sie beim Auto-Nachladen ebenso.
+RUNOUT_CLEARABLE_ERRORS = (_BOX.STATUS_RUNOUT, _BOX.STATUS_SPEED_ERR,
+                           _BOX.STATUS_NO_FEED)
 
 CHAIN_STATE_NAME = "_ktwo_box_chain"
 STEP_STATE_NAME = "_ktwo_box_step"
@@ -451,6 +478,130 @@ def retrude_extruder_steps(c, length=None):
     return out
 
 
+# ---------------------------------------------------------------------
+# Auto-Nachladen bei Runout (A7) – reine Bausteine
+# ---------------------------------------------------------------------
+# Stock (box_wrapper.so, nur Strings/Status belegt, Ablauf unbelegt):
+# BOX_CHECK_MATERIAL_REFILL -> check_material_refill / material_auto_refill /
+# is_material_available; Ersatz kommt aus der Gleich-Material-Liste
+# (BOX_UPDATE_SAME_MATERIAL_LIST, Status 'same_material', Log
+# "same_material_list: %s, same_tnn_list: %s", "same_tnn_list len smaller
+# than 2", "no tray with ingredients found", Schalter 'auto_refill' /
+# BOX_ENABLE_AUTO_REFILL). Diese Liste schickt Creality Print an die Stock-
+# Oberfläche, NICHT im G-Code (Orca-K2-Plus-Profile: nur M8200) – auf dem
+# Pi fehlt die Quelle. Daher: manuelle Liste (KTWO_BOX_SAME_MATERIAL) ODER
+# Vergleich über das RFID-Etikett (mat_id + col aus dem 40-Zeichen-vender,
+# box.split_rfid_vendor; vgl. Vanilla box.py runout_recovery: gleiches
+# Material UND gleiche Farbe, Slot belegt).
+
+def rfid_material(value):
+    """RFID-Wert eines Slots (40-Zeichen-vender) -> (mat_id, col) oder None
+    ("unknown"/"busy"/leer/kaputt = unbekannt)."""
+    if not isinstance(value, str) or len(value.strip()) != _BOX.RFID_VENDOR_LEN:
+        return None
+    try:
+        f = _BOX.split_rfid_vendor(value.strip())
+    except ValueError:
+        return None
+    mat, col = f.get("mat_id", ""), f.get("col", "").upper()
+    if not mat.strip("0") or not col:
+        return None
+    return mat, col
+
+
+def parse_same_material(text, box_addr=BOX_ADDR_DEFAULT):
+    """KTWO_BOX_SAME_MATERIAL LIST= -> [[Slotbuchstaben], ...].
+
+    Format (ANNAHME, Stock-Format von BOX_UPDATE_SAME_MATERIAL_LIST
+    unbelegt): Gruppen mit '/' getrennt, Mitglieder mit ',' – z. B.
+    ``T1A,T1C/T1B,T1D``. Nur Box ``box_addr``; jede Gruppe >= 2 Slots
+    (Stock: "same_tnn_list len smaller than 2" = kein Nachladen), jeder
+    Slot höchstens in einer Gruppe."""
+    groups, seen = [], set()
+    for part in str(text).strip().strip('"').split("/"):
+        part = part.strip()
+        if not part:
+            continue
+        letters = []
+        for tok in part.split(","):
+            tok = tok.strip()
+            if not tok:
+                continue
+            box, _idx, letter, tnn = parse_tnn(tok)
+            if box != int(box_addr):
+                raise ValueError("%s liegt in Box %d, konfiguriert ist nur "
+                                 "Box %d" % (tnn, box, int(box_addr)))
+            if letter in seen:
+                raise ValueError("%s steht in mehr als einer Gruppe" % tnn)
+            if letter not in letters:
+                letters.append(letter)
+        if len(letters) < 2:
+            raise ValueError("Gruppe %r hat weniger als 2 Slots" % (part,))
+        seen.update(letters)
+        groups.append(letters)
+    if not groups:
+        raise ValueError("LIST leer (Format: T1A,T1C/T1B,T1D)")
+    return groups
+
+
+def select_runout_slot(current, inlet_mask, rfid, same_groups=None,
+                       require_color=True):
+    """Ersatz-Slot für den leer gelaufenen Slot ``current`` (Buchstabe).
+
+    Regel (s. Block oben): Kandidaten nur mit Filament am Einlauf (0x08 [00]
+    Sensor A), nie der leere Slot selbst, Reihenfolge ab dem Slot NACH dem
+    leeren (A→B→C→D→A, ANNAHME; Stock-Reihenfolge unbelegt).
+    1. Gleich-Material-Liste gesetzt -> nur Mitglieder der Gruppe des leeren
+       Slots (in Listenreihenfolge ab dem leeren Slot, zyklisch).
+    2. Sonst RFID: gleiche mat_id UND (require_color) gleiche Farbe wie das
+       Etikett des leeren Slots; Slots ohne lesbares Etikett nie.
+    Gibt (Buchstabe oder None, Begründung) zurück."""
+    cur = str(current).upper()
+    if cur not in SLOT_LETTERS:
+        raise ValueError("Slot muss A..D sein: %r" % (current,))
+    inlet = int(inlet_mask) & MASK_ALL
+
+    def present(letter):
+        return bool(inlet & SLOT_MASKS[SLOT_LETTERS.index(letter)])
+
+    if same_groups:
+        group = next((g for g in same_groups if cur in g), None)
+        if not group:
+            return None, ("Slot %s steht in keiner Gleich-Material-Gruppe "
+                          "(KTWO_BOX_SAME_MATERIAL)" % cur)
+        k = group.index(cur)
+        order = [x for x in group[k + 1:] + group[:k]]
+        for letter in order:
+            if present(letter):
+                return letter, ("Gleich-Material-Gruppe %s, Slot %s hat "
+                                "Filament am Einlauf" % ("+".join(group),
+                                                         letter))
+        return None, ("kein Slot der Gleich-Material-Gruppe %s hat Filament "
+                      "am Einlauf (Stock „no tray with ingredients found“)"
+                      % "+".join(group))
+    ref = rfid_material((rfid or {}).get(cur))
+    if ref is None:
+        return None, ("Material/Farbe von Slot %s unbekannt (kein lesbares "
+                      "RFID-Etikett) – Gruppe per KTWO_BOX_SAME_MATERIAL "
+                      "festlegen" % cur)
+    k = SLOT_LETTERS.index(cur)
+    order = SLOT_LETTERS[k + 1:] + SLOT_LETTERS[:k]
+    for letter in order:
+        if not present(letter):
+            continue
+        m = rfid_material((rfid or {}).get(letter))
+        if m is None or m[0] != ref[0]:
+            continue
+        if require_color and m[1] != ref[1]:
+            continue
+        return letter, ("RFID gleiches Material %s%s, Filament am Einlauf" % (
+            ref[0], (" + Farbe %s" % ref[1]) if require_color else ""))
+    return None, ("kein belegter Slot mit gleichem Material %s%s (RFID) – "
+                  "Stock „no tray with ingredients found“" % (
+                      ref[0], (" und Farbe %s" % ref[1]) if require_color
+                      else ""))
+
+
 def check_not_forbidden(fun):
     """Guard: 0x50/0x06 dürfen nie gesendet werden (Beleg s. FORBIDDEN_FUNS)."""
     if fun in FORBIDDEN_FUNS:
@@ -556,6 +707,11 @@ def parse_options(opts):
         # Stock [box] switch_pin: !nozzle_mcu:PB9 (Schneidhebel) – hier nur
         # als Name eines [filament_switch_sensor …] (leer = keine Prüfung)
         "cut_sensor": _str("cut_sensor", ""),
+        # Auto-Nachladen bei Runout (A7, NOTIZ-runout.md): Default AUS;
+        # wirkt zusätzlich nur mit allow_write UND allow_move.
+        "runout_refill": _bool("runout_refill", False),
+        "runout_require_color": _bool("runout_require_color", True),
+        "runout_resume": _bool("runout_resume", True),
     }
     for key, default in CHANGE_DEFAULTS.items():
         if key in CHANGE_INT_KEYS:
@@ -578,7 +734,8 @@ def parse_options(opts):
                 "tn_extrude_velocity", "clean_velocity", "travel_velocity",
                 "z_velocity", "wipe_circle_velocity", "wipe_accel",
                 "extrude_sensor_timeout", "extrude_poll_interval",
-                "box_wait_timeout", "box_wait_interval"):
+                "box_wait_timeout", "box_wait_interval",
+                "runout_tail_velocity"):
         if not cfg[key] > 0:
             raise ValueError("%s muss > 0 sein: %r" % (key, cfg[key]))
     if cfg["cut_dwell"] > 2.0:
@@ -591,6 +748,9 @@ def parse_options(opts):
     if cfg["tn_retrude"] > 0:
         raise ValueError("tn_retrude muss <= 0 sein (Rückzug, Stock -10): %r"
                          % (cfg["tn_retrude"],))
+    if not 0.0 <= cfg["runout_tail_length"] <= 100.0:
+        raise ValueError("runout_tail_length muss 0..100 mm sein (Stock 30): %r"
+                         % (cfg["runout_tail_length"],))
     if cfg["change_z_hop"] > 5.0:
         raise ValueError("change_z_hop > 5 mm unplausibel (Stock 0.4): %r"
                          % (cfg["change_z_hop"],))
@@ -634,7 +794,9 @@ def parse_klipper_config(config):
         opts[k.lower()] = _g(k, "")
     for k in (("box_addr", "allow_write", "shutdown_on_failure", "auto_init",
                "poll_interval", "allow_move", "pause_on_failure",
-               "filament_sensor", "cut_sensor") + tuple(CHANGE_DEFAULTS)):
+               "filament_sensor", "cut_sensor", "runout_refill",
+               "runout_require_color", "runout_resume")
+              + tuple(CHANGE_DEFAULTS)):
         if k not in opts:
             v = _g(k, None)
             if v is not None:
@@ -786,6 +948,11 @@ class K2BoxController:
         self.loaded_slot = None
         self.busy = False
         self.clock = time.monotonic
+        # Auto-Nachladen (A7): Slot, den die Box im PRINT-Zustand zuletzt im
+        # Hub gemeldet hat (0x0a b4), und letztes LESBARES RFID-Etikett je
+        # Slot (die leere Spule liefert evtl. nur noch "unknown").
+        self.print_slot = None
+        self.tag_cache = {}
 
     class _print_log:
         def info(self, msg):
@@ -908,6 +1075,11 @@ class K2BoxController:
         except Exception:
             parsed = parse_box_state(raw)
         self.last_poll = parsed
+        if parsed.get("kind") == "state" \
+                and parsed.get("state") == _BOX.BOX_STATE_PRINT \
+                and parsed.get("hub_mask") in SLOT_MASKS:
+            self.print_slot = SLOT_LETTERS[SLOT_MASKS.index(
+                parsed.get("hub_mask"))]
         return parsed
 
     def start_background(self, interval=None):
@@ -941,7 +1113,24 @@ class K2BoxController:
         parsed = get_rfid(raw)
         val = parsed.get(letter)
         self.slot_cache.setdefault(letter, {})["rfid"] = val
+        if rfid_material(val) is not None:
+            self.tag_cache[letter] = val
         return val
+
+    def get_rfid_all(self):
+        """RFID aller Slots mit EINEM 0x02 [0f] (lesend, Beleg API-box_wrapper
+        communication_get_rfid(1, 15)) -> {Buchstabe: Wert}."""
+        raw = self.action.communication_get_rfid(MASK_ALL)
+        parsed = get_rfid(raw)
+        for letter, val in parsed.items():
+            self.slot_cache.setdefault(letter, {})["rfid"] = val
+            if rfid_material(val) is not None:
+                self.tag_cache[letter] = val
+        return dict(parsed)
+
+    def inlet_mask(self):
+        """Einlauf-Sensoren (0x08 [00] = Sensor A, Filament je Slot) – lesend."""
+        return int(self.get_sensor(0x00)) & MASK_ALL
 
     def get_remain(self, mask=MASK_ALL):
         if isinstance(mask, bool) or not isinstance(mask, int) \
@@ -1272,6 +1461,12 @@ class PrinterK2Box:
         self.chain_error = ""
         self.pending_resume_z = None
         self._keep_start_pos = None  # Startposition eines abgebrochenen Wechsels
+        # Auto-Nachladen bei Runout (A7): Laufzeit-Schalter (Start = Config
+        # runout_refill, Stock BOX_ENABLE_AUTO_REFILL), Gleich-Material-Liste
+        # (Stock BOX_UPDATE_SAME_MATERIAL_LIST, hier manuell), letzte Meldung.
+        self.auto_refill = bool(self.cfg.get("runout_refill"))
+        self.same_material = []
+        self.runout_last = ""
         for name, func, desc in (
                 ("KTWO_BOX_PRE_OPT", self.cmd_pre_opt,
                  "Wechsel beginnen (= M8200 P) [TNN=T1A] [Z_HOP=mm]"),
@@ -1298,7 +1493,16 @@ class PrinterK2Box:
                 ("KTWO_BOX_ERROR_CLEAR", self.cmd_error_clear,
                  "Wechsel-Fehler quittieren (+ Box 0x04 IDLE mit allow_write)"),
                 ("KTWO_BOX_RESUME_FIX", self.cmd_resume_fix,
-                 "Nach RESUME: Z auf Höhe vor dem abgebrochenen Wechsel")):
+                 "Nach RESUME: Z auf Höhe vor dem abgebrochenen Wechsel"),
+                ("KTWO_BOX_RUNOUT", self.cmd_runout,
+                 "Runout: aus der CFS nachladen (= Stock BOX_CHECK_MATERIAL_"
+                 "REFILL) [SLOT=A..D] [TEMP=] [DRY_RUN=1]"),
+                ("KTWO_BOX_AUTO_REFILL", self.cmd_auto_refill,
+                 "Auto-Nachladen an/aus (= Stock BOX_ENABLE_AUTO_REFILL) "
+                 "[ENABLE=0|1]"),
+                ("KTWO_BOX_SAME_MATERIAL", self.cmd_same_material,
+                 "Gleich-Material-Gruppen (= Stock BOX_UPDATE_SAME_MATERIAL_"
+                 "LIST) [LIST=T1A,T1C/T1B,T1D] [CLEAR=1]")):
             self.gcode.register_command(name, func, desc=desc)
 
     def _ensure_bus(self):
@@ -1405,6 +1609,11 @@ class PrinterK2Box:
             "chain_skip": bool(self.chain.get("skip")),
             "chain_error": self.chain_error or "",
             "pending_resume_z": self.pending_resume_z,
+            # Auto-Nachladen (Stock-Statusnamen 'auto_refill'/'same_material')
+            "auto_refill": 1 if self.auto_refill else 0,
+            "same_material": [["T%d%s" % (self.cfg.get("box_addr", 1), x)
+                               for x in g] for g in self.same_material],
+            "runout_last": self.runout_last or "",
         })
         return st
 
@@ -1611,8 +1820,10 @@ class PrinterK2Box:
             return {}
 
     def _print_active(self):
-        return self._obj_status("print_stats").get("state") in (
-            "printing", "paused")
+        # Pausiert zählt mit (auch ohne virtual_sdcard, z. B. PAUSE aus dem
+        # Runout-Handler vor KTWO_BOX_RUNOUT).
+        return (self._obj_status("print_stats").get("state") in (
+            "printing", "paused") or self._is_paused())
 
     def _is_paused(self):
         return bool(self._obj_status("pause_resume").get("is_paused"))
@@ -1764,10 +1975,20 @@ class PrinterK2Box:
             return ctl.loaded_slot == letter and head is not False
         if hub == SLOT_MASKS[idx] and head is not False:
             ctl.loaded_slot = letter
+            self._remember_tag(ctl, letter)
             return True
         if hub == 0:
             ctl.loaded_slot = None
         return False
+
+    @staticmethod
+    def _remember_tag(ctl, letter):
+        """RFID-Etikett des geladenen Slots merken (lesend, best effort) –
+        für das Auto-Nachladen, falls die leere Spule später nichts liefert."""
+        try:
+            ctl.get_rfid(letter)
+        except Exception:
+            pass
 
     def _go_extrude_pos(self, gcmd):
         c = self.cfg
@@ -2054,6 +2275,7 @@ class PrinterK2Box:
                 poll_interval=c["extrude_poll_interval"],
                 stage7_fn=_stage7, stage7_delay=c["stage7_delay"])
             self._move(gcmd, "Bewegungen abwarten", ["M400"], wrap=False)
+            self._remember_tag(ctl, letter)
             odo = res.get("odo_mm") or []
             gcmd.respond_info("[k2_box] EXTRUDE %s ok (Odometer %s mm, %d Polls)"
                               % (tnn, round(odo[-1], 1) if odo else "?",
@@ -2160,6 +2382,233 @@ class PrinterK2Box:
                        ["G90", "G1 Z%s F%s" % (_n(z), _n(self.cfg["z_velocity"]))])
         except Exception as exc:
             raise gcmd.error("[k2_box] RESUME_FIX: %s" % (exc,))
+
+    # =================================================================
+    # Auto-Nachladen bei Runout (A7) – Ersatz für Stock
+    # BOX_CHECK_MATERIAL_REFILL (printer.cfg runout_gcode)
+    # =================================================================
+    # Ablauf (Belege + ANNAHMEN: config-pi/NOTIZ-runout.md):
+    #   Upstream pausiert VOR runout_gcode (pause_on_runout: True,
+    #   filament_switch_sensor._runout_event_handler: "PAUSE\n" + Vorlage).
+    #   KTWO_BOX_RUNOUT prüft lesend (Freigaben, Kopfsensor, Box-Zustand
+    #   PRINT/0x50, aktueller Slot, Hub + Einlauf leer, RFID/Gruppe), wählt
+    #   den Ersatz-Slot (select_runout_slot) und fährt die vorhandene Kette:
+    #   PRE_OPT (ohne Z-Hop, PAUSE hat schon gehoben) -> Schacht + Heizen +
+    #   Restfilament E30 F600 (Stock) -> EXTRUDE -> WASTE -> FLUSH ->
+    #   END_OPT RETURN=1 -> RESUME. Kein Rückzug/Schnitt: Hub und Kopf sind
+    #   leer (der Spulenrest ist schon durch). Jeder Abbruch: Druck bleibt
+    #   pausiert + Meldung (nie Shutdown).
+    def _runout_stop(self, gcmd, text, dry=False):
+        msg = "[k2_box] RUNOUT: kein automatisches Nachladen – %s" % (text,)
+        self.runout_last = msg
+        if dry:
+            gcmd.respond_info(msg + " (DRY_RUN)")
+            return None
+        if self._print_active():
+            self._respond_error(
+                "%s – Druck bleibt PAUSIERT. Filament von Hand nachlegen bzw. "
+                "wechseln (z. B. T<n>), dann RESUME." % (msg,))
+            if not self._is_paused():
+                try:
+                    self._script(["PAUSE"])
+                except Exception as exc:
+                    self._respond_error("[k2_box] PAUSE fehlgeschlagen: %s"
+                                        % (exc,))
+            return None
+        if hasattr(gcmd, "error"):
+            raise gcmd.error(msg)
+        raise RuntimeError(msg)
+
+    def _runout_temp(self, gcmd):
+        """Lade-/Spültemperatur: TEMP= oder max(Drucktemperatur vor der Pause
+        (_PI_PARAM.hotend_temp, macros.cfg PAUSE), sonst Ziel, Tn_extrude_temp).
+        ANNAHME: Stock nimmt die Materialtemperatur aus RFID/Datenbank."""
+        t = gcmd.get_float("TEMP", None, above=0.)
+        if t is not None:
+            return float(t)
+        base = 0.0
+        try:
+            base = float(self._obj_status("gcode_macro _PI_PARAM")
+                         .get("hotend_temp") or 0.0)
+        except Exception:
+            base = 0.0
+        if base <= 0.0:
+            try:
+                base = float(self._obj_status("extruder").get("target") or 0.0)
+            except Exception:
+                base = 0.0
+        return max(base, float(self.cfg["tn_extrude_temp"]))
+
+    def _runout_analyse(self, gcmd):
+        """Nur lesend: darf/kann nachgeladen werden? -> Plan-Dict, sonst
+        BoxChangeError mit Klartext (Bus-Fehler als RuntimeError)."""
+        c = self.cfg
+        if not self.auto_refill:
+            raise BoxChangeError("Auto-Nachladen aus ([k2_box] runout_refill: "
+                                 "False bzw. KTWO_BOX_AUTO_REFILL ENABLE=0)")
+        if not self._released():
+            raise BoxChangeError(
+                "CFS-Wechsel nicht freigegeben ([k2_box] allow_write=%s, "
+                "allow_move=%s)" % (c.get("allow_write"), c.get("allow_move")))
+        if self.chain.get("active") or self.chain_error:
+            raise BoxChangeError("Wechsel aktiv oder Wechsel-Fehler offen (%s)"
+                                 % (self.chain_error or self.chain.get("tnn"),))
+        if self._head_filament() is True:
+            raise BoxChangeError("Kopfsensor meldet Filament – kein Runout "
+                                 "(Fehlauslösung?)")
+        ctl = self._ensure_controller()
+        st = ctl.poll_status()
+        if st.get("kind") not in ("state", "state_v113"):
+            st = ctl.poll_status()  # Ereignis (0x30) -> einmal nachfragen
+        state = st.get("state")
+        code = int(st.get("error_code") or st.get("frame_status") or 0)
+        clear = False
+        if state == _BOX.BOX_STATE_ERROR:
+            if code not in RUNOUT_CLEARABLE_ERRORS:
+                raise BoxChangeError("Box im Zustand ERROR (0x%02x %s) – "
+                                     "KTWO_BOX_ERROR_CLEAR" % (
+                                         code, status_name(code)))
+            clear = True
+        elif state != _BOX.BOX_STATE_PRINT:
+            raise BoxChangeError(
+                "CFS druckt nicht (Box-Zustand %s) – Runout einer externen "
+                "Spule? (ANNAHME: CFS-Druck = Box im PRINT)" % (
+                    st.get("state_name", "?"),))
+        slot = gcmd.get("SLOT", None) or ctl.loaded_slot or ctl.print_slot
+        if not slot:
+            raise BoxChangeError("aktiver CFS-Slot unbekannt (kein Wechsel "
+                                 "seit dem Start; SLOT=A..D angeben)")
+        idx, letter, mask = parse_slot(slot)
+        hub = ctl.hub_mask()
+        if hub & mask:
+            raise BoxChangeError(
+                "Hub meldet noch Filament von Slot %s – Spule nicht leer "
+                "(Bruch/Verhakung zwischen Hub und Kopf?)" % (letter,))
+        if hub:
+            raise BoxChangeError("Hub durch anderen Slot belegt (0x%02x)" % hub)
+        inlet = ctl.inlet_mask()
+        if inlet & mask:
+            raise BoxChangeError(
+                "Einlauf von Slot %s meldet noch Filament – keine leere Spule "
+                "(Bruch zwischen Box und Kopf?)" % (letter,))
+        rfid = ctl.get_rfid_all()
+        if rfid_material(rfid.get(letter)) is None \
+                and letter in ctl.tag_cache:
+            rfid[letter] = ctl.tag_cache[letter]  # Etikett vom Laden
+        try:
+            remain = ctl.get_remain(MASK_ALL)
+        except Exception:
+            remain = {}
+        target, why = select_runout_slot(letter, inlet, rfid,
+                                         self.same_material,
+                                         c["runout_require_color"])
+        if target is None:
+            raise BoxChangeError(why)
+        return {"slot": letter, "target": target, "why": why,
+                "clear_error": clear, "code": code, "inlet": inlet,
+                "remain": remain}
+
+    def cmd_runout(self, gcmd):
+        dry = bool(gcmd.get_int("DRY_RUN", 0))
+        try:
+            plan = self._runout_analyse(gcmd)
+        except Exception as exc:
+            return self._runout_stop(gcmd, self._exc_text(exc), dry)
+        c = self.cfg
+        box = int(c.get("box_addr", BOX_ADDR_DEFAULT))
+        old_tnn = "T%d%s" % (box, plan["slot"])
+        tnn = "T%d%s" % (box, plan["target"])
+        head = ("[k2_box] RUNOUT: %s leer -> Ersatz %s (%s; Einlauf 0x%02x, "
+                "Rest %s)" % (old_tnn, tnn, plan["why"], plan["inlet"],
+                              plan["remain"]))
+        if dry:
+            self.runout_last = head + " (DRY_RUN)"
+            gcmd.respond_info(head + " – DRY_RUN: nichts bewegt/gesendet")
+            return None
+        gcmd.respond_info(head)
+        temp = self._runout_temp(gcmd)
+        paused = self._is_paused()
+        if plan["clear_error"]:
+            try:
+                self._ensure_controller().action.communication_set_box_mode_feed()
+                gcmd.respond_info("[k2_box] RUNOUT: Box-Fehler 0x%02x per 0x04 "
+                                  "[00 01] quittiert" % (plan["code"],))
+            except Exception as exc:
+                return self._runout_stop(gcmd, "Box-Fehler 0x%02x nicht "
+                                         "quittierbar: %s" % (
+                                             plan["code"], self._exc_text(exc)))
+        self._script(["KTWO_BOX_PRE_OPT TNN=%s Z_HOP=%s" % (
+            tnn, "0" if paused else _n(c["change_z_hop"]))])
+        if self.chain.get("active") and not self.chain.get("skip"):
+            def tail(gcmd):
+                # Stock runout_gcode "G0 E30 F600" (wenn heiß): Rest durch die
+                # Zahnräder – hier im Schacht, nach dem Heizen.
+                self._go_extrude_pos(gcmd)
+                self._heat(gcmd, temp)
+                self._move(gcmd, "Runout: Restfilament durch den Extruder "
+                           "(Stock E30 F600)", gcode_extruder_move(
+                               c["runout_tail_length"],
+                               c["runout_tail_velocity"]) + ["M400"])
+            if c["runout_tail_length"] > 0:
+                self._run_step(gcmd, "RUNOUT_TAIL", tail)
+        self._script([
+            "KTWO_BOX_EXTRUDE TNN=%s TEMP=%s" % (tnn, _n(temp)),
+            "KTWO_BOX_WASTE",
+            "KTWO_BOX_FLUSH TNN=%s TEMP=%s" % (tnn, _n(temp)),
+            "KTWO_BOX_END_OPT RETURN=1"])
+        if self.chain_error:
+            self.runout_last = ("[k2_box] RUNOUT: Nachladen %s -> %s "
+                                "fehlgeschlagen (%s) – Druck bleibt pausiert"
+                                % (old_tnn, tnn, self.chain_error))
+            self._respond_error(self.runout_last)
+            return None
+        self.runout_last = "[k2_box] RUNOUT: %s leer -> %s nachgeladen" % (
+            old_tnn, tnn)
+        gcmd.respond_info(self.runout_last)
+        if paused and self._is_paused():
+            if c["runout_resume"]:
+                try:
+                    self._script(["RESUME"])
+                except Exception as exc:
+                    self._respond_error(
+                        "[k2_box] RUNOUT: RESUME fehlgeschlagen (%s) – Druck "
+                        "bleibt pausiert, von Hand fortsetzen" % (exc,))
+            else:
+                gcmd.respond_info("[k2_box] RUNOUT: runout_resume: False – "
+                                  "Druck bleibt pausiert, RESUME von Hand")
+        return None
+
+    def cmd_auto_refill(self, gcmd):
+        en = gcmd.get_int("ENABLE", None)
+        if en is not None:
+            self.auto_refill = bool(en)
+        gcmd.respond_info(
+            "[k2_box] Auto-Nachladen: %s (wirkt nur mit allow_write=%s UND "
+            "allow_move=%s; Regel: %s, Farbe %s)" % (
+                "AN" if self.auto_refill else "AUS",
+                self.cfg.get("allow_write"), self.cfg.get("allow_move"),
+                ("Gruppen %s" % self.get_status()["same_material"])
+                if self.same_material else "RFID gleiches Material",
+                "muss passen" if self.cfg.get("runout_require_color")
+                else "egal"))
+
+    def cmd_same_material(self, gcmd):
+        if gcmd.get_int("CLEAR", 0):
+            self.same_material = []
+        else:
+            raw = gcmd.get("LIST", None)
+            if raw is not None:
+                try:
+                    self.same_material = parse_same_material(
+                        raw, self.cfg.get("box_addr", BOX_ADDR_DEFAULT))
+                except ValueError as exc:
+                    msg = "[k2_box] SAME_MATERIAL: %s" % (exc,)
+                    if hasattr(gcmd, "error"):
+                        raise gcmd.error(msg)
+                    raise RuntimeError(msg)
+        groups = self.get_status()["same_material"]
+        gcmd.respond_info("[k2_box] Gleich-Material-Gruppen: %s" % (
+            groups if groups else "keine (Ersatz per RFID-Vergleich)",))
 
 
 def load_config(config):

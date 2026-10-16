@@ -1,4 +1,4 @@
-> **ENTWURF – am echten Gerät UNGETESTET (Stand 16.10.2026).** Klipper-Modul [k2_box] für Upstream-Klipper; offline getestet (`python3 test_k2_box.py`, 20/20 inkl. Filamentwechsel §8). Entwurf durch einen weiteren KI-Agenten, von uns geprüft.
+> **ENTWURF – am echten Gerät UNGETESTET (Stand 16.10.2026).** Klipper-Modul [k2_box] für Upstream-Klipper; offline getestet (`python3 test_k2_box.py`, 25/25 inkl. Filamentwechsel §8 und Auto-Nachladen §9). Entwurf durch einen weiteren KI-Agenten, von uns geprüft.
 
 # BERICHT – Klipper-Modul [k2_box] + serial485-Patch (Entwurf, 16.10.2026)
 
@@ -378,3 +378,34 @@ hier `max(Ziel, 220)`), Spül-Erhöhung auf Max-Temperatur/×1,2 entfällt,
 `safe_pos_x` 225 ungenutzt, Box 2–4, Lüfter fan0/„Blasen“ beim Spülen
 nicht nachgebaut, Z nach RESUME mitten im Wechsel. Details:
 `config-pi/NOTIZ-cfs.md`.
+
+## 9. Auto-Nachladen bei Runout (A7, Ergänzung 17.10.2026)
+
+> **ENTWURF – am Gerät UNGETESTET.** Offline: `test_k2_box.py` 25/25 (5
+> Runout-Prüfungen), Batch gegen Upstream 9cb9975:
+> `arbeitsdateien-lokal/upstream-test-runout/` (`ERGEBNIS.txt`). Belege,
+> Ablauf, ANNAHMEN: `config-pi/NOTIZ-runout.md`.
+
+- Stock: `pause_on_runout: true` + `runout_gcode` (E30 F600 wenn heiß +
+  `BOX_CHECK_MATERIAL_REFILL` aus `box_wrapper.so`; Strings `auto_refill`,
+  `same_material_list`/`same_tnn_list`, „no tray with ingredients found“).
+  Kein echter Runout in den Live-Logs → Frame-Folge unbelegt.
+- Pi: `printer.cfg` `runout_gcode: KTWO_BOX_RUNOUT`, `pause_on_runout: True`
+  (Upstream pausiert vor dem runout_gcode). `KTWO_BOX_RUNOUT` prüft lesend
+  (0x0a PRINT/0x50, 0x08 [01] Hub leer, 0x08 [00] Einlauf leer, 0x02 [0f]
+  RFID, 0x03 [0f]), wählt den Ersatz (`select_runout_slot`: Gleich-Material-
+  Gruppe oder RFID gleiche mat_id + Farbe, Filament am Einlauf, zyklisch ab
+  dem Nachbarslot) und fährt PRE_OPT (Z_HOP=0) → Schacht/Heizen/E30 F600 →
+  EXTRUDE → WASTE → FLUSH → END_OPT RETURN=1 → RESUME.
+- Neue Befehle `KTWO_BOX_RUNOUT`, `KTWO_BOX_AUTO_REFILL`,
+  `KTWO_BOX_SAME_MATERIAL`; Optionen `runout_refill` (False),
+  `runout_require_color` (True), `runout_resume` (True),
+  `runout_tail_length`/`_velocity` (30/600); Status `auto_refill`,
+  `same_material`, `runout_last`.
+- Sicherheit: nur mit `runout_refill` + `allow_write` + `allow_move`; jeder
+  Abbruch lässt den Druck pausiert (Meldung), Kettenfehler sperren RESUME
+  bis `KTWO_BOX_ERROR_CLEAR`, nie Shutdown. `_print_active()` zählt jetzt
+  auch `pause_resume.is_paused`.
+- Nebenbei (A6): `cut_pos_x` steht nicht mehr in `k2-module.cfg` (SAVE_CONFIG-
+  Konflikt); Default −7.80 aus `CHANGE_DEFAULTS` bzw. SAVE_CONFIG-Block.
+

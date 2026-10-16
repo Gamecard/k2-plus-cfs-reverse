@@ -123,8 +123,14 @@ Audit und Änderungsbegründungen: `<projekt>/AUDIT-UND-AENDERUNGEN.md`.
   Thermistoren, Mesh, Probe-Stack, closed-loop) ist in `pi-host/config-pi/` + eigenen Modulen umgesetzt.
   Stattdessen: Gegenprüfung config-pi/Module gegen k2-vanilla-public – **ERLEDIGT (VANILLA-ABGLEICH-BEFUND-2026-10-16.md):**
   A3 Mesh nach Homing, A8 on_error_gcode, A9 Kommentar umgesetzt; A1/A2 nachgeprüft und widerlegt.
-- [ ] Pi-Lücken aus dem Vanilla-Abgleich: A4 Düsenreinigung vor Z-Antasten, A5 RESUME mit Prime/Reinigung,
-  A6 CALIBRATE_CUT_POS-Ersatz (Stall-Mode 3 + Messfahrt), A7 CFS-Nachladen bei Runout, A10 z_align-Vergleich am Gerät
+- [x] Pi-Lücken aus dem Vanilla-Abgleich umgesetzt (16.10.2026, alles gesperrt, am Gerät ungetestet):
+  A4 `_PI_NOZZLE_CLEAN` vor Z-Antasten/START_PRINT/G29, A5 RESUME mit Vorextrusion + Reinigung + sicherer Rückfahrt,
+  A6 `CALIBRATE_CUT_POS` → `KTWO_MOTOR_CUT_CAL` (Live-Folge belegt), A7 `KTWO_BOX_RUNOUT` (Default aus)
+- [ ] A10 z_align-Vergleich am Gerät (Dual-Z ohne Lichtschranken stabil?)
+- [ ] RESUME nach abgebrochenem CFS-Wechsel im Schneidbereich: Upstream-RESUME_BASE fährt gerade zur Fehlerposition
+  zurück und könnte den Schneidhebel erneut betätigen (bisher nur Meldung) – am Pi prüfen/absichern
+- [ ] Am Pi zu prüfen: Positionen Reinigung/Schacht wegen FORCE_MOVE-Versatz einzeln langsam abfahren; Vorextrusion
+  460 mm/min/180 °C; Stall-Pin PB11 in Mode 3; RESUME direkt aus runout_gcode
   Zurückgestellt: Motor-Kalibrierfunktionen aus dessen motor_control.py (0x03 Encoder, 0x04 Elektrik-Offset,
   0x07 Flash) – schreiben Motor-Flash/drehen Motor; nur bei echtem Bedarf, dann mit Einzelfreigabe
 
