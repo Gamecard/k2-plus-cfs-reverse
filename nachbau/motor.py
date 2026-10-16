@@ -17,6 +17,13 @@ motor_control_wrapper.so + Traceback klippy.log 13:12:27): 0x08-Index 5..8 =
 pos_fdb/spd_fdb/id_fdb/iq_fdb (Host-Dict NO_ERR_CODE_TO_GET), Typkette des
 Hosts fest (1..10,17,18 '<f', 11..16 '<I'), Motor_cmd-Tabelle komplett,
 Crash-Ursache DATA=0/13 belegt (host-seitig, KEIN Frame auf dem Bus).
+NACHTRAG 16.10.2026 (LIVE-ABFRAGEN-2026-10-16.md, Abschnitt „Skalierung
+pos_fdb“, Messfahrt X nach G28, Bett leer, User-Freigabe): idx 11 =
+Single-Turn-Position 0..3199 Counts/Umdrehung (POS_COUNTS_PER_REV = 3200 =
+200 Vollschritte x 16 Microsteps; 80 Counts/mm bei rotation_distance 40),
+idx 5 pos_fdb = idx11 * 2*pi/3200 [rad]. Beide wrappen alle 40 mm (eine
+Umdrehung) -> KEINE absolute Achsposition (die hat nur Klipper über den
+Schrittzähler). idx 6 spd_fdb im Stillstand ~0 (+-0,006, Einheit offen).
 
 Umfang:
 - LESEND (live belegt, senden erlaubt):
@@ -26,7 +33,11 @@ Umfang:
   query_motor_version (0x0F [00] -> 12 B, live 16.10.),
   read_variable (0x08 [idx], NUR idx 1..12 -> 4 B, live 16.10.),
   read_position_feedback / read_speed_feedback / read_current_feedback
-  (0x08 idx 5 / 6 / 7+8, Namen REA-belegt, Skalierung/Einheit OFFEN)
+  (0x08 idx 5 / 6 / 7+8, Namen REA-belegt; pos_fdb = rad single-turn,
+  live 16.10. belegt; spd/id/iq Einheit OFFEN), read_position_counts
+  (0x08 idx 11 = Counts 0..3199/Umdrehung, live 16.10. belegt)
+- Umrechnung ohne Bus: pos_rad_to_counts, counts_to_rad, counts_to_mm,
+  counts_delta (wrap-korrigierte Differenz, nur |Weg| < 1/2 Umdrehung)
 - SETZEN (live belegt, sendet): set_mode (0x11 [01]/[02]/[03], Antwort = Echo)
 - SCHREIBEN (live belegt, aber GESCHÜTZT): write_sys_param (0x06 [01, id]+<f)
   und update_sys_params (0x06 [03]) senden NUR mit confirm=True, sonst
@@ -35,8 +46,8 @@ Umfang:
 - Reine Builder (ohne Senden): build_sys_param_read_payload,
   build_sys_param_write_payload, build_sys_param_update_payload
 - decode_sys_param_float: Dekodier-Hilfe (<f, ohne Bus)
-- read_encoder: GESPERRT (0x06-Altfalle) – Positionsrückmeldung =
-  read_position_feedback (0x08 idx 5 pos_fdb)
+- read_encoder: GESPERRT (0x06-Altfalle) – "Encoder" = 0x08 idx 5/11
+  (Single-Turn) -> read_position_feedback(with_counts=True)
 - Detail-/Sample-Kommandos 0x13..0x16 (err_detail_data, cut_detail_data,
   pos_data_sample, spd_data_sample) und 0x01/0x03/0x04/0x07/0x0B/0x0D:
   nur Konstanten + NotImplementedError-Stubs (senden NICHTS)
@@ -231,9 +242,24 @@ VARIABLE_INDEX_MAX = 12   # G-Code-Grenze des Hosts (maxval=12)
 # Host (bounded negativ). Vermutet (nur Kommentar, keine Host-Belege):
 #   idx 9  = 0.0016113 = 3,3 V/2048 -> 2 LSB eines 12-Bit-ADC bei 3,3 V
 #   idx 10 = 0.0008057 = 3,3 V/4096 -> 1 LSB (z. B. Strommess-Offset ia/ib)
-#   idx 11 = 1106 -> evtl. Roh-Encoderwert (encoder_fdb ist in 0x13 ein int)
-VARIABLE_NAMES = {5: "pos_fdb", 6: "spd_fdb", 7: "id_fdb", 8: "iq_fdb"}
+# idx 11: BELEGT live 16.10. (Messfahrt X, LIVE-ABFRAGEN-2026-10-16.md):
+#   Single-Turn-Position 0..3199 Counts/Umdrehung (690 @ X50, 1490 @ X100,
+#   3090 @ X160, 690 @ X170 -> 80 Counts/mm, Wrap alle 40 mm). Name
+#   "pos_counts" = EIGENER Name (live 16.10. abgeleitet, Host-Name
+#   UNBEKANNT – nicht im Host-Dict NO_ERR_CODE_TO_GET).
+VARIABLE_NAMES_HOST = {5: "pos_fdb", 6: "spd_fdb", 7: "id_fdb", 8: "iq_fdb"}
+VARIABLE_NAMES_DERIVED = {11: "pos_counts"}   # live 16.10. abgeleitet
+VARIABLE_NAMES = dict(list(VARIABLE_NAMES_HOST.items())
+                      + list(VARIABLE_NAMES_DERIVED.items()))
 IDX_POS_FDB, IDX_SPD_FDB, IDX_ID_FDB, IDX_IQ_FDB = 5, 6, 7, 8
+IDX_POS_COUNTS = 11
+# Skalierung (BELEGT live 16.10.): idx 5 pos_fdb [rad] = idx11 * 2*pi/3200.
+# 3200 = 200 Vollschritte x 16 Microsteps ([stepper_x] microsteps 16);
+# rotation_distance 40 -> 80 Counts/mm. Live-Rest pos_fdb - idx11*2pi/3200
+# ~ +8e-5 rad (~0,04 Counts, Ursache offen) -> Toleranz POS_RAD_TOL.
+POS_COUNTS_PER_REV = 3200
+POS_ROTATION_DISTANCE = 40.0   # mm/Umdrehung, printer.cfg [stepper_x] (live)
+POS_RAD_TOL = 2e-4
 # Typkette des Hosts (REA BELEGT: motor_get @0x51524, Py-Zeile 1987/1989,
 # Vergleiche @0x51e04-0x520e8 und @0x526bc-0x527c8; gleiche Kette in
 # motor_extruder_get und _motor_no_cut_detail_data). Fest verdrahtet, der
@@ -618,6 +644,36 @@ def _check_variable_index(idx):
             "außerhalb 1..12 unbelegt" % (VARIABLE_INDEX_MIN, VARIABLE_INDEX_MAX, idx))
 
 
+def counts_to_rad(counts, counts_per_rev=POS_COUNTS_PER_REV):
+    """idx-11-Counts -> rad (= pos_fdb-Skala). Live 16.10.: 690 -> 1.35481
+    (pos_fdb live 1.35489). KEIN Bus-Zugriff."""
+    return counts * 2.0 * math.pi / counts_per_rev
+
+
+def pos_rad_to_counts(rad, counts_per_rev=POS_COUNTS_PER_REV):
+    """pos_fdb [rad] -> Counts (float, nicht gerundet). Live 16.10.:
+    1.35489 -> 690.04. Single-Turn (0..counts_per_rev). KEIN Bus-Zugriff."""
+    return rad * counts_per_rev / (2.0 * math.pi)
+
+
+def counts_to_mm(counts, rotation_distance=POS_ROTATION_DISTANCE,
+                 counts_per_rev=POS_COUNTS_PER_REV):
+    """Counts -> mm innerhalb EINER Umdrehung (bzw. Count-Differenz -> mm).
+    Live 16.10.: 800 Counts = 10 mm (rotation_distance 40, 3200/rev).
+    ACHTUNG Single-Turn: idx 11/pos_fdb wrappen alle rotation_distance mm;
+    absolute Achsposition gibt es nur über den Klipper-Schrittzähler."""
+    return counts * float(rotation_distance) / counts_per_rev
+
+
+def counts_delta(new, old, counts_per_rev=POS_COUNTS_PER_REV):
+    """Wrap-korrigierte Differenz new-old in (-rev/2, +rev/2]. Live 16.10.:
+    3090 -> 690 = +800 (X160 -> X170). Nur eindeutig, wenn sich die Achse
+    zwischen zwei Abfragen um < 1/2 Umdrehung (20 mm) bewegt hat; 40-mm-
+    Vielfache sind unsichtbar (Aliasing). KEIN Bus-Zugriff."""
+    d = (new - old) % counts_per_rev
+    return d - counts_per_rev if d > counts_per_rev / 2 else d
+
+
 def build_variable_payload(idx):
     """0x08-Payload [idx], idx 1..12 (live 16.10.: `81 04 00 08 09`). Builder."""
     _check_variable_index(idx)
@@ -630,8 +686,9 @@ def decode_variable(idx, data):
 
     'float' = <f, 'int' = <I (UNSIGNED wie der Host, REA 16.10.),
     'fmt'/'type' = feste Host-Typkette (VARIABLE_HOST_FORMATS), 'value' =
-    Wert in diesem Typ, 'name' = VARIABLE_NAMES (5..8) oder None.
-    Skalierung/Einheit OFFEN (auch für pos_fdb/spd_fdb/id/iq).
+    Wert in diesem Typ, 'name' = VARIABLE_NAMES (5..8 Host, 11 abgeleitet)
+    oder None. Skalierung: pos_fdb/idx 11 belegt (counts_to_rad), spd/id/iq
+    OFFEN.
     Live: 33 33 d3 3a -> 0.0016113 (idx 9), 52 04 00 00 -> 1106 (idx 11).
     """
     _check_variable_index(idx)
@@ -1031,7 +1088,8 @@ class Motor:
         TypeError, kein Frame gesendet). Die Host-Typkette kennt zwar 13..18
         (VARIABLE_HOST_FORMATS), am Motor ist das aber live NICHT geprüft –
         bewusst gesperrt. Typ = feste Host-Kette (1..10 '<f', 11/12 '<I').
-        Namen: 5..8 = pos_fdb/spd_fdb/id_fdb/iq_fdb (VARIABLE_NAMES).
+        Namen: 5..8 = pos_fdb/spd_fdb/id_fdb/iq_fdb (Host), 11 = pos_counts
+        (abgeleitet, VARIABLE_NAMES).
         retries=0, Timeout 1.0 s (UNBELEGT).
         """
         payload = build_variable_payload(idx)
@@ -1040,11 +1098,28 @@ class Motor:
 
     motor_get = read_variable  # Host-Name
 
-    def read_position_feedback(self):
-        """pos_fdb (0x08 idx 5) -> float. LESEND.
-        Name REA-belegt (NO_ERR_CODE_TO_GET); Einheit/Skalierung OFFEN
-        (vermutlich rad oder Umdrehungen, live nur 0.0 im Stillstand)."""
-        return self.read_variable(IDX_POS_FDB)["value"]
+    def read_position_feedback(self, with_counts=False):
+        """pos_fdb (0x08 idx 5) -> float [rad]. LESEND.
+        Name REA-belegt (NO_ERR_CODE_TO_GET); Skalierung live 16.10. BELEGT:
+        pos_fdb = idx11 * 2*pi/3200, SINGLE-TURN (Wrap alle 40 mm bei
+        rotation_distance 40; stromlos vor G28: idx 5 = 0.0, idx 11 = 1106).
+        with_counts=True -> 2 Frames (idx 5 + idx 11), Rückgabe dict
+        {'pos_fdb' [rad], 'counts' (idx 11, 0..3199), 'counts_from_rad',
+        'mm_in_rev' (counts_to_mm, nur innerhalb der Umdrehung)}.
+        Absolute Achsposition NUR über den Klipper-Schrittzähler."""
+        rad = self.read_variable(IDX_POS_FDB)["value"]
+        if not with_counts:
+            return rad
+        counts = self.read_position_counts()
+        return {"pos_fdb": rad, "counts": counts,
+                "counts_from_rad": pos_rad_to_counts(rad),
+                "mm_in_rev": counts_to_mm(counts)}
+
+    def read_position_counts(self):
+        """0x08 idx 11 (eigener Name pos_counts, Host-Name unbekannt) -> int
+        0..3199 Counts/Umdrehung. LESEND. Live 16.10. belegt (80 Counts/mm,
+        Wrap alle 40 mm). Umrechnung: counts_to_mm / counts_delta."""
+        return self.read_variable(IDX_POS_COUNTS)["value"]
 
     def read_speed_feedback(self):
         """spd_fdb (0x08 idx 6) -> float. LESEND. Einheit OFFEN (vermutlich
@@ -1063,14 +1138,15 @@ class Motor:
         """GESPERRT – sendet KEINEN Frame.
 
         Alt-Falle: früher als 0x06 gedeutet; 0x06 ist live Sys-Param
-        (Lesen/Schreiben von Regelparametern), kein Encoder. Die Positions-
-        rückmeldung ist laut Host (REA 16.10.) 0x08 idx 5 = pos_fdb ->
-        read_position_feedback() nutzen (Einheit/Skalierung offen). Ein
-        Roh-Encoderwert (idx 11?) ist nur vermutet.
+        (Lesen/Schreiben von Regelparametern), kein Encoder. "Encoder" =
+        0x08 idx 5 (pos_fdb, rad) / idx 11 (Counts 0..3199), beide SINGLE-
+        TURN (live 16.10. belegt) -> read_position_feedback(with_counts=True)
+        bzw. read_position_counts() nutzen.
         """
         raise NotImplementedError(
             "read_encoder gesperrt (0x06 = Sys-Param): Positionsrückmeldung = "
-            "read_position_feedback() (0x08 idx 5 pos_fdb, Skalierung offen)")
+            "read_position_feedback(with_counts=True) (0x08 idx 5 pos_fdb rad / "
+            "idx 11 Counts, single-turn 3200/Umdrehung)")
 
     # --- Stubs aus der Host-Tabelle Motor_cmd (REA 16.10., live nie
     # gesehen) – senden NICHTS ---
@@ -1532,9 +1608,11 @@ def selftest():
           sorted(VARIABLE_HOST_FORMATS) == list(range(1, 19))
           and all(VARIABLE_HOST_FORMATS[i] == "<f" for i in list(range(1, 11)) + [17, 18])
           and all(VARIABLE_HOST_FORMATS[i] == "<I" for i in range(11, 17)))
-    check("0x08 Namen 5..8", VARIABLE_NAMES == {5: "pos_fdb", 6: "spd_fdb",
-                                                7: "id_fdb", 8: "iq_fdb"}
+    check("0x08 Namen 5..8 (Host) + 11 (abgeleitet)",
+          VARIABLE_NAMES_HOST == {5: "pos_fdb", 6: "spd_fdb", 7: "id_fdb", 8: "iq_fdb"}
+          and VARIABLE_NAMES == dict(list(VARIABLE_NAMES_HOST.items()) + [(11, "pos_counts")])
           and res[5]["name"] == "pos_fdb" and res[1]["name"] is None
+          and res[11]["name"] == "pos_counts" and res[9]["name"] is None
           and res[11]["fmt"] == "<I" and res[9]["fmt"] == "<f")
     check("0x08 int unsigned '<I' (ff ff ff ff -> 4294967295)",
           decode_variable(11, b"\xff\xff\xff\xff")["value"] == 0xFFFFFFFF
@@ -1554,6 +1632,39 @@ def selftest():
           pos == 1.5 and spd == -2.25 and cur == {"id": 3.0, "iq": 4.0, "abs": 5.0}
           and [c[2] for c in bus.calls] == [[5], [6], [7], [8]] and not bus.script)
     check("motor_get Alias", Motor.motor_get is Motor.read_variable)
+    # Skalierung pos_fdb / idx 11 (live 16.10., Messfahrt X, rotation_distance 40)
+    live = [(50, 1.35489, 690), (100, 2.92568, 1490), (150, 4.49648, 2290),
+            (160, 6.06728, 3090), (170, 1.35489, 690), (180, 2.92568, 1490),
+            (185, 3.71108, 1890), (200, 6.06728, 3090), (250, 1.35470, 690)]
+    check("Skalierung 690 -> 1.35481 rad, 3200/rev",
+          POS_COUNTS_PER_REV == 3200 and abs(counts_to_rad(690) - 1.35481) < 1e-5
+          and abs(counts_to_rad(3200) - 2 * math.pi) < 1e-12)
+    check("Skalierung Live-Tabelle idx5 = idx11*2pi/3200 (Tol 2e-4 rad)",
+          all(abs(counts_to_rad(c) - r) < POS_RAD_TOL
+              and abs(pos_rad_to_counts(r) - c) < 0.1 for _, r, c in live))
+    check("Skalierung 800 Counts = 10 mm, 80 Counts/mm",
+          counts_to_mm(1490 - 690) == 10.0 and counts_to_mm(80) == 1.0
+          and counts_to_mm(3200) == POS_ROTATION_DISTANCE == 40.0)
+    check("Skalierung Wrap X160->X170 (+800), X185<->X150 (+-400)",
+          counts_delta(690, 3090) == 800 and counts_delta(2290, 1890) == 400
+          and counts_delta(1890, 2290) == -400 and counts_delta(690, 690) == 0)
+    check("Skalierung Single-Turn: Live-Counts = (80*X + 3090) mod 3200",
+          all((80 * x + 3090) % 3200 == c for x, _, c in live))
+    def _vrxb(i, raw):
+        body = bytes([0x07, 0x00, FUNC_VARIABLE]) + raw
+        return ("81 04 00 08 %02x" % i,
+                "f7 81 %s %02x" % (body.hex(" "), crc8_cal(body)))
+    bus = _FakeBus([_vrxb(5, struct.pack("<f", 1.35489)),
+                    _vrxb(11, struct.pack("<I", 690))])
+    pf = Motor(bus, 0x81).read_position_feedback(with_counts=True)
+    check("read_position_feedback(with_counts) idx 5+11",
+          [c[2] for c in bus.calls] == [[5], [11]] and not bus.script
+          and pf["counts"] == 690 and abs(pf["pos_fdb"] - 1.35489) < 1e-6
+          and abs(pf["counts_from_rad"] - 690) < 0.1
+          and abs(pf["mm_in_rev"] - 8.625) < 1e-9)
+    bus = _FakeBus([_vrxb(11, struct.pack("<I", 3090))])
+    check("read_position_counts idx 11",
+          Motor(bus, 0x81).read_position_counts() == 3090 and not bus.script)
     # Motor_cmd-Tabelle + Adressen + Fehlerbits (REA-Konstanten)
     check("MOTOR_CMD Host-Tabelle", MOTOR_CMD["get"] == 0x08 == FUNC_VARIABLE
           and MOTOR_CMD["version"] == 0x0F and MOTOR_CMD["protection"] == 0x0C

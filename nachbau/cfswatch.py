@@ -914,7 +914,8 @@ def selftest():
     t11 = dm.response(0x81, motor.FUNC_VARIABLE, b"\x0b",
                       hx("f7 81 07 00 08 52 04 00 00 71"))[0]
     check(t9.startswith("Variable idx 9 = 0.00161133 (float") and
-          t11.startswith("Variable idx 11 = 1106 (int"), "Motor 0x08: %s | %s" % (t9, t11))
+          t11.startswith("Variable idx 11 pos_counts = 1106 (int"),
+          "Motor 0x08: %s | %s" % (t9, t11))
     t5 = dm.response(0x81, motor.FUNC_VARIABLE, b"\x05",
                      hx("f7 81 07 00 08 00 00 00 00 0a"))[0]
     check(t5.startswith("Variable idx 5 pos_fdb = 0 (float")
@@ -922,7 +923,7 @@ def selftest():
           == "Motor X(0x81) Variable lesen idx 8 (iq_fdb)", "Motor 0x08 Namen: " + t5)
     tq = dm.request(0x81, motor.FUNC_VARIABLE, b"\x0b")[0]
     tq0 = dm.request(0x81, motor.FUNC_VARIABLE, b"\x0d")[0]
-    check(tq == "Motor X(0x81) Variable lesen idx 11" and "Host-Crash" in tq0
+    check(tq == "Motor X(0x81) Variable lesen idx 11 (pos_counts)" and "Host-Crash" in tq0
           and dm.request(0x81, motor.FUNC_VERSION, b"\x00")[0]
           == "Motor X(0x81) Version abfragen", "Motor 0x08/0x0F-Request")
     # Flags 0x91 (BEFUND2 §8) + 0x15-Fehlerfall direkt am Decoder

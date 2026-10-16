@@ -191,12 +191,21 @@ motor 98 · motor_mini 30 · auto_addr 31 – alle grün.
   8 `iq_fdb` BELEGT (Host-Dict `NO_ERR_CODE_TO_GET`), Typkette fest (1–10/17/18 `<f`, 11–16 `<I`);
   `DATA=7/8 EXTRUDER=1` = Stats-Hook Extruder-Überstrom, `DATA=1` nur Hilfetext. Nachbau:
   `VARIABLE_NAMES`, `read_position_feedback`/`read_speed_feedback`/`read_current_feedback`.
-  **Offen:** idx 1–4 und 9–12 (keine Host-Namen; Hypothesen 9/10 = ADC-LSB, 11 = Roh-Encoder?)
-  – Scan nach Homing/in Bewegung. `read_encoder` bleibt gesperrt (0x06-Altfalle, Ersatz =
-  `read_position_feedback`). NIE `MOTOR_GET DATA=0` oder `DATA=13` senden (Host-Crash)
-- [ ] **NEU 16.10.2026 (REA):** Skalierung/Einheit von `pos_fdb` (idx 5) und `spd_fdb` (idx 6)
-  klären (rad bzw. rad/s vermutet) – Scan nach Homing/bei bekannter Fahrt; Voraussetzung, um
-  pos_fdb im Pi-Ersatz zu nutzen
+  **idx 11 ERLEDIGT 16.10.2026 (live, Messfahrt X nach G28):** Single-Turn-Position
+  0..3199 Counts/Umdrehung (80 Counts/mm bei rot.dist. 40; Nachbau-Name `pos_counts`,
+  Host-Name unbekannt; `read_position_counts`). **Offen bleiben:** idx 1–4, 9, 10, 12 (keine
+  Host-Namen; Hypothese 9/10 = ADC-LSB) sowie die Einheit von `spd_fdb` (idx 6).
+  `read_encoder` bleibt gesperrt (0x06-Altfalle, Ersatz = `read_position_feedback(with_counts=True)`).
+  NIE `MOTOR_GET DATA=0` oder `DATA=13` senden (Host-Crash)
+- [x] **NEU 16.10.2026 (REA):** Skalierung von `pos_fdb` (idx 5) klären – **ERLEDIGT 16.10.2026
+  (live, Messfahrt X nach G28, Bett leer, User-Freigabe, `LIVE-ABFRAGEN-2026-10-16.md`):**
+  pos_fdb = idx11·2π/3200 **rad**, single-turn (Wrap alle 40 mm); Nachbau `POS_COUNTS_PER_REV`,
+  `counts_to_mm`/`counts_delta`, `read_position_feedback(with_counts=True)`. Absolute Position
+  nur über Klipper-Schrittzähler. Hinweis für künftige Messfahrten: Creality-Klipper verlangt
+  für `G1` **alle** Achsen referenziert (`G28 X Y` reicht nicht → „Must home axis first“).
+- [ ] **NEU 16.10.2026 (REA):** Einheit von `spd_fdb` (idx 6) klären (rad/s vermutet; im
+  Stillstand live ≈ 0 ±0,006) – braucht Abfrage **während** einer Fahrt mit bekannter
+  Geschwindigkeit
 - [ ] **NEU 16.10.2026 (REA):** Detail-/Sample-Kommandos 0x13 `err_detail_data`
   (Host-Format `<I8BfHfiiffffffffi`), 0x14 `cut_detail_data`, 0x15 `pos_data_sample`,
   0x16 `spd_data_sample` – Request-Formen unbelegt, live nie gesehen; im Nachbau nur Stubs

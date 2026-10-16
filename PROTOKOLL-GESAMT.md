@@ -157,6 +157,9 @@ NEU 15.10.2026 (Ghidra, R153): 0x01 LED-Refresh, 0x06 Feeder (FW-Bug: immer Stat
        Bedeutung je Index OFFEN. !! Creality-Host MOTOR_GET DATA=0/13 → Klipper-SHUTDOWN !!
        REA 16.10.: idx 5 pos_fdb, 6 spd_fdb, 7 id_fdb, 8 iq_fdb (BELEGT, NO_ERR_CODE_TO_GET);
        Host-Typkette fest 1–10/17/18 '<f', 11–16 '<I' (unsigned); 1–4/9–12 ohne Host-Namen
+       LIVE 16.10. (Messfahrt X nach G28): idx 11 = Single-Turn-Position 0..3199 Counts/Umdr.
+       (Nachbau-Name pos_counts, Host-Name unbekannt; 80 Counts/mm bei rot.dist. 40),
+       idx 5 pos_fdb = idx11·2π/3200 rad; beide Wrap alle 40 mm
 Host-Tabelle Motor_cmd (REA 16.10., BELEGT): 01 reboot, 03 encoder_calibrate_official,
        04 elec_offset_calibrate, 05 control, 06 sys_param, 07 flash_param, 08 get, 0b boot,
        0c protection, 0d systemid, 0e read/set485_addr, 0f version, 11 stall_mode, 12 dev_uuid,
@@ -338,8 +341,14 @@ Details siehe Subagenten-Bericht in der Session-Historie.
   (Stock-Host crasht bei 0/13).
   **NACHTRAG 16.10.2026 (REA):** Für einen Pi-Ersatz steht die Positionsrückmeldung als
   0x08 **idx 5 (`pos_fdb`)** bereit (dazu 6 `spd_fdb`, 7/8 `id_fdb`/`iq_fdb`), direkt über
-  ttyS5 lesbar (`read_position_feedback()`); Einheit/Skalierung von pos_fdb noch offen
-  (Scan nach Homing/in Bewegung nötig).
+  ttyS5 lesbar (`read_position_feedback()`); ~~Einheit/Skalierung von pos_fdb noch offen~~
+  → **BELEGT live 16.10.** (Messfahrt X nach G28, PROTOKOLL-485.md §3.1 NACHTRAG (3)):
+  Position-Feedback ist **single-turn** – idx 11 = 0..3199 Counts/Umdrehung (3200/rev =
+  200 Vollschritte × 16), idx 5 pos_fdb = idx11·2π/3200 rad, Wrap alle 40 mm (rot.dist. 40).
+  Ein Pi-Ersatz bekommt damit die Winkellage innerhalb der Umdrehung (z. B. Schleppfehler-/
+  Schrittverlust-Kontrolle per `counts_delta`), die **absolute** Achsposition muss er weiter
+  selbst über Homing + Schrittzähler führen (`read_position_feedback(with_counts=True)`,
+  `read_position_counts()`, `counts_to_mm()`).
 
 **Kreuzvergleich: fake-name/cfs-reverse-engineering (CFS-Hardware, 15.10.2026 gesichtet)**
 
@@ -447,8 +456,9 @@ ein FW-File pro Board. Noch nicht dekompiliert.
   Überstrom-Monitoring über transparent, nicht ttyS5); `DATA=1` = nur Hilfetext. Crash
   DATA=0/13 belegt (Traceback, `parse_num_to_byte(None)`, kein Frame). Fehlerbits
   `motor_error_dict` (key781..794), `motor_warning_dict` (key795..797), `ERR_CODE_TO_UNION`.
-  Offen: Bedeutung idx 1–4/9–12, Skalierung pos_fdb, Byte-Layout der 0x0C-Antwort,
-  Request-Formen 0x13–0x16.
+  Offen: Bedeutung idx 1–4/9/10/12, ~~Skalierung pos_fdb~~ (live 16.10. belegt: idx 11 =
+  Counts 0..3199/Umdr., pos_fdb = idx11·2π/3200 rad, single-turn), Einheit spd_fdb,
+  Byte-Layout der 0x0C-Antwort, Request-Formen 0x13–0x16.
 - Config: `motor_closed_loop: x,y,z,z1,e`, LESO/PID-Parameter je Achse
   (Pos-/Spd-/Cur-Loop), Stall-Pins je Achse
 - Board-FW: `fw/F008/mot*_022_C30-mot2_002_081.bin` (123K, Klartext-Strings)

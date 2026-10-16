@@ -597,6 +597,38 @@ selbst gegengeprüft; bei der Einarbeitung zusätzlich nachgeprüft (Abschnitt �
 - Selbsttests danach alle grün: serial485 93/93 · box 179 · boxmini 17 · cfsseq 28 ·
   motor 167 · motor_mini 60 · auto_addr 33 · cfswatch `--selftest` OK.
 
+## 16.10.2026 Messfahrt Motor X – Skalierung pos_fdb (idx 5) / idx 11
+
+- **Live-Zugriff (mit ausdrücklicher User-Freigabe, Bett leer):** `G28` komplett (zuvor
+  `G28 X Y` + `G1` → „Must home axis first“: Creality-Klipper verlangt für G1 alle Achsen
+  referenziert), Messfahrt X 50…250 mm bei Y=175, Z=10, F3000–6000, je Position `M400` +
+  `MOTOR_GET` idx 5/11 (nur Index 1..12, kein DATA=0/13), danach Park X175 und **`M84`**
+  (Motoren stromlos). Klipper durchgehend ready, kein SHUTDOWN. Rohdaten:
+  `LIVE-ABFRAGEN-2026-10-16.md` (Abschnitt „Skalierung pos_fdb“).
+- **Befund (BELEGT):** idx 11 = Single-Turn-Position 0..3199 Counts/Umdrehung (3200 =
+  200 Vollschritte × 16, 80 Counts/mm bei rotation_distance 40); idx 5 pos_fdb =
+  idx11·2π/3200 rad; beide Wrap alle 40 mm; idx 6 spd_fdb im Stillstand ≈ 0.
+- **Code:**
+  - `nachbau/motor.py`: `POS_COUNTS_PER_REV = 3200`, `POS_ROTATION_DISTANCE = 40.0`,
+    `POS_RAD_TOL`, `IDX_POS_COUNTS = 11`, `VARIABLE_NAMES_HOST` (5–8) +
+    `VARIABLE_NAMES_DERIVED` ({11: 'pos_counts'}, live abgeleitet, Host-Name unbekannt) →
+    `VARIABLE_NAMES`; Helfer `counts_to_rad`, `pos_rad_to_counts`, `counts_to_mm`,
+    `counts_delta` (wrap-korrigiert); `Motor.read_position_counts()` (idx 11),
+    `read_position_feedback(with_counts=False)` (Default unverändert float, mit
+    `with_counts=True` dict pos_fdb/counts/counts_from_rad/mm_in_rev, 2 Frames).
+    `read_encoder` bleibt gesperrt (Docstring: „Encoder“ = idx 5/11 single-turn).
+    7 neue Selbsttests mit den Live-Werten (690 → 1.35481 rad, Tabelle mit Tol 2e-4 rad,
+    800 Counts = 10 mm, Wrap 3090 → 690 = +800, (80·X + 3090) mod 3200, Fake-Bus idx 5+11).
+  - `nachbau/motor_mini.py`: `VARIABLE_NAMES[11]`, `POS_COUNTS_PER_REV`, `counts_to_mm`,
+    `read_position_counts`, Docstrings; 1 Selbsttest + Name-Check idx 11.
+  - `nachbau/cfswatch.py`: idx 11 erscheint als `pos_counts` (Request + Antwort; Tests angepasst).
+- **Doku:** PROTOKOLL-485.md §3.1 „NACHTRAG 16.10.2026 (3)“ (Tabelle, Hypothese idx 11
+  gestrichen), PROTOKOLL-GESAMT.md (§1.5 0x08, Pi-Ersatz: Position-Feedback single-turn
+  3200/rev, Offen-Liste), CHECKLISTE.md (Skalierung pos_fdb + idx 11 erledigt; offen
+  idx 1–4/9/10/12 und spd_fdb-Einheit; G1-Referenzierungs-Hinweis), UEBERGABE.md.
+- Selbsttests danach alle grün: serial485 93/93 · box 179 · boxmini 17 · cfsseq 28 ·
+  motor 174 · motor_mini 61 · auto_addr 33 · cfswatch `--selftest` OK.
+
 ## Anonymisierung (Repo-Fassung)
 
 Gegenüber der lokalen Forschungsablage sind im Repo folgende Werte durch syntaktisch

@@ -22,7 +22,10 @@ LIVE-STAND 15.10.2026 (live-logs-2026-10-15/klippy.log*, lokal, nicht im Repo; s
 - Reine Builder: build_sys_param_write_payload, build_sys_param_update_payload
 - read_position_feedback / read_speed_feedback / read_current_feedback:
   0x08 idx 5 / 6 / 7+8 (pos_fdb/spd_fdb/id_fdb/iq_fdb, REA-belegt 16.10.;
-  Skalierung offen)
+  pos_fdb = rad single-turn, live 16.10. belegt; spd/id/iq Einheit offen)
+- read_position_counts: 0x08 idx 11 = 0..3199 Counts/Umdrehung (live 16.10.,
+  Name pos_counts abgeleitet); counts_to_mm (80 Counts/mm bei rot.dist. 40).
+  Single-Turn, Wrap alle 40 mm -> absolute Position nur Klipper-Schrittzähler
 - read_encoder: GESPERRT (0x06-Altfalle) -> read_position_feedback (idx 5)
 - WARNUNG: Creality-Host MOTOR_GET DATA=0/13 -> Klipper-SHUTDOWN (live 16.10.,
   2x reproduziert; Ursache belegt: get_int -> None -> parse_num_to_byte
@@ -64,8 +67,13 @@ VARIABLE_INDEX_MIN, VARIABLE_INDEX_MAX = 1, 12  # 0/13: Host-Crash (s. oben)
 # 11/12 '<I' (UNSIGNED; 13..16 '<I', 17/18 '<f' per G-Code unerreichbar).
 VARIABLE_TYPES = dict([(i, "float") for i in range(1, 11)]
                       + [(11, "int"), (12, "int")])
-# Indexnamen (REA belegt, Host-Dict NO_ERR_CODE_TO_GET); 1-4/9-12 ohne Namen
-VARIABLE_NAMES = {5: "pos_fdb", 6: "spd_fdb", 7: "id_fdb", 8: "iq_fdb"}
+# Indexnamen (REA belegt, Host-Dict NO_ERR_CODE_TO_GET); 1-4/9-12 ohne
+# Host-Namen. 11 = "pos_counts": EIGENER Name (live 16.10. abgeleitet,
+# Host-Name unbekannt) – Single-Turn-Position 0..3199 Counts/Umdrehung.
+VARIABLE_NAMES = {5: "pos_fdb", 6: "spd_fdb", 7: "id_fdb", 8: "iq_fdb",
+                  11: "pos_counts"}
+# Skalierung live 16.10. (Messfahrt X): pos_fdb [rad] = idx11 * 2*pi/3200
+POS_COUNTS_PER_REV = 3200   # 200 Vollschritte x 16 Microsteps
 SUB_SYS_WRITE = 0x01
 SUB_SYS_READ = 0x02
 SUB_SYS_UPDATE = 0x03
@@ -168,9 +176,16 @@ def _check_variable_index(idx):
                          "laufen; außerhalb 1..12 unbelegt" % (idx,))
 
 
+def counts_to_mm(counts, rotation_distance=40.0, counts_per_rev=POS_COUNTS_PER_REV):
+    """Counts (idx 11, oder Count-Differenz) -> mm innerhalb einer Umdrehung.
+    Live 16.10.: 800 Counts = 10 mm. Single-Turn (Wrap alle 40 mm)."""
+    return counts * float(rotation_distance) / counts_per_rev
+
+
 def decode_variable(idx, data):
     """4 B 0x08-Antwort -> {'index','name','raw','float' (<f),'int' (<I wie
-    Host),'type' (feste Host-Kette),'value'}. Namen nur 5..8, Skalierung offen."""
+    Host),'type' (feste Host-Kette),'value'}. Namen 5..8 (Host) + 11
+    (abgeleitet); Skalierung nur pos_fdb/idx 11 belegt (motor.py)."""
     _check_variable_index(idx)
     raw = bytes(data)
     if len(raw) != 4:
@@ -301,8 +316,13 @@ class MotorMini:
                                              TIMEOUT_VARIABLE))
 
     def read_position_feedback(self):
-        """pos_fdb (0x08 idx 5) -> float; Einheit/Skalierung offen."""
+        """pos_fdb (0x08 idx 5) -> float [rad] = idx11*2pi/3200, single-turn
+        (live 16.10.). Mit Counts: motor.py read_position_feedback(with_counts)."""
         return self.read_variable(5)["value"]
+
+    def read_position_counts(self):
+        """0x08 idx 11 (pos_counts, Name abgeleitet) -> int 0..3199/Umdrehung."""
+        return self.read_variable(11)["value"]
 
     def read_speed_feedback(self):
         """spd_fdb (0x08 idx 6) -> float; Einheit offen."""
@@ -315,11 +335,12 @@ class MotorMini:
 
     def read_encoder(self, *args, **kwargs):
         """GESPERRT – sendet KEINEN Frame (0x06-Altfalle: 0x06 = Sys-Param).
-        Positionsrückmeldung = read_position_feedback (0x08 idx 5 pos_fdb,
-        Einheit/Skalierung offen)."""
+        "Encoder" = 0x08 idx 5 (pos_fdb rad) / idx 11 (Counts), single-turn
+        -> read_position_feedback / read_position_counts."""
         raise NotImplementedError(
             "read_encoder gesperrt (0x06 = Sys-Param): Positionsrückmeldung = "
-            "read_position_feedback() (0x08 idx 5 pos_fdb, Skalierung offen)")
+            "read_position_feedback()/read_position_counts() (0x08 idx 5/11, "
+            "single-turn 3200/Umdrehung)")
 
     def query_version(self):
         """Version über Update-Pfad abfragen (Func 0xf0/Sub 0x00). Rohdaten.
@@ -460,7 +481,11 @@ def selftest():
           and bus.calls[1][3] == {"timeout": TIMEOUT_VARIABLE, "retries": 0})
     check("0x08 idx 9 = 0.0016113", abs(r9["float"] - 0.0016113281) < 1e-9)
     check("0x08 idx 10 = 0.0008057", abs(r10["value"] - 0.0008056641) < 1e-9)
-    check("0x08 idx 11 = 1106 (int)", r11["int"] == 1106 and r11["value"] == 1106)
+    check("0x08 idx 11 = 1106 (int)", r11["int"] == 1106 and r11["value"] == 1106
+          and r11["name"] == "pos_counts")
+    check("Skalierung 690 -> 1.35481 rad, 800 Counts = 10 mm",
+          abs(690 * 2 * math.pi / POS_COUNTS_PER_REV - 1.35481) < 1e-5
+          and counts_to_mm(1490 - 690) == 10.0 and counts_to_mm(3200) == 40.0)
     check("0x08 idx 12 = 0 (int)", r12["value"] == 0 and r12["type"] == "int")
     check("0x0F/0x08 Script verbraucht", not bus.script)
     check("0x08 Namen 5..8 + '<I' unsigned",

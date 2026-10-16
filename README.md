@@ -16,7 +16,7 @@ Lizenz: GPL-3.0-or-later (siehe `LICENSE`), Herkunft Dritter in `NOTICES.md`.
 | `API-box_wrapper.md` | Live-introspektierte API-Fläche der CFS-`.so` |
 | `AUDIT-UND-AENDERUNGEN.md` | Audit-Protokoll aller Korrekturen mit Begründung |
 | `CHECKLISTE.md` | Projektstatus (erledigt/offen) |
-| `LIVE-ABFRAGEN-2026-10-16.md` | Live-Abfragen Motor X 16.10.2026: 0x0F Version, 0x08 Variablen-Scan, Pin-IO, Host-Crash-Warnung |
+| `LIVE-ABFRAGEN-2026-10-16.md` | Live-Abfragen Motor X 16.10.2026: 0x0F Version, 0x08 Variablen-Scan, Pin-IO, Host-Crash-Warnung, Skalierung pos_fdb/idx 11 (Messfahrt) |
 | `REA-MOTOR-BEFUND-2026-10-16.md` | Statische Analyse `motor_control_wrapper.so`: Motor_cmd-Tabelle, 0x08-Indexnamen, Typkette, Crash-Ursache, Fehlerbits |
 | `GHIDRA-CFS-BEFUND-2026-10-15.md` | Ghidra-Neuanalyse der CFS-FW R153: Dispatcher, Func-/Status-Tabelle, 0x0a-Layout |
 | `GHIDRA-CFS-BEFUND2-2026-10-16.md` | Zweite Ghidra-Runde: Temp/Feuchte, 0x15, Statuscodes 0x50–0x52, Motorblock-Flags, Auto-Addr-Box-Seite, Sensor-Pins |
@@ -45,9 +45,9 @@ ssh root@<drucker> 'tail -F /mnt/UDISK/printer_data/logs/klippy.log' | python3 n
 Echte Hardware braucht `pyserial`; der Import erfolgt erst bei Benutzung
 (`Serial485(port, baud)`), die Tests laufen ohne.
 
-Stand der Selbsttests (16.10.2026 nach dem REA-Motor-Befund, `ok`-Zeilen, 0 FAIL):
+Stand der Selbsttests (16.10.2026 nach der Skalierungs-Messfahrt, `ok`-Zeilen, 0 FAIL):
 `serial485` 93/93 (inkl. ref-hi: 16 CRC-Vektoren + 12 Nachrichten), `box` 179,
-`boxmini` 17, `cfsseq` 28, `motor` 167, `motor_mini` 60, `auto_addr` 33,
+`boxmini` 17, `cfsseq` 28, `motor` 174, `motor_mini` 61, `auto_addr` 33,
 `cfswatch --selftest` OK.
 
 > **WARNUNG – Creality-Host-Bug:** `MOTOR_GET … DATA=0` und `MOTOR_GET … DATA=13` lassen
@@ -60,12 +60,25 @@ Stand der Selbsttests (16.10.2026 nach dem REA-Motor-Befund, `ok`-Zeilen, 0 FAIL
 > Creality-`gcode.py` lehnt den Bereich nur mit Warnung ab (`get_int` → None); es geht **kein
 > Frame** auf den Bus.
 
+Skalierung Positionsrückmeldung – live belegt 16.10.2026 (Messfahrt X nach `G28`, Bett leer;
+Details: `LIVE-ABFRAGEN-2026-10-16.md`, `PROTOKOLL-485.md` §3.1 „NACHTRAG (3)“):
+
+- `0x08` idx 11 = **Single-Turn-Position 0..3199 Counts/Umdrehung** (3200 = 200 Vollschritte ×
+  16 Microsteps; 80 Counts/mm bei rotation_distance 40) – Nachbau-Name `pos_counts` (eigener
+  Name, Host-Name unbekannt) → `read_position_counts()`.
+- idx 5 `pos_fdb` = idx11 · 2π/3200 **rad**. Beide wrappen alle 40 mm (eine Umdrehung) – eine
+  absolute Achsposition liefert nur Klipper (Homing + Schrittzähler). Helfer `counts_to_mm`,
+  `counts_delta` (wrap-korrigiert), `read_position_feedback(with_counts=True)`.
+- `spd_fdb` (idx 6) im Stillstand ≈ 0; Einheit weiter offen. Hinweis: Creality-Klipper verlangt
+  für `G1` alle Achsen referenziert (`G28 X Y` reicht nicht).
+
 REA-Motor-Befund 16.10.2026 (statische Analyse `motor_control_wrapper.so`, Details:
 `REA-MOTOR-BEFUND-2026-10-16.md`, `PROTOKOLL-485.md` §3.1 „NACHTRAG (2)“):
 
 - `0x08`-Indizes 5–8 = `pos_fdb`, `spd_fdb`, `id_fdb`, `iq_fdb` (Positions-, Drehzahl-, d-/q-Strom-
   Rückmeldung) → `read_position_feedback()`, `read_speed_feedback()`, `read_current_feedback()`;
-  1–4/9–12 ohne Host-Namen, Skalierung offen. Typ fest im Host: 1–10 float, 11/12 `uint32`.
+  1–4/9–12 ohne Host-Namen (Skalierung pos_fdb/idx 11 seit der Messfahrt belegt, s. oben).
+  Typ fest im Host: 1–10 float, 11/12 `uint32`.
 - Vollständige Host-Tabelle `Motor_cmd` (0x01–0x16) als Konstanten; neue Kommandos
   (0x13–0x16 Detail-/Sample-Daten u. a.) nur als Stubs, die nichts senden.
 - `MOTOR_GET … DATA=7/8 EXTRUDER=1` im Stock = Extruder-Überstrom-Monitoring (|I| = hypot(id, iq)).
@@ -146,7 +159,7 @@ RS485 protocol between the Creality K2 Plus host board and its lower boards
 by live captures and Ghidra analysis. License: GPL-3.0-or-later.
 
 Status 16.10.2026: all self-tests green (serial485 93/93 incl. Hi reference
-vectors, box 179, boxmini 17, cfsseq 28, motor 167, motor_mini 60, auto_addr 33,
+vectors, box 179, boxmini 17, cfsseq 28, motor 174, motor_mini 61, auto_addr 33,
 `cfswatch.py --selftest` OK).
 
 **WARNING – Creality host bug:** `MOTOR_GET … DATA=0` and `MOTOR_GET … DATA=13` make
@@ -158,9 +171,17 @@ Root cause confirmed by traceback: `motor_get` line 1982 → `parse_num_to_byte(
 `TypeError`; Creality's `gcode.py` only warns on out-of-range values (`get_int` returns None),
 so the host crashes **before** any frame is sent.
 
+Position feedback scaling, measured live 16.10.2026 (axis X move after `G28`, empty bed;
+`LIVE-ABFRAGEN-2026-10-16.md`, German): `0x08` idx 11 is a **single-turn position of
+0..3199 counts per revolution** (3200 = 200 full steps × 16 microsteps, 80 counts/mm at
+rotation_distance 40; our name `pos_counts`, the host name is unknown) and idx 5 `pos_fdb` =
+idx11 · 2π/3200 **rad**. Both wrap every 40 mm, so the absolute axis position still comes only
+from Klipper's step counter. Helpers: `read_position_counts()`, `counts_to_mm()`,
+`counts_delta()`, `read_position_feedback(with_counts=True)`. The unit of `spd_fdb` is still open.
+
 Static analysis of `motor_control_wrapper.so` (16.10.2026, `REA-MOTOR-BEFUND-2026-10-16.md`,
 German): `0x08` indices 5–8 are `pos_fdb`, `spd_fdb`, `id_fdb`, `iq_fdb` (FOC position, speed and
-d/q current feedback; scaling still open) → `read_position_feedback()`, `read_speed_feedback()`,
+d/q current feedback; position scaling now measured, see above) → `read_position_feedback()`, `read_speed_feedback()`,
 `read_current_feedback()`. The host decodes indices 1–10/17/18 as float and 11–16 as uint32.
 The full host command table `Motor_cmd` (0x01–0x16) is included as constants; unverified
 commands (0x13–0x16 detail/sample data etc.) are stubs that never transmit. The stock

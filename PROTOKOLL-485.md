@@ -936,7 +936,7 @@ tragen → Nachbau nur Bit-Decoder (`decode_error_bits`/`decode_warning_bits`), 
 | G-Code / Index | Cmd | Hypothese |
 |---|---|---|
 | idx 9 / 10 | 0x08 | 0.0016113 = 3,3 V/2048, 0.0008057 = 3,3 V/4096 → 2 bzw. 1 LSB eines 12-Bit-ADC (Strommess-Offset ia/ib?) |
-| idx 11 | 0x08 | 1106 = Roh-Encoderwert? (`encoder_fdb` ist in 0x13 ein int) |
+| ~~idx 11~~ | 0x08 | ~~1106 = Roh-Encoderwert?~~ → **BELEGT 16.10.** als Single-Turn-Position 0..3199 Counts/Umdrehung, s. NACHTRAG (3) |
 | MOTOR_FLASH_PARAM | 0x07 | `[DATA]` (+`00` bei 3/4, +ID bei 5/6); DATA=5 Schreiben (float `f`, uint16 `<H`, uint32 **`>I` Big-Endian**, int16 `<h`, sonst `>I`; Antwort Status 0 = OK), DATA=6 Lesen |
 | MOTOR_CONTROL | 0x05 | `[DATA]` bis 12, Antwort 3 Statusbytes (Enable/EN-Pin/Controller/PWM); DATA-Bedeutung offen |
 | MOTOR_STALL_MODE | 0x11 | 1 = Endschalter-/Blockiersignal, 2 = Notfall-Schutzausgang (Hilfetext, belegt); 4 = Messmodus für Cut-Positionierung (vermutet, `MOTOR_CHECK_CUT_POS`) |
@@ -952,6 +952,37 @@ zusätzlich `name`/`fmt`; `read_position_feedback()` (idx 5), `read_speed_feedba
 senden nichts). `read_encoder` bleibt gesperrt (0x06-Altfalle) und verweist auf
 `read_position_feedback` (Einheit/Skalierung von pos_fdb offen). `cfswatch.py` zeigt die Namen
 für idx 5–8.
+
+#### NACHTRAG 16.10.2026 (3): Skalierung pos_fdb (idx 5) / idx 11 – LIVE BELEGT
+
+Messfahrt Motor X (0x81) nach `G28` (Bett leer, User-Freigabe), Y=175, Z=10, F3000–6000, je
+Position `M400` + `MOTOR_GET` idx 5/11; `[stepper_x]` rotation_distance 40, microsteps 16; am Ende
+Park X175 + `M84`, Klipper durchgehend ready. Rohdaten: `LIVE-ABFRAGEN-2026-10-16.md`.
+
+| X [mm] | 50 | 100 | 150 | 160 | 170 | 185 | 200 | 250 |
+|---|---|---|---|---|---|---|---|---|
+| idx 11 | 690 | 1490 | 2290 | 3090 | 690 | 1890 | 3090 | 690 |
+| idx 5 [rad] | 1.35489 | 2.92568 | 4.49648 | 6.06728 | 1.35489 | 3.71108 | 6.06728 | 1.35470 |
+
+- **idx 11 = Single-Turn-Position, 0..3199 Counts/Umdrehung** (3200 = 200 Vollschritte × 16
+  Microsteps; bei rotation_distance 40 → **80 Counts/mm**). Live: Counts = (80·X + 3090) mod 3200.
+  Name im Nachbau `pos_counts` – **eigener Name** (live abgeleitet, Host-Name unbekannt).
+- **idx 5 pos_fdb = idx11 · 2π/3200 [rad]** (Rest ≈ +8·10⁻⁵ rad ≈ 0,04 Counts, Ursache offen).
+- Beide **wrappen alle 40 mm** (eine Umdrehung); 50-mm-Schritte zeigen deshalb nur +π/2
+  (Aliasing). Eine **absolute** Achsposition liefern sie nicht – die hat nur Klipper
+  (Schrittzähler/Homing).
+- idx 6 spd_fdb im Stillstand ≈ 0 (±0,006; Einheit weiter offen). Vor G28 (stromlos):
+  idx 5 = 0.0, idx 11 = 1106.
+- Ablauf-Hinweis: `G28 X Y` + `G1` → „Must home axis first“ – Creality-Klipper verlangt für G1
+  **alle** Achsen referenziert (auch Z) → `G28` komplett.
+
+Nachbau: `POS_COUNTS_PER_REV = 3200`, `VARIABLE_NAMES[11] = 'pos_counts'`
+(`VARIABLE_NAMES_DERIVED`), `counts_to_rad`/`pos_rad_to_counts`/`counts_to_mm`/`counts_delta`
+(wrap-korrigiert, nur < ½ Umdrehung eindeutig), `read_position_counts()` (idx 11),
+`read_position_feedback(with_counts=True)` → {pos_fdb, counts, counts_from_rad, mm_in_rev}.
+`read_encoder` bleibt gesperrt („Encoder“ = idx 5/11 single-turn). `cfswatch.py` zeigt idx 11
+als `pos_counts`. Selbsttests mit den Live-Werten (690 → 1.35481 rad, 800 Counts = 10 mm,
+3090 → 690 = +800 über den Wrap).
 
 ## 4. Update-Werkzeuge
 

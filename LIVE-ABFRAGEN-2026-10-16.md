@@ -62,3 +62,26 @@ SHUTDOWN. **`motor_send_data` wird nie erreicht – bei DATA=0 und DATA=13 ging 
 Bus.** Ob der Motor idx ≥ 13 verträgt, bleibt damit ungeprüft (Host kennt 13–18 in seiner
 Typkette). Zusätzlich aus REA: idx 5 = `pos_fdb`, 6 = `spd_fdb`, 7 = `id_fdb`, 8 = `iq_fdb`
 (Standby-Scan oben: alle 0.0, passt zu stromlosen Motoren); Typ 11/12 = `<I` (unsigned).
+
+## Skalierung pos_fdb (idx 5) / idx 11 – live gemessen 16.10.2026 nach G28 (Bett leer, User-Freigabe)
+
+Motor X (0x81), Y=175, Z=10, F3000–6000, je Position M400 + Abfrage. printer.cfg [stepper_x]:
+rotation_distance 40, microsteps 16.
+
+| X [mm] | idx 5 (float) | idx 11 (uint) |
+|---|---|---|
+| 50 | 1.35489 | 690 |
+| 100 | 2.92568 | 1490 |
+| 150 | 4.49648 | 2290 |
+| 160 | 6.06728 | 3090 |
+| 170 | 1.35489 | 690 |
+| 180 | 2.92568 | 1490 |
+| 185 | 3.71108 | 1890 |
+| 200 | 6.06728 | 3090 |
+| 250 | 1.35470 | 690 |
+
+Ergebnis (BELEGT): **idx 11 = Single-Turn-Position 0..3199 Counts/Umdrehung** (80 Counts/mm, 3200 = 40 mm =
+1 Umdrehung = 200 Vollschritte × 16), **idx 5 pos_fdb = idx11 · 2π/3200 [rad]** (auf 5 Stellen). Beide laufen
+alle 40 mm über (50-mm-Schritte zeigen daher nur +π/2 = Aliasing). idx 6 spd_fdb im Stillstand ≈ 0 (±0,006).
+Vor G28 (Motor stromlos): idx 5 = 0.0, idx 11 = 1106. Vorgang: G28 X Y → „Must home axis first“ bei G1
+(Creality verlangt auch Z) → G28 komplett → Messfahrt → Park X175 → M84. Klipper durchgehend ready.
