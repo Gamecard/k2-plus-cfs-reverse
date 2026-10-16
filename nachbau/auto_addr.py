@@ -605,7 +605,11 @@ class FakeSerial:
     """Busmodell: Gerät antwortet auf 0xA1 nur ohne Adresse, auf 0xA0 bei
     passender UUID (übernimmt dann die Adresse), auf 0xA2/0xA3 nur unter
     seiner Adresse. 0x0B an 0xFF schaltet Loader-Geräte in die App (keine
-    Antwort). Mehrere adresslose Geräte: es antwortet das erste."""
+    Antwort). Mehrere adresslose Geräte: es antwortet das erste.
+    Vereinfachung ggü. CFS-FW R153 (GHIDRA-CFS-BEFUND2 §7): die echte Box
+    beantwortet 0xA0 3x (Duplikate) und ignoriert 0xA0/0xA1 an 0xFE, sobald
+    sie eine Adresse hat; A1-Antwort 0-1000 ms zufällig verzögert. Selbsttest
+    13 prüft den Port gegen dieses FW-Verhalten (FwSerial)."""
 
     UUID = U1
 
@@ -867,6 +871,46 @@ def selftest():
     check("offline -> Rückkehr per a1 (Methode 1) auf 0x01",
           e.online == ONLINE_STATE_ONLINE and dev.addr == 1
           and uuids_unique(aa.tables[DEV_TYPE_MB]))
+
+    # 13. BEFUND2 §7 (CFS-FW R153): A0-Antwort kommt 3x, adressierte Box
+    #     ignoriert A0/A1. Port muss Duplikate tolerieren und nach Host-
+    #     Neustart (Box behält Adresse) über A3 wieder ONLINE kommen.
+    class FwSerial(FakeSerial):
+        def __init__(self, devs=None):
+            FakeSerial.__init__(self, devs)
+            self.dups = []  # 2 weitere A0-Antworten je erfolgreichem A0
+
+        def cmd_send_data_with_response(self, data, timeout, retransmit):
+            addr, fun = data[0], data[3]
+            if fun in (CMD_GET_SLAVE_INFO, CMD_SET_SLAVE_ADDR) and all(
+                    d.addr is not None for d in self.devs if d.alive):
+                self.sent.append((addr, fun, list(data[4:])))
+                return None  # adressierte Box verwirft A0/A1 im RX-Zustand 1
+            ret = FakeSerial.cmd_send_data_with_response(self, data, timeout,
+                                                         retransmit)
+            if fun == CMD_SET_SLAVE_ADDR and ret is not None:
+                self.dups += [ret, ret]
+            return ret
+
+    dev = FakeDev(U1)
+    fw = FwSerial([dev])
+    aa = AutoAddr(fw)
+    t = aa.tables[DEV_TYPE_MB]
+    aa.online_once()
+    saves = aa.store.get("mb_addr_table_uniids")
+    for dup in fw.dups:          # Duplikate wie von der FW nachgereicht
+        aa.data_handler(dup)
+    check("FW: A0-Antwort 3x toleriert (Zustand/Store unverändert)",
+          len(fw.dups) == 2 and t[0].online == ONLINE_STATE_ONLINE
+          and t[0].acked == 1 and uuids_unique(t) and t[1].mapped == 0
+          and aa.store.get("mb_addr_table_uniids") == saves)
+    aa2 = AutoAddr(fw, store=aa.store)   # Host-Neustart, Box behält 0x01
+    n = len(fw.sent)
+    aa2.startup()
+    t2 = aa2.tables[DEV_TYPE_MB]
+    check("FW: adressierte Box ignoriert A0 -> ONLINE über A3",
+          (FE, A0) in fw.cmds(n) and (1, A3) in fw.cmds(n)
+          and t2[0].online == ONLINE_STATE_ONLINE and t2[0].uniid == U1)
 
     # 12. G2: unbekannter Function-Code / Kurz-Frame ohne Crash
     aa = AutoAddr(FakeSerial())

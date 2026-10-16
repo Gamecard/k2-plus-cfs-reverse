@@ -8,10 +8,13 @@ z.B. bei der Pi-Inbetriebnahme: aufgezeichnete Frames gegen Muster prüfen.
 Belege: PROTOKOLL-485.md + PROTOKOLL-GESAMT.md, Live-Mitschnitte 12.10.2026
 (T1A 229 mm, T1B/T1C je 160 mm, T1D 247 mm @220 °C; Retrude -10 mm).
 
-Ablauf Extrude (Func 0x10): Requests [Slotmaske, Stufe, Parameter] mit Stufen
-00/04/05/06/07; 0x05-Push wiederholt sich sensor-/Messrad-gesteuert.
-High-Level flankiert das mit 0x04 Feed-Mode, 0x0f Engage/Release, 0x08 Sensor
-und 0x05 Buffer-Read. K2-Logframes mit `status=0x00` sind häufig ACKs.
+Ablauf Extrude (Func 0x10): Requests [Slotmaske, mode, p] mit den Modi
+00/04/05/06/07 (Ghidra-Namen s. EXTRUDE_MODE_*); mode 05 ist eine
+Odometer-ABFRAGE (Poll), die sich sensor-/Messrad-gesteuert wiederholt.
+High-Level flankiert das mit 0x04 Box-Mode, 0x0f TIGHTEN_UP_ENABLE
+(Auto-Preload-Sperre, ~~Engage/Release~~ widerlegt 15.10.2026), 0x08
+GET_FILAMENT_SENSOR_STATE und 0x05 Buffer-Read. K2-Logframes mit
+`status=0x00` sind ANTWORTEN (Requests tragen Status 0xff).
 Ablauf Retrude (Func 0x11): ~~Requests [Slotmaske,00] START und [Slotmaske,01]
 FINISH, dazwischen einmaliger Toolhead-Pull + 0x08 [01]~~ KORRIGIERT
 15.10.2026 (LIVE, klippy.log 12.-16.10.): 04 [00 01] -> 08 [00] ->
@@ -58,6 +61,9 @@ EXTRUDE_MODE_FEED_TO_STALL = 0x01  # RELOAD, fördern bis Odometer-Stillstand (>
 EXTRUDE_MODE_FEED_CHECKED = 0x02   # wie 1, vorher >=5 mm in 3 s nötig (sonst 0x0a)
 EXTRUDE_MODE_CLEAR_ERROR = 0x03    # Fehler löschen: Zustand IDLE, Fehlercode 0
 EXTRUDE_MODE_FEED_START = 0x04     # Dauerfördern, Antwort SOFORT Status 0
+#   BEFUND2 §8 (FUN_08025c4e): Takt 20 ms, prüft NUR das gemeinsame Odometer
+#   (keinen Einlauf-/Hub-Sensor): 25x <0,01 mm = 500 ms -> 0x0c, >3000 mm
+#   -> 0x0b, 1250 Runden = 25 s -> 0x0a; Fehler holt mode 5 ab.
 EXTRUDE_MODE_QUERY = 0x05          # Abfrage: Fehler aus mode 4 + 4 B Odometer-Float BE
 EXTRUDE_MODE_STOP_BUFFER = 0x06    # Fördern beenden / Buffer füllen bis voll (sonst 0x0d)
 EXTRUDE_MODE_EXTRUDER_CHECK = 0x07  # Odometer muss in 300 ms > p mm laufen (sonst 0x0e)
@@ -75,6 +81,11 @@ EXTRUDER_CHECK_MM = 0x03  # Live-Parameter von [mask 07 03] = p 3 mm
 # 0x11-Parameter p (BELEGT 15.10.2026, Ghidra FUN_08004d90)
 RETRUDE_P_TO_BUFFER = 0x00  # Feeder+Hauptmotor rückwärts bis Buffer-Sensor (live „START“)
 RETRUDE_P_PULL_HUB = 0x01   # rfid_mgr_fila_back + pull_back_hub (live „FINISH“)
+#   BEFUND2 §8 (FUN_0800494e/08004884/08004c5a): Einlauf-Sensor leer -> 0x17;
+#   Ziel Hub-Sensor 5x frei, Takt 20 ms, max. 40 s -> 0x1a; Odometer steht
+#   UND Motorblock > 10 s -> 0x19; Stufe 2: Hub nach 7 s belegt -> 0x14.
+#   ACHTUNG Maske 0 (und 0x0d op 2/3 in IDLE): zieht ALLE Slots mit aktivem
+#   Hub-Sensor zurück – ein dauerhaft aktiver Hub-Sensor A blockiert so B/C/D.
 FUNC_SET_BOX_MODE = 0x04
 FUNC_SET_PRE_LOADING = 0x0D
 FUNC_FILAMENT_SENSOR_STATE = 0x08  # Host: GET_FILAMENT_SENSOR_STATE (live 15.10.)
@@ -87,8 +98,12 @@ FUNC_RETRUDE = 0x11
 FUNC_WHEEL = 0x0E
 FUNC_05, FUNC_04, FUNC_0F = 0x05, 0x04, 0x0F
 
-EXTRUDE_POLL = bytes.fromhex("f7 01 03 00 10 cd")
-RETRUDE_POLL = bytes.fromhex("f7 01 03 00 11 ca")
+# Leere ANTWORTEN (Status 00, ohne Daten) auf 0x10/0x11 – KEINE Polls/
+# Requests (Requests haben Status 0xff), Review G5 16.10.2026.
+EXTRUDE_ACK = bytes.fromhex("f7 01 03 00 10 cd")
+RETRUDE_ACK = bytes.fromhex("f7 01 03 00 11 ca")
+EXTRUDE_POLL = EXTRUDE_ACK  # ALT-NAME (irreführend), nur Kompatibilität
+RETRUDE_POLL = RETRUDE_ACK  # ALT-NAME (irreführend), nur Kompatibilität
 
 
 def _check_mask(mask):
@@ -108,8 +123,15 @@ def _one_hot(mask):
     return mask
 
 
+check_one_hot = _one_hot  # öffentlicher Name (genutzt von box.py)
+
+
 def slot_to_mask(index):
-    """Slot-Index 0..3 (A..D) -> 1-hot-Maske (wie box.slot_to_mask)."""
+    """Slot-Index 0..3 (A..D) -> 1-hot-Maske 0x01/0x02/0x04/0x08.
+
+    EINZIGE Implementierung (Review G6, 16.10.2026): box.py und boxmini.py
+    importieren sie von hier (cfsseq importiert nur serial485 -> kein
+    Zirkelimport)."""
     if isinstance(index, bool) or index not in range(4):
         raise ValueError("Slot-Index muss 0..3 sein: %r" % (index,))
     return SLOT_MASKS[index]
@@ -133,11 +155,15 @@ def build_extrude_stage(mask, stage, parameter=0x00):
 
     mask = 1-hot-Slotmaske (0x01=A … 0x08=D), KEIN Slot-Index – dafür
     slot_to_mask() verwenden.
-    Stufen gemäß unabhängiger, hardwarevalidierter Referenz:
-    00 init, 04 engage, 05 push, 06 settle, 07 finalize mit Parameter 03.
-    BELEGT 15.10.2026 (Ghidra): stage = 0x10-Modus 0..7 (EXTRUDE_MODE_*),
-    parameter = p (nur mode 7 nutzt ihn: mm für den Extruder-Check).
-    Keine Einschränkung des Wertebereichs (Verhalten unverändert).
+    ~~00 init, 04 engage, 05 push, 06 settle, 07 finalize~~ (alte Namen
+    der Fremd-Referenz) – BELEGT 15.10.2026 (Ghidra FUN_080045c6):
+    stage = 0x10-Modus 0..7 (EXTRUDE_MODE_*): 00 Stage1 (Pretension ->
+    feed_top_to_hub), 04 Dauerfördern starten, 05 Odometer-Abfrage,
+    06 Fördern beenden + Buffer-Check, 07 Extruder-Check mit p mm (live 03).
+    parameter = p (nur mode 7 nutzt ihn).
+    Keine Einschränkung des Wertebereichs hier (reiner Frame-Builder,
+    Verhalten unverändert); geprüfte Bus-Variante: box.BoxAction.
+    communication_extrude (mode/p-Prüfung, retries=0).
     """
     mask = _one_hot(mask)
     return build_frame(BOX_ADDR, FUNC_EXTRUDE,
@@ -342,8 +368,12 @@ def selftest():
     check("retrude ohne Rad scheitert", not ok)
 
     # Poll-Konstanten gegen Doku
-    check("extrude-poll", EXTRUDE_POLL == bytes.fromhex("f7 01 03 00 10 cd"))
-    check("retrude-poll", RETRUDE_POLL == bytes.fromhex("f7 01 03 00 11 ca"))
+    check("extrude-ack (leere Antwort, Status 00)",
+          EXTRUDE_ACK == EXTRUDE_POLL == bytes.fromhex("f7 01 03 00 10 cd")
+          and EXTRUDE_ACK[3] == 0x00)
+    check("retrude-ack (leere Antwort, Status 00)",
+          RETRUDE_ACK == RETRUDE_POLL == bytes.fromhex("f7 01 03 00 11 ca")
+          and parse_frame(RETRUDE_ACK) == (FUNC_RETRUDE, b""))
     check("build extrude request",
           build_extrude_stage(slot_to_mask(0), 0x05) ==
           bytes.fromhex("f7 01 06 ff 10 01 05 00 82"))

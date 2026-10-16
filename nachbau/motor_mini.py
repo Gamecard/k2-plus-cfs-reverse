@@ -12,10 +12,16 @@ LIVE-STAND 15.10.2026 (live-logs-2026-10-15/klippy.log*, lokal, nicht im Repo; s
 - set_mode (0x11 [01]/[02]/[03], Antwort = Echo) – sendet, live belegt
 - write_sys_param: 0x06 [01, id] + <f – sendet NUR mit confirm=True
   (sonst PermissionError); verändert Motorregelparameter, FLÜCHTIG bis
-  Kaltstart. Reine Builder: build_sys_param_write_payload,
-  build_sys_param_update_payload ([03])
+  Kaltstart. Nur IDs aus MINI_WRITABLE_IDS (= Stock-[motor_control]-IDs);
+  alle anderen -> PermissionError, Verweis auf motor.py (Namen-Tabelle +
+  allow_locked). Wert-Plausibilität wie motor.py (1e-50 -> ValueError).
+- update_sys_params: 0x06 [03] – NUR mit confirm=True (wie motor.py)
+- Reine Builder: build_sys_param_write_payload, build_sys_param_update_payload
 - read_encoder: GESPERRT (0x08 nie beobachtet, 0x06 = Sys-Param)
-- query_version: Update-Pfad (0xF0/00, Decompile; live nie beobachtet)
+- query_version: Update-Pfad (0xF0/00, Decompile; live nie beobachtet) –
+  FREI, reine "get version"-Abfrage (erster Schritt vor request-update).
+  Die zustandsändernden F0-Sender (request_update/send_fw_len/update_end)
+  gibt es hier bewusst NICHT – nur in motor.py, dort mit confirm-Sperre.
 
 Adressen: X/Y/Z/Z1 = 0x81-0x84 nur über serial_485 (ttyS5). Der Extruder ist
 NICHT 0x85 auf dem RS485 (antwortet nie, klippy.log.2026-10-05:4013-4280),
@@ -60,6 +66,19 @@ TIMEOUT_STALL = 1.0        # unbelegt (nie Timeout beobachtet)
 UPDATE_RETRIES = 2
 
 MOTOR_ADDRS = (0x81, 0x82, 0x83, 0x84)  # X/Y/Z/Z1 über serial_485
+SYS_UPDATE_OK = 0x01       # Antwort auf [03] (klippy.log:2875)
+FLOAT32_MAX = 3.4028234663852886e38
+
+# Schreibbare IDs (motor_mini hat keine Namen-/Configurable-Tabelle):
+# genau die IDs, die die Stock-K2-Plus-Config [motor_control] nach jedem
+# Kaltstart schreibt (= motor.SYS_PARAM_STOCK_CONFIGURED, Teilmenge von
+# motor.SYS_PARAM_CONFIGURABLE). Live geschrieben beobachtet: 70 (Pos-Kp,
+# klippy.log.2026-10-05:16596, 10-12:10700), 86, 87, 188 (Schleppfehler-
+# Zeit). 226 nur X/Y, Motor-FW kennt sie nicht (0-B-Antwort). Weitere IDs
+# (auch "not configurable" wie 1 param_boot_key) -> motor.py mit
+# confirm=True (+ allow_locked=True). Abgleich im motor.py-Selbsttest.
+MINI_WRITABLE_IDS = frozenset((70, 86, 87, 102, 103, 116, 118, 119, 120, 121,
+                               187, 188, 226))
 
 
 def decode_sys_param_float(data):
@@ -80,15 +99,21 @@ def _check_param_id(param_id):
 def build_sys_param_write_payload(param_id, value):
     """[01, id] + <f LE – REINER BUILDER, sendet nichts.
     Live: klippy.log.2026-10-05:16596 `81 09 00 06 01 46 00 00 96 43`
-    (ID 70 = 300.0), Vollframe f7 81 09 00 06 01 46 00 00 96 43 8f."""
+    (ID 70 = 300.0), Vollframe f7 81 09 00 06 01 46 00 00 96 43 8f.
+    Wert: endlich, |Wert| <= float32-Max, != 0 darf nicht auf 0.0 runden
+    (struct schreibt 1e-50 sonst still als 0.0) -> sonst ValueError."""
     _check_param_id(param_id)
     if isinstance(value, bool) or not isinstance(value, (int, float)) \
-            or not math.isfinite(value):
-        raise ValueError("Sys-Param-Wert muss endliche Zahl sein: %r" % (value,))
+            or not math.isfinite(value) or abs(value) > FLOAT32_MAX:
+        raise ValueError("Sys-Param-Wert muss endliche float32-Zahl sein: %r"
+                         % (value,))
     try:
-        return [SUB_SYS_WRITE, param_id] + list(struct.pack("<f", value))
+        raw = struct.pack("<f", value)
     except OverflowError:
         raise ValueError("Sys-Param-Wert passt nicht in float32: %r" % (value,))
+    if value != 0 and struct.unpack("<f", raw)[0] == 0.0:
+        raise ValueError("Sys-Param-Wert %r rundet in float32 auf 0.0" % (value,))
+    return [SUB_SYS_WRITE, param_id] + list(raw)
 
 
 def build_sys_param_update_payload():
@@ -124,16 +149,35 @@ class MotorMini:
 
     def write_sys_param(self, param_id, value, confirm=False):
         """0x06 SCHREIBEN – nur mit confirm=True, sonst PermissionError ohne
-        Senden. Verändert Motorregelparameter (flüchtig bis Kaltstart).
+        Senden. Verändert Motorregelparameter (flüchtig bis Kaltstart). Nur
+        IDs aus MINI_WRITABLE_IDS, sonst PermissionError (-> motor.py).
         Live-Echo: klippy.log.2026-10-12:10700/10706. Echo-Fehler -> RuntimeError."""
         payload = build_sys_param_write_payload(param_id, value)
         if confirm is not True:
             raise PermissionError("write_sys_param gesperrt: verändert Motorregel"
                                   "parameter – nur mit confirm=True")
+        if param_id not in MINI_WRITABLE_IDS:
+            raise PermissionError(
+                "write_sys_param(ID %d) in motor_mini gesperrt: nur Stock-"
+                "konfigurierte IDs %s; andere IDs über motor.py (Namen-Tabelle, "
+                "allow_locked)" % (param_id, sorted(MINI_WRITABLE_IDS)))
         echo = self._tx(FUNC_SYS_PARAM, payload, TIMEOUT_SYS_PARAM)
         if echo != bytes(payload[2:]):
             raise RuntimeError("0x06 Schreib-Echo passt nicht: %s" % echo.hex())
         return decode_sys_param_float(echo)
+
+    def update_sys_params(self, confirm=False):
+        """0x06 [03] "Updata param" – nur mit confirm=True, sonst
+        PermissionError ohne Senden. Stock: einmal je Motor am Ende der
+        Enumeration (klippy.log:2869 -> 2875 `f7 81 04 00 06 01 21`); Wirkung
+        unbelegt (live NICHT dauerhaft). Antwort != [01] -> RuntimeError."""
+        if confirm is not True:
+            raise PermissionError("update_sys_params gesperrt: nur mit confirm=True")
+        ans = self._tx(FUNC_SYS_PARAM, build_sys_param_update_payload(),
+                       TIMEOUT_SYS_PARAM)
+        if ans != bytes([SYS_UPDATE_OK]):
+            raise RuntimeError("0x06 [03]: Antwort %s statt 01" % ans.hex())
+        return True
 
     def check_protection(self):
         """0x0C [0b] -> 8 B Schutzstatus (live immer 8×00; klippy.log:2441/2447).
@@ -186,7 +230,8 @@ class MotorMini:
             "nie beobachtet – Encoder-Lesen unbelegt")
 
     def query_version(self):
-        """Version über Update-Pfad abfragen (Func 0xf0/Sub 0x00). Gibt Rohdaten zurück."""
+        """Version über Update-Pfad abfragen (Func 0xf0/Sub 0x00). Rohdaten.
+        FREI: reine Abfrage ("get version", 1.7), ändert keinen Zustand."""
         return self.bus.transact(self.addr, FUNC_FW_UPDATE, [SUB_GET_VERSION],
                                  retries=UPDATE_RETRIES)
 
@@ -223,7 +268,8 @@ def selftest():
             self.calls.append((addr, fun, list(data), kw))
             assert self.script, "unerwarteter Sendeversuch"
             want_tx, rx = self.script.pop(0)
-            assert build_frame(addr, fun, list(data))[1:-1] == bytes.fromhex(want_tx)
+            frame, want = build_frame(addr, fun, list(data)), bytes.fromhex(want_tx)
+            assert (frame if want[0] == 0xF7 else frame[1:-1]) == want
             raw = bytes.fromhex(rx)
             rfun, rdata = parse_frame(raw)
             assert raw[1] == addr and rfun == fun
@@ -254,6 +300,9 @@ def selftest():
         # 0x12: TX klippy.log:2349-Form; Antwort PLATZHALTER-UUID, CRC neu
         ("81 04 00 12 02", "f7 81 0b 00 12 cd ab 00 00 00 00 00 00 ad"),
         ("81 09 00 06 01 46 00 00 c8 42", "f7 81 07 00 06 00 00 c8 42 d4"),  # 10-12:10700/10706
+        ("81 04 00 06 03", "f7 81 04 00 06 01 21"),              # klippy.log:2869/2875
+        # verifizierter Live-Vollframe (10-05:16596) -> Echo (10-14:25260)
+        ("f7 81 09 00 06 01 46 00 00 96 43 8f", "f7 81 07 00 06 00 00 96 43 09"),
     ])
     mm = MotorMini(bus, 0x81)
     check("ID 9 = 123.58", abs(mm.read_sys_param(9) - 123.58) < 1e-3
@@ -271,7 +320,20 @@ def selftest():
           raises(PermissionError, MotorMini(nobus, 0x81).write_sys_param, 70, 100.0)
           and nobus.calls == [])
     check("write confirm=True Echo", mm.write_sys_param(70, 100.0, confirm=True) == 100.0)
+    check("update [03] -> [01]", mm.update_sys_params(confirm=True) is True)
+    check("Live-Vollframe ID70=300", mm.write_sys_param(70, 300.0, confirm=True) == 300.0)
     check("alle Script-Frames verbraucht", not bus.script)
+    m0 = MotorMini(nobus, 0x83)
+    check("update ohne confirm gesperrt",
+          raises(PermissionError, m0.update_sys_params)
+          and raises(PermissionError, m0.update_sys_params, confirm="yes"))
+    for pid in (1, 9, 224, 225, 0):
+        check("ID %d nicht in MINI_WRITABLE_IDS gesperrt" % pid,
+              raises(PermissionError, m0.write_sys_param, pid, 1.0, confirm=True))
+    for bad in (1e-50, -1e-50, 3.5e38, float("inf")):
+        check("Wert %r -> ValueError" % (bad,),
+              raises(ValueError, m0.write_sys_param, 70, bad, confirm=True))
+    check("Sperren senden nichts", nobus.calls == [])
 
     # 3. Guards / Sperren senden nichts
     check("addr-guard 0x85", raises(ValueError, MotorMini, None, 0x85))

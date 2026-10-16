@@ -49,11 +49,10 @@ SLOT_KEYS = "ABCD"  # Slot-Index 0..3 -> A/B/C/D (Beleg: Live-Frames)
 SLOT_MASKS = (0x01, 0x02, 0x04, 0x08)
 
 
-def slot_to_mask(index):
-    """Slot-Index 0..3 (A..D) -> 1-hot-Maske 0x01/0x02/0x04/0x08."""
-    if isinstance(index, bool) or index not in range(4):
-        raise ValueError("Slot-Index muss 0..3 sein: %r" % (index,))
-    return SLOT_MASKS[index]
+# slot_to_mask: Slot-Index 0..3 (A..D) -> 1-hot-Maske 0x01/0x02/0x04/0x08.
+# Einzige Implementierung in cfsseq.py (Review G6, 16.10.2026; cfsseq
+# importiert nur serial485 -> kein Zirkelimport). Name bleibt hier exportiert.
+from cfsseq import slot_to_mask  # noqa: E402,F401
 
 
 def parse_rfid_response(data):

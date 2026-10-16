@@ -37,8 +37,42 @@ CMD_LOADER_TO_APP = 0x0B
 BROADCAST_MB = 0xFE      # CFS-Box
 BROADCAST_CLM = 0xFD     # Closed-loop-Motoren
 BROADCAST_BTM = 0xFC     # Belt-Module
+BROADCAST_ALL = 0xFF     # Loader-Check (auto_addr.py BROADCAST_ADDR, 0x0B)
+# 0xEA/0xEB: CFS-App-Sonderadressen (Ghidra, PROTOKOLL-485.md:321-328):
+# ~~0xEA = Broadcast ohne Antwort~~ KORRIGIERT BEFUND2 §6: 0xEA wird bei
+# normalen Kommandos TROTZDEM beantwortet (Absender = eigene Adresse; nur
+# CRC-Fehler-/unbekannt-fun-/0x50-Antwort entfallen); 0xEB nur für 0x50
+# (Antwort mit Absender 0xEB) / 0x51 (Debug, keine Antwort). 0xFE/0xFF nimmt
+# die App nur ohne eigene Adresse an. Für Abfragen bei mehreren Boxen
+# ungeeignet (Kollision) – Absenderprüfung bleibt hier "beliebig".
+ADDR_EA = 0xEA
+ADDR_EB = 0xEB
+# Ziele, bei denen der Absender der Antwort NICHT gleich dem Ziel sein muss
+# (Review M1, 16.10.2026): Broadcasts antworten mit Geräte- ODER Broadcast-
+# Adresse (live: a1 an 0xFE -> Antwort von 0xFE, klippy.log.2026-10-12:6922;
+# a2 an 0x01 -> Antwort von 0x01). Für alle anderen Ziele gilt: Antwort-
+# Absender == Ziel (live: 0x01 und 0x81..0x84 antworten nur mit eigener
+# Adresse). Ohne diese Prüfung würde z.B. ein Box-Frame (0x01, fun 0x0e) als
+# Antwort für Motor 0x81 (gleicher fun auf ttyS5) akzeptiert.
+BROADCAST_ADDRS = frozenset((BROADCAST_MB, BROADCAST_CLM, BROADCAST_BTM,
+                             BROADCAST_ALL, ADDR_EA, ADDR_EB))
+_AUTO = object()  # Sentinel: expect_addr aus Zieladresse ableiten
+
+
+def reply_addr_for(addr):
+    """Erwarteter Absender der Antwort auf einen Request an addr:
+    addr selbst, bei BROADCAST_ADDRS None (= beliebig)."""
+    return None if addr in BROADCAST_ADDRS else addr
 
 MAX_RETRIES = 4          # Beleg: klippy.log "retries = 4"
+
+# Obergrenze, wie lange EINE Transaktion den Bus-Lock halten darf
+# (timeout * (retries + 1)), Review M6 16.10.2026. Längster belegter Fall:
+# 0x0d op 2/3 Maske 0x0F = 980 s (box.preload_force_timeout, retries=0).
+# Darüber -> ValueError statt stundenlanger Bus-Blockade (z.B. 300 s x 5).
+MAX_BUS_HOLD_S = 1200.0
+# Ab dieser Haltedauer wird der lange Lock im Log vermerkt (INFO).
+LONG_HOLD_LOG_S = 5.0
 
 # Plausibilitätsgrenzen für das Längenfeld (len = status+fun+daten... inkl. crc,
 # vgl. build_frame: len = len(data)+3). Minimum 3 = Frame ohne Daten.
@@ -284,14 +318,22 @@ class Serial485:
         raise TimeoutError(last_err or "keine Antwort")
 
     def _transact_locked(self, addr, fun, data, timeout, retries,
-                         expect_fun, status, want_full=False):
+                         expect_fun, status, want_full=False,
+                         expect_addr=_AUTO):
         """Kern unter gehaltenem _lock. want_full -> (addr,status,fun,daten,roh),
         sonst nur daten. Zählt sent/retries/received/timeouts.
+
+        expect_addr (Review M1): Default = reply_addr_for(addr), d.h. nur
+        Frames mit Absender == Ziel gelten als Antwort (Broadcast-Ziele:
+        beliebig). Fremde Frames mit passendem fun werden übersprungen.
+        Explizit None = beliebiger Absender, int = genau dieser Absender.
 
         Dispatcht NICHT selbst: der Aufrufer ruft _dispatch_safe erst nach
         Freigabe von _lock (sonst Deadlock, wenn ein Handler Bus-Funktionen
         aufruft – threading.Lock ist nicht reentrant)."""
         expect_fun = fun if expect_fun is None else expect_fun
+        if expect_addr is _AUTO:
+            expect_addr = reply_addr_for(addr)
         frame = build_frame(addr, fun, data, status=status)
         last_err = None
         # TODO: am klippy.log nachzählen, ob 4 Versuche oder 1+4
@@ -309,7 +351,7 @@ class Serial485:
             deadline = time.monotonic() + timeout
             try:
                 raddr, rstatus, rfun, rdata, rraw = self._recv_frame_locked(
-                    deadline, expect_fun=expect_fun)
+                    deadline, expect_fun=expect_fun, expect_addr=expect_addr)
             except TimeoutError as e:
                 last_err = e
                 continue
@@ -440,35 +482,80 @@ class Serial485:
 
     def raw_send_wait_ack(self, addr, fun, data=(), timeout=None,
                           retries=MAX_RETRIES, expect_fun=None,
-                          status=STATUS_OK):
-        """Sendet, wartet auf Antwort mit passendem fun-Code
+                          status=STATUS_OK, expect_addr=_AUTO):
+        """Sendet, wartet auf Antwort mit passendem fun-Code UND passendem
+        Absender (expect_addr, s. _transact_locked)
         (Beleg: Serialhdl_485.raw_send_wait_ack). Gibt Antwort-Daten zurück."""
         full = self._send_wait_full_nodispatch(addr, fun, data, timeout,
-                                               retries, expect_fun, status)
+                                               retries, expect_fun, status,
+                                               expect_addr=expect_addr)
         self._dispatch_safe(*full[:4])  # nach Freigabe von _lock
         return full[3]
 
     def raw_send_wait_ack_full(self, addr, fun, data=(), timeout=None,
                                retries=MAX_RETRIES, expect_fun=None,
-                               status=STATUS_OK):
+                               status=STATUS_OK, expect_addr=_AUTO):
         """Wie raw_send_wait_ack, gibt aber (addr, status, fun, daten, rohframe)
         zurück (für Wrapper-Vollframes, vgl. auto_addr data_handler)."""
         full = self._send_wait_full_nodispatch(addr, fun, data, timeout,
-                                               retries, expect_fun, status)
+                                               retries, expect_fun, status,
+                                               expect_addr=expect_addr)
         self._dispatch_safe(*full[:4])  # nach Freigabe von _lock
         return full
 
+    @staticmethod
+    def _check_hold(timeout, retries):
+        """Review M6: Haltedauer des Bus-Locks begrenzen (MAX_BUS_HOLD_S)."""
+        if timeout < 0 or retries < 0:
+            raise ValueError("timeout/retries dürfen nicht negativ sein: "
+                             "%r/%r" % (timeout, retries))
+        hold = timeout * (retries + 1)
+        if hold > MAX_BUS_HOLD_S:
+            raise ValueError(
+                "Transaktion würde den Bus bis %.0f s blockieren "
+                "(timeout %.1f s x %d Sendungen) > MAX_BUS_HOLD_S %.0f s"
+                % (hold, timeout, retries + 1, MAX_BUS_HOLD_S))
+        return hold
+
     def _send_wait_full_nodispatch(self, addr, fun, data=(), timeout=None,
                                    retries=MAX_RETRIES, expect_fun=None,
-                                   status=STATUS_OK):
+                                   status=STATUS_OK, expect_addr=_AUTO):
         """Intern: wie raw_send_wait_ack_full, aber OHNE Dispatch. Der
         Aufrufer muss _dispatch_safe(*full[:4]) selbst (ohne Locks) aufrufen
-        (genutzt vom Wrapper, der unter _send_lock sendet)."""
+        (genutzt vom Wrapper, der unter _send_lock sendet).
+
+        BUS-LOCK (Review M6, Entscheidung 16.10.2026): _lock bleibt für die
+        GANZE Transaktion gehalten (Senden bis Antwort/Timeout), auch bei
+        langen Kommandos (0x0d op 2/3 bis 980 s, 0x11 bis 150 s). Andere
+        Threads (Motoren, 0x0a-Poll, _bg_thread) warten solange. Gründe:
+        (1) RS485 halbduplex: der Slave antwortet asynchron am Ende seines
+            Vorgangs; sendet der Host in dieser Zeit, kollidieren die Frames
+            (keine Arbitrierung, beide Frames kaputt -> Antwort verloren,
+            bei retries=0 nicht wiederholbar).
+        (2) Original genauso: live sendet der Host während 0x0d [01 02]
+            (31-37 s) nichts, auch keine 0x0a-Polls (PROTOKOLL-485.md 6.4,
+            klippy.log.2026-10-13:90197-90211).
+        (3) Box-FW bearbeitet 0x0d op 2/3 synchron und ist solange stumm
+            (live 0x04 5x unbeantwortet, 13:130637-130652).
+        Absicherung: Haltedauer timeout*(retries+1) <= MAX_BUS_HOLD_S, sonst
+        ValueError; ab LONG_HOLD_LOG_S INFO-Logzeile.
+        TODO (M6): Pending-Registry (Senden unter Lock, Warten ohne Lock)
+          wäre nur für Geräte sinnvoll, die während einer laufenden Box-
+          Operation sicher senden dürfen – dafür fehlt ein Kollisions-Beleg;
+          0x10 mode 4 (Box liest den Bus selbst, Ghidra §4) zeigt, dass die
+          Box kurze Fragen während des Förderns beantwortet, aber nicht,
+          ob fremde Slaves dazwischen senden dürfen.
+        """
         timeout = self.default_timeout if timeout is None else timeout
+        hold = self._check_hold(timeout, retries)
+        if hold >= LONG_HOLD_LOG_S:
+            _log.info("Bus-Lock bis %.0f s für addr 0x%02x fun 0x%02x",
+                      hold, addr, fun)
         with self._lock:
             return self._transact_locked(addr, fun, list(data), timeout,
                                          retries, expect_fun, status,
-                                         want_full=True)
+                                         want_full=True,
+                                         expect_addr=expect_addr)
 
     def get_response(self, timeout=None, expect_fun=None, expect_addr=None):
         """Liest EINEN gültigen Frame (Beleg: Serialhdl_485.get_response).
@@ -517,16 +604,32 @@ class Serial485:
             return dict(self._stats)
 
     def transact(self, addr, fun, data=(), timeout=None, retries=MAX_RETRIES,
-                 expect_fun=None, status=STATUS_OK):
-        """Sendet Frame, wartet auf Antwort mit passendem fun-Code (vgl. raw_send_wait_ack).
+                 expect_fun=None, status=STATUS_OK, expect_addr=_AUTO):
+        """Sendet Frame, wartet auf Antwort mit passendem fun-Code und
+        Absender (vgl. raw_send_wait_ack; expect_addr s. _transact_locked).
 
         Gibt die Antwort-Daten (bytes) zurück, wirft TimeoutError nach retries.
+        Das Status-Byte der Antwort geht hier verloren -> transact_full.
         Der Empfangspuffer wird auf PACK_HEAD resynchronisiert, damit Müll oder
         halbe Frames vom Bus den Parser nicht blockieren.
+        Bus-Lock für die ganze Dauer, begrenzt durch MAX_BUS_HOLD_S
+        (s. _send_wait_full_nodispatch).
         """
         return self.raw_send_wait_ack(addr, fun, data, timeout=timeout,
                                       retries=retries, expect_fun=expect_fun,
-                                      status=status)
+                                      status=status, expect_addr=expect_addr)
+
+    def transact_full(self, addr, fun, data=(), timeout=None,
+                      retries=MAX_RETRIES, expect_fun=None, status=STATUS_OK,
+                      expect_addr=_AUTO):
+        """Wie transact, gibt aber (addr, status, fun, daten, rohframe)
+        zurück – mit dem Status-Byte der Antwort (Review M2, 16.10.2026;
+        = raw_send_wait_ack_full mit transact-Signatur)."""
+        return self.raw_send_wait_ack_full(addr, fun, data, timeout=timeout,
+                                           retries=retries,
+                                           expect_fun=expect_fun,
+                                           status=status,
+                                           expect_addr=expect_addr)
 
 
 class Serial_485_Wrapper:
@@ -762,10 +865,11 @@ _LIVE_FRAMES = [
     ("f7 01 11 00 a2 01 00 a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 aa ab f0", "Auto-Addr a2"),
     ("f7 01 07 00 03 ff ff ff 00 98", "GET_REMAIN_LEN leer"),
     ("f7 01 09 00 0a 13 34 00 00 00 00 d7", "Herzschlag 0x0a"),
-    ("f7 01 03 00 02 b3", "GET_RFID Req"),
+    ("f7 01 03 00 02 b3", "GET_RFID leere Antwort (Status 00)"),
     ("f7 01 07 00 03 1a 00 ff 00 99", "Remain A=26%"),
-    ("f7 01 03 00 10 cd", "EXTRUDE Poll"),
-    ("f7 01 03 00 11 ca", "RETRUDE Poll"),
+    # Status 00 = ANTWORT ohne Daten (Requests tragen Status 0xff), Review G5
+    ("f7 01 03 00 10 cd", "EXTRUDE leere Antwort (Status 00)"),
+    ("f7 01 03 00 11 ca", "RETRUDE leere Antwort (Status 00)"),
     ("f7 22 10 00 04 03 00 00 00 8a ff f1 63 09 ff ed 12 bd 3c", "belt mdly write_flash"),
 ]
 
@@ -1102,6 +1206,147 @@ def selftest():
     finally:
         _lg.disabled = _old_disabled
     check2("handler-exception nicht propagiert", ok)
+
+    # 10c. Review M1 (16.10.2026): Absenderadresse muss zum Ziel passen
+    box_wheel = bytes.fromhex("f7 01 07 00 0e c4 e6 fe 0b f3")  # Box, fun 0x0e
+    mot_reply = build_frame(0x81, 0x0e, [0x11, 0x22])          # synthetisch
+    busm = Serial485("/dev/ttyFAKE1", ser=FakeSerial([box_wheel + mot_reply]))
+    try:
+        ok = busm.transact(0x81, 0x0e, [0x02], timeout=0.2, retries=0) \
+            == bytes([0x11, 0x22])
+    except TimeoutError:
+        ok = False
+    check2("M1 fremder Frame (0x01) vor Motor-Antwort -> echte Antwort", ok)
+    busm2 = Serial485("/dev/ttyFAKE1", ser=FakeSerial([box_wheel]))
+    try:
+        busm2.transact(0x81, 0x0e, [0x02], timeout=0.05, retries=0)
+        ok = False
+    except TimeoutError as e:
+        ok = "addr-Mismatch" in str(e)
+    check2("M1 nur fremder Frame -> Timeout (addr-Mismatch)", ok)
+    busm3 = Serial485("/dev/ttyFAKE1", ser=FakeSerial([box_wheel]))
+    try:
+        ok = busm3.transact(0x81, 0x0e, [0x02], timeout=0.1, retries=0,
+                            expect_addr=None) == box_wheel[5:-1]
+    except TimeoutError:
+        ok = False
+    check2("M1 expect_addr=None -> beliebiger Absender (explizit)", ok)
+    a1_fe = build_frame(0xFE, 0xA1, [0x01])
+    a2_01 = build_frame(0x01, 0xA2, [0x01])
+    busbc = Serial485("/dev/ttyFAKE1", ser=FakeSerial([a1_fe, a2_01]))
+    try:
+        ok = (busbc.transact(0xFE, 0xA1, [0xFE, 0xFE], timeout=0.1,
+                             retries=0) == b"\x01"
+              and busbc.transact(0xFF, 0xA2, [], timeout=0.1, retries=0)
+              == b"\x01")
+    except TimeoutError:
+        ok = False
+    check2("M1 Broadcast-Ziel 0xFE/0xFF: Absender beliebig", ok)
+    check2("M1 reply_addr_for", reply_addr_for(0x81) == 0x81
+           and all(reply_addr_for(a) is None
+                   for a in (0xFE, 0xFF, 0xFD, 0xFC, 0xEA, 0xEB)))
+    wrm = Serial_485_Wrapper(bus=Serial485(
+        "/dev/ttyFAKE1", ser=FakeSerial([box_wheel + mot_reply])))
+    check2("M1 Wrapper-Pfad überspringt fremden Absender",
+           wrm.cmd_send_data_with_response(
+               bytes([0x81, 4, STATUS_OK, 0x0e, 0x02]), 0.2, False)
+           == mot_reply)
+
+    # 10d. Review M2: transact_full liefert das Status-Byte (Live-Frame
+    #      0x10 mode 5 mit Status 0x0c Odometer-Stillstand)
+    st0c = bytes.fromhex("f7 01 07 0c 10 c3 30 40 af a4")
+    bussf = Serial485("/dev/ttyFAKE1", ser=FakeSerial([st0c]))
+    full = bussf.transact_full(0x01, 0x10, [0x02, 0x05, 0x00], timeout=0.1,
+                               retries=0, status=STATUS_OPERATIONAL)
+    check2("M2 transact_full Status 0x0c + Daten",
+           full[:4] == (0x01, 0x0c, 0x10, bytes.fromhex("c3 30 40 af"))
+           and full[4] == st0c)
+
+    # 10e. Spätantwort nach Timeout bei retries=0: genau 1 Sendung (keine
+    #      Mehrfachauslösung der Mechanik); die Spätantwort verwirft das
+    #      reset_input_buffer der nächsten Transaktion, sofern sie VOR deren
+    #      Senden eintrifft (sonst fun/addr-Filter, s. _recv_frame_locked)
+    class LateSerial(FakeSerial):
+        """Antwort auf die 1. Sendung erst nach delay s (nach dem Timeout)."""
+
+        def __init__(self, late, delay, script=()):
+            FakeSerial.__init__(self, script)
+            self.late, self.delay, self.t_write = late, delay, None
+
+        def write(self, frame):
+            if self.t_write is None:
+                self.t_write = time.monotonic()
+                self.written.append(bytes(frame))
+                return
+            FakeSerial.write(self, frame)
+
+        def read(self, n):
+            if (self.late is not None and self.t_write is not None
+                    and time.monotonic() - self.t_write >= self.delay):
+                self._read_buf += self.late
+                self.late = None
+            return FakeSerial.read(self, n)
+
+    late_ack = build_frame(0x01, 0x11, [])
+    busl = Serial485("/dev/ttyFAKE1", ser=LateSerial(late_ack, 0.08))
+    try:
+        busl.transact(0x01, 0x11, [0x02, 0x01], timeout=0.04, retries=0,
+                      status=STATUS_OPERATIONAL)
+        ok = False
+    except TimeoutError:
+        ok = True
+    check2("Spätantwort retries=0: Timeout, genau 1 Sendung",
+           ok and len(busl.ser.written) == 1 and busl.stats()["sent"] == 1
+           and busl.stats()["retries"] == 0)
+
+    # 10f. Review M6: Bus-Lock-Obergrenze + kein Deadlock bei langem Halten
+    busv = Serial485("/dev/ttyFAKE1", ser=FakeSerial([]))
+    for bad_t, bad_r in ((MAX_BUS_HOLD_S + 1, 0), (300.0, 4), (-1.0, 0)):
+        try:
+            busv.transact(0x01, 0x0d, [0x0f, 0x02], timeout=bad_t,
+                          retries=bad_r)
+            ok = False
+        except ValueError:
+            ok = busv.stats()["sent"] == 0
+        check2("M6 Haltedauer-Guard %.0f s x %d" % (bad_t, bad_r + 1), ok)
+
+    class SlowSerial(FakeSerial):
+        """1. Antwort kommt erst nach delay s (langes Kommando)."""
+
+        def __init__(self, script, delay):
+            FakeSerial.__init__(self, script)
+            self.delay, self.t0, self.pending = delay, None, None
+
+        def write(self, frame):
+            FakeSerial.write(self, frame)
+            if self.t0 is None:  # 1. Sendung: Antwort zurückhalten
+                self.t0 = time.monotonic()
+                self.pending, self._read_buf = bytes(self._read_buf), bytearray()
+
+        def read(self, n):
+            if self.pending and time.monotonic() - self.t0 >= self.delay:
+                self._read_buf += self.pending
+                self.pending = None
+            return FakeSerial.read(self, n)
+
+    ack0d = build_frame(0x01, 0x0d, [])
+    busw = Serial485("/dev/ttyFAKE1", ser=SlowSerial([ack0d, good], 0.25))
+    res = {}
+    tl = threading.Thread(target=lambda: res.__setitem__("long", busw.transact(
+        0x01, 0x0d, [0x01, 0x02], timeout=1.0, retries=0)), daemon=True)
+    tl.start()
+    time.sleep(0.05)
+    t_b = time.monotonic()
+    ts = threading.Thread(target=lambda: res.__setitem__("short", busw.transact(
+        0x01, 0x03, [0x0F], timeout=0.3, retries=0)), daemon=True)
+    ts.start()
+    tl.join(2.0)
+    ts.join(2.0)
+    check2("M6 zweiter Thread wartet auf Lock, dann eigene Antwort",
+           not tl.is_alive() and not ts.is_alive()
+           and res.get("long") == b"" and res.get("short") == gdata
+           and time.monotonic() - t_b >= 0.15
+           and [bytes(w)[4] for w in busw.ser.written] == [0x0d, 0x03])
 
     # 11. Kreuzvalidierung gegen Fremd-Referenz ref-hi/ (GPL-3.0, nur lesen;
     #     Herkunft siehe ref-hi/HERKUNFT.txt). Hex-Strings enthalten teils

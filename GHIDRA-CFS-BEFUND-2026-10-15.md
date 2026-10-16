@@ -7,6 +7,10 @@
 > keine größeren Rekonstruktionen von Creality-Code landen.
 > Eingearbeitet in: PROTOKOLL-485.md, PROTOKOLL-GESAMT.md, CHECKLISTE.md,
 > AUDIT-UND-AENDERUNGEN.md, `nachbau/box.py`, `nachbau/cfsseq.py`, `nachbau/boxmini.py`.
+>
+> **KORRIGIERT/ERGÄNZT durch `GHIDRA-CFS-BEFUND2-2026-10-16.md`** (zweite Ghidra-Analyse 16.10.2026):
+> 0x0a Byte 0/1/2/5, 0x15, Status 0x50/0x51/0x52/0x53, Adressen 0xEA/0xEB, Auto-Addr. Betroffene Stellen sind unten mit
+> „→ BEFUND2“ markiert; der ursprüngliche Text bleibt zur Nachvollziehbarkeit stehen.
 
 
 Ziel: `fw/cfs/cfs0_050_G32-cfs0_000_153.bin` (GD32F303VET6, Cortex-M4/Thumb, RT-Thread 5.0.2).
@@ -59,7 +63,7 @@ Speicherblöcke nach `SetCfsBase`: `bootloader` (0x08000000, uninit.), `flash` (
 
 Request-Status-Byte: Der Dispatcher liest `frame[2]` (status) **nie** aus (**B**). Der Host sendet live 0xFF (`f7 01 03 ff 14 06`), der Wert ist für die FW egal.
 
-Broadcasts (**B**): `addr 0xEA` heißt keine Antwort (bei unbekanntem fun, bei CRC-Fehler, bei 0x50). `addr 0xEB` heißt Antwort mit Absenderadresse 0xEB (bei 0x50; 0x51 wirkt nur bei 0xEB).
+Broadcasts (**B**): `addr 0xEA` heißt keine Antwort (bei unbekanntem fun, bei CRC-Fehler, bei 0x50). **→ BEFUND2 §6: Bei normalen Kommandos antwortet die Box auf 0xEA trotzdem (mit eigener Adresse); 0xFE/0xFF nimmt die App nur ohne eigene Adresse an.** `addr 0xEB` heißt Antwort mit Absenderadresse 0xEB (bei 0x50; 0x51 wirkt nur bei 0xEB).
 
 TBB-Problem: Ghidra disassembliert die TBB-Tabellenbytes als Code. Das ergab vorher `halt_baddata` und Phantom-`case`s. `CfsDispatch.java` legt die Tabellen als Daten an, setzt COMPUTED_JUMP-Referenzen und einen `JumpTable`-Override. Danach ist das Dekompilat sauber (0 × `halt_baddata`; Datei `dispatcher_cfs0_153.c`).
 
@@ -91,7 +95,7 @@ TBB-Problem: Ghidra disassembliert die TBB-Tabellenbytes als Code. Das ergab vor
 | 0x12 | 8 (mask, mode, s, dist_hi, dist_lo) | `FUN_080047f6` | `cmd_feed_process_3`: mode 0 = `FUN_080047c6` (feed_top_to_hub), Antwort status + 1 Byte Zustand; mode 1 = `FUN_0800472c`: Hauptmotor Param[3] bis Odometer > dist (u16 BE, max. 3000 mm) oder Stillstand 2 s, status 0. Das Byte s wird nur geloggt („speed“) | B (nur R153; in R150 fehlt 0x12) |
 | 0x13 | 4 (1: mask) | `FUN_08004dc2` | Pretension-Check (`FUN_08004460`) → feed_top_to_hub (`FUN_08004326`) → `FUN_08003e74` (fördern bis Stillstand); status = Fehlercode | B |
 | 0x14 | 3 (0) | inline | 22 Byte: `"153"` + 19 Byte aus 0x200038f0 (Version/Seriennummer) | B (Inhalt V) |
-| 0x15 | 3 (0) | `FUN_0800f16e` | 16 Byte: 6 Einträge `((i+1)<<4) | X[i]` aus 0x2000390d, Rest 0 | B (Bedeutung offen) |
+| 0x15 | 3 (0) | `FUN_0800f16e` | 16 Byte: 6 Einträge `((i+1)<<4) | X[i]` aus 0x2000390d, Rest 0 | B (~~Bedeutung offen~~ → BEFUND2 §3: Init-Flags EEPROM/AHT30/Odometer/Buffer/RFID0/RFID1, 0 = OK) |
 | 0x30 | 4 (1) | `FUN_0800f19c` | GPIO 0x10 setzen (Pin = (x==1)), status 0 | B |
 | 0x50 | 4 (1: wert) | inline | Config #6 schreiben + `FUN_08011df0` (speichern), status 0, dann `rt_thread_delay(100)` + `FUN_08016388` (vermutlich Reset). Gleicher Wert ⇒ status 3, kein Reset | B (Reset: V) |
 | 0x51 | 4 (1) | inline | nur bei `addr==0xEB`: `G[3]=x`, keine Antwort | B |
@@ -204,14 +208,14 @@ cfs6_222 (`FUN_0800dac8`, `FUN_0800e324`; **B**): andere Implementierung über e
 | 0x13 | Rückzug: Buffer-Sensor-Timeout 5 s | `FUN_08004c9a` | B |
 | 0x14 | pull back hub PE timeout | `FUN_08004884` | B |
 | 0x16 | Slot ohne Filament | `FUN_08004d4a`/`FUN_0800e81a` | B |
-| 0x17 | pull_back_hub: Sensor A nicht aktiv | `FUN_08004c5a` | B |
+| 0x17 | pull_back_hub: Sensor A nicht aktiv (→ BEFUND2 §8: Einlauf-Sensor meldet kein Filament) | `FUN_08004c5a` | B |
 | 0x18 | (intern) kein Slot belegt; wird in `d4a` auf 0x16 abgebildet | `FUN_0800e81a` | B |
 | 0x19 | pull_back_hub motor block | `FUN_0800494e` | B |
 | 0x30 | nur 0x0a: Preload-Ereignis anstehend (`preload_check_flag`), 4 Byte Ereignisdaten | `FUN_0800ed26` | B+L (`f7 01 07 30 0a 03 00 00 00`) |
-| 0x50 | nur 0x0a in STATE_PRINT: Sensorprüfung `FUN_0800e8e0` ≠ 0 (setzt R[8]=1, LED-Fehler 0x50) | `FUN_0800ed26` | B (Bedeutung: V, z.B. Filament-Runout) |
+| 0x50 | nur 0x0a in STATE_PRINT: Sensorprüfung `FUN_0800e8e0` ≠ 0 (setzt R[8]=1, LED-Fehler 0x50) | `FUN_0800ed26` | B (Bedeutung: V, z.B. Filament-Runout; → BEFUND2 §4: Einlauf oder Hub des Druck-Slots frei = Runout) |
 | S[3] | nur 0x0a in STATE_ERROR: gespeicherter Fehlercode (einer der obigen) | `FUN_0800ed26` | B |
 
-Weitere Fehlercodes im LED-Mapping `FUN_08010c8a`: 0x1a, 0x20, 0x22, 0x51, 0x52, 0x53. Ihre Quellen sind nicht verfolgt (**V**: weitere Fehler).
+Weitere Fehlercodes im LED-Mapping `FUN_08010c8a`: 0x1a, 0x20, 0x22, 0x51, 0x52, 0x53. Ihre Quellen sind nicht verfolgt (**V**: weitere Fehler). **→ BEFUND2 §4/§8 KORRIGIERT: 0x51/0x52 sind echte Fehler aus dem Thread print_check (0x51 ≥ 40 mm bzw. ≥ 3× Buffer leer ohne „voll“, 0x52 < 5 mm in ~10 s), 0x1a = Pull-back-Timeout 40 s; 0x53 wird nie erzeugt.**
 
 Fehler-Mechanik `FUN_08003e3a(err)` (**B**): Für err ∉ {1,3} gilt `S[3]=err`, `S[2]=4` (STATE_ERROR) und die LED zeigt den Fehler. err 1/3 stellt nur den Slot-Index wieder her. Gelöscht wird der Fehler mit 0x10 mode 3 (`FUN_08003e2c`).
 
@@ -245,14 +249,14 @@ Antwort 0x0a, normal (**B+L**): 6 Datenbytes
 
 | Byte | Inhalt |
 |---|---|
-| 0 | S[1] |
-| 1 | S[0] |
-| 2 | Flags: `R[3] | 0x80` einmalig, wenn R[3]≠0 (R[3]: Motorblock-Status, **V**), sonst R[5] (ebenfalls zurückgesetzt) |
+| 0 | S[1] (→ BEFUND2 §1: Temperatur °C, int8, AHT30) |
+| 1 | S[0] (→ BEFUND2 §1: rel. Feuchte %, uint8) |
+| 2 | Flags: `R[3] | 0x80` einmalig, wenn R[3]≠0 (R[3]: Motorblock-Status, **V**), sonst R[5] (ebenfalls zurückgesetzt). **→ BEFUND2 §8 KORRIGIERT (B): R[3] = Motorblock > 10 s (Timer motor_blocked_detect_timer), Bit 4 Hauptmotor, Bit 0–3 Feeder A–D; R[5] = Blockmaske sofort** |
 | 3 | **S[2] = Box-Zustand** |
 | 4 | Bitmaske Sensor B (aktiv = 1) |
-| 5 | Bitmaske `FUN_080053f2` (Slot hat gültige RFID-Daten mit Status 7, **V**) |
+| 5 | Bitmaske `FUN_080053f2` (~~Slot hat gültige RFID-Daten mit Status 7, **V**~~ **→ BEFUND2 §2 KORRIGIERT: Einlauf-Flag && Tag geladen && Tag-Typ 7 && Tag-Feld+0x10 == 0 – Sperrbit, schließt 0x02-Daten aus**) |
 
-Live `09 00 0a 13 34 00 00 00 00` ⇒ S[1..0]=0x13/0x34, Zustand IDLE. Woher S[0]/S[1] kommen, ist nicht gefunden (**offen**). Denselben Wert liefert 0x52 (Antwort-fun 0x53).
+Live `09 00 0a 13 34 00 00 00 00` ⇒ S[1..0]=0x13/0x34, Zustand IDLE. Woher S[0]/S[1] kommen, ist nicht gefunden (**offen** → BEFUND2 §1 geklärt: AHT30). Denselben Wert liefert 0x52 (Antwort-fun 0x53).
 
 Status der 0x0a-Antwort, nach Zustand (**B**):
 
@@ -332,12 +336,12 @@ Arbeitsdateien lokal (`/tmp/claude-0/ghidra-cfs/`, flüchtig, nicht im Repo):
 
 ## 9. Offen
 
-- Woher S[0]/S[1] kommen (0x0a Bytes 0–1, live 0x13 0x34).
-- R[3]-Quelle.
+- ~~Woher S[0]/S[1] kommen (0x0a Bytes 0–1, live 0x13 0x34).~~ → BEFUND2 §1
+- ~~R[3]-Quelle.~~ → BEFUND2 §8
 - Bedeutung von Config #6 (0x0c/0x50).
-- 0x15-Inhalt.
-- Initialisierung der Auto-Addr-Tabelle (0xA0–0xA3).
-- Physische Zuordnung von Sensor A/B (Pin-Tabelle @0x20000218).
+- ~~0x15-Inhalt.~~ → BEFUND2 §3
+- ~~Initialisierung der Auto-Addr-Tabelle (0xA0–0xA3).~~ → BEFUND2 §7
+- ~~Physische Zuordnung von Sensor A/B (Pin-Tabelle @0x20000218).~~ → BEFUND2 §8 (PD7–PD4 / PE10–PE7)
 - cfs6-Handler 0x16–0x19/0x57 (Trockner?) im Detail.
 
 ## 10. Nachprüfung bei der Einarbeitung (15.10.2026, gegen `all_cfs0.c`)
@@ -381,12 +385,12 @@ Details und Belegzeilen: PROTOKOLL-485.md §6. Achtung: Logs vor dem 12.10.2026 
 
 **Widersprochen / neu:**
 - **0x0a Byte 5** („Slot hat gültige RFID-Daten“, §6 Tabelle Zeile 5, V): live **immer 0**
-  (8 268 Frames, auch mit RFID-Spule) → Deutung **unbelegt/widersprochen**.
+  (8 268 Frames, auch mit RFID-Spule) → Deutung **unbelegt/widersprochen**. **→ BEFUND2 §2: Typ-7-Tag-Sperrbit.**
 - **0x51** (§5: „nur LED-Mapping“): live **echter Fehlercode** in STATE_ERROR, Host-Name
   SPEED_ERR, key846 „box speed is smaller than extruder“ (452× am 12.10.). Quelle im Code
-  weiter nicht verfolgt.
+  weiter nicht verfolgt. **→ BEFUND2 §4: Quelle = Thread print_check.**
 - **0x0a Byte 0/1** (§9 offen): langsam gegenläufig variierend → Vermutung Temp °C / Feuchte %
-  (AHT30); nicht gegengeprüft.
+  (AHT30); nicht gegengeprüft. **→ BEFUND2 §1: belegt (B+L).**
 - **FW 113** liefert 0x0a mit nur 4 Datenbytes (Status 0) – nicht mit dem 0x30-Ereignis verwechseln.
 - Fehler löschen: Host nutzt 0x04 [00 01] (ERROR → IDLE), nie 0x10 mode 3.
 - Host-Namen: 0x08 GET_FILAMENT_SENSOR_STATE, 0x0f TIGHTEN_UP_ENABLE (Semantik „Auto-

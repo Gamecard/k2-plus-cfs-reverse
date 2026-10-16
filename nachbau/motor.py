@@ -23,8 +23,12 @@ Umfang:
   build_sys_param_write_payload, build_sys_param_update_payload
 - decode_sys_param_float: Dekodier-Hilfe (<f, ohne Bus)
 - read_encoder: GESPERRT (0x08 "get feedback" nie beobachtet)
-- query_version + Update-Sequenz-Builder (Func 0xF0, aus mcu_util_485-
-  Decompile; auf dem Motorbus live NIE beobachtet – unverändert)
+- Update-Pfad (Func 0xF0, aus mcu_util_485-Decompile; auf dem Motorbus
+  live NIE beobachtet): query_version/query_sector_size frei (Abfragen),
+  request_update/send_fw_len/update_end NUR mit confirm=True (Bootloader-
+  Risiko, Haltemoment weg); Builder + update_sequence senden nichts.
+- write_sys_param: IDs außerhalb SYS_PARAM_CONFIGURABLE zusätzlich nur mit
+  allow_locked=True; Werte mit float32-Plausibilitätsprüfung.
 
 Adressen / Pfade (live):
 - X/Y/Z/Z1 = 0x81/0x82/0x83/0x84, AUSSCHLIESSLICH über serial_485
@@ -363,15 +367,37 @@ def decode_sys_param_float(data):
     return struct.unpack("<f", raw)[0]
 
 
+FLOAT32_MAX = 3.4028234663852886e38   # größter endlicher float32-Betrag
+
+
 def _float_bytes(value):
+    """Wert -> 4 Bytes `<f` mit Plausibilitätsprüfung (ValueError bei):
+    nicht int/float bzw. bool, nicht endlich, |Wert| > float32-Max, oder
+    Eingabe != 0 rundet in float32 auf 0 (z.B. 1e-50 – struct schreibt das
+    sonst STILL als 0.0)."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError("Sys-Param-Wert muss int/float sein: %r" % (value,))
     if not math.isfinite(value):
         raise ValueError("Sys-Param-Wert muss endlich sein: %r" % (value,))
+    if abs(value) > FLOAT32_MAX:
+        raise ValueError("Sys-Param-Wert |%r| > float32-Max %r" % (value, FLOAT32_MAX))
     try:
-        return struct.pack("<f", value)
+        raw = struct.pack("<f", value)
     except OverflowError:
         raise ValueError("Sys-Param-Wert passt nicht in float32: %r" % (value,))
+    if value != 0 and struct.unpack("<f", raw)[0] == 0.0:
+        raise ValueError("Sys-Param-Wert %r rundet in float32 auf 0.0 (Unterlauf)"
+                         % (value,))
+    return raw
+
+
+def float32_rounding(value):
+    """(float32-Wert, relative Abweichung) für einen Sys-Param-Wert, ohne Bus.
+    Gleiche Prüfungen wie beim Schreiben (ValueError). Abweichung =
+    |f32 - value| / |value| (0.0 bei value == 0); z.B. 0.1 -> ~1.5e-8,
+    Subnormal 1e-45 -> ~0.4 (geschriebener Wert 1.4e-45)."""
+    f32 = struct.unpack("<f", _float_bytes(value))[0]
+    return f32, (abs(f32 - value) / abs(value) if value else 0.0)
 
 
 def build_sys_param_read_payload(param_id):
@@ -564,7 +590,7 @@ class Motor:
         """Alias für read_sys_param (Wrapper-Name MOTOR_SYS_PARAM lesen)."""
         return self.read_sys_param(param_id)
 
-    def write_sys_param(self, param_id, value, confirm=False):
+    def write_sys_param(self, param_id, value, confirm=False, allow_locked=False):
         """Sys-Param SCHREIBEN (0x06 [01, id] + <f) – GESCHÜTZT.
 
         ACHTUNG: verändert Motorregelparameter (z.B. ID 70 Positionsregler-Kp,
@@ -572,6 +598,14 @@ class Motor:
         Kaltstart wieder Werkswerte (Kp 300, err_time 0.01 …), nach Soft-
         Restart noch der geschriebene Wert (BEFUND-MOTOR.md 2.2).
         Ohne confirm=True -> PermissionError, es wird NICHTS gesendet.
+
+        Zweite Sperre: IDs AUSSERHALB SYS_PARAM_CONFIGURABLE (166 IDs, im
+        Plus-Log "is not configurable", z.B. ID 1 param_boot_key, 224/225
+        param_flash_key/param_flash_checksum, Kalibrier-/Phasenwerte) nur mit
+        ZUSÄTZLICHEM allow_locked=True – sonst PermissionError mit ID-Namen.
+        Wert-Plausibilität (ValueError, vor allen Sperren): endlich,
+        |Wert| <= float32-Max, Eingabe != 0 darf nicht auf 0.0 runden (1e-50).
+        Rundung vorab prüfbar: float32_rounding(value).
 
         Live: klippy.log.2026-10-12:10700 `81 09 00 06 01 46 00 00 c8 42` ->
         10706 Echo `f7 81 07 00 06 00 00 c8 42 d4` ("写入成功", 100.0).
@@ -584,15 +618,21 @@ class Motor:
                 "write_sys_param(ID %d=%r) gesperrt: verändert Motorregel"
                 "parameter (flüchtig bis Kaltstart) – nur mit confirm=True"
                 % (param_id, value))
+        if param_id not in SYS_PARAM_CONFIGURABLE and allow_locked is not True:
+            raise PermissionError(
+                "write_sys_param(ID %d %s) gesperrt: laut Stock 'not configurable' "
+                "(Schlüssel/Checksumme/Kalibrierung) – nur mit confirm=True UND "
+                "allow_locked=True" % (param_id, SYS_PARAM_NAMES[param_id]))
         echo = self._tx(FUNC_SYS_PARAM, payload, TIMEOUT_SYS_PARAM)
         if echo != bytes(payload[2:]):
             raise RuntimeError("0x06 Schreib-Echo passt nicht: gesendet %s, "
                                "Antwort %s" % (bytes(payload[2:]).hex(), echo.hex()))
         return decode_sys_param_float(echo)
 
-    def set_sys_param(self, param_id, value, confirm=False):
+    def set_sys_param(self, param_id, value, confirm=False, allow_locked=False):
         """Alias für write_sys_param (gleicher Schutz, confirm=True nötig)."""
-        return self.write_sys_param(param_id, value, confirm=confirm)
+        return self.write_sys_param(param_id, value, confirm=confirm,
+                                    allow_locked=allow_locked)
 
     def update_sys_params(self, confirm=False):
         """0x06 [03] "Updata param" – GESCHÜTZT (confirm=True nötig).
@@ -724,35 +764,67 @@ class Motor:
             "read_encoder gesperrt: 0x06 = Sys-Param (live), 0x08 'get feedback' "
             "nie beobachtet – Encoder-Lesen unbelegt")
 
-    # --- Update-Pfad (Func 0xF0, live nie beobachtet – unverändert) ---
+    # --- Update-Pfad (Func 0xF0, live NIE beobachtet) ---
+    # FREI (lesend): query_version (Sub 00), query_sector_size (Sub 03) – im
+    # Binary reine "get"-Abfragen VOR request-update (1.7, 3 Retries), sie
+    # ändern laut Ablauf keinen Zustand. Restrisiko: wie die Motor-App-FW
+    # auf F0 reagiert, ist live unbelegt.
+    # GESCHÜTZT (confirm=True, sonst PermissionError ohne Bus-Zugriff):
+    # request_update, send_fw_len, update_end. Es gibt bewusst KEINE Methode
+    # für Daten-Chunks/Erase (nur Builder + update_sequence, senden nichts).
+
+    @staticmethod
+    def _check_update_confirm(name, confirm):
+        if confirm is not True:
+            raise PermissionError(
+                "%s gesperrt: F0-Update-Pfad (live nie beobachtet) kann den Motor "
+                "in den Bootloader schicken – Haltemoment weg, Z kann absacken; "
+                "nur mit confirm=True" % name)
 
     def query_version(self):
-        """Version über Update-Pfad abfragen (Func 0xF0/Sub 0x00). Rohdaten."""
+        """Version über Update-Pfad abfragen (Func 0xF0/Sub 0x00). Rohdaten.
+        FREI: reine Abfrage (1.7 "get version", erster Schritt vor
+        request-update); live nie beobachtet."""
         return self.bus.transact(self.addr, FUNC_FW_UPDATE,
                                  build_version_payload(),
                                  retries=UPDATE_RETRIES)
 
     def query_sector_size(self):
-        """Sector-Größe abfragen (Func 0xF0/Sub 0x03). Rohdaten."""
+        """Sector-Größe abfragen (Func 0xF0/Sub 0x03). Rohdaten.
+        FREI: reine Abfrage (1.7 "get sector size", vor request-update)."""
         return self.bus.transact(self.addr, FUNC_FW_UPDATE,
                                  build_sector_payload(),
                                  retries=UPDATE_RETRIES)
 
-    def request_update(self):
-        """Update anmelden (Func 0xF0/Sub 0x01)."""
+    def request_update(self, confirm=False):
+        """Update anmelden (Func 0xF0/Sub 0x01) – GESCHÜTZT (confirm=True).
+
+        RISIKO: Schaltet den Slave vermutlich in den Bootloader/Update-Modus
+        (danach im Binary nur noch len/Daten/update_end, "wait to startup
+        app"). Ein Achsmotor verliert dabei die Regelung/das Haltemoment –
+        bei Z (0x83/0x84) kann das Bett/Portal mechanisch absacken. Live nie
+        beobachtet; ohne confirm=True PermissionError, nichts gesendet."""
+        self._check_update_confirm("request_update", confirm)
         self.bus.transact(self.addr, FUNC_FW_UPDATE,
                           build_update_request_payload(),
                           retries=UPDATE_RETRIES)
 
-    def send_fw_len(self, fw_len):
-        """FW-Länge senden (4B LE, Func 0xF0)."""
-        self.bus.transact(self.addr, FUNC_FW_UPDATE,
-                          build_fw_len_payload(fw_len),
+    def send_fw_len(self, fw_len, confirm=False):
+        """FW-Länge senden (4B LE, Func 0xF0) – GESCHÜTZT (confirm=True).
+        Teil des Update-Ablaufs nach request_update (gleiches Risiko);
+        Länge wird vor der Sperre geprüft (ValueError)."""
+        payload = build_fw_len_payload(fw_len)
+        self._check_update_confirm("send_fw_len", confirm)
+        self.bus.transact(self.addr, FUNC_FW_UPDATE, payload,
                           retries=UPDATE_RETRIES)
 
-    def update_end(self):
+    def update_end(self, confirm=False):
         """Update abschließen (Func 0xF0/Sub 0x02, Timeout 500 ms,
-        Beleg: mcu_util_485 Zustand 10 @0x15a64)."""
+        Beleg: mcu_util_485 Zustand 10 @0x15a64) – GESCHÜTZT (confirm=True).
+        RISIKO: startet laut Binary die (evtl. unvollständige) App neu
+        ("update end, wait to startup app") – Motor kurz/dauerhaft ohne
+        Regelung."""
+        self._check_update_confirm("update_end", confirm)
         self.bus.transact(self.addr, FUNC_FW_UPDATE,
                           build_update_end_payload(),
                           timeout=UPDATE_END_TIMEOUT,
@@ -896,6 +968,13 @@ def selftest():
           set(SYS_PARAM_STOCK_CONFIGURED) | set(SYS_PARAM_STOCK_ALWAYS_READ)
           <= SYS_PARAM_CONFIGURABLE and len(SYS_PARAM_CONFIGURABLE) == 61)
     check("name-guard", raises(ValueError, sys_param_id, "gibtsnicht"))
+    import motor_mini  # nur Abgleich; motor_mini importiert motor.py NICHT
+    check("motor_mini-Schreibliste = Stock-Config-IDs (configurable)",
+          motor_mini.MINI_WRITABLE_IDS == set(SYS_PARAM_STOCK_CONFIGURED)
+          <= SYS_PARAM_CONFIGURABLE)
+    wrong = _FakeBus([("81 05 00 06 02 09", "f7 82 07 00 06 53 4a 18 43 ae")])
+    check("FakeBus prüft Absenderadresse (Antwort von 0x82 an 0x81)",
+          raises(AssertionError, Motor(wrong, 0x81).read_sys_param, 9))
 
     # 3. read_sys_param gegen Live-Frames (klippy.log:2511-2550, 2859-2865)
     bus = _FakeBus([
@@ -945,6 +1024,43 @@ def selftest():
           mw.update_sys_params(confirm=True) is True)
     check("falsches Echo -> RuntimeError",
           raises(RuntimeError, mw.write_sys_param, 70, 100.0, confirm=True))
+    check("alle Write-Frames verbraucht", not bus.script)
+
+    # 4b. Gesperrte IDs (not configurable) + Wert-Plausibilität (nichts gesendet)
+    for pid in (1, 224, 225, 0, 11):
+        check("ID %d (%s) ohne allow_locked gesperrt" % (pid, sys_param_name(pid)),
+              raises(PermissionError, m0.write_sys_param, pid, 1.0, confirm=True)
+              and raises(PermissionError, m0.set_sys_param, pid, 1.0, confirm=True))
+    check("allow_locked ohne confirm weiter gesperrt",
+          raises(PermissionError, m0.write_sys_param, 1, 1.0, allow_locked=True))
+    check("allow_locked='yes' zählt nicht",
+          raises(PermissionError, m0.write_sys_param, 1, 1.0, confirm=True,
+                 allow_locked="yes"))
+    for bad in (1e-50, -1e-50, 3.5e38, -1e39, float("inf"), float("nan")):
+        check("Wert %r -> ValueError (auch mit confirm)" % (bad,),
+              raises(ValueError, m0.write_sys_param, 70, bad, confirm=True)
+              and raises(ValueError, build_sys_param_write_payload, 70, bad))
+    check("float32-Grenzen ok", build_sys_param_write_payload(70, FLOAT32_MAX)[2:]
+          == list(struct.pack("<f", FLOAT32_MAX))
+          and build_sys_param_write_payload(70, 0.0)[2:] == [0, 0, 0, 0]
+          and build_sys_param_write_payload(70, -0.0)[2:] == [0, 0, 0, 0x80])
+    f32, rel = float32_rounding(0.1)
+    check("float32_rounding 0.1", f32 != 0.1 and 0 < rel < 1e-7
+          and float32_rounding(300.0) == (300.0, 0.0))
+    check("Sperren/Plausibilität senden nichts", nobus.calls == [])
+    bus = _FakeBus([
+        # verifizierter Live-Frame (klippy.log.2026-10-05:16596), Echo 10-14:25260
+        ("f7 81 09 00 06 01 46 00 00 96 43 8f", "f7 81 07 00 06 00 00 96 43 09"),
+        # ID 1 mit allow_locked: SYNTHETISCH (nie live geschrieben), CRC neu
+        ("81 09 00 06 01 01 00 00 80 3f", "f7 81 07 00 06 00 00 80 3f %02x"
+         % crc8_cal(bytes.fromhex("07 00 06 00 00 80 3f"))),
+    ])
+    mw = Motor(bus, 0x81)
+    check("gültiger Write ID70=300 = Live-Frame",
+          mw.write_sys_param(70, 300.0, confirm=True) == 300.0)
+    check("ID 1 nur mit confirm+allow_locked",
+          mw.write_sys_param(1, 1.0, confirm=True, allow_locked=True) == 1.0
+          and not bus.script)
 
     # 5. check_protection / write_params_raw ([0b] live, [05] nie)
     bus = _FakeBus([
@@ -1026,6 +1142,38 @@ def selftest():
           list(Motor(bus, 0x81).query_version()) == [0, 2, 2]
           and bus.calls[0][3].get("retries") == UPDATE_RETRIES)
     check("retries=2 -> 3 Versuche wie Binary", UPDATE_RETRIES + 1 == 3)
+    # F0-Sender: ohne confirm KEIN Bus-Zugriff
+    for addr in MOTOR_ADDRS:
+        mu = Motor(nobus, addr)
+        for name, fn in [("request_update", lambda c: mu.request_update(**c)),
+                         ("send_fw_len", lambda c: mu.send_fw_len(6, **c)),
+                         ("update_end", lambda c: mu.update_end(**c))]:
+            check("%s 0x%02x ohne confirm gesperrt" % (name, addr),
+                  raises(PermissionError, fn, {})
+                  and raises(PermissionError, fn, {"confirm": "yes"})
+                  and raises(PermissionError, fn, {"confirm": 1}))
+    check("send_fw_len Längen-Guard vor Sperre",
+          raises(ValueError, Motor(nobus, 0x83).send_fw_len, -1))
+    check("F0-Sperren senden nichts", nobus.calls == [])
+
+    def _syn(addr, data_hex):
+        # SYNTHETISCHE Antwort (F0 live nie beobachtet), CRC neu berechnet
+        body = bytes([len(bytes.fromhex(data_hex)) + 3, 0x00, 0xF0]) \
+            + bytes.fromhex(data_hex)
+        return "f7 %02x %s %02x" % (addr, body.hex(" "), crc8_cal(body))
+    bus = _FakeBus([
+        ("83 04 00 f0 01", _syn(0x83, "00")),
+        ("83 07 00 f0 06 00 00 00", _syn(0x83, "00")),
+        ("83 04 00 f0 02", _syn(0x83, "00")),
+    ])
+    mu = Motor(bus, 0x83)
+    mu.request_update(confirm=True)
+    mu.send_fw_len(6, confirm=True)
+    mu.update_end(confirm=True)
+    check("F0-Sender mit confirm=True senden korrekt",
+          not bus.script and [c[2] for c in bus.calls] == [[1], [6, 0, 0, 0], [2]]
+          and all(c[3].get("retries") == UPDATE_RETRIES for c in bus.calls)
+          and bus.calls[2][3].get("timeout") == UPDATE_END_TIMEOUT)
     check("payload version", build_version_payload() == [0x00])
     check("payload sector", build_sector_payload() == [0x03])
     check("payload erase", build_erase_payload() == [0x06])

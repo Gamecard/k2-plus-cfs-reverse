@@ -25,7 +25,7 @@ Audit und Änderungsbegründungen: `/home/pro/k2-fw-live-1.1.7.0/AUDIT-UND-AENDE
 ## Offen – Mitschnitt
 - [x] `klippy.log` loggt ALLE 485-Frames selbst (`cmd_485_send_data_with_response params:`) – kein Hardware-Mitschnitt nötig
 - [x] CRC geknackt: CRC-8/ATM (poly 0x07, init 0x00) über `[len..data]`, head/addr NICHT enthalten
-- [x] Belt-Frames live verifiziert (Version/Flash/ADC), UUID `b0 5d … (12 B UUID, gekürzt)`
+- [x] Belt-Frames live verifiziert (Version/Flash/ADC), UUID `a0 a1 … (12 B UUID, Platzhalter)`
 - [x] Box-Func-Codes live (Stand: 0x02 RFID, 0x03 Remain, 0x04 Box-Mode, 0x05 Buffer,
   0x08 HW-Status, 0x0a Box-State/Event, 0x0d SET_PRE_LOADING/RFID-Control (live nur ACK len 3; Aktionen 00/01/02 =
   disable/enable/Force-Read, KORRIGIERT 15.10.2026), 0x0e Messrad-Float,
@@ -157,12 +157,14 @@ motor 98 · motor_mini 30 · auto_addr 31 – alle grün.
   Ghidra-Befund (bisher nur leeres ACK len 3; Request-Bytes des Hosts, Laufzeit bis zur
   Antwort, Status-Byte, Ablauf op 2 vs. 3) – **TEILWEISE ERLEDIGT 15.10.2026 (Live-Logs):**
   op 0/1/2 live (55 Requests; [0f 01]/[0f 00] sofort, [01 02] nach 31–37 s, Status 0);
-  **op 3 nie live**; [00 02]-Bursts ohne Antwort offen (PROTOKOLL-485.md §6.4)
+  **op 3 nie live**; ~~[00 02]-Bursts ohne Antwort offen~~ (PROTOKOLL-485.md §6.4) – Bursts
+  16.10.2026 geklärt (BEFUND2 §5: Box verweigert nicht, Ursache Host-seitig vermutet)
 - [x] Status-Byte-Werte belegt (15.10.2026, Ghidra): 0 ok, 1 ungültig, 2 CRC, 3 busy/
   Zustand, Ablauf-Fehler 0x05–0x19, 0x30/0x50 nur bei 0x0a – `box.STATUS_NAMES`
-- [ ] Status-Byte (`raw[3]`) der Antworten auswerten (Fehler/Busy) –
-  `box._response_data` ignoriert es noch (TODO im Code; Werte jetzt als `box.STATUS_*`
-  bereitgestellt, Logik bewusst unverändert)
+- [x] Status-Byte (`raw[3]`) der Antworten auswerten (Fehler/Busy) –
+  ~~`box._response_data` ignoriert es noch (TODO im Code; Werte jetzt als `box.STATUS_*`
+  bereitgestellt, Logik bewusst unverändert)~~ **ERLEDIGT 16.10.2026 (Review 2, M2):**
+  `serial485.transact_full` + `box.CfsStatusError`/`StatusBytes`/`raise_on_status`
 - [x] **Timeout 0x0d op 2/3** (Bezug Retry-TODO oben): FW antwortet erst nach bis zu ~3 min
   pro Slot – Nachbau-Default 2 s + 4 Retries hätte den Force-Preload bis zu 5× gesendet.
   ERLEDIGT 15.10.2026: `box.communication_set_pre_loading` nutzt bei op 2/3 langen Timeout
@@ -207,6 +209,10 @@ PROTOKOLL-GESAMT.md 1.9.
   0x0e MEASURING_WHEEL gegen Förderweg/BLDC-Laufzeit korrelieren
 - [ ] Bootloader-Parser: Bedeutung der akzeptierten Adresse 0xF0 klären (App akzeptiert
   dagegen nur eigene/0xEA/0xEB – Unterschied belegt, s. PROTOKOLL-485.md)
+- [x] **0xEA/0xEB-Semantik der App** – ERLEDIGT 16.10.2026 (BEFUND2 §6): „halbe Broadcasts“ –
+  0xEA wird bei normalen Kommandos mit eigener Adresse beantwortet (nur CRC-Fehler/
+  unbekannte fun/0x50 still), 0xEB nur 0x50/0x51; 0xFE/0xFF nur ohne eigene Adresse
+  (PROTOKOLL-485.md §6.8)
 - [ ] Längengrenze Bootloader len ≤ 0xFC vs. `serial485`-Prüfung bis 255 – nur notiert,
   Code NICHT geändert (App-Grenze unbekannt)
 - [x] Hypothese 0x10 `[mask 07 03]` – **BESTÄTIGT 15.10.2026 (Ghidra):** mode 7 mit
@@ -218,18 +224,29 @@ PROTOKOLL-GESAMT.md 1.9.
 ## Offen – aus Ghidra-Neuanalyse CFS-FW (15.10.2026)
 
 Details: `GHIDRA-CFS-BEFUND-2026-10-15.md` §9/§10.
-- [ ] Quelle von 0x0a Byte 0/1 (S[1]/S[0], live 0x13 0x34; = 0x52-Antwort) – LIVE 15.10.2026:
+- [x] Quelle von 0x0a Byte 0/1 (S[1]/S[0], live 0x13 0x34; = 0x52-Antwort) – LIVE 15.10.2026:
   langsam gegenläufig (b0 0x11–0x1c, b1 0x2d–0x39) → Vermutung Temp °C / rel. Feuchte;
-  mit Hygrometer gegenprüfen
-- [ ] R[3]-Quelle (0x0a Byte 2, Flag 0x80 – Motorblock?)
+  mit Hygrometer gegenprüfen – **ERLEDIGT 16.10.2026 (BEFUND2 §1, B+L):** AHT30, Temp °C int8 /
+  Feuchte % uint8, abgeschnitten, ~1,2 s (`box.parse_box_state` → `temp_c`/`rh`)
+- [x] R[3]-Quelle (0x0a Byte 2, Flag 0x80 – Motorblock?) – **ERLEDIGT 16.10.2026 (BEFUND2 §8):**
+  Motorblock > 10 s (Bit 4 Hauptmotor, Bit 0–3 Feeder), R[5] = Blockmaske sofort (`block_*`)
+- [x] 0x0a Byte 5 – **ERLEDIGT 16.10.2026 (BEFUND2 §2):** Typ-7-Tag-Sperrbit, nicht „RFID gültig“
+  (`inlet_tag_mask`; live immer 0 erklärt)
 - [ ] Bedeutung Config #6 (0x0c lesen / 0x50 schreiben + Reset) – NICHT senden (0x50 resettet)
-- [ ] Inhalt 0x15 (6 Einträge `((i+1)<<4)|X[i]`) – live `10 20 30 40 50 60 00…` (alle X = 0),
-  Host-Name GET_HARDWARE_STATUS; Bedeutung von X weiter offen
-- [ ] Init der Auto-Addr-Tabelle (0xA0–0xA3 in der App)
-- [ ] Physische Zuordnung Sensor A/B (Pin-Tabelle @0x20000218; Deutung A = Einlauf, B = Hub)
+- [x] Inhalt 0x15 (6 Einträge `((i+1)<<4)|X[i]`) – live `10 20 30 40 50 60 00…` (alle X = 0),
+  Host-Name GET_HARDWARE_STATUS; ~~Bedeutung von X weiter offen~~ **ERLEDIGT 16.10.2026
+  (BEFUND2 §3):** Init-Flags EEPROM/AHT30/Odometer/Buffer/RFID0/RFID1, 0 = OK
+  (`box.parse_get_hardware_status` → `components`/`all_ok`; cfswatch dekodiert)
+- [x] Init der Auto-Addr-Tabelle (0xA0–0xA3 in der App) – **ERLEDIGT 16.10.2026 (BEFUND2 §7):**
+  Tabelle aus entpackter `.data`; A0 3× beantwortet, A1 0–1000 ms verzögert, adressierte Box
+  ignoriert A0/A1, A2 = A3. `auto_addr.py` kompatibel (Selbsttest 13 `FwSerial`)
+- [x] Physische Zuordnung Sensor A/B (Pin-Tabelle @0x20000218; Deutung A = Einlauf, B = Hub) –
+  **ERLEDIGT 16.10.2026 (BEFUND2 §8):** Einlauf PD7–PD4, Hub PE10–PE7, Buffer PD8/PD9; ein
+  gemeinsames Odometer MT6826
 - [ ] cfs6-Handler 0x16–0x19/0x57 (Trockner?) im Detail
-- [ ] Weitere Fehlercodes nur im LED-Mapping (0x1a, 0x20, 0x22, ~~0x51~~, 0x52, 0x53) – Quellen
-  (0x51 LIVE 15.10.2026 als SPEED_ERR belegt, key846)
+- [~] Weitere Fehlercodes nur im LED-Mapping (~~0x1a~~, 0x20, 0x22, ~~0x51~~, ~~0x52~~, ~~0x53~~) – Quellen
+  (0x51 LIVE 15.10.2026 als SPEED_ERR belegt, key846) – **16.10.2026 (BEFUND2 §4/§8):** 0x50 Runout
+  im Druck-Slot, 0x51/0x52 aus print_check, 0x1a Pull-back 40 s, 0x53 nie erzeugt; offen 0x20/0x22
 - [ ] 0x0d op 2 mit Mehrfachmaske: Laufzeit summiert sich je Slot (bis > 12 min bei 4 Slots)
   – live prüfen, ob der Host (box_wrapper) dafür eigene Timeouts hat (.so: SET_PRE_LOADING=300 s)
 - [ ] 0x06 Feeder-Kommando: FW-Bug (Maske aus r7) → am Bus praktisch immer Status 1; nicht
@@ -277,10 +294,61 @@ Quelle: `live-logs-2026-10-15/` (lokal, nicht fürs Repo), Auswertung PROTOKOLL-
   → Verdacht **Filamentrest im Hub / Förderrolle bzw. Pfad A** (mechanisch, nicht Bus –
   alle A-Kommandos sauber quittiert); **B/C/D fehlerfrei**
 - RFID A: Spule ohne Tag (A:unknown, remain 0xFF) – kein Defektbeleg
-- [ ] Hub/Pfad A mechanisch prüfen (Filamentrest entfernen), danach 0x0a Byte 4 = 00 kontrollieren
+- **KONSEQUENZ (BEFUND2 §8, 16.10.2026):** Ein dauerhaft aktiver **Hub-Sensor A blockiert auch
+  B/C/D** – jedes 0x0d op 2/3 (Force-Preload) in IDLE und jedes 0x11 Maske 0 zieht zuerst alle
+  Slots mit aktivem Hub-Sensor zurück (`FUN_08004cd0(4,1)`) → A läuft in ≥ 10 s Motorblock
+  (0x19, Flags 0x90/0x91) → STATE_ERROR, Abbruch, kein Preload der anderen Slots. Der Einzug-
+  Abbruch nach ≈ 240 mm (0x0c) ist reine Odometer-Logik (mode 4 prüft keinen Sensor; gemeinsames
+  Odometer → B/C/D können bei mechanisch blockiertem Pfad ebenfalls 0x09/0x0c/0x52 bekommen).
+- [ ] Hub/Pfad A mechanisch prüfen (Filamentrest entfernen), danach 0x0a Byte 4 = 00 kontrollieren.
+  Konkrete Schritte:
+  1. Drucker aus, Hub öffnen, **Filamentrest von Slot A** aus Hub/Pfad entfernen (auch
+     abgebrochene Stücke an der Förderrolle).
+  2. **Hub-Sensor A** prüfen (PE10, optische Gabellichtschranke; Indizes PE10..PE7 = A..D):
+     Staub/Abrieb entfernen, Fahne frei beweglich, Stecker J6 auf Sitz.
+  3. Drucker an, **live gegenprüfen mit cfswatch**:
+     `ssh root@<drucker> 'tail -F /mnt/UDISK/printer_data/logs/klippy.log' | python3 nachbau/cfswatch.py --local --all`
+     → in den 0x0a-Zeilen muss **„Hub-Maske leer“** stehen (Byte 4 = 00) und darf ohne
+     Filament in A nicht wieder „Hub-Maske A“ werden. Zusätzlich 0x15 = „HW-Init alles ok“.
+  4. Erst danach Force-Preload/Einzug B/C/D bzw. A erneut testen (Flags-Spalte auf
+     „Motorblock > 10 s“ beobachten).
 
 ### Offen nach den Live-Logs
-- [ ] 0x0d op 3 und Status 0x50 – live nie gesehen
-- [ ] 0x0d [00 02]-Bursts (5 Sendungen in ~20 ms) – warum keine Antwort?
-- [ ] 0x0a Byte 0/1 = Temp/Feuchte gegenprüfen (Hygrometer)
+- [ ] 0x0d op 3 ~~und Status 0x50~~ – live nie gesehen (0x50-Semantik per BEFUND2 §4 geklärt: Runout)
+- [x] 0x0d [00 02]-Bursts (5 Sendungen in ~20 ms) – warum keine Antwort? – **16.10.2026
+  (BEFUND2 §5):** Box verweigert nicht (RX synchron, keine Busy-Antwort, keine Duplikat-
+  erkennung, mind. ein Burst-Frame live ausgeführt); **Ursache Host-seitig vermutet**
+  (Burst-Timeout 2–3 ms < Box-Latenz, Halbduplex-Kollision, späte Antworten verworfen).
+  Folge für den Nachbau: keine Bursts, retries=0 bei Mechanik-Kommandos (so umgesetzt)
+- [x] 0x0a Byte 0/1 = Temp/Feuchte gegenprüfen (Hygrometer) – **16.10.2026 per Disassembly
+  belegt** (AHT30); Hygrometer-Vergleich nur noch optional (Genauigkeit)
 - [ ] Motor 0x05 (`[01]/[02]` bei BELT_TENSION, nie Antwort) – Semantik
+
+## Review 2 (16.10.2026) – Fixes (abgehakt) + BEFUND2
+
+Details: `AUDIT-UND-AENDERUNGEN.md` „Review 2 (16.10.2026)“, PROTOKOLL-485.md §6.9.
+Selbsttests 16.10.2026 (in `nachbau/`, `ok`-Zeilen gezählt, alle grün): serial485 93/93 ·
+box 179 · boxmini 17 · cfsseq 28 · motor 134 · motor_mini 43 · auto_addr 33 · cfswatch `--selftest` OK.
+
+- [x] serial485: Absenderprüfung `expect_addr` / `BROADCAST_ADDRS` / `reply_addr_for` (M1)
+- [x] serial485: `transact_full` mit Status-Byte (M2)
+- [x] serial485: Bus-Hold-Grenze `MAX_BUS_HOLD_S = 1200` s; Lock bleibt bewusst über die
+  Transaktion (Halbduplex, Original identisch) (M6)
+- [x] box: `CfsStatusError`/`StatusBytes`/`raise_on_status` (M2)
+- [x] box: `FUNC_RETRIES` 0x10/0x11 = 0 (bewusste Abweichung, `FUNC_RETRIES_ORIGINAL` = 4),
+  `communication_extrude`/`communication_retrude` (M3)
+- [x] box: Messrad op 0 nur mit `reset=True` (G1); Maske 0 bei 0x0d op 2/3 = 4 Slots, 980 s (G2);
+  `_box_fw_num` Host-Formate „1.5.3“ (G3); `_is_full_frame` robust (G4);
+  DeprecationWarning bei `get_hardware_status(channel)` (G6)
+- [x] cfsseq: `EXTRUDE_ACK`/`RETRUDE_ACK`, `check_one_hot`, einziges `slot_to_mask` (G5/G6)
+- [x] motor: F0-Sender nur mit `confirm=True`; `write_sys_param` `allow_locked` für 166
+  gesperrte IDs; float32-Plausibilität
+- [x] motor_mini: `MINI_WRITABLE_IDS` (13 Stock-IDs) + `update_sys_params` (confirm)
+- [x] neues Werkzeug `nachbau/cfswatch.py` (nur lesender Live-Monitor, Bedienung im Docstring
+  und PROTOKOLL-485.md §6.9)
+- [x] BEFUND2 eingearbeitet (`GHIDRA-CFS-BEFUND2-2026-10-16.md`): `parse_box_state`
+  (`temp_c`/`rh`, `inlet_tag_mask`, `block_*`), `parse_get_hardware_status` (`components`),
+  `STATUS_NAMES` (0x05/0x0a/0x0c/0x14/0x17/0x19/0x1a/0x50/0x51/0x52), cfswatch-Texte,
+  auto_addr-Selbsttest 13 (A0 3×, adressierte Box ignoriert A0)
+- [ ] Offen aus BEFUND2: Config #6, Fehlercodes 0x20/0x22, Zweck Typ-7-Tag-Sperrbit (0x5c-Auth?),
+  Host-Burst-Timing im `.so`, Treiber-RX-Puffergröße der Box

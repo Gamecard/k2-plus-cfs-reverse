@@ -1,4 +1,4 @@
-# K2 Plus – Gesamt-Protokoll-Inventar (Stand 13.10.2026, Live-Log-Abgleich 15.10.2026)
+# K2 Plus – Gesamt-Protokoll-Inventar (Stand 13.10.2026, Live-Log-Abgleich 15.10.2026, BEFUND2 16.10.2026)
 
 Audit/Korrekturen der Nachbau-Module: `/home/pro/k2-fw-live-1.1.7.0/AUDIT-UND-AENDERUNGEN.md`.
 
@@ -66,6 +66,8 @@ Broadcasts: retries=0; Belt: 4. Tabelle PROTOKOLL-485.md §6.2.
        (Host-Name live): GET_FILAMENT_SENSOR_STATE [00] Sensor A / [01] Sensor B (Hub)
 0x0a = Herzschlag/Poll 6 Datenbytes Zustand, alle ~4s (retries=0; FW 113: 4 Datenbytes;
        LIVE 15.10.2026: Byte 5 immer 0 → „RFID gültig“ unbelegt; Byte 0/1 V: Temp/Feuchte)
+       BELEGT 16.10.2026 (BEFUND2): Byte 0 = Temp °C (int8), Byte 1 = rel. Feuchte % (AHT30),
+       Byte 2 = Motorblock-Flags, Byte 5 = Typ-7-Tag-Sperrbit (nicht „RFID gültig“)
        ~~(Kandidaten STATE_IDLE/PRELOAD/PRINT/RELOAD/ERROR/TEST/CHECK_HUB – schwach,
        FW-Strings ohne Zahlenwerte, fake-name; s. PROTOKOLL-485.md)~~
        BELEGT 15.10.2026 (Ghidra): Byte 3 = Zustand IDLE=0…TEST=5, CHECK_HUB ist
@@ -87,8 +89,11 @@ Broadcasts: retries=0; Belt: 4. Tabelle PROTOKOLL-485.md §6.2.
        (LIVE 15.10.2026: [m 00] meist 4×, dann [m 01]; kein 0x08 [01] dazwischen)
 0x14 = GET_VERSION_SN ASCII-Version+SN ("113" bis 12.10.2026, danach "153")
 0x15 = GET_HARDWARE_STATUS (Host-Name live 15.10.2026) – 16 B `10 20 30 40 50 60 00…`
+       BELEGT 16.10.2026 (BEFUND2): Init-Flags EEPROM/AHT30/Odometer/Buffer/RFID0/RFID1, 0 = OK
 Status 0x30 = UPDATE_STATE (Ereignis 1 Einstecken / 2 Herausziehen / 3 Preload fertig, V);
        0x51 = SPEED_ERR (live echter Fehlercode, key846)
+       BEFUND2 16.10.2026: 0x50 Runout im Druck-Slot, 0x51 Buffer-Nachschub zu langsam,
+       0x52 kein Vorschub (beide Thread print_check), 0x53 nie erzeugt, 0x1a Pull-back 40 s
 NEU 15.10.2026 (Ghidra, R153): 0x01 LED-Refresh, 0x06 Feeder (FW-Bug: immer Status 1),
        0x07 Hauptmotor, 0x09 Speeds, 0x0b LED, 0x0c Config#6, 0x12/0x13 Feed-Prozesse,
        0x15, 0x30 GPIO, 0x50–0x56, 0x5b UID, 0x5c I2C-Auth, 0x5d Testmodus –
@@ -187,6 +192,11 @@ die zugewiesene Adresse ("set slave address [%02x] success"), nächste Adresse =
 **Start-Adressen je Typ** (local_138 = {0x01, 0x11, 0x23, 0x85}):
 CFS ab `0x01`, RFID/Filament-Rack ab `0x11`, Belt ab `0x23`, Motor ab `0x85`.
 (Klippy nutzt danach eigene feste Adressen: CFS 0x01, Rack 0x11, Belt 0x21/0x22 laut belt_mdl.py.)
+
+**Box-Seite (CFS-App R153, BEFUND2 16.10.2026 §7):** A1 nur ohne Adresse, Antwort mit
+Zufallsverzögerung 0–1000 ms; A0 wird **3×** beantwortet (von der neuen Adresse); eine
+adressierte Box ignoriert A0/A1; A2 = A3. `nachbau/auto_addr.py` ist damit kompatibel
+(Duplikate werden ignoriert, Selbsttest 13). Details PROTOKOLL-485.md §6.8.
 
 **Idle-Poll im Log bestätigt das:** `cmd[0xfe 0x5 0x0 0xa1 0xfe 0xfe]` = ADDR_CFS-Discovery
 alle ~1 s (Timeout wenn kein neues Gerät), `0xa2`-SN-Query an bekannte Adressen alle ~2 s.
@@ -479,6 +489,27 @@ String-Inventar (Beleg für Fähigkeiten/Zustände):
   Slot-Events `insert/pullout/start preloading/read rfid and margin estimation/pretension`
 - **Bus:** `RS485_AUTO_ADDR`, `heartbeat_wait`, `preload_check_flag`, `COMM ch`
 - **Build:** `MF003 Vx.y.z build Sep 2 2026`
+
+**Nachtrag BEFUND2 16.10.2026** (`GHIDRA-CFS-BEFUND2-2026-10-16.md`):
+
+- **Keil-komprimierte `.data`:** Scatter-Tabelle @0x0802da08 (Quelle 0x0802db6c → 0x20000000,
+  0xbc4 Byte), Entpacker `0x0800316c`. Erst entpackt sind Auto-Addr-Tabelle (@0x200000c4) und
+  Pin-Tabelle (@0x20000218) lesbar. Systemtakt: 1 RT-Tick = 1 ms.
+- **Sensor-Pins** (Indizes B, Port-Zuordnung pin = Port·16+n V):
+
+  | Funktion | Slot A/B/C/D |
+  |---|---|
+  | Sensor A = Einlauf (0 = Filament da) | PD7 / PD6 / PD5 / PD4 |
+  | Sensor B = Hub (0 = Filament am Hub) | PE10 / PE9 / PE8 / PE7 (pro Slot getrennt) |
+  | Buffer | PD8 „full“, PD9 „free“ (beide aktiv = unplausibel → 0x15 Buffer-Flag) |
+
+- **Odometer:** ein MT6826 (magnetisch) **für alle Slots** – gemeinsamer Pfad hinter dem Hub.
+  Ein blockierter Kanal verfälscht damit Odometer-Prüfungen aller Slots (0x09/0x0c/0x52).
+- **AHT30** @I2C 0x38 („i2c0“), Messung `AC 33 00`, 200 ms, ~1,2 s Takt; Status/CRC ungeprüft.
+- **Motorblock-Erkennung:** Timer motor_blocked_detect_timer (100 ms); R[3] erst nach > 10 s
+  Block (Bit 4 Hauptmotor MS3791, Bit 0–3 Feeder), dann EEPROM-Ereignis + Motor-Stopp.
+- **RX-Thread synchron:** blockierender Handler stoppt den Empfang; keine Busy-Antwort, keine
+  Duplikaterkennung (Wiederholungen werden erneut ausgeführt).
 | `fan_feedback` | Lüfter-RPM-Feedback (Pins PC6/PA12/PC13) | NICHT analysiert |
 | `bl24c16f` | EEPROM (I2C am rpi-MCU, addr 0x57) | Standard |
 | `z_align` | Dual-Z mit Druck-Endstopps (PA15/PA8) | teilweise |
@@ -523,3 +554,9 @@ String-Inventar (Beleg für Fähigkeiten/Zustände):
    0x0a Byte 0/1 (live 0x13 0x34) und R[3]; Bedeutung Config #6 (0x0c/0x50); Inhalt 0x15;
    Init der Auto-Addr-Tabelle (0xA0–0xA3); physische Zuordnung Sensor A/B (Pin-Tabelle
    @0x20000218); weitere Fehlercodes 0x1a/0x20/0x22/0x51–0x53.
+   → **BEFUND2 16.10.2026 ERLEDIGT:** 0x0a Byte 0/1 (AHT30), R[3] (Motorblock > 10 s), 0x15,
+   Auto-Addr-Tabelle, Pin-Tabelle, 0x1a/0x51/0x52/0x53. **Noch offen:** Config #6 (0x0c/0x50),
+   Fehlercodes 0x20/0x22, Zweck des Typ-7-Tag-Sperrbits (vermutlich 0x5c-Auth, V),
+   Treiber-RX-Puffergröße, Host-Burst-Timing im `.so` (0x0d-Bursts unbeantwortet).
+10. Kanal-A-Störung (Hub-Sensor A dauerhaft aktiv) – blockiert Force-Preload/Retract auch
+    für B/C/D; Diagnose-Schritte in CHECKLISTE.md.

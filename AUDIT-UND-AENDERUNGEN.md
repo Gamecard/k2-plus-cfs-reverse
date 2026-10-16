@@ -452,6 +452,56 @@ selbst gegengeprüft; bei der Einarbeitung zusätzlich nachgeprüft (Abschnitt �
 - Selbsttests danach alle grün: serial485 81 · box 126 · boxmini 17 · cfsseq 28 · motor 98 ·
   motor_mini 30 · auto_addr 31.
 
+## 16.10.2026 – Review 2 (Code-Fixes) + Ghidra-BEFUND2 eingearbeitet
+
+### Review 2 – Fixes im Code (Kennungen wie in den Code-Kommentaren)
+
+| Kennung | Datei | Problem | Korrektur | Test |
+|---|---|---|---|---|
+| M1 | serial485.py | Antwort wurde nur über fun zugeordnet – ein Box-Frame (0x01, fun 0x0e) hätte als Antwort für Motor 0x81 gegolten | `expect_addr` (Default `reply_addr_for(ziel)`), `BROADCAST_ADDRS` (0xEA/0xEB/0xFC–0xFF) = beliebiger Absender | Selbsttest 10c |
+| M2 | serial485.py, box.py | Status-Byte der Antworten wurde verschluckt | `transact_full`; `box.CfsStatusError`/`StatusBytes`/`raise_on_status` | serial485 10d, box 8c |
+| M3 | box.py | 0x10/0x11 mit 4 Retries würden Mechanik bei Timeout erneut auslösen | `FUNC_RETRIES` 0x10/0x11 = 0 (**bewusste Abweichung**, `FUNC_RETRIES_ORIGINAL` = 4 hält das Original fest), `communication_extrude`/`communication_retrude` mit langen Timeouts | box 8c |
+| M6 | serial485.py | Lock-Haltedauer unbegrenzt (z.B. 300 s × 5) | `MAX_BUS_HOLD_S = 1200` s → ValueError; Lock bleibt **bewusst** über die ganze Transaktion (Halbduplex, Original identisch) | serial485 10f |
+| G1 | box.py | Messrad op 0 = Nullen (FW `FUN_0800efc6`) ohne Schutz | nur mit `reset=True` | box |
+| G2 | box.py | Maske 0 bei 0x0d op 2/3 nicht in Timeout gerechnet | wie 4 Slots (980 s) | box |
+| G3 | box.py | `_box_fw_num` kannte Host-Form „1.5.3“ nicht | Formate „153“/153/„1.5.3“ belegt | box |
+| G4 | box.py | `_is_full_frame` scheiterte an angehängten Bytes | robust | box |
+| G5/G6 | cfsseq.py, box.py | ACK-Konstanten irreführend benannt, `slot_to_mask` doppelt; alte `get_hardware_status(channel)`-Signatur still auf 0x08 | `EXTRUDE_ACK`/`RETRUDE_ACK` (Status 00), `check_one_hot`, einziges `slot_to_mask`; DeprecationWarning | cfsseq, box |
+| – | motor.py | F0-Update/Schreiben ohne Schutz möglich | F0-Sender nur mit `confirm=True`; `write_sys_param` für 166 gesperrte IDs nur mit `allow_locked=True`; float32-Plausibilität | motor |
+| – | motor_mini.py | Schreib-ID-Menge nicht begrenzt | `MINI_WRITABLE_IDS` (13 Stock-IDs), `update_sys_params` nur mit `confirm=True` | motor_mini |
+| – | nachbau/cfswatch.py | (neu) | nur lesender Live-Monitor für klippy.log; sendet nie, maskiert SN/UUID/Vendor | `--selftest` |
+
+### BEFUND2 (Ghidra, `GHIDRA-CFS-BEFUND2-2026-10-16.md`) – Folgen
+
+- **Korrekturen an GHIDRA-CFS-BEFUND-2026-10-15.md** (dort mit „→ BEFUND2“ markiert, Altext
+  bleibt): 0x0a Byte 5 ist **kein** „RFID gültig“, sondern Typ-7-Tag-Sperrbit; 0x51 ist **nicht**
+  nur LED-Mapping, sondern print_check-Fehler; Byte-2-Flag R[3] = Motorblock > 10 s (Bit 4
+  Hauptmotor, Bit 0–3 Feeder); 0xEA wird bei normalen Kommandos beantwortet.
+- **Neu belegt:** 0x0a Byte 0/1 = Temp °C / Feuchte % (AHT30); 0x15 = Init-Flags von 6
+  Komponenten; 0x50 = Runout im Druck-Slot, 0x52 = kein Vorschub, 0x53 nie erzeugt, 0x1a =
+  Pull-back 40 s; Auto-Addr-Box-Seite (A0 3×, A1 0–1000 ms); Sensor-Pins PD7–PD4/PE10–PE7/
+  PD8/PD9; ein gemeinsames Odometer; Keil-komprimierte `.data`; 1 Tick = 1 ms; RX synchron
+  ohne Busy/Duplikaterkennung (Bursts: Ursache Host-seitig vermutet).
+- **Code (minimal):**
+  - `box.py`: `parse_box_state` → `temp_c` (int8)/`rh` belegt (`temp_c_guess`/`rh_guess`
+    Aliase), `inlet_tag_mask` (`b5`/`rfid_valid_mask` Aliase), `block_long`/`block_main_motor`/
+    `block_feeder_mask`; `HW_COMPONENTS` + `parse_get_hardware_status` → `components`/`all_ok`
+    (`entries` unverändert); `STATUS_NAMES` präzisiert (0x05/0x0a/0x0c/0x14/0x17/0x19/0x50/0x51),
+    neu `STATUS_PULL_HUB_ODO_TIMEOUT` 0x1a, `STATUS_NO_FEED` 0x52, Aliase `STATUS_RUNOUT`/
+    `STATUS_BUFFER_SLOW`/`STATUS_HUB_TIMEOUT`; 0x53 bewusst ohne Konstante.
+  - `cfswatch.py`: Temp/Feuchte ohne „Vermutung“, Motorblock-Flags im Klartext, 0x15
+    „HW-Init alles ok“ bzw. Komponentenfehler (Warnung), Typ-7-Tag-Sperre; Selbsttest um
+    Live-0x15-Frame, 0x91-Flags und 0x15-Fehlerfall erweitert.
+  - `cfsseq.py`: nur Kommentare (mode-4-/p=1-Schwellen, Hub-Sensor-A-Folgefehler).
+  - `serial485.py`: nur Kommentar zu 0xEA/0xEB korrigiert (Verhalten unverändert –
+    `BROADCAST_ADDRS` bleibt „beliebiger Absender“).
+  - `auto_addr.py`: **keine Logikänderung** – Abgleich ergab keinen echten Fehler: A0-Duplikate
+    treffen auf `acked == 1` und werden ignoriert; adressierte Box (ignoriert A0) wird über
+    0xA3 ONLINE. Neuer Selbsttest 13 mit FW-treuem `FwSerial` belegt beides; FakeSerial-
+    Docstring nennt die Vereinfachung.
+- Selbsttests 16.10.2026 alle grün: serial485 93/93 · box 179 · boxmini 17 · cfsseq 28 ·
+  motor 134 · motor_mini 43 · auto_addr 33 · cfswatch `--selftest` OK.
+
 ## Anonymisierung (Repo-Fassung)
 
 Gegenüber der lokalen Forschungsablage sind im Repo folgende Werte durch syntaktisch
@@ -470,9 +520,10 @@ verifizierte CRCs (CRC-8/ATM über `[len..data]`), die Selbsttests laufen damit 
 | RFID-Frame 0x02 `A:<vendor>;` | `f7 01 2e 00 02 41 3a 31 30 … 30 3b d7` (CRC neu: `0xd7`; Original-CRC `0x02` bezog sich auf die echten Bytes) |
 | Motor-UUID (0x12-Antwort, 8 Byte, Präfix `cd ab`) | `cd ab 00 00 00 00 00 00` (Antwortframe `f7 81 0b 00 12 cd ab 00×6 ad`, CRC neu: `0xad`) |
 | Gekürzte Angaben (`…`) in der Doku | nur Platzhalter-Präfixe (`SN-DEMO-…`, `1012…`, Vendor-Felder `1`·`01`·…), nie echte Teilstücke |
+| cfswatch-Selbsttest (`SELFTEST_LOG`) | RFID-Frame mit Platzhalter-Vendor (CRC `0xd7`), 0x14 mit `153SN-DEPLATZHALTER00` (CRC `0x42`), 0xa2 mit UUID-Präfix `a0 a1` (CRC `0x25`); Bedienbeispiel mit neutralem `ssh root@<drucker> …` statt lokalem Login-Alias |
 
 Nicht im Repo: Klartextquelle `auto_addr_wrapper.py` (Creality, 729 Zeilen; Zeilenangaben
 „Orig :<zeile>“ bzw. „:604-607“ beziehen sich auf sie), Firmware-/Config-Tarball,
 lokale Übergabenotizen, die Live-Logs `live-logs-2026-10-15/` (Zeilenangaben wie
-`klippy.log:2512` beziehen sich auf sie) sowie Zugangsdaten/Login-Hinweise zum Drucker. Die Seriennummer aus den Dumps von `fake-name/cfs-reverse-engineering`
+`klippy.log:2512` beziehen sich auf sie) sowie Zugangsdaten/Login-Hinweise zum Drucker (auch der lokale SSH-Alias aus den cfswatch-Beispielen). Die Seriennummer aus den Dumps von `fake-name/cfs-reverse-engineering`
 ist nicht übernommen.

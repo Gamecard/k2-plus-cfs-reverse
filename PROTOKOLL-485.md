@@ -21,7 +21,7 @@ len = len(data) + 3
   - `f7 21 07 00 00 01 02 03 04 f0` (Version-Resp: hal 0102 / soft 0304)
   - `f7 21 10 00 02 03 ... 3d` (Flash-Resp: place=147)
   - `f7 21 07 00 06 ff f8 c7 12 4c` (ADC-Resp -> 135,18 N)
-  - `f7 01 11 00 a2 01 00 b0 5d … (12 B UUID, gekürzt) a3` (Auto-Addr)
+  - `f7 01 11 00 a2 01 00 a0 a1 … ab f0` (12 B UUID als Platzhalter, CRC neu) (Auto-Addr)
   - `f7 01 07 00 03 ff ff ff 00 98` (GET_REMAIN_LEN: 255 = keine Daten)
   - `f7 01 09 00 0a 13 34 00 00 00 00 d7`
 - Antwort: `[0]==0xF7`, `[1]==addr`, `[2]=len`, `[4]=fun`, Daten `rec[5 : len-3+5]`
@@ -60,7 +60,7 @@ GCode: `BELT_MDL_INFO/MOVE(POS)/SET(MDL_N)/CALI(DIR,TEN)/TEST`, Fehler `key712-k
   Host-MCU `linux` K2_1.1.3.2; Mainboard-Klipper `1.1.0.48-293-g493f9a0f-dirty`
 - Live-Serials: `[mcu]=/dev/ttyS2`, `[nozzle]=/dev/ttyS3`, `[485]=/dev/ttyS5 @230400`
   (Image 1.1.3.13 hatte ttyS7/ttyS1/ttyS6 @460800 → Board-Revision anders!)
-- `auto_addr` UUID (mb_addr_table_uniids): `b0 5d … (12 B UUID, gekürzt)`
+- `auto_addr` UUID (mb_addr_table_uniids): `a0 a1 … (12 B UUID, Platzhalter)`
   = exakt die 12 Bytes im 0xa2-Frame nach `01 00`
 - Bus-Polling idle: alle ~2s `0xa2`-Frame an addr 0x01, ~~4 Retries, dann Timeout~~ (CFS aus)
   **KORRIGIERT – LIVE BELEGT 15.10.2026:** 0xa2 läuft mit `retries = 0` (eine Sendung je ~2 s,
@@ -174,7 +174,7 @@ früheren Fehlschläge). Display-Flow bleibt zusätzlich belegt.
 
 ### RFID-Frame LIVE DEKODIERT (12.10.2026, 22:52:19)
 
-`f7 01 2e 00 02 41 3a 33 41 39 32 … (Vendor-ASCII gekürzt) … 3b ...`
+`f7 01 2e 00 02 41 3a 31 30 31 32 … (Vendor-ASCII, Platzhalter, gekürzt) … 3b ...`
 
 - Func `0x02` = GET_RFID-Antwort, Daten als **ASCII**: `A:<hex>;...`
 - `A:` = Slot-Key, dann Vendor-Hex `1012…(gekürzt, mat 101001/col 0FFFFFF)…`, dann `;` –
@@ -326,7 +326,11 @@ V = Deutung). Gegenprobe R150: identisch außer 0x12.
   B+L, 6 Live-Frames nachgerechnet).
 - **Status-Byte im Request wird ignoriert** (B): Dispatcher `FUN_0800f27c` liest `frame[2]` nie.
 - CRC-Fehler → Antwort `fun`, Status 2, ohne Daten (nicht bei addr 0xEA).
-- 0xEA = Broadcast ohne Antwort; 0xEB = Antwort mit Absender 0xEB (nur 0x50/0x51 relevant).
+- ~~0xEA = Broadcast ohne Antwort~~; 0xEB = Antwort mit Absender 0xEB (nur 0x50/0x51 relevant).
+  **KORRIGIERT 16.10.2026 (BEFUND2 §6, B):** 0xEA ist nur ein „halber Broadcast“ – bei normalen
+  Kommandos (0x0a, 0x10 …) antwortet die Box trotzdem, mit **eigener** Adresse; unterdrückt
+  werden nur CRC-Fehler-Antwort, unbekannte fun und 0x50. 0xFE/0xFF nimmt die App **nur ohne
+  eigene Adresse** an (0xFF praktisch Bootloader-only). Details: „Adressen-Semantik“ in §6.8.
 - Antwort-Builder `FUN_0800eaf2`: `F7, own_addr, n+3, status, fun, data, crc`.
 - Längenprüfung `FUN_0800ebc2`: falsches len → Status 1. Maskenprüfung `FUN_0800eb88`:
   nur 1-hot 0x01/0x02/0x04/0x08; 0x00 = „alle“ nur wo erlaubt; sonst Status 1.
@@ -353,7 +357,7 @@ V = Deutung). Gegenprobe R150: identisch außer 0x12.
 | 0x12 | mask, mode, s, dist_hi, dist_lo | `FUN_080047f6` | mode 0 feed_top_to_hub (+1 B Zustand), mode 1 fördern bis dist (u16 BE, ≤3000 mm) (NEU; nur R153) |
 | 0x13 | mask | `FUN_08004dc2` | Pretension → feed_top_to_hub → fördern bis Stillstand; Status = Fehlercode (NEU) |
 | 0x14 | – | inline | 22 B: `"153"` + 19 B SN (B+L) |
-| 0x15 | – | `FUN_0800f16e` | 16 B: 6 Einträge `((i+1)<<4)|X[i]` (NEU; Bedeutung offen) |
+| 0x15 | – | `FUN_0800f16e` | 16 B: 6 Einträge `((i+1)<<4)|X[i]` (NEU; ~~Bedeutung offen~~ **BEFUND2: Init-Flags EEPROM/AHT30/Odometer/Buffer/RFID0/RFID1, 0 = OK**, s. §6.8) |
 | 0x30 | x | `FUN_0800f19c` | GPIO 0x10 = (x==1), Status 0 (NEU) |
 | 0x50 | wert | inline | Config #6 schreiben+speichern, dann vermutl. Reset; gleicher Wert → Status 3 (NEU) |
 | 0x51 | x | inline | nur addr 0xEB: G[3]=x, keine Antwort (NEU) |
@@ -364,7 +368,7 @@ V = Deutung). Gegenprobe R150: identisch außer 0x12.
 | 0x5b | – | `FUN_0800f1ba` | 8 B GD32-Unique-ID (NEU) |
 | 0x5c | 16 B | `FUN_0800f1e8` | Block an I2C-Gerät 0x60, 16 B Ergebnis (Auth/Krypto V) (NEU) |
 | 0x5d | – | `FUN_08007c0e` | `main_pcb_test_mode` (NEU) |
-| 0xA0–0xA3 | – | Modul `RS485_AUTO_ADDR` | nicht im Dispatcher; Antworten auf Box-eigene Anfragen |
+| 0xA0–0xA3 | – | Modul `RS485_AUTO_ADDR` | nicht im Dispatcher (eigene Tabelle @0x200000c4, BEFUND2 §7); Box-Seite der Auto-Adressierung, s. §6.8 |
 | sonst | – | `LAB_0800f7f8` | Status 1 ohne Daten |
 
 **FW-Bug 0x06 (B, auch R150):** Die Maske für `eb88` kommt aus Register `r7`
@@ -394,6 +398,10 @@ p=1 zuerst `rfid_mgr_fila_back`; Zustand muss IDLE/PRELOAD sein (sonst 3), Slot 
 Filament → 0x16 + ERROR. p=0: Feeder + Hauptmotor rückwärts P[7] bis Buffer-Sensor
 (≤5 s, sonst 0x13). p=1: pull_back_hub (Sensor A muss 0 sein, sonst 0x17; Motorblock 0x19;
 „pull back hub PE“-Timeout 0x14). Anderes p → 1. Danach IDLE bzw. ERROR mit Code.
+**Schwellen (BEFUND2 §8, B+L):** p=1 Takt 20 ms, Ziel Hub-Sensor 5× in Folge frei, max. 2000
+Runden = 40 s → **0x1a**; Odometer < 0,01 mm/20 ms **und** R[3] (Motorblock > 10 s) → **0x19**
+(passt zu live 11,6/12,2 s); Stufe 2: Hub nach 7 s noch belegt → **0x14**; vorab Einlauf-Sensor
+leer → **0x17**. Maske 0 wählt alle Slots mit aktivem Hub-Sensor.
 
 **Status-Byte (Antworten):**
 
@@ -403,42 +411,46 @@ Filament → 0x16 + ERROR. p=0: Feeder + Hauptmotor rückwärts P[7] bis Buffer-
 | 0x01 | ungültig: len falsch, Maske ungültig, Subcode ungültig, fun unbekannt |
 | 0x02 | CRC-Fehler im Request |
 | 0x03 | busy / falscher Zustand (z.B. 0x04 in PRELOAD/RELOAD, 0x06/0x07 ≠ IDLE); bei 0x50 „Wert unverändert“ |
-| 0x05 | Feeder-Out-Fehler (`cmd_parse_out`) |
+| 0x05 | Feeder-Out-Fehler (`cmd_parse_out`); **BEFUND2:** auch 0x10 mode 0 – Hub-Sensor nicht innerhalb 7 s (700×10 ms) erreicht (`FUN_080042a8`, B+L) |
 | 0x06 | `buffer_fill_timeout` |
 | 0x08 | Pretension-Warten erfolglos |
 | 0x09 | feed_top_to_hub: Odometer bewegt sich nicht |
-| 0x0a | 25-s-Timeout bzw. < 5 mm in 3 s |
+| 0x0a | 25-s-Timeout (mode 4: 1250×20 ms) bzw. < 5 mm in 3 s (mode 2) |
 | 0x0b | Fördern > 3000 mm |
-| 0x0c | Odometer-Stillstand 500 ms |
+| 0x0c | Odometer-Stillstand 500 ms (mode 4: 25×20 ms in Folge < 0,01 mm vorwärts; Rückfedern zählt als Stillstand; nur gemeinsames Odometer, kein Sensor) |
 | 0x0d | Buffer nicht voll |
 | 0x0e | feed extruder timeout (0x10 mode 7) |
 | 0x13 | Rückzug: Buffer-Sensor-Timeout 5 s |
-| 0x14 | pull back hub PE timeout |
+| 0x14 | pull back hub PE timeout (Pull-back Stufe 2: Hub nach 7 s noch belegt) |
 | 0x16 | Slot ohne Filament (setzt STATE_ERROR) |
-| 0x17 | pull_back_hub: Sensor A nicht aktiv |
+| 0x17 | pull_back_hub: Sensor A nicht aktiv (= Einlauf meldet kein Filament, `FUN_08004c5a`) |
 | 0x18 | intern „kein Slot belegt“ → auf 0x16 abgebildet |
-| 0x19 | pull_back_hub motor block (LIVE 15.10.2026: 2× bei 0x11 [01 01], key865) |
+| 0x19 | pull_back_hub motor block (LIVE 15.10.2026: 2× bei 0x11 [01 01], key865); **BEFUND2:** Odometer steht und Motorblock > 10 s (R[3]) |
+| 0x1a | **BEFUND2 (B):** Pull-back p=1 Timeout 40 s (2000×20 ms, Hub nicht frei) – live nie |
 | 0x30 | **nur 0x0a**: Preload-Ereignis anstehend (4 B je Slot 1/2/3) (B+L); Host-Name **UPDATE_STATE** (LIVE 15.10.2026) |
-| 0x50 | **nur 0x0a** in STATE_PRINT: Sensorprüfung ≠ 0 (V: Runout); live nie gesehen |
-| 0x51 | **LIVE BELEGT 15.10.2026:** Fehlercode in STATE_ERROR, Host-Name **SPEED_ERR**, key846 „empty printing, box speed is smaller than extruder“ (452× am 12.10.); vorher nur aus LED-Mapping bekannt |
+| 0x50 | **nur 0x0a** in STATE_PRINT: Sensorprüfung ≠ 0 (V: Runout); live nie gesehen. **BEFUND2 §4 (B):** aktueller Druck-Slot, `(Einlauf frei) | (Hub frei)<<1` ≠ 0 → Runout, setzt R[8]=1 |
+| 0x51 | **LIVE BELEGT 15.10.2026:** Fehlercode in STATE_ERROR, Host-Name **SPEED_ERR**, key846 „empty printing, box speed is smaller than extruder“ (452× am 12.10.); vorher nur aus LED-Mapping bekannt. **BEFUND2 §4 (B):** Thread print_check – ≈10 s ohne „buffer full“ und Odometer ≥ 40 mm nachgeschoben **oder** ≥ 3 Buffer-leer-Meldungen = Buffer-Nachschub zu langsam (Schlupf/Reibung, V) |
+| 0x52 | **BEFUND2 §4 (B):** print_check – ≈10 s ohne „buffer full“ und Odometer < 5 mm = kein Vorschub (Blockade, V); nicht, wenn vorher 0x50. Live nie |
+| 0x53 | **BEFUND2 (B):** wird nie erzeugt (nur LED-Mapping; Zweig in `FUN_0800ed26` toter Code) |
 | S[3] | nur 0x0a in STATE_ERROR: gespeicherter Fehlercode |
 
 Fehler ∉ {1,3} setzen STATE_ERROR mit S[3]=Code (`FUN_08003e3a`); löschen per 0x10 mode 3.
 **LIVE 15.10.2026:** der Host löscht Fehler stattdessen per 0x04 [00 01] (ERROR → IDLE),
 0x10 mode 3 wird nie gesendet.
-Weitere Codes nur im LED-Mapping (0x1a, 0x20, 0x22, ~~0x51~~, 0x52, 0x53), Quellen offen
-(0x51 inzwischen live als SPEED_ERR belegt, s. oben).
+Weitere Codes nur im LED-Mapping (~~0x1a~~, 0x20, 0x22, ~~0x51~~, ~~0x52~~, 0x53), Quellen offen
+(0x51 inzwischen live als SPEED_ERR belegt, s. oben; **BEFUND2:** 0x1a/0x51/0x52 Quellen gefunden,
+0x53 nie erzeugt; offen nur noch 0x20/0x22).
 
 **0x0a Box-State** (`FUN_0800ed26`, Antwort 6 Datenbytes, B+L):
 
 | Byte | Inhalt |
 |---|---|
-| 0 | S[1] (live 0x13; Quelle offen, = 0x52-Antwort Byte 0). **LIVE 15.10.2026 (V):** variiert langsam 0x11–0x1c → Kandidat **Temperatur °C** (AHT30) |
-| 1 | S[0] (live 0x34). **LIVE 15.10.2026 (V):** 0x2d–0x39, gegenläufig zu Byte 0 → Kandidat **rel. Feuchte %** |
-| 2 | Flags: `R[3] | 0x80` einmalig wenn R[3]≠0 (V: Motorblock), sonst R[5] (wird zurückgesetzt) |
+| 0 | S[1] (live 0x13; ~~Quelle offen~~, = 0x52-Antwort Byte 0). ~~LIVE 15.10.2026 (V): Kandidat~~ **BELEGT (BEFUND2 §1, B+L): Temperatur °C**, AHT30 @I2C 0x38, int8 (Zweierkomplement), abgeschnitten, Takt ~1,2 s; bei AHT-Initfehler dauerhaft 0 |
+| 1 | S[0] (live 0x34). **BELEGT (BEFUND2 §1, B+L): rel. Feuchte %**, uint8 0..100, abgeschnitten |
+| 2 | Flags: `R[3] | 0x80` einmalig wenn R[3]≠0 (~~V: Motorblock~~ **BEFUND2 §8, B:** R[3] = Motorblock > 10 s aus Timer motor_blocked_detect_timer), sonst R[5] = Blockmaske sofort (wird zurückgesetzt). **Bit 4 = Hauptmotor, Bit 0–3 = Feeder A–D**; live 0x90 = Hauptmotor > 10 s, 0x91 = + Feeder A, 01/02/04/08 = Feeder-Block (V: Pretension-Endanschlag) |
 | 3 | **Box-Zustand** S[2]: IDLE=0, PRELOAD=1, PRINT=2, RELOAD=3, ERROR=4, TEST=5 (≥6 „unknown“) |
 | 4 | Bitmaske Sensor B (aktiv = 1); LIVE 15.10.2026: = Slot im Hub, deckungsgleich mit 0x08 [01] |
-| 5 | ~~Bitmaske „Slot hat gültige RFID-Daten“ (V)~~ **UNBELEGT** – live in 8 268 R153-Frames immer 0, auch mit RFID-Spule (WIDERSPRICHT der Deutung, LIVE 15.10.2026) |
+| 5 | ~~Bitmaske „Slot hat gültige RFID-Daten“ (V)~~ ~~UNBELEGT~~ – live in 8 268 R153-Frames immer 0, auch mit RFID-Spule (WIDERSPRICHT der Deutung, LIVE 15.10.2026). **BEFUND2 §2 (B):** Bit i = Einlauf-Flag && Tag geladen && **Tag-Typ 7** && Tag-Feld+0x10 == 0 – Sperrbit „Typ-7-Tag ohne Datenfreigabe“; schließt 0x02-Daten/0x03-% des Slots aus (Nachbau `inlet_tag_mask`) |
 
 **STATE_CHECK_HUB ist KEIN Box-Zustand**, sondern Zustand 2 der Preload-Statemachine
 `FUN_080064b8` (0 forced-Start, 1 idle/Queue, 2 CHECK_HUB, 3 pretension, 4 read rfid +
@@ -894,7 +906,7 @@ prüfbar. **Adressen 0xEA/0xEB kommen nie vor**; 0xFE nur bei a1/a0 und Bootload
 | `[0f 01]` (enable) | 22 (+9 Sendungen) | st=0 nach 3–10 ms (`13:69418/69421`, `12:65812`) | bestätigt: op 0/1 sofort, Host sendet Maske 0x0F |
 | `[0f 00]` (disable) | 3 | st=0 sofort | bestätigt |
 | `[01 02]` (Force A) | 4 | st=0 nach **31,0 / 37,0 / 35,0 / 31,0 s**, 1 Sendung (`13:90197→90211`, `13:134512→134526`, `13:135603`, `13:137449`); Host pollt solange nicht | bestätigt (≈ 30–37 s je Slot, < 3 min) |
-| `[00 02]` (Force alle) | 26 Sendungen in Bursts | leerer Hub: st=0 nach 5 ms (`13:48753/48755`); Hub belegt: Box ≈ 11 s stumm (0x04 5× unbeantwortet `13:130637–130652`), danach 0x0a Flags 0x90 (`13:130760`), Hub bleibt belegt; Bursts sonst unbeantwortet | Blockade bestätigt; Burst-Antwort **offen** |
+| `[00 02]` (Force alle) | 26 Sendungen in Bursts | leerer Hub: st=0 nach 5 ms (`13:48753/48755`); Hub belegt: Box ≈ 11 s stumm (0x04 5× unbeantwortet `13:130637–130652`), danach 0x0a Flags 0x90 (`13:130760`), Hub bleibt belegt; Bursts sonst unbeantwortet | Blockade bestätigt; Burst-Antwort ~~offen~~ **BEFUND2 §5: Box verweigert nicht; Ursache Host-seitig vermutet** (s. §6.8) |
 | op 3 (`[m 03]`) | 0 | – | **offen** (nie live) |
 
 ### 6.5 0x10 / 0x11 / 0x04 / 0x08 live
@@ -927,19 +939,133 @@ prüfbar. **Adressen 0xEA/0xEB kommen nie vor**; 0xFE nur bei a1/a0 und Bootload
   `0x90` (`13:130760`), `0x91` bei Fehler 0x19 (`13:95774`) – R[3]-Deutung „Motorblock“ gestützt.
 - Byte 4 = Slot am Hub (1-hot), deckungsgleich mit 0x08 [01].
 - **Byte 5: immer 0** (8 268 Frames, auch mit RFID-Spule in C, remain 29 %) → Deutung
-  „gültige RFID-Daten“ **WIDERSPRICHT/unbelegt**.
+  „gültige RFID-Daten“ **WIDERSPRICHT/unbelegt**. → **BEFUND2 §2:** Typ-7-Tag-Sperrbit; live
+  steckte nie ein gesperrter Typ-7-Tag.
 - **Byte 0/1:** variieren langsam und gegenläufig (b0 0x11–0x1c, b1 0x2d–0x39; z.B. `13:7924`
-  16/2f … `14:19447` 14/37) → **Vermutung: Temperatur °C / rel. Feuchte % (AHT30)**, mit
-  Hygrometer gegenprüfen.
+  16/2f … `14:19447` 14/37) → ~~Vermutung~~ **BELEGT (BEFUND2 §1): Temperatur °C / rel. Feuchte % (AHT30)**;
+  Hygrometer-Abgleich nur noch optional (Genauigkeit, keine Semantikfrage).
 - **FW 113:** nur 4 Datenbytes `b0 b1 ?? Zustand` mit Status 0 (`05:4452` `17 34 00 00`, `18 33 00 02`).
 - **0x30 UPDATE_STATE** (nur 12./13.10., 63×): **2 = Herausziehen** (remain danach 00,
   `13:132699→132971`), **1 = Einstecken/Preload-Start** (`13:133324`), **3 = Preload fertig**
   (danach GET_RFID, `12:42031→42107`) – Deutung, gestützt (Nachbau `box.EVENT_*`).
 - **0x51 SPEED_ERR:** S[3] in ERROR, key846 „empty printing, box speed is smaller than
   extruder“ (`12:15733/15748`, 452× am 12.10. 00:28–01:11 Log-Uhr, Hub = Slot A).
-- Status 0x50 (PRINT-Sensorprüfung): nie gesehen – offen.
+- Status 0x50 (PRINT-Sensorprüfung): nie gesehen – ~~offen~~ Semantik per BEFUND2 §4 geklärt (Runout im Druck-Slot), live weiter nie.
 
 ### 6.7 Offen nach der Live-Gegenprobe
 
-0x0d op 3; Status 0x50; Zustände RELOAD/TEST im 0x0a; warum die [00 02]-Bursts nie beantwortet
-werden; 0x06/0x07/0x09 an die Box; Byte 0/1 = Temp/Feuchte gegenprüfen; Bedeutung 0x15-Nibbles.
+0x0d op 3; ~~Status 0x50~~; Zustände RELOAD/TEST im 0x0a; ~~warum die [00 02]-Bursts nie beantwortet
+werden~~ (BEFUND2 §5: Host-seitig vermutet); 0x06/0x07/0x09 an die Box; ~~Byte 0/1 = Temp/Feuchte
+gegenprüfen~~ (belegt); ~~Bedeutung 0x15-Nibbles~~ (belegt). Neu offen: Host-Burst-Timing im
+`.so` (2–3 ms-Timeout?), Treiber-RX-Puffergröße der Box, 0x20/0x22-Quellen.
+
+### 6.8 BEFUND2 16.10.2026 – Ghidra-Nachanalyse R153 (Details `GHIDRA-CFS-BEFUND2-2026-10-16.md`)
+
+Belegstärke wie oben (B / B+L / V). Takt: 1 RT-Tick = 1 ms (`rt_tick_from_millisecond`). Die
+`.data`-Sektion ist Keil-komprimiert (Entpacker `0x0800316c`) – erst entpackt waren Auto-Addr-
+und Pin-Tabelle lesbar.
+
+**0x0a – vollständiges Layout (R153, 6 Byte):**
+
+| Byte | Inhalt | Beleg |
+|---|---|---|
+| 0 | Temperatur °C, int8, abgeschnitten (AHT30 @I2C 0x38, ~1,2 s) | B+L |
+| 1 | rel. Feuchte %, uint8 0..100, abgeschnitten | B+L |
+| 2 | Motorblock-Flags: Bit 7 = Block > 10 s (R[3], einmalig), Bit 4 Hauptmotor, Bit 0–3 Feeder A–D (sonst R[5] sofort) | B (+L 0x90/0x91) |
+| 3 | Box-Zustand S[2] | B+L |
+| 4 | Hub-Sensor-Maske (Sensor B, PE10..PE7) | B+L |
+| 5 | Typ-7-Tag-Sperrbit (Einlauf-Flag && Tag geladen && Typ 7 && Feld+0x10 == 0) | B (Zweck V) |
+
+AHT-Fehler: Messrückgabe ignoriert, letzte Werte bleiben stehen; schlug die Init fehl, bleiben
+0/0 (dann 0x15 Byte 1 = 0x21). Debug-Override per finsh `temp_humi`. 0x52 liefert dasselbe Paar.
+
+**0x15 GET_HARDWARE_STATUS:** Byte i = `((i+1)<<4) | Flag[i]`, Flag 0 = OK:
+
+| Byte | Komponente | Flag ≠ 0 |
+|---|---|---|
+| 0 (0x1_) | EEPROM | 1 fehlt, 2 Verify @0x7f0 fehlgeschlagen |
+| 1 (0x2_) | AHT30 | 1 nicht gefunden / 3× Lesefehler |
+| 2 (0x3_) | Odometer MT6826 | 1 Timer-/Kommunikationsfehler |
+| 3 (0x4_) | Buffer | 1 PD8 **und** PD9 aktiv (unplausibel) |
+| 4/5 (0x5_/0x6_) | RFID-Leser 0/1 | 1 Fehler (Leser 1: Flag schon beim ersten Fehlversuch) |
+
+Live `10 20 30 40 50 60 00…` = alles OK. Nachbau: `box.parse_get_hardware_status` → `components`/`all_ok`.
+
+**Adressen-Semantik (App, RX-Zustand 1):** angenommen werden `{eigene, 0xEA, 0xEB}`; 0xFE/0xFF
+nur, wenn die eigene Adresse 0xFE ist (Box ohne Adresse). 0xEA: normale Kommandos werden mit
+eigener Adresse beantwortet (nur CRC-Fehler/unbekannte fun/0x50 still). 0xEB: nur 0x50
+(Antwort mit Absender 0xEB) und 0x51 (Debug-Schalter, keine Antwort). Für Abfragen bei mehreren
+Boxen ungeeignet (Kollision); live nie genutzt. `serial485.BROADCAST_ADDRS` enthält 0xEA/0xEB/
+0xFC–0xFF → Absender der Antwort „beliebig“.
+
+**Auto-Addr – Box-Seite (Tabelle @0x200000c4, B):**
+
+| fun | Bedingung | Antwort |
+|---|---|---|
+| 0xA1 get_uniid | eigene Adr = 0xFE, Daten `[FE FE]` | 1×, an 0xFE, **Zufallsverzögerung 0–1000 ms** |
+| 0xA0 set_addr | eigene Adr = 0xFE, `[neue_addr]+UID12` passt | Adresse übernehmen, **3×** Antwort von der neuen Adresse |
+| 0xA2 online_check / 0xA3 get_addr_table | eigene Adresse | 1×, identisch |
+
+Antwortdaten immer `[01, 00] + UID12` (dev_type 1, mode 0 = APP). Eine adressierte Box ignoriert
+A0/A1 an 0xFE. Abgleich mit `nachbau/auto_addr.py`: kompatibel – A0-Duplikate werden
+toleriert (Eintrag schon `acked`, `function_code_cb` ignoriert sie; im Nachbau-Transport verwirft
+`reset_input_buffer` bzw. der fun-Filter sie), eine adressierte Box wird nach Host-Neustart über
+0xA3 wieder ONLINE (Selbsttest 13, `FwSerial`). Rest-Risiko: A1-Antworten mit Verzögerung nahe
+1000 ms können das 1-s-Timeout knapp verfehlen → nächster Zyklus holt sie (kein Fehler).
+
+**Kanal-A-Schwellen (BEFUND2 §8):**
+
+| Ablauf | Schwelle | Code |
+|---|---|---|
+| 0x10 mode 0 feed_top_to_hub | Hub-Sensor nicht in 7 s (700×10 ms, 10× stabil) | 0x05 |
+| 0x10 mode 4 | 25×20 ms < 0,01 mm (500 ms) | 0x0c |
+| 0x10 mode 4 | > 3000 mm | 0x0b |
+| 0x10 mode 4 | 1250×20 ms = 25 s | 0x0a |
+| 0x11 p=1 vorab | Einlauf-Sensor leer | 0x17 |
+| 0x11 p=1 | Odometer steht + Motorblock > 10 s | 0x19 |
+| 0x11 p=1 | 2000×20 ms = 40 s | 0x1a |
+| 0x11 p=1 Stufe 2 | Hub nach 7 s belegt | 0x14 |
+| PRINT print_check | ~10 s ohne „buffer full“: ≥ 40 mm/≥ 3× leer → 0x51; < 5 mm → 0x52 | 0x51/0x52 |
+
+Mode 4 prüft nur das **gemeinsame** Odometer (MT6826, eines für alle Slots), keinen Sensor.
+**Folgefehler bei dauerhaft aktivem Hub-Sensor A:** jedes 0x0d op 2/3 in IDLE und jedes 0x11
+Maske 0 zieht A zuerst zurück (`FUN_08004cd0(4,1)`) → ≥10 s Motorblock, STATE_ERROR, Abbruch →
+**blockiert B/C/D**. 0x10 mode 0 für A sieht den Hub sofort „erreicht“. Im Druck meldet der
+Hub-Sensor nur 0x50, wenn er frei wird.
+
+**Bursts `0x0d [00 02]` (BEFUND2 §5):** Der RX-Thread ruft den Dispatcher **synchron** auf – ein
+blockierender Handler hält den Empfang an, Folge-Bytes landen im Treiberpuffer; **keine
+Busy-Antwort, keine Duplikaterkennung** (identische Wiederholungen werden erneut ausgeführt).
+Jeder vollständig empfangene 0x0d-Frame wird beantwortet. Live kamen Burst-Frames an und wurden
+ausgeführt; die Antworten fehlen im Host-Log → Ursache **Host-seitig vermutet** (Burst-Timeout
+2–3 ms unter Box-Latenz, Kollision auf dem Halbduplex-Bus, späte Antworten verworfen).
+
+### 6.9 Code-Fixes / Schutzmechanismen im Nachbau (Review 2, 16.10.2026) und cfswatch
+
+| Modul | Fix / Schutz |
+|---|---|
+| serial485 | Absenderprüfung `expect_addr` (Default `reply_addr_for(ziel)`; Broadcast-Ziele `BROADCAST_ADDRS` = beliebig) – fremde Frames mit gleichem fun (z.B. Box 0x0e vs. Motor) werden übersprungen (M1) |
+| serial485 | `transact_full` liefert Status-Byte + Rohframe (M2) |
+| serial485 | `MAX_BUS_HOLD_S = 1200` s: timeout × (retries+1) darüber → ValueError. Der Bus-Lock bleibt **bewusst** über die ganze Transaktion (Halbduplex, Original identisch) (M6) |
+| box | `CfsStatusError` / `StatusBytes` / `raise_on_status`: Status ≠ 0 wird gemeldet statt verschluckt (M2) |
+| box | `FUNC_RETRIES` 0x10/0x11 = 0 (**bewusste Abweichung**, `FUNC_RETRIES_ORIGINAL` = 4): Retransmit würde Mechanik doppelt auslösen – passt zu BEFUND2 §5 (Box hat keine Duplikaterkennung); `communication_extrude`/`communication_retrude` mit langen Timeouts (M3) |
+| box | Messrad 0x0e op 0 (Nullen) nur mit `reset=True` (G1); Maske 0 bei 0x0d op 2/3 = 4 Slots (980 s) (G2); `_box_fw_num` versteht Host-Form „1.5.3“ (G3); `_is_full_frame` robust gegen Anhang (G4); DeprecationWarning bei `get_hardware_status(channel)` (sendet 0x08) (G6) |
+| cfsseq | `EXTRUDE_ACK`/`RETRUDE_ACK`, `check_one_hot`, einziges `slot_to_mask` (G5/G6) |
+| motor | F0-Update-Sender nur mit `confirm=True`; `write_sys_param` für die 166 gesperrten IDs nur mit `allow_locked=True`; float32-Plausibilität |
+| motor_mini | `MINI_WRITABLE_IDS` (13 Stock-IDs), `update_sys_params` nur mit `confirm=True` |
+| BEFUND2 | `parse_box_state`: `temp_c`/`rh` (belegt; `*_guess` Aliase), `inlet_tag_mask` (Alias `b5`/`rfid_valid_mask`), `block_long`/`block_main_motor`/`block_feeder_mask`; `parse_get_hardware_status`: `components`/`all_ok`; `STATUS_NAMES` 0x05/0x0a/0x0c/0x14/0x17/0x19/0x1a/0x50/0x51/0x52 |
+
+**cfswatch.py** (`nachbau/cfswatch.py`, nur lesend, sendet nie, öffnet keinen Port): parst
+klippy.log-Zeilen (stdin/Dateien) zu einer deutschen Zeitleiste – Request → Antwort mit Latenz,
+fun-Name, Status-Klartext, 0x0a (Zustand, Hub-Maske, Motorblock-Flags, Temp/Feuchte), 0x15
+(Komponenten), Odometer seit Förderstart, Retries/Timeouts, key8xx. SN/UUID/Vendor maskiert
+(`--unmask`). Bedienung:
+
+```
+ssh root@<drucker> 'tail -F /mnt/UDISK/printer_data/logs/klippy.log' | python3 nachbau/cfswatch.py --local
+python3 nachbau/cfswatch.py --slot A --only-errors klippy.log.2026-10-13   # lokale Log-Kopie
+python3 nachbau/cfswatch.py --selftest
+```
+
+Optionen: `--slot A..D`, `--only-errors`, `--since HH:MM`, `--raw`, `--local` (UTC+8 → Europe/Berlin),
+`--all`, `--no-motor`, `--unmask`, `--no-color`.

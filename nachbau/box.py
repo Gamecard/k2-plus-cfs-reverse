@@ -28,7 +28,7 @@ FUNC_RETRIES/func_retries (Original-Retries je fun, 0x0a-Poll retries=0),
 Host-Namen 0x08 GET_FILAMENT_SENSOR_STATE / 0x15 GET_HARDWARE_STATUS /
 0x0f TIGHTEN_UP_ENABLE / Status 0x30 UPDATE_STATE / 0x51 SPEED_ERR (alte
 Namen als Aliase), 0x0a b5 „RFID gültig“ unbelegt (live immer 0), b0/b1
-Temp/Feuchte-Kandidat, FW-113-0x0a mit 4 Byte (parse_box_state box_fw),
+Temp/Feuchte-Kandidat (beides inzwischen geklärt, s. BEFUND2 unten), FW-113-0x0a mit 4 Byte (parse_box_state box_fw),
 EVENT_* für 0x30-Ereignisse, Selbsttests mit echten Live-Frames
 (SN/Vendor durch Platzhalter ersetzt).
 
@@ -43,6 +43,20 @@ Belege (alle in /home/pro/k2-fw-live-1.1.7.0/):
 - Slots als 1-hot-Maske A=0x01/B=0x02/C=0x04/D=0x08, Default 0x0f = alle.
 - Extrude/Retrude-Stufen-Sequenzen stehen bewusst NICHT hier, sondern in
   nachbau/cfsseq.py (dort belegt) – hier kein Duplikat, nur Verweis.
+  Geprüfte Einzel-Requests 0x10/0x11 (retries=0, lange Timeouts):
+  BoxAction.communication_extrude / communication_retrude (16.10.2026).
+
+REVIEW 16.10.2026: Statusprüfung (CfsStatusError/StatusBytes, M2),
+0x10/0x11-Pfad (M3), Messrad op 0 nur mit reset=True (G1), Maske 0 bei
+0x0d op 2/3 = 4 Slots (G2), _box_fw_num mit Host-Form "1.5.3" (G3),
+Voll-Frame mit Anhang (G4), DeprecationWarning für
+communication_get_hardware_status(channel) (G6), slot_to_mask aus cfsseq.
+
+GHIDRA BEFUND2 16.10.2026 (GHIDRA-CFS-BEFUND2-2026-10-16.md): 0x0a b0/b1 =
+Temperatur °C (int8) / rel. Feuchte % aus AHT30 (BELEGT, Schlüssel temp_c/
+rh; *_guess bleiben Aliase), b5 = inlet_tag_mask (Typ-7-Tag-Sperrbit, NICHT
+„RFID gültig“), b2-Flags dekodiert (block_*), 0x15 Komponenten-Init-Flags
+(HW_COMPONENTS), Status 0x50/0x51/0x52 und Kanal-A-Codes präzisiert.
 
 PRINZIP: Nichts erfinden. Was nicht auf dem Bus belegt ist, ist als TODO
 markiert (insbesondere Tn-Innensemantik und .so-Entscheidungslogik).
@@ -50,6 +64,7 @@ Kein Netzwerk (Drucker-IP tabu), keine Hardware im Selbsttest.
 """
 
 import struct
+import warnings
 
 import serial485
 from serial485 import Serial485  # noqa: F401 (für echten Betrieb)
@@ -94,7 +109,8 @@ FUNC_GET_VERSION_SN = 0x14
 # 0x15: Host-Name GET_HARDWARE_STATUS (LIVE BELEGT 15.10.2026, .so
 # communication_get_hardware_status(addr), Request leer). Antwort 16 Byte:
 # 6 Einträge ((i+1)<<4)|X[i] + 10 x 00 (Ghidra FUN_0800f16e; live
-# 10 20 30 40 50 60 00.. = alle X 0). Bedeutung von X offen.
+# 10 20 30 40 50 60 00.. = alle X 0). ~~Bedeutung von X offen~~ BEFUND2:
+# Init-Flags EEPROM/AHT30/Odometer/Buffer/RFID0/RFID1 (HW_COMPONENTS).
 FUNC_GET_HARDWARE_STATUS = 0x15
 
 # --- Retries/Timeouts wie im Original (LIVE BELEGT 15.10.2026, alle 6
@@ -107,18 +123,30 @@ FUNC_GET_HARDWARE_STATUS = 0x15
 #   0x10 4 (191) | 0x11 4 (90) | 0x14 4 (78) | 0x15 4 (10)
 # Auto-Addr 0xa0..0xa3, Motoren 0x81..0x85, 0xff-Broadcasts: retries=0
 #   (nicht hier, s. auto_addr.py / motor.py). Belt 0x21/0x22: retries=4.
-FUNC_RETRIES = {
+# 0x10/0x11: BEWUSSTE ABWEICHUNG vom Original (Original 4, Review M3
+# 16.10.2026): hier retries=0. Begründung wie bei 0x0d op 2/3 – 0x10/0x11
+# lösen Mechanik aus (Fördern/Rückzug), ein Retransmit nach Timeout würde
+# den Vorgang ein zweites Mal starten; die Antwort kommt erst nach dem
+# Vorgang (0x10 mode 0 live <= 7,25 s, 0x11 p1 <= 23 s) -> lange Timeouts
+# (FUNC_TIMEOUTS_SO) statt Wiederholung. FUNC_RETRIES_ORIGINAL hält die
+# live gezählten Original-Werte fest.
+FUNC_RETRIES_ORIGINAL = {
     FUNC_GET_RFID: 4, FUNC_GET_REMAIN_LEN: 4, FUNC_SET_BOX_MODE: 4,
     FUNC_GET_BUFFER_STATE: 4, FUNC_GET_FILAMENT_SENSOR_STATE: 4,
     FUNC_GET_BOX_STATE: 0, FUNC_SET_PRE_LOADING: 4,
     FUNC_MEASURING_WHEEL: 4, FUNC_TIGHTEN_UP_ENABLE: 4, 0x10: 4, 0x11: 4,
     FUNC_GET_VERSION_SN: 4, FUNC_GET_HARDWARE_STATUS: 4,
 }
+FUNC_RETRIES = dict(FUNC_RETRIES_ORIGINAL)
+FUNC_RETRIES.update({0x10: 0, 0x11: 0})  # bewusste Abweichung (s. oben)
 # Host-Timeouts (s) laut box_wrapper-Modulkonstanten (API-box_wrapper.md
 # „Timeouts“), live konsistent: 0x0d op 2 Antwort nach 31-37 s bei EINER
 # Sendung, 0x10 mode 0 nach <=7,25 s, 0x11 p1 nach <=23 s, sonst 2 s
 # (Retry-Abstand 2,00-2,17 s). 0x0a: Konstante GET_BOX_STATE=3600 existiert,
 # ob sie der Poll-Timeout ist, ist unbelegt (Poll-Antworten 3-390 ms).
+# GENUTZT (Review M3, 16.10.2026) von BoxAction.communication_extrude (0x10,
+# 15 s > live 7,25 s) und communication_retrude (0x11, 150 s > live 23 s).
+# 0x0d nutzt bewusst preload_force_timeout (>= 380 s) statt 300 s.
 FUNC_TIMEOUTS_SO = {
     FUNC_SET_PRE_LOADING: 300.0, 0x10: 15.0, 0x11: 150.0,
 }
@@ -137,40 +165,56 @@ from cfsseq import (  # noqa: E402,F401
     EXTRUDE_MODE_STAGE1, EXTRUDE_MODE_FEED_TO_STALL, EXTRUDE_MODE_FEED_CHECKED,
     EXTRUDE_MODE_CLEAR_ERROR, EXTRUDE_MODE_FEED_START, EXTRUDE_MODE_QUERY,
     EXTRUDE_MODE_STOP_BUFFER, EXTRUDE_MODE_EXTRUDER_CHECK, EXTRUDE_MODES,
-    EXTRUDER_CHECK_MM, RETRUDE_P_TO_BUFFER, RETRUDE_P_PULL_HUB)
+    EXTRUDER_CHECK_MM, RETRUDE_P_TO_BUFFER, RETRUDE_P_PULL_HUB,
+    slot_to_mask, check_one_hot)
 
 # --- Status-Byte der ANTWORTEN (BELEGT 15.10.2026, Ghidra CFS-FW R153;
-# GHIDRA-CFS-BEFUND-2026-10-15.md §5). Nur Bereitstellung – die Auswertung
-# in _response_data bleibt TODO (keine Logikänderung).
+# GHIDRA-CFS-BEFUND-2026-10-15.md §5). Auswertung seit 16.10.2026 in
+# BoxAction (CfsStatusError, Review M2); die reinen Parser ignorieren ihn.
 # Hinweis: das Status-Byte im REQUEST ignoriert die App (Dispatcher liest
 # frame[2] nie) – STATUS_OPERATIONAL 0xFF bleibt aus Kompatibilität.
 STATUS_OK = 0x00
 STATUS_INVALID = 0x01        # len/Maske/Subcode ungültig, fun unbekannt (FUN_0800ebc2/eb88)
 STATUS_CRC = 0x02            # CRC-Fehler im Request (FUN_0800f880)
 STATUS_BUSY = 0x03           # busy / falscher Box-Zustand; 0x50: Wert unverändert
-STATUS_FEED_OUT = 0x05       # cmd_parse_out: Feeder-Out-Fehler (FUN_08004df2)
+STATUS_FEED_OUT = 0x05       # cmd_parse_out (FUN_08004df2); BEFUND2 §8: auch 0x10 mode 0
+#                              feed_top_to_hub FUN_080042a8 – Hub-Sensor nicht in 7 s (700x10 ms) erreicht (B+L)
+STATUS_HUB_TIMEOUT = STATUS_FEED_OUT  # Alias (Bedeutung aus BEFUND2)
 STATUS_BUFFER_FILL_TIMEOUT = 0x06  # buffer_fill_timeout (FUN_08004df2)
 STATUS_PRETENSION = 0x08     # Pretension-Warten erfolglos (FUN_08004460)
 STATUS_HUB_NO_MOVE = 0x09    # feed_top_to_hub: Odometer bewegt sich nicht (FUN_08004190)
-STATUS_FEED_TIMEOUT = 0x0A   # 25-s-Timeout bzw. <5 mm in 3 s (FUN_08025c4e/08003efa)
-STATUS_FEED_MAX_LEN = 0x0B   # Fördern > 3000 mm
-STATUS_ODOMETER_STALL = 0x0C  # Odometer-Stillstand 500 ms
+STATUS_FEED_TIMEOUT = 0x0A   # mode 4: 1250x20 ms = 25 s ohne Abschluss; mode 2: <5 mm in 3 s (FUN_08025c4e/08003efa)
+STATUS_FEED_MAX_LEN = 0x0B   # Fördern > 3000 mm (odom_start-odom, @0x08025f24)
+STATUS_ODOMETER_STALL = 0x0C  # 25x20 ms in Folge <0,01 mm Vorwärts = 500 ms (@0x08025f28; Rückfedern zählt mit)
 STATUS_BUFFER_NOT_FULL = 0x0D  # Buffer nicht voll (FUN_08025d96)
 STATUS_EXTRUDER_TIMEOUT = 0x0E  # feed extruder timeout, 0x10 mode 7 (FUN_08025dea)
 STATUS_RETRACT_BUFFER_TIMEOUT = 0x13  # Rückzug: Buffer-Sensor 5 s (FUN_08004c9a)
-STATUS_PULL_HUB_TIMEOUT = 0x14  # pull back hub PE timeout (FUN_08004884)
+STATUS_PULL_HUB_TIMEOUT = 0x14  # Pull-back Stufe 2: Hub nach 7 s noch belegt (FUN_08004884)
 STATUS_NO_FILAMENT = 0x16    # Slot ohne Filament (FUN_08004d4a/0800e81a), setzt ERROR
-STATUS_PULL_HUB_SENSOR = 0x17  # pull_back_hub: Sensor A nicht aktiv (FUN_08004c5a)
+STATUS_PULL_HUB_SENSOR = 0x17  # vor Pull-back: Einlauf-Sensor A meldet kein Filament (FUN_08004c5a)
 STATUS_NO_SLOT_INTERNAL = 0x18  # intern, wird auf 0x16 abgebildet
-STATUS_PULL_HUB_BLOCK = 0x19  # pull_back_hub motor block (FUN_0800494e)
+STATUS_PULL_HUB_BLOCK = 0x19  # Pull-back p=1: Odometer <0,01 mm/20 ms UND R[3] (Motorblock >10 s) (FUN_0800494e)
+STATUS_PULL_HUB_ODO_TIMEOUT = 0x1A  # Pull-back p=1: 2000x20 ms = 40 s ohne Hub frei (BEFUND2 §8)
 STATUS_PRELOAD_EVENT = 0x30  # NUR 0x0a: Preload-Ereignis anstehend (+4 B)
 # Host-Name (LIVE 15.10.2026, klippy.log "UPDATE_STATE[0x30]"):
 STATUS_UPDATE_STATE = STATUS_PRELOAD_EVENT
-STATUS_PRINT_SENSOR = 0x50   # NUR 0x0a in STATE_PRINT: Sensorprüfung != 0 (Deutung offen; live nie)
+# 0x50: ~~Sensorprüfung, Deutung offen~~ BEFUND2 16.10.2026 §4 (B): nur
+# STATE_PRINT, aktueller Druck-Slot: (Einlauf frei) | (Hub frei)<<1 != 0 ->
+# 0x50, setzt R[8]=1 = Runout/Filament-Verlust im druckenden Slot.
+STATUS_PRINT_SENSOR = 0x50
+STATUS_RUNOUT = STATUS_PRINT_SENSOR  # Alias (BEFUND2)
 # 0x51: ~~nur LED-Mapping~~ LIVE BELEGT 15.10.2026 als echter Fehlercode
 # (0x0a in STATE_ERROR, Host "SPEED_ERR[0x51]", key846 „empty printing, box
 # speed is smaller than extruder“; klippy.log.2026-10-12:15733, 452x).
+# BEFUND2 §4 (B): Thread print_check, ~10 s ohne „buffer full“ und
+# Odometer >= 40 mm nachgeschoben ODER >= 3 Buffer-leer-Meldungen.
 STATUS_SPEED_ERR = 0x51
+STATUS_BUFFER_SLOW = STATUS_SPEED_ERR  # Alias (BEFUND2)
+# 0x52: BEFUND2 §4 (B): print_check, ~10 s ohne „buffer full“ und Odometer
+# < 5 mm (Box soll fördern, nichts bewegt sich), nur ohne vorherigen 0x50.
+STATUS_NO_FEED = 0x52
+# 0x53: wird von der App NIE erzeugt (nur LED-Mapping FUN_08010c8a,
+# Zweig in FUN_0800ed26 toter Code) – bewusst keine Konstante.
 
 # Ereigniswerte im 0x30-UPDATE_STATE (je Slot A..D ein Byte). Ghidra:
 # Werte 1/2/3 aus FUN_080065f4; Bedeutung DEUTUNG, live gestützt 15.10.2026
@@ -186,7 +230,7 @@ STATUS_NAMES = {
     STATUS_INVALID: "ungültig (len/Maske/Subcode/fun)",
     STATUS_CRC: "CRC-Fehler im Request",
     STATUS_BUSY: "busy / falscher Zustand",
-    STATUS_FEED_OUT: "Feeder-Out-Fehler",
+    STATUS_FEED_OUT: "Feeder-Out / Hub nicht in 7 s erreicht",
     STATUS_BUFFER_FILL_TIMEOUT: "buffer_fill_timeout",
     STATUS_PRETENSION: "Pretension erfolglos",
     STATUS_HUB_NO_MOVE: "feed_top_to_hub: Odometer steht",
@@ -196,20 +240,47 @@ STATUS_NAMES = {
     STATUS_BUFFER_NOT_FULL: "Buffer nicht voll",
     STATUS_EXTRUDER_TIMEOUT: "feed extruder timeout",
     STATUS_RETRACT_BUFFER_TIMEOUT: "Rückzug: Buffer-Sensor-Timeout",
-    STATUS_PULL_HUB_TIMEOUT: "pull back hub PE timeout",
+    STATUS_PULL_HUB_TIMEOUT: "Pull-back: Hub nach 7 s noch belegt",
     STATUS_NO_FILAMENT: "Slot ohne Filament",
-    STATUS_PULL_HUB_SENSOR: "pull_back_hub: Sensor A nicht aktiv",
+    STATUS_PULL_HUB_SENSOR: "Pull-back: Einlauf-Sensor leer",
     STATUS_NO_SLOT_INTERNAL: "kein Slot belegt (intern)",
-    STATUS_PULL_HUB_BLOCK: "pull_back_hub motor block",
+    STATUS_PULL_HUB_BLOCK: "Pull-back: Motorblock > 10 s",
+    STATUS_PULL_HUB_ODO_TIMEOUT: "Pull-back: Timeout 40 s",
     STATUS_PRELOAD_EVENT: "UPDATE_STATE / Preload-Ereignis (nur 0x0a)",
-    STATUS_PRINT_SENSOR: "Sensorprüfung in PRINT (nur 0x0a)",
-    STATUS_SPEED_ERR: "SPEED_ERR (Box langsamer als Extruder)",
+    STATUS_PRINT_SENSOR: "Runout im Druck-Slot (nur 0x0a PRINT)",
+    STATUS_SPEED_ERR: "SPEED_ERR: Buffer-Nachschub zu langsam",
+    STATUS_NO_FEED: "kein Vorschub im Druck (<5 mm in ~10 s)",
 }
 
 
 def status_name(code):
     """Klartext zu einem Antwort-Status-Byte (unbekannt -> 'unbekannt 0x..')."""
     return STATUS_NAMES.get(code, "unbekannt 0x%02x" % code)
+
+
+class CfsStatusError(Exception):
+    """Box-Antwort mit Status != 0 (Review M2, 16.10.2026).
+
+    Attribute: status (int), name (STATUS_NAMES-Klartext), data (bytes,
+    Antwortdaten – z.B. 0x10 mode 5 liefert trotz Fehler den Odometer-Float,
+    0x10 mode 0 / Busy 1 Byte Box-Zustand), fun (Antwort-fun)."""
+
+    def __init__(self, status, name, data=b"", fun=None):
+        self.status, self.name, self.data, self.fun = status, name, bytes(data), fun
+        Exception.__init__(self, "Box-Status 0x%02x (%s)%s, Daten %s" % (
+            status, name, "" if fun is None else " auf fun 0x%02x" % fun,
+            bytes(data).hex(" ") or "-"))
+
+
+class StatusBytes(bytes):
+    """Antwortdaten (bytes, API-kompatibel) + Attribut .status (Status-Byte
+    der Antwort; None, wenn der Bus kein transact_full bietet) und .fun.
+    get_box_status/parse_box_state werten .status bei Rohdaten aus."""
+
+    def __new__(cls, data=b"", status=None, fun=None):
+        obj = bytes.__new__(cls, bytes(data))
+        obj.status, obj.fun = status, fun
+        return obj
 
 
 # --- Box-Zustand (0x0a Byte 3), BELEGT 15.10.2026 (Ghidra FUN_0800fa0c/
@@ -267,10 +338,23 @@ PRELOAD_FORCE_TIMEOUT_PER_SLOT = 200.0  # s, 5 s + 180 s + Reserve je Slot
 
 
 def preload_force_timeout(mask):
-    """Host-Timeout (s) für 0x0d op 2/3: Vorlauf + 200 s je Slot der Maske
-    (mind. 1 Slot). Beispiel Maske 0x01 -> 380 s, 0x0F -> 980 s."""
+    """Host-Timeout (s) für 0x0d op 2/3: Vorlauf + 200 s je Slot der Maske.
+    Beispiel Maske 0x01 -> 380 s, 0x0F -> 980 s.
+
+    Maske 0 (Review G2, Entscheidung 16.10.2026): wird wie 4 Slots gerechnet
+    (980 s), NICHT abgelehnt. Gründe: der Host sendet live [00 02]
+    („Force alle“, G-Code-Pfad, PROTOKOLL-485.md 6.4) – Ablehnen würde
+    diesen belegten Request unmöglich machen. Die Laufzeit ist für Maske 0
+    unbelegt: Ghidra-Schleife über die Maskenbits ergäbe 0 Slots, der
+    Vorlauf (FUN_08004cd0(4,1)) betrifft aber ALLE Slots am Hub (live: Box
+    ~11 s stumm). Bei retries=0 ist ein zu kurzer Timeout schädlicher als
+    ein zu langer (Spätantwort kollidiert mit Folgeverkehr), daher die
+    konservative Obergrenze. Früher: max(1, n) = 380 s.
+    """
     n = bin(check_mask(mask)).count("1")
-    return PRELOAD_FORCE_TIMEOUT_BASE + PRELOAD_FORCE_TIMEOUT_PER_SLOT * max(1, n)
+    if n == 0:
+        n = len(SLOT_MASKS)
+    return PRELOAD_FORCE_TIMEOUT_BASE + PRELOAD_FORCE_TIMEOUT_PER_SLOT * n
 
 
 def check_mask(mask):
@@ -286,23 +370,33 @@ def check_mask(mask):
     return mask
 
 
-def slot_to_mask(index):
-    """Slot-Index 0..3 (A..D) -> 1-hot-Maske 0x01/0x02/0x04/0x08."""
-    if isinstance(index, bool) or index not in range(4):
-        raise ValueError("Slot-Index muss 0..3 sein: %r" % (index,))
-    return SLOT_MASKS[index]
+# slot_to_mask (Slot-Index 0..3 -> 1-hot-Maske): einzige Implementierung in
+# cfsseq.py, unten mit importiert (Review G6, 16.10.2026; kein Zirkelimport,
+# cfsseq importiert nur serial485).
 
 
 def _is_full_frame(raw):
-    """Voll-Frame erkennen: Head 0xF7, Mindestlänge 6 UND Längenfeld passt
-    exakt zur Gesamtlänge (len + 3). Rohdaten, die zufällig mit 0xF7
-    beginnen, gelten damit nur als Frame, wenn auch das Längenfeld stimmt;
-    die CRC prüft danach parse_frame (Fehler -> ValueError).
+    """Voll-Frame erkennen: Head 0xF7, Mindestlänge 6 UND
+    (a) Längenfeld passt exakt zur Gesamtlänge (len + 3) – CRC prüft danach
+        parse_frame (Fehler -> ValueError, wie bisher), oder
+    (b) Review G4 16.10.2026: Puffer ist LÄNGER als len + 3 (angehängte
+        Bytes, z.B. Folgeframe-Anfang) UND die CRC über die ersten len + 3
+        Bytes ist gültig -> Frame (Anhang wird ignoriert). Früher galt so
+        ein Puffer als Rohdaten (Frame-Bytes landeten im Parser).
+    Rohdaten, die zufällig mit 0xF7 beginnen, gelten nur bei passendem
+    Längenfeld (a) bzw. passendem Längenfeld + gültiger CRC (b) als Frame.
     TODO: Restmehrdeutigkeit (Rohdaten mit 0xF7 + passendem Längenbyte) ist
       nur durch getrennte API (Frame vs. Rohdaten) restlos lösbar.
     """
-    return (len(raw) >= 6 and raw[0] == serial485.PACK_HEAD
-            and raw[2] + 3 == len(raw))
+    raw = bytes(raw)
+    if len(raw) < 6 or raw[0] != serial485.PACK_HEAD:
+        return False
+    expect = raw[2] + 3
+    if expect == len(raw):
+        return True
+    if serial485.FRAME_LEN_MIN <= raw[2] and expect < len(raw):
+        return serial485.crc8_cal(raw[2:expect - 1]) == raw[expect - 1]
+    return False
 
 
 def _response_data(msg, expect_fun):
@@ -311,8 +405,8 @@ def _response_data(msg, expect_fun):
     Voll-Frame (s. _is_full_frame) wird per serial485.parse_frame
     CRC-geprüft und der fun-Code verglichen. Sonst gilt msg als bereits
     extrahierte Rohdaten (z.B. Rückgabe von Serial485.transact).
-    TODO (offen): Status-Byte raw[3] wird NICHT ausgewertet (Fehler-/Busy-
-      Codes ≠ 0x00, vgl. vanilla STATUS_*), Antwort wird trotzdem geparst.
+    Status-Byte raw[3] wird hier (reine Parser) NICHT ausgewertet; die
+      Statusprüfung macht BoxAction (CfsStatusError, Review M2 16.10.2026).
     """
     raw = bytes(msg)
     if _is_full_frame(raw):
@@ -448,7 +542,8 @@ def get_box_status(msg):
     ~~Semantik der Einzelbytes ist UNBELEGT~~ BELEGT 15.10.2026 (Ghidra
     FUN_0800ed26) – benannte Felder liefert parse_box_state(); diese
     Funktion bleibt generisch (b0..bN, unverändert).
-    Gibt dict {raw, len, frame_status (None bei Rohdaten), b0..bN} zurück.
+    Gibt dict {raw, len, frame_status (None bei Rohdaten ohne .status),
+    b0..bN} zurück. StatusBytes (BoxAction-Rückgabe) liefern frame_status.
     """
     raw = bytes(msg)
     frame_status = None
@@ -457,6 +552,8 @@ def get_box_status(msg):
         data = _response_data(raw, FUNC_GET_BOX_STATE)
     else:
         data = raw
+        # Rohdaten von BoxAction (StatusBytes) tragen den Status mit
+        frame_status = getattr(msg, "status", None)
     out = {"raw": bytes(data), "len": len(data), "frame_status": frame_status}
     for i, byte in enumerate(bytes(data)):
         out["b%d" % i] = byte
@@ -467,29 +564,72 @@ BOX_FW_6BYTE_STATE = 153  # ab Box-App 153 hat 0x0a 6 Datenbytes (live)
 
 
 def _box_fw_num(box_fw):
-    """Box-App-Version ("113"/"153"/113/None) -> int oder None."""
+    """Box-App-Version -> int (z.B. 153) oder None.
+
+    Akzeptierte Formate (Review G3, 16.10.2026, belegt):
+    - Wire-Form aus 0x14 / parse_version_sn: "153", "113" (genau 3 Ziffern,
+      auch bytes) bzw. int 100..999.
+    - Host-Form aus klippy.log: "1.5.3" / "1.1.3" – Host loggt die Wire-
+      Ziffern punktgetrennt (klippy.log.2026-10-14:4377-4380: Daten
+      31 35 33 ... -> "version: 1.5.3"; klippy.log.2026-10-05:4335
+      "version: 1.1.3" vor dem Box-Update). Nur genau 3 einstellige Teile.
+    Alles andere (z.B. "15", "1.5", "1.10.3", "153"+SN) -> ValueError –
+      eine Zuordnung wie "15" -> 15x/113 ist NICHT belegt. Früher wurden die
+      ersten 3 Zeichen genommen ("1.5.3" -> ValueError, "15" -> 15).
+    """
     if box_fw is None:
         return None
-    try:
-        return int(str(box_fw).strip()[:3])
-    except ValueError:
-        raise ValueError("box_fw muss z.B. '153' oder 113 sein: %r" % (box_fw,))
+    if isinstance(box_fw, bool):
+        raise ValueError("box_fw darf nicht bool sein: %r" % (box_fw,))
+    if isinstance(box_fw, int):
+        if 100 <= box_fw <= 999:
+            return box_fw
+        raise ValueError("box_fw als int muss 3-stellig sein (z.B. 153): %r"
+                         % (box_fw,))
+    if isinstance(box_fw, (bytes, bytearray)):
+        box_fw = bytes(box_fw).decode("ascii", "replace")
+    text = str(box_fw).strip()
+    if len(text) == 3 and text.isdigit() and text.isascii():
+        return int(text)
+    parts = text.split(".")
+    if len(parts) == 3 and all(len(p) == 1 and p.isdigit() and p.isascii()
+                               for p in parts):
+        return int("".join(parts))
+    raise ValueError("box_fw unbekanntes Format %r – erlaubt: '153'/'113', "
+                     "153/113 oder Host-Form '1.5.3'/'1.1.3'" % (box_fw,))
+
+
+# 0x0a Byte 2 (BEFUND2 §8, B): R[3]|0x80 = Motorblock > 10 s (einmalig
+# gemeldet), sonst R[5] = Blockmaske sofort. Bit 4 = Hauptmotor (MS3791),
+# Bit 0..3 = Feeder A..D. Live 0x90 = Hauptmotor > 10 s, 0x91 = Hauptmotor
+# + Feeder A, 01/02/04/08 nach Preload/Retract = Feeder-Block des Slots
+# (vermutlich normaler Pretension-Endanschlag, V).
+FLAG_BLOCK_LONG = 0x80
+FLAG_BLOCK_MAIN_MOTOR = 0x10
+FLAG_BLOCK_FEEDER_MASK = 0x0F
+
+
+def _int8(v):
+    return v - 0x100 if v >= 0x80 else v
 
 
 def parse_box_state(msg, box_fw=None):
     """0x0a-Antwort mit Namen (BELEGT 15.10.2026, Ghidra FUN_0800ed26;
-    LIVE-GEGENPROBE 15.10.2026, klippy.log 05.-16.10.).
+    LIVE-GEGENPROBE 15.10.2026, klippy.log 05.-16.10.; BEFUND2 16.10.2026).
 
-    Normal R153 (6 Datenbytes): b0 = S[1], b1 = S[0], b2 = Flags (R[3]|0x80
-    einmalig bzw. R[5]; live 01/02/04/08 = Slotmaske nach 0x11 p1/Preload,
-    0x90/0x91 bei Motorblock), b3 = Box-Zustand (BOX_STATE_*; live 0,1,2,4),
+    Normal R153 (6 Datenbytes): b0 = S[1] = Temperatur °C, b1 = S[0] = rel.
+    Feuchte % – BELEGT (BEFUND2 §1, B+L): AHT30 @I2C 0x38, ~1,2 s Takt,
+    ganzzahlig abgeschnitten, Temperatur int8 (Zweierkomplement), Feuchte
+    uint8 0..100; bei AHT-Initfehler dauerhaft 0 (s. 0x15). Schlüssel
+    "temp_c"/"rh"; ~~Vermutung~~ "temp_c_guess"/"rh_guess" bleiben Aliase.
+    b2 = Flags (R[3]|0x80 = Motorblock > 10 s bzw. R[5] = Blockmaske; Bit 4
+    Hauptmotor, Bit 0..3 Feeder A..D -> block_long/block_main_motor/
+    block_feeder_mask), b3 = Box-Zustand (BOX_STATE_*; live 0,1,2,4),
     b4 = Bitmaske Sensor B/Hub (live = 0x08 [01]), b5 = Bitmaske aus
-    FUN_080053f2 – ~~„Slot hat gültige RFID-Daten“~~ UNBELEGT: live in
-    8 268 Frames IMMER 0 (auch mit RFID-Spule) -> Feld heißt jetzt "b5",
-    "rfid_valid_mask" bleibt nur als Alias-Schlüssel.
-    b0/b1: VERMUTUNG (live, langsam gegenläufig variierend b0 0x11-0x1c,
-    b1 0x2d-0x39) Temperatur °C / rel. Feuchte % -> Schlüssel
-    "temp_c_guess"/"rh_guess" (nicht gegengeprüft).
+    FUN_080053f2 – ~~„Slot hat gültige RFID-Daten“~~ KORRIGIERT BEFUND2 §2:
+    Bit i = Einlauf-Flag && Tag geladen && Tag-Typ 7 && Tag-Feld+0x10 == 0
+    („Typ-7-Tag ohne Datenfreigabe“; schließt 0x02-Daten des Slots aus) ->
+    Schlüssel "inlet_tag_mask"; "b5"/"rfid_valid_mask" bleiben Aliase.
     Frame-Status: ERROR -> S[3] (gespeicherter Fehlercode, live 05/0c/14/
     19/51), PRINT -> 0x50 oder 0, sonst 0.
     Ereignis (Status 0x30 UPDATE_STATE, 4 Datenbytes): je Slot A..D ein
@@ -497,7 +637,8 @@ def parse_box_state(msg, box_fw=None):
     Deutung, live gestützt) – dann KEIN Zustandsbyte.
     FW 113 (Box-App vor dem Update am 12.10.2026): nur 4 Datenbytes
     b0 b1 ?? Zustand mit Status 0 (live f7 01 07 00 0a 17 34 00 00 81)
-    -> kind 'state_v113' (KEIN Ereignis!).
+    -> kind 'state_v113' (KEIN Ereignis!); b0/b1 dort nur *_guess (FW 113
+    nicht disassembliert).
     Rohdaten ohne Frame (kein Status bekannt): 6 Byte -> 'state'; 4 Byte
     sind mehrdeutig -> nur mit box_fw entscheidbar (>=153: 'event',
     <153: 'state_v113'), sonst kind 'ambiguous' (früher fälschlich 'event').
@@ -538,7 +679,15 @@ def parse_box_state(msg, box_fw=None):
                     "state_name": BOX_STATE_NAMES.get(data[3], "unknown"),
                     "temp_c_guess": data[0], "rh_guess": data[1]})
         if kind == "state":
-            out.update({"sensor_b_mask": data[4], "hub_mask": data[4],
+            fl = data[2]
+            t = _int8(data[0])
+            out.update({"temp_c": t, "rh": data[1],
+                        "temp_c_guess": t, "rh_guess": data[1],
+                        "block_long": bool(fl & FLAG_BLOCK_LONG),
+                        "block_main_motor": bool(fl & FLAG_BLOCK_MAIN_MOTOR),
+                        "block_feeder_mask": fl & FLAG_BLOCK_FEEDER_MASK,
+                        "sensor_b_mask": data[4], "hub_mask": data[4],
+                        "inlet_tag_mask": data[5],
                         "b5": data[5], "rfid_valid_mask": data[5]})
         if data[3] == BOX_STATE_ERROR and fst is not None:
             out["error_code"] = fst
@@ -599,19 +748,43 @@ def parse_hardware_status(msg):
     return parse_filament_sensor_state(msg)
 
 
+# 0x15-Komponenten (BEFUND2 §3, B+L): Init-Flags @0x2000390d, Namen aus
+# FUN_080050fe; Byte i = ((i+1)<<4) | Flag[i], 0 = OK.
+HW_COMPONENTS = (
+    ("eeprom", "EEPROM"),             # 1 = fehlt, 2 = Verify @0x7f0 fehlgeschlagen
+    ("aht", "AHT30 Temp/Feuchte"),    # 1 = nicht gefunden / 3x Lesefehler
+    ("odometer", "Odometer MT6826"),  # 1 = Timer-Create-/Kommunikationsfehler
+    ("buffer", "Buffer-Sensor"),      # 1 = PD8 UND PD9 aktiv (unplausibel)
+    ("rfid0", "RFID-Leser 0"),        # 1 = Fehler (Leser-Erkennung FUN_080145be)
+    ("rfid1", "RFID-Leser 1"),        # 1 = Fehler (auch bei erst später gelungenem Retry)
+)
+
+
 def parse_get_hardware_status(msg):
     """GET_HARDWARE_STATUS-Antwort parsen (Func 0x15, Request leer, 16 Byte).
 
     LIVE BELEGT 15.10.2026: f7 01 13 00 15 10 20 30 40 50 60 + 10 x 00 (ad).
-    Ghidra FUN_0800f16e: 6 Einträge ((i+1)<<4)|X[i], Rest 0. Bedeutung von X
-    offen (live alle 0). Gibt dict {raw, entries: [(index, x), ...]} zurück
-    (index = oberes Nibble 1..6, x = unteres Nibble; Null-Bytes entfallen).
+    Ghidra FUN_0800f16e: 6 Einträge ((i+1)<<4)|X[i], Rest 0.
+    ~~Bedeutung von X offen~~ BELEGT BEFUND2 §3: X = Init-Flags EEPROM,
+    AHT30, Odometer MT6826, Buffer, RFID0, RFID1 (HW_COMPONENTS), 0 = OK.
+    Gibt dict zurück: raw, entries [(index, x), ...] (index = oberes Nibble
+    1..6, x = unteres Nibble; Null-Bytes entfallen – kompatibel),
+    components [{key, name, code, ok}] für die 6 Positionen (code None,
+    wenn das obere Nibble nicht zur Position passt), all_ok (bool).
     """
     data = bytes(_response_data(msg, FUNC_GET_HARDWARE_STATUS))
     if len(data) != 16:
         raise ValueError("Hardware-Status muss 16 Byte haben: %r" % (data,))
+    comps = []
+    for i, (key, name) in enumerate(HW_COMPONENTS):
+        b = data[i]
+        code = (b & 0x0F) if (b >> 4) == i + 1 else None
+        comps.append({"key": key, "name": name, "code": code,
+                      "ok": code == 0})
     return {"raw": data,
-            "entries": [(b >> 4, b & 0x0F) for b in data if b]}
+            "entries": [(b >> 4, b & 0x0F) for b in data if b],
+            "components": comps,
+            "all_ok": all(c["ok"] for c in comps) and not any(data[6:])}
 
 
 # =====================================================================
@@ -958,84 +1131,137 @@ def build_get_version():
                                  status=STATUS_OPERATIONAL)
 
 
-class BoxAction:
-    """Box-Abläufe gegen den Bus (vgl. BoxAction.communication_*)."""
+# Status-Bytes, die bei 0x0a REGULÄR Ereignisse/Zustände tragen (kein Fehler
+# des Requests): 0x30 UPDATE_STATE, 0x50 PRINT-Sensor, in STATE_ERROR der
+# gespeicherte Fehlercode S[3] (live 05/0c/14/19/51). Nur dataless 0x01/0x02
+# (ungültig / CRC-Fehler im Request, Antwort ohne Daten, PROTOKOLL-485.md:327)
+# sind dort echte Transportfehler.
+_REQUEST_ERROR_STATUSES = (STATUS_INVALID, STATUS_CRC)
 
-    def __init__(self, bus, addr=BOX_ADDR):
+# 0x0e-Ops (Ghidra FUN_0800efc6): 0 = Odometer NULLEN, 1 = lesen (4 B Float)
+WHEEL_OP_RESET = 0x00
+WHEEL_OP_READ = 0x01
+
+# 0x11 p (Ghidra FUN_08004d90): nur 0/1 gültig, sonst Status 1
+RETRUDE_PARAMS = (RETRUDE_P_TO_BUFFER, RETRUDE_P_PULL_HUB)
+
+
+class BoxAction:
+    """Box-Abläufe gegen den Bus (vgl. BoxAction.communication_*).
+
+    STATUSPRÜFUNG (Review M2, 16.10.2026): Bietet der Bus transact_full
+    (serial485.Serial485), wird das Status-Byte der Antwort ausgewertet:
+    Status != 0 -> CfsStatusError(status, name, data) – AUSSER bei 0x0a
+    (communication_get_box_state), dessen Status regulär Ereignisse trägt
+    (0x30/0x50/gespeicherter Fehler): dort wird NICHT geworfen, der Status
+    kommt als .status der Rückgabe (StatusBytes) zurück (nur dataless
+    0x01/0x02 = Request ungültig/CRC werfen auch dort).
+    raise_on_status=False (Konstruktor, bei extrude/retrude auch je Aufruf)
+    schaltet das Werfen ab; dann trägt die Rückgabe den Status als .status.
+    Alle communication_* geben StatusBytes zurück (bytes-Unterklasse ->
+    API-kompatibel zu den bisherigen Rohdaten). Busse ohne transact_full
+    (Fremd-Adapter): Status unbekannt (.status None), keine Prüfung.
+    """
+
+    def __init__(self, bus, addr=BOX_ADDR, raise_on_status=True):
         self.bus = bus
         self.addr = addr
+        self.raise_on_status = raise_on_status
+
+    def _call(self, fun, data, timeout=TIMEOUT_OPERATIONAL, retries=None,
+              raise_on_status=None, status_is_report=False):
+        """Ein Request an die Box, Antwort als StatusBytes (s. Klasse)."""
+        retries = func_retries(fun) if retries is None else retries
+        raise_on_status = (self.raise_on_status if raise_on_status is None
+                           else raise_on_status)
+        kw = dict(status=STATUS_OPERATIONAL, timeout=timeout, retries=retries)
+        full_fn = getattr(self.bus, "transact_full", None)
+        if full_fn is None:
+            return StatusBytes(self.bus.transact(self.addr, fun, data, **kw),
+                               None, fun)
+        _raddr, rstatus, rfun, rdata, _raw = full_fn(self.addr, fun, data, **kw)
+        out = StatusBytes(rdata, rstatus, rfun)
+        if raise_on_status and rstatus != STATUS_OK:
+            if (not status_is_report
+                    or (rstatus in _REQUEST_ERROR_STATUSES and not rdata)):
+                raise CfsStatusError(rstatus, status_name(rstatus), rdata, rfun)
+        return out
 
     # -- Abfragen (alle Timeout 2 s, STATUS 0xff; vgl. API-box_wrapper.md) --
     def communication_get_rfid(self, num=0x0F):
         """RFID lesen (num = Slotmaske 0x00..0x0f wie im Original, z.B.
         1 = Slot A, 15 = alle; KEINE Slotnummer). Gibt Rohdaten zurück;
         parsen per get_rfid()."""
-        return self.bus.transact(self.addr, FUNC_GET_RFID, [check_mask(num)],
-                                 status=STATUS_OPERATIONAL,
-                                 timeout=TIMEOUT_OPERATIONAL,
-                                 retries=func_retries(FUNC_GET_RFID))
+        return self._call(FUNC_GET_RFID, [check_mask(num)])
 
     def communication_get_remain_len(self, num=0x0F):
         """Restmengen lesen (num = Slotmaske 0x00..0x0f, Default alle)."""
-        return self.bus.transact(self.addr, FUNC_GET_REMAIN_LEN, [check_mask(num)],
-                                 status=STATUS_OPERATIONAL,
-                                 timeout=TIMEOUT_OPERATIONAL,
-                                 retries=func_retries(FUNC_GET_REMAIN_LEN))
+        return self._call(FUNC_GET_REMAIN_LEN, [check_mask(num)])
 
-    def communication_measuring_wheel(self, action=0x01):
-        """Messrad lesen (belegt action [01]; andere TODO). Gibt Float zurück."""
-        raw = self.bus.transact(self.addr, FUNC_MEASURING_WHEEL, [action],
-                                status=STATUS_OPERATIONAL,
-                                timeout=TIMEOUT_OPERATIONAL,
-                                retries=func_retries(FUNC_MEASURING_WHEEL))
+    def communication_measuring_wheel(self, action=WHEEL_OP_READ, reset=False):
+        """Messrad (0x0e [op]).
+
+        op 1 (Default) = lesen -> Float (mm, negativ, s. get_measuring_wheel).
+        op 0 = Odometer NULLEN (Ghidra FUN_0800efc6, Review G1 16.10.2026) –
+          verändert Box-Zustand, live nie vom Host gesendet (0x0e live nur
+          [01]); daher NUR mit reset=True erlaubt, Rückgabe dann die
+          (unbelegte) Antwort als StatusBytes statt Float.
+        Andere ops -> ValueError.
+        """
+        if isinstance(action, bool) or action not in (WHEEL_OP_RESET,
+                                                      WHEEL_OP_READ):
+            raise ValueError("Messrad-op muss 0x01 (lesen) oder 0x00 "
+                             "(nullen, nur mit reset=True) sein: %r"
+                             % (action,))
+        if action == WHEEL_OP_RESET:
+            if reset is not True:
+                raise ValueError("0x0e op 0 nullt das Odometer – nur mit "
+                                 "reset=True erlaubt")
+            return self._call(FUNC_MEASURING_WHEEL, [WHEEL_OP_RESET])
+        raw = self._call(FUNC_MEASURING_WHEEL, [WHEEL_OP_READ])
         return get_measuring_wheel(bytes([action]), raw)
 
     def communication_get_box_state(self):
         """Box-State lesen (0x0a-Poll, Antwort via get_box_status/
         parse_box_state). Wie im Original OHNE Retransmit (retries=0, live
-        10 560 Polls alle ~4 s; ein verpasster Poll wird nicht wiederholt)."""
-        return self.bus.transact(self.addr, FUNC_GET_BOX_STATE, [],
-                                 status=STATUS_OPERATIONAL,
-                                 timeout=TIMEOUT_OPERATIONAL,
-                                 retries=func_retries(FUNC_GET_BOX_STATE))
+        10 560 Polls alle ~4 s; ein verpasster Poll wird nicht wiederholt).
+        Status wirft NICHT (Ereignis-/Fehlerbericht), steht in .status;
+        parse_box_state(rueckgabe) nutzt ihn als frame_status."""
+        return self._call(FUNC_GET_BOX_STATE, [], status_is_report=True)
 
     def communication_get_buffer_state(self):
         """Buffer-State lesen (0x05, 1 Byte)."""
-        return self.bus.transact(self.addr, FUNC_GET_BUFFER_STATE, [],
-                                 status=STATUS_OPERATIONAL,
-                                 timeout=TIMEOUT_OPERATIONAL,
-                                 retries=func_retries(FUNC_GET_BUFFER_STATE))
+        return self._call(FUNC_GET_BUFFER_STATE, [])
 
     def communication_get_filament_sensor_state(self, pos=0x00):
         """Filament-Sensor lesen (0x08 [pos], 1 Byte Bitmaske; .so-Name
         communication_get_filament_sensor_state(addr, pos)). pos 0 = Sensor A,
         1 = Sensor B/Hub (live belegt)."""
-        return self.bus.transact(self.addr, FUNC_GET_FILAMENT_SENSOR_STATE,
-                                 [pos], status=STATUS_OPERATIONAL,
-                                 timeout=TIMEOUT_OPERATIONAL,
-                                 retries=func_retries(
-                                     FUNC_GET_FILAMENT_SENSOR_STATE))
+        if isinstance(pos, bool) or not isinstance(pos, int) \
+                or not 0 <= pos <= 0xFF:
+            raise ValueError("pos muss 0x00..0xff sein: %r" % (pos,))
+        return self._call(FUNC_GET_FILAMENT_SENSOR_STATE, [pos])
 
     def communication_get_hardware_status(self, channel=None):
         """Hardware-Status lesen – .so-Name, KORRIGIERT 15.10.2026: Func 0x15
         (leer, 16 Byte, s. parse_get_hardware_status).
 
-        KOMPATIBILITÄT: mit channel (alte Signatur) wird wie früher 0x08
-        [channel] gesendet (= communication_get_filament_sensor_state).
+        VERALTET (Review G6, 16.10.2026): mit channel (alte Signatur) wird
+        wie früher 0x08 [channel] gesendet – das ist ein ANDERES Kommando.
+        Dafür DeprecationWarning; stattdessen
+        communication_get_filament_sensor_state(channel) verwenden.
         """
         if channel is not None:
+            warnings.warn(
+                "communication_get_hardware_status(channel) sendet 0x08 – "
+                "veraltet, communication_get_filament_sensor_state(channel) "
+                "verwenden", DeprecationWarning, stacklevel=2)
             return self.communication_get_filament_sensor_state(channel)
-        return self.bus.transact(self.addr, FUNC_GET_HARDWARE_STATUS, [],
-                                 status=STATUS_OPERATIONAL,
-                                 timeout=TIMEOUT_OPERATIONAL,
-                                 retries=func_retries(FUNC_GET_HARDWARE_STATUS))
+        return self._call(FUNC_GET_HARDWARE_STATUS, [])
 
     def communication_get_version_sn(self):
         """Version/SN lesen (0x14, ASCII "153"+SN)."""
-        return self.bus.transact(self.addr, FUNC_GET_VERSION_SN, [],
-                                 status=STATUS_OPERATIONAL,
-                                 timeout=TIMEOUT_OPERATIONAL,
-                                 retries=func_retries(FUNC_GET_VERSION_SN))
+        return self._call(FUNC_GET_VERSION_SN, [])
 
     # -- Aktionen (belegte Einzel-Steps; Antwort = Box-ACK, kein Parsen) --
     def communication_set_pre_loading(self, mask, action, timeout=None):
@@ -1058,41 +1284,90 @@ class BoxAction:
         nach Ghidra-Laufzeit (>=380 s), weil ein Retransmit nach 300 s den
         Force-Preload erneut auslösen würde (Mehrslot-Masken > 300 s
         möglich). Die Host-Bursts [00 02] (5 Sendungen in ~20 ms, nie
-        beantwortet) werden NICHT nachgebildet.
+        beantwortet) werden NICHT nachgebildet. Maske 0 bei op 2/3: 980 s
+        (wie 4 Slots, s. preload_force_timeout). Der Bus-Lock wird so lange
+        gehalten (serial485 MAX_BUS_HOLD_S, Review M6).
         timeout = expliziter Override (s).
         """
         if action not in PRELOAD_ACTIONS:
             raise ValueError("Aktion muss 0x00..0x03 sein")
         mask = check_mask(mask)
         if action in PRELOAD_FORCE_ACTIONS:
-            return self.bus.transact(
-                self.addr, FUNC_SET_PRE_LOADING, [mask, action],
-                status=STATUS_OPERATIONAL,
+            return self._call(
+                FUNC_SET_PRE_LOADING, [mask, action],
                 timeout=(preload_force_timeout(mask) if timeout is None
                          else timeout),
                 retries=0)
-        return self.bus.transact(self.addr, FUNC_SET_PRE_LOADING,
-                                 [mask, action],
-                                 status=STATUS_OPERATIONAL,
-                                 timeout=(TIMEOUT_OPERATIONAL if timeout is None
-                                          else timeout),
-                                 retries=func_retries(FUNC_SET_PRE_LOADING))
+        return self._call(FUNC_SET_PRE_LOADING, [mask, action],
+                          timeout=(TIMEOUT_OPERATIONAL if timeout is None
+                                   else timeout))
+
+    def communication_extrude(self, mask, mode, p=0x00, timeout=None,
+                              raise_on_status=None):
+        """Extrude-/Feed-Prozess (0x10 [mask][mode][p]) – geschützter Pfad
+        (Review M3, 16.10.2026).
+
+        mask = 1-hot-Slotmaske (Ghidra: Maske 0 ungültig, eb88 strict;
+          Mehrfachmasken unbelegt -> ValueError, wie cfsseq).
+        mode = EXTRUDE_MODE_* 0..7 (Ghidra FUN_080045c6; > 7 = keine Antwort
+          -> ValueError). mode 3 (EXTRUDE_MODE_CLEAR_ERROR) LÖSCHT den
+          Box-Fehler (STATE_ERROR -> IDLE, Fehlercode 0, FUN_08003e2c); der
+          Host nutzt live stattdessen 0x04 [00 01]. mode 1/2 fördern bis
+          Stillstand (live nie gesendet, Laufzeit unbelegt -> ggf. timeout
+          übergeben). mode 4 antwortet sofort, die Box fördert danach selbst
+          und beantwortet mode 5 (Odometer-Abfrage, Status = Fehler aus mode
+          4, z.B. 0x0c) und mode 6.
+        p = int 0..255 (nur mode 7 nutzt ihn: Extruder-Check p mm, live 3).
+        retries=0 (FUNC_RETRIES, bewusste Abweichung vom Original 4: ein
+        Retransmit würde die Mechanik erneut auslösen); timeout Default
+        FUNC_TIMEOUTS_SO[0x10] = 15 s (live mode 0 <= 7,25 s).
+        Status != 0 -> CfsStatusError (data = Antwortdaten, z.B. Odometer bei
+        mode 5 / Box-Zustand bei mode 0), außer raise_on_status=False.
+        """
+        mask = check_one_hot(mask)
+        if isinstance(mode, bool) or mode not in EXTRUDE_MODES:
+            raise ValueError("0x10-mode muss 0..7 sein (EXTRUDE_MODE_*): %r"
+                             % (mode,))
+        if isinstance(p, bool) or not isinstance(p, int) or not 0 <= p <= 0xFF:
+            raise ValueError("0x10-p muss int 0..255 sein: %r" % (p,))
+        return self._call(FUNC_EXTRUDE, [mask, mode, p],
+                          timeout=(FUNC_TIMEOUTS_SO[FUNC_EXTRUDE]
+                                   if timeout is None else timeout),
+                          raise_on_status=raise_on_status)
+
+    def communication_retrude(self, mask, p, timeout=None,
+                              raise_on_status=None):
+        """Retrude (0x11 [mask][p]) – geschützter Pfad (Review M3).
+
+        mask = 1-hot-Slotmaske oder 0 (Ghidra FUN_08004d90: 0 = alle Slots
+          mit aktivem Sensor B).
+        p = RETRUDE_P_TO_BUFFER (0, bis Buffer-Sensor, live „START“) oder
+          RETRUDE_P_PULL_HUB (1, pull_back_hub, live „FINISH“); andere p
+          beantwortet die FW mit Status 1 -> hier ValueError.
+        retries=0 (bewusste Abweichung vom Original 4, s. FUNC_RETRIES);
+        timeout Default FUNC_TIMEOUTS_SO[0x11] = 150 s (live p1 <= 23 s).
+        Status != 0 (z.B. 0x13/0x14/0x16/0x17/0x19, Busy 0x03 + Zustand) ->
+        CfsStatusError, außer raise_on_status=False.
+        """
+        if mask != 0:
+            mask = check_one_hot(mask)
+        elif isinstance(mask, bool):
+            raise ValueError("Maske muss int sein: %r" % (mask,))
+        if isinstance(p, bool) or p not in RETRUDE_PARAMS:
+            raise ValueError("0x11-p muss 0 oder 1 sein: %r" % (p,))
+        return self._call(FUNC_RETRUDE, [mask, p],
+                          timeout=(FUNC_TIMEOUTS_SO[FUNC_RETRUDE]
+                                   if timeout is None else timeout),
+                          raise_on_status=raise_on_status)
 
     def communication_set_box_mode_feed(self):
         """Feed-Mode betreten (0x04 [00 01]) – live auch zum Fehlerlöschen
         aus STATE_ERROR genutzt (Host nutzt 0x10 mode 3 nie)."""
-        return self.bus.transact(self.addr, FUNC_SET_BOX_MODE, [0x00, 0x01],
-                                 status=STATUS_OPERATIONAL,
-                                 timeout=TIMEOUT_OPERATIONAL,
-                                 retries=func_retries(FUNC_SET_BOX_MODE))
+        return self._call(FUNC_SET_BOX_MODE, [0x00, 0x01])
 
     def communication_set_box_mode_print(self, mask):
         """Print-Mode (0x04 [Maske 00])."""
-        return self.bus.transact(self.addr, FUNC_SET_BOX_MODE,
-                                 [check_mask(mask), 0x00],
-                                 status=STATUS_OPERATIONAL,
-                                 timeout=TIMEOUT_OPERATIONAL,
-                                 retries=func_retries(FUNC_SET_BOX_MODE))
+        return self._call(FUNC_SET_BOX_MODE, [check_mask(mask), 0x00])
 
     def communication_set_preload_inhibit(self, inhibit):
         """Auto-Preload-Sperre setzen (0x0f [01] sperren / [00] frei).
@@ -1104,10 +1379,7 @@ class BoxAction:
             inhibit = int(inhibit)
         if inhibit not in (0x00, 0x01):
             raise ValueError("inhibit muss 0/1 bzw. False/True sein")
-        return self.bus.transact(self.addr, FUNC_PRELOAD_INHIBIT, [inhibit],
-                                 status=STATUS_OPERATIONAL,
-                                 timeout=TIMEOUT_OPERATIONAL,
-                                 retries=func_retries(FUNC_PRELOAD_INHIBIT))
+        return self._call(FUNC_PRELOAD_INHIBIT, [inhibit])
 
     def communication_tighten_up_enable(self, enable):
         """Host-/.so-Name für 0x0f (TIGHTEN_UP_ENABLE) – identisch mit
@@ -1123,8 +1395,10 @@ class BoxAction:
         return self.communication_set_preload_inhibit(act)
 
     # -- TODO (unbelegt, bewusst NICHT implementiert) ---------------------
-    # communication_extrude_process / retrude_process (Stufen + lange
-    #   Timeouts 15/150 s, sensor-/messrad-gesteuert): siehe cfsseq.py.
+    # communication_extrude_process / retrude_process als ABLAUF (Stufen-
+    #   Steuerung sensor-/messrad-gesteuert): siehe cfsseq.py; die
+    #   Einzel-Requests 0x10/0x11 gibt es oben (communication_extrude/
+    #   communication_retrude, seit 16.10.2026).
     # DryRun/Dryer (get/set_dry_mode, pause/continue/auto_dry),
     # create_connect, set_motor_speed, Test-Loop (Tighten-Up = 0x0f und
     # Filament-Sensor = 0x08 sind seit 15.10.2026 oben umgesetzt):
@@ -1144,6 +1418,17 @@ class _FakeBus:
         fun_exp, rdata = serial485.parse_frame(self.answers.pop(0))
         assert fun_exp == fun, (fun_exp, fun)
         return rdata
+
+
+class _FakeBusFull(_FakeBus):
+    """Wie _FakeBus, zusätzlich transact_full (Status-Byte, wie Serial485)."""
+
+    def transact_full(self, addr, fun, data=(), **kwargs):
+        self.calls.append((addr, fun, list(data), dict(kwargs)))
+        raw = self.answers.pop(0)
+        fun_exp, rdata = serial485.parse_frame(raw)
+        assert fun_exp == fun, (fun_exp, fun)
+        return raw[1], raw[3], fun_exp, rdata, raw
 
 
 def selftest():
@@ -1266,10 +1551,17 @@ def selftest():
     # -- 4b. LIVE-GEGENPROBE 15.10.2026: echte 0x0a-Frames aus klippy.log*
     #    (keine SN/UUID darin; CRC wird von parse_frame geprüft) --
     li = parse_box_state(F("f7 01 09 00 0a 16 2e 00 00 00 00 b5"))  # 13.10. IDLE
-    check("live 0x0a R153 IDLE, b5=0, temp/rh-Kandidat",
+    check("live 0x0a R153 IDLE, b5=0, Temp 22 °C / 46 % rF (BEFUND2)",
           li["kind"] == "state" and li["state"] == BOX_STATE_IDLE
           and li["b5"] == 0 and li["rfid_valid_mask"] == 0
-          and li["temp_c_guess"] == 22 and li["rh_guess"] == 46)
+          and li["inlet_tag_mask"] == 0
+          and li["temp_c"] == 22 and li["rh"] == 46
+          and li["temp_c_guess"] == 22 and li["rh_guess"] == 46
+          and not li["block_long"] and li["block_feeder_mask"] == 0)
+    lneg = parse_box_state(serial485.build_frame(
+        BOX_ADDR, FUNC_GET_BOX_STATE, [0xFD, 0x50, 0, 0, 0, 0]))
+    check("0x0a Temperatur int8: 0xfd -> -3 °C", lneg["temp_c"] == -3
+          and lneg["rh"] == 80 and lneg["s1"] == 0xFD)
     lsp = parse_box_state(F("f7 01 09 51 0a 11 35 00 04 01 00 a1"))  # 12.10. key846
     check("live 0x0a SPEED_ERR 0x51 in ERROR, Hub=A",
           lsp["state_name"] == "STATE_ERROR" and lsp["error_code"] == 0x51
@@ -1278,6 +1570,15 @@ def selftest():
     lmb = parse_box_state(F("f7 01 09 19 0a 16 2f 91 04 01 00 95"))  # 13.10. key865
     check("live 0x0a motor block 0x19, flags 0x91",
           lmb["error_code"] == STATUS_PULL_HUB_BLOCK and lmb["flags"] == 0x91)
+    check("0x0a flags 0x91 = Block >10 s, Hauptmotor + Feeder A (BEFUND2)",
+          lmb["block_long"] and lmb["block_main_motor"]
+          and lmb["block_feeder_mask"] == 0x01)
+    check("STATUS 0x50/0x51/0x52/0x1a benannt, 0x53 nicht",
+          STATUS_RUNOUT == 0x50 and STATUS_BUFFER_SLOW == 0x51
+          and STATUS_NO_FEED == 0x52 and STATUS_PULL_HUB_ODO_TIMEOUT == 0x1A
+          and all(c in STATUS_NAMES for c in (0x50, 0x51, 0x52, 0x1A))
+          and 0x53 not in STATUS_NAMES
+          and status_name(0x53) == "unbekannt 0x53")
     l113 = parse_box_state(F("f7 01 07 00 0a 17 34 00 00 81"))  # 05.10. FW 113
     check("live 0x0a FW113 4 Byte -> state_v113, KEIN Ereignis",
           l113["kind"] == "state_v113" and "events" not in l113
@@ -1312,6 +1613,21 @@ def selftest():
         "f7 01 13 00 15 10 20 30 40 50 60 00 00 00 00 00 00 00 00 00 00 ad"))
     check("live 0x15 GET_HARDWARE_STATUS 6 Einträge",
           hw["entries"] == [(i, 0) for i in range(1, 7)])
+    check("live 0x15 Komponenten alle ok (BEFUND2)", hw["all_ok"]
+          and [c["key"] for c in hw["components"]] ==
+          ["eeprom", "aht", "odometer", "buffer", "rfid0", "rfid1"]
+          and all(c["code"] == 0 for c in hw["components"]))
+    hwf = parse_get_hardware_status(serial485.build_frame(
+        BOX_ADDR, FUNC_GET_HARDWARE_STATUS,
+        [0x12, 0x21, 0x30, 0x40, 0x50, 0x61] + [0] * 10))
+    check("0x15 Fehlerfall EEPROM=2, AHT=1, RFID1=1", not hwf["all_ok"]
+          and [c["code"] for c in hwf["components"]] == [2, 1, 0, 0, 0, 1]
+          and [c["ok"] for c in hwf["components"]] ==
+          [False, False, True, True, True, False])
+    hwx = parse_get_hardware_status(serial485.build_frame(
+        BOX_ADDR, FUNC_GET_HARDWARE_STATUS, [0x20] + [0] * 15))
+    check("0x15 Nibble passt nicht zur Position -> code None",
+          hwx["components"][0]["code"] is None and not hwx["all_ok"])
     check("namen 0x08/0x15/0x0f",
           FUNC_GET_FILAMENT_SENSOR_STATE == FUNC_HARDWARE_STATUS_LEGACY_08 == 0x08
           and FUNC_GET_HARDWARE_STATUS == 0x15
@@ -1321,10 +1637,14 @@ def selftest():
     check("builder tighten-up == inhibit",
           build_tighten_up_enable(1) == build_preload_inhibit(True))
     # Retries wie Original (live: Startwert je fun)
-    check("FUNC_RETRIES 0x0a=0, Rest 4",
+    check("FUNC_RETRIES 0x0a=0, 0x10/0x11=0 (bewusste Abweichung), Rest 4",
           func_retries(FUNC_GET_BOX_STATE) == 0
+          and func_retries(FUNC_EXTRUDE) == func_retries(FUNC_RETRUDE) == 0
           and all(func_retries(f) == 4 for f in FUNC_RETRIES
-                  if f != FUNC_GET_BOX_STATE))
+                  if f not in (FUNC_GET_BOX_STATE, FUNC_EXTRUDE, FUNC_RETRUDE)))
+    check("FUNC_RETRIES_ORIGINAL 0x10/0x11 = 4 (live)",
+          FUNC_RETRIES_ORIGINAL[FUNC_EXTRUDE] == FUNC_RETRIES_ORIGINAL[
+              FUNC_RETRUDE] == 4)
 
     # -- 5. Version/SN: Live-Layout, SN durch Platzhalter ersetzt
     #    (DATENSCHUTZ 15.10.2026; CRC neu berechnet, = build_frame) --
@@ -1413,7 +1733,8 @@ def selftest():
           FUNC_MOTOR_ACTION == FUNC_PRELOAD_INHIBIT == 0x0F)
     check("force-timeout 1 slot 380 s", preload_force_timeout(0x01) == 380.0)
     check("force-timeout 4 slots 980 s", preload_force_timeout(0x0F) == 980.0)
-    check("force-timeout maske 0 -> 1 slot", preload_force_timeout(0x00) == 380.0)
+    check("force-timeout maske 0 -> wie 4 slots (G2)",
+          preload_force_timeout(0x00) == 980.0)
     check("extrude-modi re-export",
           EXTRUDE_MODE_EXTRUDER_CHECK == 7 and EXTRUDE_MODE_QUERY == 5
           and EXTRUDER_CHECK_MM == 3 and RETRUDE_P_PULL_HUB == 1)
@@ -1513,11 +1834,180 @@ def selftest():
     check("action 0x08 [01] Hub-Maske",
           act2.communication_get_filament_sensor_state(1) == b"\x01"
           and bus2.calls[2][1:3] == (0x08, [0x01]))
-    act2.communication_get_hardware_status(0)  # alte Signatur -> 0x08
-    check("action alte hw-Signatur -> 0x08", bus2.calls[3][1:3] == (0x08, [0]))
+    import warnings as _w
+    with _w.catch_warnings(record=True) as wl:
+        _w.simplefilter("always")
+        act2.communication_get_hardware_status(0)  # alte Signatur -> 0x08
+    check("action alte hw-Signatur -> 0x08 + DeprecationWarning",
+          bus2.calls[3][1:3] == (0x08, [0])
+          and any(issubclass(x.category, DeprecationWarning) for x in wl))
     act2.communication_tighten_up_enable(1)
     check("action tighten-up 0x0f [01] retries 4",
           bus2.calls[4][1:3] == (0x0F, [1]) and bus2.calls[4][3]["retries"] == 4)
+
+    # -- 8c. Review 16.10.2026: Status-Durchreichung (M2), 0x10/0x11 (M3),
+    #    Wheel-Guard (G1), Maske 0 (G2), box_fw-Formate (G3), Anhang (G4) --
+    st0c = F("f7 01 07 0c 10 c3 30 40 af a4")  # live: 0x10 mode 5, Status 0x0c
+    bus3 = _FakeBusFull([
+        st0c, st0c,
+        F("f7 01 09 51 0a 11 35 00 04 01 00 a1"),  # live 0x0a SPEED_ERR
+        F("f7 01 07 30 0a 03 00 00 00 51"),        # live 0x0a UPDATE_STATE
+        serial485.build_frame(BOX_ADDR, FUNC_GET_BOX_STATE, [], status=0x02),
+        serial485.build_frame(BOX_ADDR, FUNC_RETRUDE, [], status=0x16),
+        F("f7 01 03 00 11 ca"),                    # live leere 0x11-Antwort
+        F("f7 01 03 00 0d 9e"),
+        serial485.build_frame(BOX_ADDR, FUNC_MEASURING_WHEEL, []),
+    ])
+    act3 = BoxAction(bus3)
+    try:
+        act3.communication_extrude(0x02, EXTRUDE_MODE_QUERY)
+        check("M2 Status 0x0c -> CfsStatusError", False)
+    except CfsStatusError as e:
+        check("M2 Status 0x0c -> CfsStatusError (Name, Daten)",
+              e.status == 0x0C and e.name == STATUS_NAMES[0x0C]
+              and e.data == F("c3 30 40 af") and e.fun == FUNC_EXTRUDE)
+    check("M3 extrude: [02 05 00], retries 0, timeout 15 s",
+          bus3.calls[0][1:3] == (0x10, [0x02, 0x05, 0x00])
+          and bus3.calls[0][3]["retries"] == 0
+          and bus3.calls[0][3]["timeout"] == FUNC_TIMEOUTS_SO[0x10] == 15.0)
+    r = act3.communication_extrude(0x02, EXTRUDE_MODE_QUERY,
+                                   raise_on_status=False)
+    check("M2 raise_on_status=False -> StatusBytes .status 0x0c",
+          isinstance(r, bytes) and r == F("c3 30 40 af") and r.status == 0x0C)
+    r = act3.communication_get_box_state()
+    pb = parse_box_state(r)
+    check("M2 0x0a Status 0x51 wirft NICHT, Status durchgereicht",
+          r.status == 0x51 and pb["error_code"] == 0x51
+          and pb["frame_status"] == 0x51)
+    r = act3.communication_get_box_state()
+    check("M2 0x0a UPDATE_STATE 4 B Rohdaten -> event (über .status)",
+          r.status == 0x30 and parse_box_state(r)["kind"] == "event")
+    try:
+        act3.communication_get_box_state()
+        check("M2 0x0a dataless CRC-Status 0x02 wirft", False)
+    except CfsStatusError as e:
+        check("M2 0x0a dataless CRC-Status 0x02 wirft", e.status == 0x02)
+    try:
+        act3.communication_retrude(0x01, RETRUDE_P_TO_BUFFER)
+        check("M2 0x11 Status 0x16 wirft", False)
+    except CfsStatusError as e:
+        check("M2 0x11 Status 0x16 wirft", e.status == 0x16
+              and e.name == "Slot ohne Filament")
+    r = act3.communication_retrude(0x00, RETRUDE_P_PULL_HUB)
+    check("M3 retrude mask 0 (alle), p1, retries 0, timeout 150 s",
+          r == b"" and r.status == 0
+          and bus3.calls[6][1:3] == (0x11, [0x00, 0x01])
+          and bus3.calls[6][3]["retries"] == 0
+          and bus3.calls[6][3]["timeout"] == 150.0)
+    act3.communication_set_pre_loading(0x00, PRELOAD_FORCE_READ)
+    check("G2 0x0d op 2 Maske 0 -> 980 s, retries 0",
+          bus3.calls[7][2] == [0x00, 0x02]
+          and bus3.calls[7][3]["timeout"] == 980.0
+          and bus3.calls[7][3]["retries"] == 0)
+    r = act3.communication_measuring_wheel(WHEEL_OP_RESET, reset=True)
+    check("G1 wheel op 0 mit reset=True sendet [00]",
+          bus3.calls[8][1:3] == (0x0E, [0x00]) and r.status == 0)
+    n_calls = len(bus3.calls)
+    for name, call in (
+            ("G1 wheel op 0 ohne reset", lambda: act3.communication_measuring_wheel(0)),
+            ("G1 wheel op 2", lambda: act3.communication_measuring_wheel(2)),
+            ("M3 extrude mode 8", lambda: act3.communication_extrude(0x01, 8)),
+            ("M3 extrude p 256", lambda: act3.communication_extrude(0x01, 7, 256)),
+            ("M3 extrude maske 0", lambda: act3.communication_extrude(0, 0)),
+            ("M3 extrude maske 0x03", lambda: act3.communication_extrude(3, 0)),
+            ("M3 retrude p 2", lambda: act3.communication_retrude(0x01, 2)),
+            ("M3 retrude maske 0x05", lambda: act3.communication_retrude(5, 0))):
+        try:
+            call()
+            check("guard " + name, False)
+        except ValueError:
+            check("guard " + name, True)
+    check("guards senden nichts", len(bus3.calls) == n_calls)
+    check("M3 mode 3 = Fehler löschen dokumentiert",
+          EXTRUDE_MODE_CLEAR_ERROR == 3
+          and "Fehler" in EXTRUDE_MODES[EXTRUDE_MODE_CLEAR_ERROR])
+
+    # Am ECHTEN Serial485 mit Mock-Port: Status-Fehler + Spätantwort
+    import time as _t
+
+    class _MockPort:
+        def __init__(self, reply=None, delay=0.0):
+            self.reply, self.delay, self.written, self.t0 = reply, delay, [], None
+            self.buf = bytearray()
+
+        def reset_input_buffer(self):
+            self.buf.clear()
+
+        def write(self, frame):
+            self.written.append(bytes(frame))
+            self.t0 = _t.monotonic()
+
+        def read(self, n):
+            if (self.reply is not None and self.t0 is not None
+                    and _t.monotonic() - self.t0 >= self.delay):
+                self.buf += self.reply
+                self.reply = None
+            if self.buf:
+                c = bytes(self.buf[:n])
+                del self.buf[:n]
+                return c
+            _t.sleep(0.002)
+            return b""
+
+    real = serial485.Serial485("/dev/ttyFAKE", ser=_MockPort(st0c))
+    try:
+        BoxAction(real).communication_extrude(0x02, EXTRUDE_MODE_QUERY,
+                                              timeout=0.2)
+        check("M2 echter Serial485: Status 0x0c wirft", False)
+    except CfsStatusError as e:
+        check("M2 echter Serial485: Status 0x0c wirft", e.status == 0x0C
+              and real.ser.written[0] == cfsseq.build_extrude_stage(0x02, 5))
+    late = serial485.Serial485("/dev/ttyFAKE", ser=_MockPort(
+        F("f7 01 03 00 11 ca"), delay=0.1))
+    try:
+        BoxAction(late).communication_retrude(0x02, RETRUDE_P_PULL_HUB,
+                                              timeout=0.03)
+        ok = False
+    except TimeoutError:
+        ok = True
+    check("M3 Spätantwort nach Timeout (retries 0): genau 1 Sendung",
+          ok and len(late.ser.written) == 1 and late.stats()["sent"] == 1)
+    fe = serial485.Serial485("/dev/ttyFAKE", ser=_MockPort(
+        serial485.build_frame(0x81, 0x0e, [1, 2, 3, 4]) + F(
+            "f7 01 07 00 0e c4 e6 fe 0b f3")))
+    check("M1 Box-Messrad: fremder Absender 0x81 übersprungen",
+          abs(BoxAction(fe).communication_measuring_wheel() - (-1847.94)) < 0.02)
+
+    # G3: box_fw-Formate (Host loggt "1.5.3", Wire "153")
+    for val, exp in (("153", 153), ("113", 113), (153, 153), (113, 113),
+                     (b"153", 153), ("1.5.3", 153), ("1.1.3", 113),
+                     (" 1.5.3 ", 153), (None, None)):
+        check("G3 box_fw %r -> %r" % (val, exp), _box_fw_num(val) == exp)
+    for val in ("15", "1.5", "1.10.3", "153" + "1" * 5, 15, 1153, True, "",
+                "abc", "1.5.x"):
+        try:
+            _box_fw_num(val)
+            check("G3 box_fw %r -> ValueError" % (val,), False)
+        except ValueError:
+            check("G3 box_fw %r -> ValueError" % (val,), True)
+    six = F("f7 01 09 00 0a 16 2e 00 00 00 00 b5")
+    check("G3 6-Byte-Frame mit box_fw=113 / '1.1.3' -> unknown",
+          parse_box_state(six, box_fw=113)["kind"] == "unknown"
+          and parse_box_state(six, box_fw="1.1.3")["kind"] == "unknown"
+          and parse_box_state(six, box_fw="1.5.3")["kind"] == "state")
+
+    # G4: Voll-Frame mit angehängtem Byte -> Frame (CRC über len+3 Bytes)
+    rem = F("f7 01 07 00 03 1c ff 00 00 11")
+    check("G4 Frame + Anhang 0x00 -> als Frame geparst",
+          get_remain_len(b"\x0f", rem + b"\x00")
+          == {"A": 28, "B": None, "C": 0, "D": 0})
+    check("G4 0x0a-Frame + 0xF7 -> frame_status erkannt",
+          get_box_status(six + b"\xf7")["frame_status"] == 0
+          and get_box_status(six + b"\xf7")["len"] == 6)
+    bad_tail = bytearray(rem + b"\x00")
+    bad_tail[9] ^= 0xFF  # CRC kaputt -> kein Frame -> Rohdaten (Länge 11)
+    check("G4 kaputte CRC + Anhang -> Rohdaten", not _is_full_frame(bad_tail)
+          and _is_full_frame(rem))
 
     # -- 9. CRC-Negativtest (verfälschtes Byte muss scheitern) --
     bad = bytearray(F("f7 01 07 00 03 1c ff 00 00 11"))

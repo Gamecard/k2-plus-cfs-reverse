@@ -17,7 +17,8 @@ Lizenz: GPL-3.0-or-later (siehe `LICENSE`), Herkunft Dritter in `NOTICES.md`.
 | `AUDIT-UND-AENDERUNGEN.md` | Audit-Protokoll aller Korrekturen mit Begründung |
 | `CHECKLISTE.md` | Projektstatus (erledigt/offen) |
 | `GHIDRA-CFS-BEFUND-2026-10-15.md` | Ghidra-Neuanalyse der CFS-FW R153: Dispatcher, Func-/Status-Tabelle, 0x0a-Layout |
-| `nachbau/` | Python-Module: `serial485`, `boxmini`, `box`, `motor_mini`, `motor`, `cfsseq`, `auto_addr` – alle mit Selbsttests |
+| `GHIDRA-CFS-BEFUND2-2026-10-16.md` | Zweite Ghidra-Runde: Temp/Feuchte, 0x15, Statuscodes 0x50–0x52, Motorblock-Flags, Auto-Addr-Box-Seite, Sensor-Pins |
+| `nachbau/` | Python-Module: `serial485`, `boxmini`, `box`, `motor_mini`, `motor`, `cfsseq`, `auto_addr` – alle mit Selbsttests; `cfswatch` = nur lesender Live-Monitor für `klippy.log` |
 | `nachbau/ref-hi/` | Unabhängige Hi-CFS-Testvektoren (CRC/Frames) zur Kreuzvalidierung |
 | `fw/`, `klippy/`, `config/`, `rootfs-live/` | Live-Artefakte vom Drucker (1.1.7.0) |
 | `ghidra-scripts/` | Ghidra-Skripte (CFS-Import mit korrigierter Basis, Dispatcher-/TBB-Reparatur `CfsDispatch`, Funktionslisten, CRC-Suche) |
@@ -30,14 +31,40 @@ cd nachbau
 for f in serial485 boxmini motor_mini cfsseq auto_addr box motor; do
   python3 "$f.py"   # jeder Selbsttest muss mit Exit-Code 0 enden
 done
+python3 cfswatch.py --selftest
+```
+
+Live-Monitor (sendet nie, öffnet keinen Port, maskiert SN/UUID/Vendor):
+
+```sh
+ssh root@<drucker> 'tail -F /mnt/UDISK/printer_data/logs/klippy.log' | python3 nachbau/cfswatch.py --local
 ```
 
 Echte Hardware braucht `pyserial`; der Import erfolgt erst bei Benutzung
 (`Serial485(port, baud)`), die Tests laufen ohne.
 
-Stand der Selbsttests (15.10.2026 nach Live-Log-Einarbeitung, `ok`-Zeilen, 0 FAIL):
-`serial485` 81/81 (inkl. ref-hi: 16 CRC-Vektoren + 12 Nachrichten), `box` 126,
-`boxmini` 17, `cfsseq` 28, `motor` 98, `motor_mini` 30, `auto_addr` 31.
+Stand der Selbsttests (16.10.2026 nach Review 2 und BEFUND2, `ok`-Zeilen, 0 FAIL):
+`serial485` 93/93 (inkl. ref-hi: 16 CRC-Vektoren + 12 Nachrichten), `box` 179,
+`boxmini` 17, `cfsseq` 28, `motor` 134, `motor_mini` 43, `auto_addr` 33,
+`cfswatch --selftest` OK.
+
+Ghidra-BEFUND2 16.10.2026 (Details: `GHIDRA-CFS-BEFUND2-2026-10-16.md`):
+
+- 0x0a Byte 0/1 = Temperatur °C / rel. Feuchte % (AHT30) belegt; Byte 2 = Motorblock-Flags
+  (Bit 7 > 10 s, Bit 4 Hauptmotor, Bit 0–3 Feeder); Byte 5 = Typ-7-Tag-Sperre (kein „RFID gültig“).
+- 0x15 = Init-Flags der 6 Komponenten (EEPROM, AHT30, Odometer, Buffer-Sensor, 2 RFID-Leser).
+- Statuscodes: 0x50 = Runout im Druck-Slot, 0x51 = SPEED_ERR (print_check), 0x52 = kein Vorschub.
+- Kanal-A-Diagnose: dauerhafte „Hub-Maske A“ in 0x0a = Hub-Sensor A blockiert B/C/D
+  (Filamentrest/Sensor prüfen, danach muss die Hub-Maske leer sein; `cfswatch` zeigt das).
+
+Review 2 (16.10.2026, Details: `AUDIT-UND-AENDERUNGEN.md`):
+
+- `serial485`: Antworten müssen vom angesprochenen Gerät kommen (Absenderprüfung, Broadcasts
+  ausgenommen); `transact_full` liefert das Status-Byte; Bus-Lock-Haltedauer begrenzt.
+- `box`: Status-Byte wird ausgewertet (`CfsStatusError`, `raise_on_status`); Extrude/Retrude
+  (0x10/0x11) bewusst **ohne** Wiederholung, damit ein Timeout die Mechanik nicht erneut auslöst.
+- `motor`/`motor_mini`: F0-Update und Parameter-Schreiben nur mit `confirm=True`
+  (gesperrte IDs zusätzlich `allow_locked=True`).
 
 Live-Gegenprobe 15.10.2026 (Drucker-Logs `klippy.log` 05.–16.10., nur lesend geholt;
 die Logs selbst sind nicht im Repo, Details: `PROTOKOLL-485.md` §3.1 und §6):
@@ -84,8 +111,18 @@ RS485 protocol between the Creality K2 Plus host board and its lower boards
 (CFS filament box, closed-loop motors, belt modules). All findings are backed
 by live captures and Ghidra analysis. License: GPL-3.0-or-later.
 
-Status 15.10.2026: all self-tests green (serial485 81/81 incl. Hi reference
-vectors, box 126, boxmini 17, cfsseq 28, motor 98, motor_mini 30, auto_addr 31).
+Status 16.10.2026: all self-tests green (serial485 93/93 incl. Hi reference
+vectors, box 179, boxmini 17, cfsseq 28, motor 134, motor_mini 43, auto_addr 33,
+`cfswatch.py --selftest` OK).
+
+New: `nachbau/cfswatch.py`, a read-only live monitor for `klippy.log` (never
+transmits, masks SN/UUID/vendor). Second Ghidra pass (`GHIDRA-CFS-BEFUND2-2026-10-16.md`):
+box-state bytes 0/1 are temperature/humidity (AHT30), byte 2 holds motor-block flags,
+0x15 reports the init flags of six components, status 0x50 = runout, 0x51 = speed
+error, 0x52 = no feed; a persistent hub mask "A" means hub sensor A blocks channels
+B–D. Review 2 hardening: replies are matched by sender address, the status byte is
+evaluated, extrude/retrude are sent without retries, and motor F0 updates / parameter
+writes require `confirm=True`.
 
 Live cross-check 15.10.2026 against the printer's own logs (klippy.log, read-only;
 logs not included in the repo): retry semantics confirmed (`retries = 4` means
