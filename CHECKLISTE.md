@@ -461,3 +461,7 @@ box 179 · boxmini 17 · cfsseq 28 · motor 134 · motor_mini 43 · auto_addr 33
 - [x] Strapping-Mechanismus: `[duplicate_pin_override]` + Zeitmultiplex, kein Spezialbefehl
 - [ ] Pi-Host-Modul: Strapping über digital_out vor Broadcast + Extruder über transparent_send nachbauen
 - [ ] `mcu0_130`-Dictionary ohne `transparent_*` prüfen (vermutl. Extraktionslücke)
+- [x] Pi-Host-Modul ENTWURF `pi-host/` (16.10.2026): k2_transport.py (RS485 + transparent_send), k2_motor_init.py
+  ([k2_motor] für Upstream-Klipper: Strapping, Init P0–P9, Param-Abgleich, Extruder via transparent 0x81),
+  test_k2_motor.py 9/9 offline. Review-Fixes: Pins vor Connect, gültige print_time, query_gpio_status
+- [ ] pi-host: Test mit echtem Upstream-Klipper (Pi) + Creality-MCU-FW; Rs485Transport an Klipper-Reactor anbinden
