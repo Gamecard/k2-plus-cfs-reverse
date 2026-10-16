@@ -313,6 +313,73 @@ Strapping-Tiefe gilt die Hauptanalyse.
    nach erfolgreichem Param-Abgleich – ein Ersatz sollte dieselbe Reihenfolge einhalten (gemeinsame ttyS5-Queue).
 5. **UUID-Poll ist optional:** `12 02` gehört nicht zur Init; nur nachbauen, wenn ein Client (Display) den
    Endpunkt `motor_dev_uuid` braucht.
-6. **Offen vor dem ersten Live-Lauf:** Trockenlauf von `motor_init.py` gegen FakeBus und die Live-Log-Sequenz;
-   Pegel vor dem Broadcast gegen `MOTOR_READ_ALL_PIN_IO` prüfen (Stock tut das per `query_gpio_status`);
-   transparent-Pfad für den Extruder-Param-Abgleich nachbauen.
+6. **Offen vor dem ersten Live-Lauf:** ~~Trockenlauf von `motor_init.py` gegen FakeBus und die Live-Log-Sequenz~~
+   (**erledigt 16.10.2026**, §10); Pegel vor dem Broadcast gegen `MOTOR_READ_ALL_PIN_IO` prüfen (Stock tut das per
+   `query_gpio_status`); transparent-Pfad für den Extruder-Param-Abgleich nachbauen.
+
+## 10. Abgleich Plan ↔ Boot-Log (`nachbau/motor_init.py`, 16.10.2026)
+
+`nachbau/motor_init.py` setzt §2–§5 und §9 als Plan um: `parse_motor_control_config` (liest `[motor_control]`
+inkl. aufgelöster `[include]`s und die `[stepper_*]`-Pins), `build_init_plan` (Schrittliste P0–P9 mit Ziel, Fun,
+Payload, Timeout, Versuchen, Pausen, Bedingung, „schreibend“, Beleg), `dry_run` (Text, kein Bus),
+`compare_with_log` (Boot-Log-Abgleich, kein Bus) und `run` (nur mit `confirm=True`; schreibende Schritte nur mit
+`allow_write=True`, Broadcast zusätzlich nur mit `strapping_ok=True`; GPIO-/transparent-Schritte und 0x85 werden
+immer übersprungen). Bewusste Abweichungen vom Stock: Extruder-Param-Abgleich über transparent 0x81 markiert
+(„transparent – Nachbau fehlt“; `stock_compatible=True` baut den 0x85-Weg nach), ID 226 nicht gesendet, keine
+`12 02`-Abfragen.
+
+**Plan aus der Live-Config** (`--dry-run --config live-1.1.7.0-configs/printer-live.cfg`; `motor_control.cfg`
+liegt nicht neben der Live-Kopie und wird aus `config/F008_CR0CN240319C13/` genommen, das Skript meldet das):
+
+| Phase | Schritte | Inhalt |
+|---|---|---|
+| P0 | 1 | transparent-Kanal (MCU, fehlt im Nachbau) |
+| P1 | 8 + 1 | Dir/Step-Pegel X/Y/Z/Z1 + Rücklesen, danach 0,2 s |
+| P2 | 8 | Runde: `FF 0E 01` ttyS5 + transparent (0,1 s), `0E 02` an 0x81–0x84 + E transparent (je 0,05 s davor), Auswertung (1,0 s, max. 4 Runden) |
+| P3–P6 | 1 / 3 / 5 / 5 | „All motors are normal“; `11 [02]` Z/Z1/E; `0C [0b]` alle; `0C [05]` alle |
+| P7 | 8 + 1 | alle Pins physisch 0, 0,1 s, Rücklesen, 1,0 s |
+| P8 | 65 Lesen, 50 bedingte Writes, 5 × `06 [03]` | X/Y je 16 IDs (9/10/25 + 13 konfigurierte inkl. 226), Z/Z1 je 15, E 3 (transparent) |
+| P9 | 1 | `is_ready`, `auto_addr:start` |
+
+Summe 167 Schritte; aktive Bus-Schritte ttyS5 127, transparent 9; 16 GPIO-Schritte; 63 schreibend;
+4 bewusst nicht gesendet (ID 226 lesen/schreiben an X/Y). Strapping aus der Config: X (DIR 0, STEP 0) = 0x81,
+Y (1, 0) = 0x82, Z (0, 1) = 0x83, Z1 (1, 1) = 0x84 – alle passend. **Nebenbefund (corexy):** Die Pins von
+`motor_x` (PB9/PB10) sind die von `[stepper_y]`, die von `motor_y` (!PB7/PB8) die von `[stepper_x]`; Z/Z1 passen
+namensgleich. Bei corexy treiben `stepper_x`/`stepper_y` die beiden Riemenmotoren, die Namen in `[motor_control]`
+folgen also nicht den Klipper-Stepper-Namen (für die Init ohne Folgen, die Adressen hängen nur an den Pins).
+
+**Abgleich mit dem Boot 16.10.** (`--compare live-logs-2026-10-15/klippy.log`, Zeilen 2259–4311, lokal, nicht im
+Repo; Ausgabe gekürzt, ohne UUIDs und Kalibrierwerte):
+
+```
+Übereinstimmungen: 111 Planschritte, 118 Log-Ereignisse (inkl. Wiederholungen/Runden)
+  je Phase: P1 8, P2 7, P4 3, P5 5, P6 5, P7 8, P8 75
+Adress-Runden: 2 (max. 4)
+  Runde 1: Antwort z=0x83, e=0x81; ohne Antwort: x, y, z1
+  Runde 2: Antwort x=0x81, y=0x82, z=0x83, z1=0x84, e=0x81
+GPIO-Rücklesen: 16/16 Pegel wie geplant (physisch)
+Abweichungen (Ziel/Payload anders): 0
+Bewusst anders als Stock: 6 Planschritte
+  2× Stock sendet, Plan sendet bewusst nicht: ID 226 (X, Y; 0-B-Antwort)
+  4× Stock sendet an 0x85 auf ttyS5 (Stock-Bug): E ID 9/10/25 je 3 Versuche (alle Timeout), E 06 [03]
+Im Log zusätzlich: 0 Init-Ereignisse ohne Planschritt, 4 Client-Polls (12 02, [webhooks:_process_request])
+Im Plan fehlend (nicht im Log): 0
+Bedingte Writes nicht ausgelöst (Wert lag in Toleranz): 37
+Param-Abgleich: 65 Lesungen im Log, 11 Writes live
+Konsistenz isclose ↔ Write im Log: 48/48
+```
+
+Die 11 Writes (alle mit passendem Echo): ID 70 300 → 100 an X, Z, Z1; ID 188 0,01 → 0,1 an X, Y, Z, Z1;
+ID 86 0,028 → 0,035 und ID 87 6 → 2 an Z, Z1. Alle übrigen konfigurierten Werte lagen innerhalb
+`isclose(rel_tol=1e-9, abs_tol=1e-6)` (z. B. ID 86 an X: Float32 0.02800000086 vs. 0.028). Für jede gelesene,
+konfigurierte ID sagt `isclose` genau dann „schreiben“, wenn der Stock auch geschrieben hat (48/48).
+
+**Alle 10 Boots der Live-Logs** (`klippy.log*`, 05.–16.10.) gleich ausgewertet: überall 0 Abweichungen,
+0 zusätzliche Init-Frames, 0 fehlende Schritte, GPIO 16/16, Konsistenz 48/48; 4–5 `12 02`-Polls je Boot.
+Sieben Boots mit 2 Runden und 11 Writes (Kaltstart), drei mit 1 Runde und **0 Writes** (12.10. 22:48,
+13.10. 02:28 und 03:16) – dort waren die Werte noch gesetzt. Das passt zu „flüchtig bis Kaltstart, nach
+Soft-Restart noch gesetzt“ (§4, `motor.py`).
+
+Offen bleiben: transparent-Pfad (Extruder-Adresse, Stall, Schutz, Param-Abgleich), GPIO-Phase über die
+Klipper-MCU und ein echter Lauf. Bis dahin sendet `run()` nur mit ausdrücklicher Freigabe und nie den Broadcast,
+solange die Pins nicht nachweislich gesetzt sind.

@@ -787,6 +787,13 @@ Config-Steuerung, Strapping, Zeiten, Abgleich mit einer Zweitanalyse):
 Abweichungen zu grant (K2): alle vier Achsen antworten (grant: Z/Z1 stumm), Stall/Protection
 an X–Z1 über serial_485 statt transparent, GPIO-Setzen vor **und** nach der Abfrage.
 
+**Nachbau der Sequenz (16.10.2026): `nachbau/motor_init.py`** – Plan P0–P9 aus `[motor_control]`,
+Trockenlauf (`--dry-run`), Abgleich mit dem Boot-Log (`--compare <klippy.log>`) und geschützter Lauf
+(`run(confirm, allow_write, strapping_ok)`). Abgleich gegen alle 10 Live-Boots: 0 Abweichungen, 0 fehlende
+Schritte, 4–5 `12 02`-Client-Polls je Boot getrennt ausgewiesen, `isclose` ↔ Write 48/48; bewusst anders als
+Stock nur ID 226 (nicht gesendet) und der Extruder-Param-Abgleich (transparent statt 0x85). Details
+`MOTOR-INIT-BEFUND-2026-10-16.md` §10.
+
 **flash_param-Enumeration: 227 IDs (0–226), nicht 226** – Namen identisch zu grant (inkl.
 Tippfehler). **Log-Falle:** in `update_flash_param key:… value:N` ist N die **Param-ID**,
 nicht der Wert. Gelesen werden nur IDs 9/10/25 + in `[motor_control]` konfigurierte;

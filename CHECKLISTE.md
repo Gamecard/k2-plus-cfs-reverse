@@ -351,10 +351,20 @@ Quelle: `live-logs-2026-10-15/` (lokal, nicht fürs Repo), Auswertung PROTOKOLL-
   `configurable` ∩ Config, 61 von 227; IDs 9/10/25 immer gelesen; `isclose` abs_tol 1e-6; lesen/schreiben
   je ≤ 3 Versuche; `06 [03]` je Motor; ID 226 nur Host), **Adress-Strapping belegt** (Motor-FW 0x0E Sub 01:
   Adresse = 0x81 + 2·STEP + DIR), Zeiten 0,1/0,2/0,05/1,0/5 s, Stock-Bug Extruder-Param-Abgleich (0x85 auf ttyS5)
-- [ ] **`motor_init.py`** (Nachbau der Init nach `MOTOR-INIT-BEFUND-2026-10-16.md` §9) – zuerst nur
-  **Trockenlauf** gegen FakeBus und die Live-Log-Sequenz, kein Senden ohne Freigabe
+- [x] **`motor_init.py` – ERLEDIGT 16.10.2026** (Nachbau der Init nach `MOTOR-INIT-BEFUND-2026-10-16.md` §9,
+  Ergebnis §10): Config-Parser `[motor_control]`, Plan P0–P9 (167 Schritte, Strapping-Prüfung), Trockenlauf,
+  Boot-Log-Abgleich (alle 10 Live-Boots: 0 Abweichungen, 0 fehlend, Konsistenz `isclose` ↔ Write 48/48),
+  geschützter `run()` (confirm / allow_write / strapping_ok), Selbsttest mit FakeBus und anonymisiertem
+  Log-Auszug. Kein Senden ohne Freigabe.
+- [ ] **GPIO-Phase über die Klipper-MCU** (P1/P7 von `motor_init.py`: Dir/Step-Pegel setzen + `query_gpio_status`
+  zurücklesen, Resend/key799/key800) – fehlt; ohne sie darf der Broadcast `FF 0E 01` nicht gesendet werden
+  (`run(strapping_ok=…)`)
+- [ ] **Echter Lauf `motor_init.py`** am Drucker (erst nach GPIO-Phase und mit Freigabe; zuerst lesend
+  `run(confirm=True)` ohne `allow_write`)
 - [ ] **Extruder-Transparent-Pfad** für den Param-Abgleich nachbauen (E über nozzle_mcu `transparent_send`,
   Adresse 0x81 – Stock-Bug 0x85 auf ttyS5 nicht übernehmen; Vorbild ungenutzter `motor_extruder_sys_param_init`)
+  – in `motor_init.py` als transparent-Schritte markiert („transparent – Nachbau fehlt“: Adresse, Stall-Mode,
+  `0C [0b]/[05]`, Param-Abgleich E)
 - [x] Konstanten-Gegenprüfung: 13 falsch aufgelöste Float-Konstanten der Vorarbeit korrigiert
   (`MOTOR-INIT-BEFUND-2026-10-16.md` §7); `REA-MOTOR-BEFUND`/`MOTOR-FW-BEFUND` geprüft – keine Aussage beruht
   darauf (Prüfvermerk in beiden Dateien). Offen nur, falls künftig weitere Float-Konstanten aus der alten

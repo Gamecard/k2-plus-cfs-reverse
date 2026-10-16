@@ -761,6 +761,37 @@ selbst gegengeprüft; bei der Einarbeitung zusätzlich nachgeprüft (Abschnitt �
   `verify_sys_param` und die Pin-Liste (inkl. Stall-Pins und `!PA9`, die nur die Zweitanalyse nennt).
 - **Code:** unverändert (`motor_init.py` folgt später). Selbsttests unverändert grün.
 
+## 16.10.2026 `nachbau/motor_init.py` (Nachbau Motor-Init, Trockenlauf + Log-Abgleich)
+
+- **Anlass:** CHECKLISTE-Punkt `motor_init.py` (Vorgaben `MOTOR-INIT-BEFUND-2026-10-16.md` §9). Kein
+  Druckerzugriff, nichts gesendet.
+- **Neu `nachbau/motor_init.py`:** `parse_motor_control_config` (`[motor_control]` + `[stepper_*]`-Pins,
+  `[include]` aufgelöst, Werksvorlage `config/F008_CR0CN240319C13/` als Rückfall), `build_init_plan` (P0–P9
+  exakt nach Befund, je Schritt Ziel/Fun/Payload/Timeout/Versuche/Pausen/Bedingung/„schreibend“/Beleg;
+  Strapping-Prüfung 0x81 + 2·STEP + DIR, falsche Pegel → ValueError), `dry_run`, `compare_with_log`
+  (Request-/Result-Zeilen aus klippy.log, Tags `klippy:_connect`/`gcode:<lambda>` = Init,
+  `webhooks:_process_request` = Client-Poll; Runden, GPIO-Pegel, Param-Werte, Konsistenz `isclose` ↔ Write),
+  `run` (PermissionError ohne `confirm=True`; Broadcast, Stall-Mode, `0C [05]`, Param-Writes und `06 [03]` nur
+  mit `allow_write=True`, Broadcast zusätzlich nur mit `strapping_ok=True`; GPIO-/transparent-Schritte und 0x85
+  immer übersprungen). Nutzt `motor.py` (`Motor.read_485_addr`, `set_mode`, `check_protection`,
+  `read_sys_param_raw`, `write_sys_param(confirm=True)`, `update_sys_params(confirm=True)`, Payload-Builder).
+- **Bewusst anders als Stock:** Extruder-Param-Abgleich über transparent 0x81 markiert statt 0x85 auf ttyS5
+  (`stock_compatible=True` baut den Stock-Weg nach, `run()` spricht 0x85 trotzdem nie an); ID 226 nicht
+  gesendet; keine `12 02`.
+- **Ergebnis** (Details `MOTOR-INIT-BEFUND-2026-10-16.md` §10): Plan aus der Live-Config 167 Schritte. Abgleich
+  gegen alle 10 Live-Boots: 0 Abweichungen, 0 fehlend, 0 zusätzliche Init-Frames, GPIO 16/16,
+  Konsistenz 48/48; 7 Kaltstarts mit 11 Writes, 3 Soft-Restarts mit 0 Writes. Nebenbefund corexy:
+  `motor_x`-Pins = `[stepper_y]`, `motor_y`-Pins = `[stepper_x]`.
+- **Selbsttest** (`python3 motor_init.py --selftest`, 67 Prüfungen, im Repo 66 ohne lokale `ptable_fix.json`):
+  Plan aus der echten Live-Config, Strapping-Formel für alle 4 Motoren + Negativfall, Abgleich gegen einen
+  eingebetteten, gekürzten Boot-Log-Auszug (135 echte Zeilen; UUID-Antworten durch `cd ab 00×6` ersetzt,
+  Kalibrierwerte ID 9/25 synthetisch, CRC neu), PermissionError-Verhalten, FakeBus-Läufe (lesend, schreibend,
+  2 Runden, Abbruch nach 4 Runden, ohne `strapping_ok`, `stock_compatible`).
+- **Doku:** MOTOR-INIT-BEFUND §9.6/§10, CHECKLISTE (erledigt; offen GPIO-Phase über MCU, Transparent-Pfad,
+  echter Lauf), PROTOKOLL-485.md §3.1 Verweis, lokale Übergabenotiz (nicht im Repo).
+- **Selbsttests:** alle 9 grün (serial485, box, boxmini, cfsseq, motor, motor_mini, auto_addr, cfswatch,
+  motor_init). Bestehende Module unverändert.
+
 ## Anonymisierung (Repo-Fassung)
 
 Gegenüber der lokalen Forschungsablage sind im Repo folgende Werte durch syntaktisch

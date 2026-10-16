@@ -22,7 +22,7 @@ Lizenz: GPL-3.0-or-later (siehe `LICENSE`), Herkunft Dritter in `NOTICES.md`.
 | `MOTOR-INIT-BEFUND-2026-10-16.md` | Statische Rekonstruktion der Stock-Motor-Init (`set_motor_pin`): Ablauf, Fehlerzweige, Param-Abgleich, Adress-Strapping, Vorgaben für den Pi-Ersatz |
 | `GHIDRA-CFS-BEFUND-2026-10-15.md` | Ghidra-Neuanalyse der CFS-FW R153: Dispatcher, Func-/Status-Tabelle, 0x0a-Layout |
 | `GHIDRA-CFS-BEFUND2-2026-10-16.md` | Zweite Ghidra-Runde: Temp/Feuchte, 0x15, Statuscodes 0x50–0x52, Motorblock-Flags, Auto-Addr-Box-Seite, Sensor-Pins |
-| `nachbau/` | Python-Module: `serial485`, `boxmini`, `box`, `motor_mini`, `motor`, `cfsseq`, `auto_addr` – alle mit Selbsttests; `cfswatch` = nur lesender Live-Monitor für `klippy.log` |
+| `nachbau/` | Python-Module: `serial485`, `boxmini`, `box`, `motor_mini`, `motor`, `cfsseq`, `auto_addr` – alle mit Selbsttests; `cfswatch` = nur lesender Live-Monitor für `klippy.log`; `motor_init` = Plan/Trockenlauf/Log-Abgleich der Motor-Init |
 | `nachbau/ref-hi/` | Unabhängige Hi-CFS-Testvektoren (CRC/Frames) zur Kreuzvalidierung |
 | `fw/`, `klippy/`, `config/`, `rootfs-live/` | Live-Artefakte vom Drucker (1.1.7.0) |
 | `ghidra-scripts/` | Ghidra-Skripte (CFS-Import mit korrigierter Basis, Dispatcher-/TBB-Reparatur `CfsDispatch`, Funktionslisten, CRC-Suche) |
@@ -36,7 +36,11 @@ for f in serial485 boxmini motor_mini cfsseq auto_addr box motor; do
   python3 "$f.py"   # jeder Selbsttest muss mit Exit-Code 0 enden
 done
 python3 cfswatch.py --selftest
+python3 motor_init.py --selftest
 ```
+
+Motor-Init (sendet nie): `python3 motor_init.py --dry-run` zeigt die Init-Sequenz aus der Live-Config,
+`python3 motor_init.py --compare <klippy.log>` gleicht sie mit einem Boot-Log ab.
 
 Live-Monitor (sendet nie, öffnet keinen Port, maskiert SN/UUID/Vendor):
 
@@ -50,7 +54,7 @@ Echte Hardware braucht `pyserial`; der Import erfolgt erst bei Benutzung
 Stand der Selbsttests (16.10.2026 nach der Live-Prüfung 0x13–0x16, `ok`-Zeilen, 0 FAIL):
 `serial485` 93/93 (inkl. ref-hi: 16 CRC-Vektoren + 12 Nachrichten), `box` 179,
 `boxmini` 17, `cfsseq` 28, `motor` 208, `motor_mini` 64, `auto_addr` 33,
-`cfswatch --selftest` OK.
+`cfswatch --selftest` OK; `motor_init --selftest` 66 Prüfungen ok (16.10.2026).
 
 > **WARNUNG – Creality-Host-Bug:** `MOTOR_GET … DATA=0` und `MOTOR_GET … DATA=13` lassen
 > `motor_control_wrapper.so` intern scheitern (`key60: Internal error on command:MOTOR_GET`)
@@ -87,6 +91,8 @@ einer Zweitanalyse durch einen weiteren KI-Agenten; Details: `MOTOR-INIT-BEFUND-
 - `0x12 [02]` (UUID) ist **kein** Init-Schritt, sondern ein Webhook-Poll (`motor_dev_uuid`).
 - Stock-Bug: Der Param-Abgleich spricht den Extruder als 0x85 auf ttyS5 an (nur Timeouts), statt über
   den transparent-Pfad der Düsen-MCU.
+- Nachbau `nachbau/motor_init.py`: Plan, Trockenlauf und Boot-Log-Abgleich; gegen 10 Live-Boots ohne
+  Abweichung. Offen: GPIO-Phase über die Klipper-MCU, transparent-Pfad (Extruder), echter Lauf.
 
 Motor-FW-Befund 16.10.2026 (statische Analyse der Motor-Firmware selbst, Details:
 `MOTOR-FW-BEFUND-2026-10-16.md`, `PROTOKOLL-485.md` §3.1 „NACHTRAG (4)“):
@@ -210,7 +216,8 @@ system parameters (`0x06`, only configurable IDs set in the config plus IDs 9/10
 `abs_tol=1e-6`) and finally fires `auto_addr:start`. The motor firmware derives its bus address from the
 pin levels (**address strapping**: 0x81 + 2·STEP + DIR). `0x12 [02]` (UUID) is a webhook poll, not part
 of the init. Stock bug: the parameter sync addresses the extruder as 0x85 on ttyS5 instead of using the
-nozzle-MCU transparent path.
+nozzle-MCU transparent path. `nachbau/motor_init.py` rebuilds the sequence as a plan with dry run and
+boot-log comparison (matches all 10 captured boots; never sends without explicit confirmation).
 
 Motor firmware found and analysed statically (16.10.2026, `MOTOR-FW-BEFUND-2026-10-16.md`,
 German): `fw/F008|F012/mot*_022_C30-mot2_002_081.bin` is a **WCH RISC-V (CH32V30x-class)**
