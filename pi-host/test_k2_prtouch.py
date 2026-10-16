@@ -233,7 +233,7 @@ def make_ctl(z_start=0.2, z_true=0.0, cfg_over=None, fake_over=None):
     cfg_over = dict(cfg_over or {})
     fake_over = dict(fake_over or {})
     base = {"allow_move": True, "step_mm": 0.02, "probe_speed": 5.0,
-            "max_travel_mm": 5.0}
+            "max_travel_mm": 5.0, "packing": "struct"}  # Fakes liefern feste Breite
     base.update(cfg_over)
     cfg = K.parse_options(base)
     tool = FakeToolhead(z_start=z_start,
@@ -393,7 +393,127 @@ def test_extra_can_brk_retry():
     check("(x) normal → can_brk True", can2 is True)
 
 
+# Echte Pakete (Live-Lesetest 16.10.2026, Düsen-MCU, Stock-READ-Parameter):
+LIVE_PACKED = [('08aaab5679b6082c7301927201a27201927201927201927201a27201', '081012f034ea30c500bfdf359b002f', [146176342, 146271362, 146366228, 146461110, 146555976, 146650842, 146745708, 146840590], [-1428240, -1428192, -1427995, -1428060, -1428093, -1428040, -1427885, -1427838]), ('08aaabf20ec2089471019c7301d27101927201d87301a27201a27201', '0814166a37ea5effd8fe631cb100c100b1', [146935538, 147030150, 147125282, 147219956, 147314822, 147410014, 147504896, 147599778], [-1427606, -1427768, -1428064, -1427965, -1427937, -1427760, -1427567, -1427646]), ('0902aaab2a41a809d672014a72019e7201927201927201927201d87301927201', '090000025a35ea67232d27f6e4fcad', [162021674, 162116608, 162211402, 162306280, 162401146, 162496012, 162590878, 162686070, 162780936], [-1428134, -1428031, -1427996, -1427951, -1427912, -1427922, -1427950, -1427954, -1428037])]
+
+
+def test_live_packed_decode():
+    cfg = K.parse_options({})
+    check("(live) Default packing = packed", cfg["packing"] == "packed")
+    for tk, dt, exp_t, exp_d in LIVE_PACKED:
+        t = K.decode_ticks(bytes.fromhex(tk), cfg)
+        d = K.decode_pres_datas(bytes.fromhex(dt), cfg)
+        check("(live) Paket n=%d ticks exakt" % len(t), t == exp_t)
+        check("(live) Paket n=%d datas exakt" % len(d), d == exp_d)
+        dts = [(b - a) & 0xFFFFFFFF for a, b in zip(t, t[1:])]
+        check("(live) Abstand 0,78..0,80 ms", all(93500 <= x <= 96500 for x in dts))
+        check("(live) Ruhewert um -1,428e6", all(-1430000 < v < -1426000 for v in d))
+    try:
+        K.decode_packed(bytes.fromhex(LIVE_PACKED[0][1])[:-1])
+        check("(live) verkürzter Puffer -> Fehler", False)
+    except ValueError:
+        check("(live) verkürzter Puffer -> Fehler", True)
+
+
+# Live-Test D1 (16.10.2026): 8 Blöcke à <=8 Samples aus dem 64er-Ring (dekodiert)
+LIVE_D1 = [(0, [462289465, 462384385, 462479321, 462574299, 462668985, 462763905, 462858825], [-1427901, -1427746, -1427906, -1427725, -1427921, -1427938, -1427640]), (8, [463902365, 463997285, 464092205, 464187125, 464282061, 464376981, 464471917, 464566523], [-1427658, -1427741, -1427844, -1427841, -1428038, -1427964, -1427806, -1427800]), (16, [465515473, 465610409, 465705329, 465800249, 465895185, 465989791, 466084711, 466179647], [-1427644, -1427681, -1427749, -1427591, -1427509, -1427641, -1427408, -1427400]), (24, [467223517, 467318107, 467413027, 467507963, 467602899, 467697819, 467792739, 467887675], [-1427843, -1427994, -1427708, -1427409, -1427500, -1427741, -1427747, -1427628]), (32, [468836519, 468931125, 469026061, 469121181, 469215873, 469310805, 469405647, 469500739], [-1427628, -1427614, -1427658, -1427858, -1427873, -1427708, -1427378, -1427432]), (40, [470639049, 470733969, 470828889, 470923641, 471018557, 471113411, 471208271, 471303269], [-1427666, -1427966, -1427881, -1427963, -1427936, -1427618, -1427793, -1427419]), (48, [472441963, 472536569, 472631489, 472726409, 472821369, 472916147, 473011103, 473105957], [-1427565, -1427591, -1427742, -1427891, -1427936, -1427924, -1427698, -1427282]), (56, [474149623, 474244639, 474339229, 474434149, 474529069, 474623981, 474718901, 474813837], [-1427492, -1427511, -1427694, -1427781, -1427788, -1427840, -1427553, -1427606])]
+
+
+class _RingQuery:
+    """Fake read_prtouch_pres: liefert die Live-Blöcke als gepackte Puffer."""
+    def __init__(self, blocks):
+        self.blocks = {i: (t, d) for i, t, d in blocks}
+        self.sent = []
+
+    @staticmethod
+    def _pack(vals):
+        n = len(vals)
+        mask = 0
+        body = b""
+        prev = None
+        for i, v in enumerate(vals):
+            x = v if prev is None else v - prev
+            prev = v
+            for sz in (1, 2, 3, 4):
+                lo, hi = -(1 << (8 * sz - 1)), (1 << (8 * sz - 1)) - 1
+                if lo <= x <= hi:
+                    break
+            mask |= (sz - 1) << (2 * i)
+            body += int(x).to_bytes(sz, "little", signed=True)
+        mb = (n + 3) // 4
+        return bytes([n]) + mask.to_bytes(mb, "big") + body
+
+    def send(self, params):
+        self.sent.append(list(params))
+        oid, is_src, ch, idx, ln = params
+        t, d = self.blocks[idx]
+        # Ticks > 2^31 als vorzeichenbehaftete Werte packen (kumuliert ok)
+        tt = [x - (1 << 32) if x >= (1 << 31) else x for x in t]
+        return {"ticks": self._pack(tt), "datas": self._pack(d), "idx": idx,
+                "len": len(d)}
+
+
+def test_live_ring_read():
+    cfg = K.parse_options({})
+    q = _RingQuery(LIVE_D1)
+    pres = K.KlippyPresMcu(None, None, cfg, 0, {})
+    pres._q_read = q
+    t, d = pres.read_pres()
+    check("(ring) 8 Abfragen idx 0..56, len 8, is_src 1",
+          [p[3] for p in q.sent] == list(range(0, 64, 8))
+          and all(p[1] == 1 and p[4] == 8 for p in q.sent))
+    check("(ring) %d Samples zusammengeführt (<= 64)" % len(d), 56 <= len(d) <= 64)
+    check("(ring) Ticks streng steigend", all(b > a for a, b in zip(t, t[1:])))
+    check("(ring) Rohwerte im Ruhebereich", all(-1430000 < v < -1426000 for v in d))
+    ok, info = K.check_rest_ok(d, cfg)
+    check("(ring) Ruhetest ok (dif=%d)" % info["dif"], ok)
+    t2, d2 = K.merge_ring([5, 3, 5, 4], [50, 30, 51, 40], 64)
+    check("(ring) merge_ring sortiert + entfernt Duplikate", t2 == [3, 4, 5] and d2 == [30, 40, 51])
+    t3, _ = K.merge_ring([0xFFFFFFF0, 0x10, 0xFFFFFFF8], [1, 3, 2], 64)
+    check("(ring) merge_ring u32-Überlauf", t3 == [0xFFFFFFF0, 0xFFFFFFF8, 0x10])
+
+
+class _SwapPres:
+    def __init__(self):
+        self.levels = []
+
+    def set_swap(self, level):
+        self.levels.append(level)
+        return {"err": 0, "expar0": 0, "expar1": 71}
+
+
+class _SwapStep:
+    def __init__(self, answers):
+        self.answers = list(answers)
+
+    def read_swap(self):
+        return {"err": 0, "expar0": self.answers.pop(0), "expar1": 71}
+
+
+def test_swap_mechanism():
+    cfg = K.parse_options({})
+    # Erfolgstabelle aus der Emulation des Stock-Moduls (16.10.2026):
+    for ans, exp in (((0, 1), True), ((1, 0), False), ((0, 0), False), ((1, 1), False)):
+        pres, step = _SwapPres(), _SwapStep(ans)
+        ctl = K.K2PrtouchController(cfg, pres, step, FakeToolhead(z_start=1.0),
+                                    pause=lambda s: None)
+        try:
+            r = ctl.test_swap()
+            got = True
+            vers = (r["pres"]["pres_ver"], r["step"]["step_ver"])
+        except K.K2PrtouchError:
+            got = False
+            vers = None
+        check("(swap) Pegel %s -> %s" % (ans, "Success" if exp else "ERROR"), got is exp)
+        check("(swap) Reihenfolge sta_swap 0, dann 1", pres.levels == [0, 1])
+        if exp:
+            check("(swap) Versionen 71/71", vers == (71, 71))
+
+
 def main():
+    test_live_ring_read()
+    test_swap_mechanism()
+    test_live_packed_decode()
     test_a_contact_accuracy()
     test_b_step_limits()
     test_c_emergency()

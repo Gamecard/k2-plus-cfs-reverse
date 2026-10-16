@@ -1,5 +1,8 @@
 # BEWEIS: Z-Stopp beim Düsenkontakt (Creality K2 Plus, PrTouch v3) — statischer Nachweis
 
+> **KORREKTUR 16.10.2026 (PRTOUCH-LESETEST-BEFUND-2026-10-16.md §3): §1 ist WIDERLEGT.** Die Emulation des Stock-Moduls zeigt `config_endstop oid=1 pin=PC7` + `config_trsync` + `stepper_stop_on_trigger` und Homing-Event-Handler – der Z-Stopp läuft über einen normalen Klipper-Endstop auf der Swap-Leitung (Düse PA15 → Main PC7). Die Aussagen zu den prtouch-MCU-Befehlen selbst (§2/§3: sie stoppen nichts) bleiben gültig.
+
+
 > Statischer Beweis (weiterer KI-Agent, Ghidra mit korrekter Basis 0x08003000); Kernstellen von uns nachgeprüft: 0x0800426C = gpio_out_write (BSRR/BRR), 0x0800411C = gpio_in_read (IDR), Host-Modul ohne home_start/home_wait/add_stepper/trsync/setup_pin. Arbeitsdateien lokal, nicht im Repo.
 
 

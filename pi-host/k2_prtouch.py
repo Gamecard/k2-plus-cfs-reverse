@@ -178,6 +178,10 @@ MAX_TRAVEL_DEFAULT = 5.0  # Stock-Hub
 Z_LIFT_DEFAULT = 2.0  # wie sample_retract_dist 2.0
 TIMEOUT_DEFAULT_S = 30.0  # wie z_align timeout 30s
 
+READ_CHUNK = 8  # BELEGT 16.10.2026 live: read_prtouch_* liefert <= 8 Samples
+# je Abfrage aus einem 64er-Ringpuffer (idx = Ringposition, laufend
+# überschrieben) -> 8 Blöcke lesen, nach Tick sortieren (merge_ring).
+
 HOST_PY_VER = 1  # eigene Host-Version (nicht Stock-78; ANNAHME: nur
 # geloggt, kein exakter Match nötig – FW-Updates ändern PRES/STEP_VER).
 
@@ -353,6 +357,13 @@ def parse_options(opts):
     # BELEGT: ticks/datas sind Byte-Arrays (%.*s), 64 Samples, little/
     # signed/median-Strings in unzip_data. Byte-Breite statisch nicht
     # entscheidbar → Arbeitshypothese 4B u32-LE / 4B s32-LE (MCU-clock).
+    # BELEGT 16.10.2026 (Live-Lesetest): MCU packt ticks/datas
+    # (n + Größenmaske + Delta-Kodierung) -> packing "packed" (Default).
+    # "struct" = alte Arbeitshypothese (feste Breite, tick/data_format).
+    cfg["packing"] = _str("packing", "packed") or "packed"
+    if cfg["packing"] not in ("packed", "struct"):
+        raise ValueError("packing muss 'packed' oder 'struct' sein: %r"
+                         % (cfg["packing"],))
     cfg["tick_format"] = _str("tick_format", "<I") or "<I"
     cfg["data_format"] = _str("data_format", "<i") or "<i"
     cfg["tick_size"] = _int("tick_size", 4)
@@ -443,7 +454,7 @@ def parse_klipper_config(config):
               "pres_clk_sdo_swap", "cfg_regs", "acq_tick", "aqc_tick",
               "ned_tftr", "ned_hftr", "ned_lftr", "ned_lftr_scale",
               "min_hold", "max_hold", "add_hold", "lmt_dead",
-              "tick_format", "data_format", "tick_size", "data_size",
+              "packing", "tick_format", "data_format", "tick_size", "data_size",
               "clock_freq", "step_dist_mm", "retry_dx", "retry_dy",
               "retry_lift_mm", "temp_nozzle_warn", "temp_bed_warn",
               "temp_tolerance", "shutdown_on_failure"):
@@ -495,20 +506,86 @@ def decode_int_list(raw, fmt, size, count=None):
     return out
 
 
+def decode_packed(raw):
+    """Gepackter MCU-Puffer -> int-Liste (BELEGT live 16.10.2026).
+
+    Format (ticks UND datas von resault_prtouch_pres, 315+3/318 Paketen
+    exakt, s. PRTOUCH-LESETEST-BEFUND-2026-10-16.md):
+      [n][Größenmaske, ceil(n/4) Byte, Big-Endian]
+      [Wert 0 absolut][Wert 1..n-1 als Delta zum Vorgänger]
+    Je Sample i liefert die Maske 2 Bit (LSB zuerst): Länge = Feld+1 Byte,
+    jeder Wert little-endian mit Vorzeichen. Beispiel ticks:
+    08 aaab | 4B Startzeit | 7× 3B Delta (~94 900 Ticks = 0,79 ms).
+    """
+    b = bytes(raw)
+    if not b:
+        return []
+    n = b[0]
+    mb = (n + 3) // 4
+    if len(b) < 1 + mb:
+        raise ValueError("gepackter Puffer zu kurz: %d Byte" % len(b))
+    mask = int.from_bytes(b[1:1 + mb], "big")
+    p = 1 + mb
+    out = []
+    for i in range(n):
+        sz = ((mask >> (2 * i)) & 3) + 1
+        if p + sz > len(b):
+            raise ValueError("gepackter Puffer endet bei Sample %d" % i)
+        v = int.from_bytes(b[p:p + sz], "little", signed=True)
+        p += sz
+        out.append(v if i == 0 else out[-1] + v)
+    if p != len(b):
+        raise ValueError("gepackter Puffer: %d Restbytes" % (len(b) - p))
+    return out
+
+
+def _decode_buf(raw, cfg, fmt, size):
+    if isinstance(raw, (list, tuple)):
+        return [int(x) for x in raw]  # schon dekodiert (merge_ring)
+    if cfg.get("packing", "packed") == "packed":
+        return decode_packed(raw)
+    return decode_int_list(raw, fmt, size)
+
+
 def decode_ticks(raw, cfg):
-    """ticks-Bytes -> u32-Liste (ANNAHME)."""
+    """ticks-Bytes -> Tick-Liste (packed BELEGT; struct = alte Annahme).
+    Gepackte Ticks sind kumuliert -> auf u32 begrenzen (MCU-Uhr läuft über)."""
+    if isinstance(raw, (list, tuple)):
+        return [int(x) & 0xFFFFFFFF for x in raw]  # schon dekodiert
+    if cfg.get("packing", "packed") == "packed":
+        return [t & 0xFFFFFFFF for t in decode_packed(raw)]
     return decode_int_list(raw, cfg["tick_format"], cfg["tick_size"],
                            count=PRES_N if len(bytes(raw)) // int(cfg["tick_size"]) == PRES_N else None)
 
 
 def decode_pres_datas(raw, cfg):
-    """datas-Bytes (pres) -> s32-Liste (ANNAHME)."""
-    return decode_int_list(raw, cfg["data_format"], cfg["data_size"])
+    """datas-Bytes (pres) -> Rohwert-Liste (packed BELEGT)."""
+    return _decode_buf(raw, cfg, cfg["data_format"], cfg["data_size"])
 
 
 def decode_step_counts(raw, cfg):
-    """datas-Bytes (step) -> s32-Zählerliste (ANNAHME)."""
-    return decode_int_list(raw, cfg["data_format"], cfg["data_size"])
+    """datas-Bytes (step) -> Zählerliste (ANNAHME: gleiche Packung wie pres,
+    Main-MCU-Seite live noch nicht mitgeschnitten)."""
+    return _decode_buf(raw, cfg, cfg["data_format"], cfg["data_size"])
+
+
+def merge_ring(ticks, datas, n=PRES_N):
+    """Blöcke aus dem 64er-Ringpuffer zusammenführen (BELEGT live 16.10.):
+    Duplikate (gleicher Tick) entfernen, nach Tick sortieren (u32-Überlauf
+    relativ zum ersten Sample), die jüngsten n behalten."""
+    if len(ticks) != len(datas):
+        raise ValueError("ticks/datas ungleich lang: %d/%d"
+                         % (len(ticks), len(datas)))
+    if not ticks:
+        return [], []
+    ref = int(ticks[0])
+    seen = {}
+    for t, d in zip(ticks, datas):
+        seen[int(t) & 0xFFFFFFFF] = int(d)
+    keyed = sorted(seen.items(),
+                   key=lambda kv: (kv[0] - ref + (1 << 31)) & 0xFFFFFFFF)
+    keyed = keyed[-int(n):]
+    return [k for k, _ in keyed], [v for _, v in keyed]
 
 
 def ticks_to_times(ticks, freq=None):
@@ -737,7 +814,8 @@ class KlippyPresMcu(PrtouchMcuOps):
     """Echte pres-Anbindung (ANNAHMEN s. BERICHT §Annahmen).
 
     - oid via mcu.create_oid() in _build_config (vor connect).
-    - config via mcu.add_config_cmd(CMD_CONFIG_PRES, is_init=True).
+    - config via mcu.add_config_cmd(CMD_CONFIG_PRES) wie Stock (is_init
+      False, per Emulation des Stock-Moduls belegt 16.10.2026).
     - start/read/stop via mcu.lookup_query_command(cmd, resp, oid=...)
       nach klippy:connect (ANNAHME Query-Semantik wie Stock-Tupel-Slots).
     - Pins via ppins.lookup_pin/mcu.get_enumeration aufgelöst (wie
@@ -761,22 +839,34 @@ class KlippyPresMcu(PrtouchMcuOps):
         self._q_stop = mcu.lookup_query_command(
             CMD_STOP_PRES, RESP_ACK, oid=self.oid)
 
+    def set_swap(self, level):
+        """Swap-Leitung setzen: stop_prtouch_pres sta_swap=level (BELEGT per
+        Emulation 16.10.: Stock-TEST_SWAP sendet sta_swap 0, dann 1;
+        Antwort ack_prtouch expar1 = PRES_VER, live 71)."""
+        r = self._q_stop.send([self.oid, 1 if level else 0])
+        return {"err": int(r.get("err", 0)), "expar0": int(r.get("expar0", 0)),
+                "expar1": int(r.get("expar1", 0))}
+
     def test_swap(self):
-        # ANNAHME: TEST_SWAP als get_status-Abfrage beider OIDs; hier
-        # via ack-Prüfung (err==0) + Versions-Event. Exakte
-        # PY/PRES/STEP_VER-Register nur per Roh-Mitschnitt beweisbar.
+        # Echter Ablauf in K2PrtouchController.test_swap (set_swap/read_swap).
         return {"py_ver": HOST_PY_VER, "pres_ver": None, "step_ver": None,
-                "note": "ANNAHME: Swap als Sync-Basis, kein Triggertest"}
+                "note": "s. K2PrtouchController.test_swap"}
 
     def start_sampling(self):
         args = build_start_pres_tuple(self.cfg, self.oid)
         return self._q_start.send(list(args))
 
     def read_pres(self):
-        # ANNAHME is_src/ch/idx/len: ch=0 (alle Logs nur CH0), len=64,
-        # is_src=1 (FTR, gefiltert für Trigger), idx=0 (Ringoffset 0).
-        res = self._q_read.send([self.oid, 1, 0, 0, PRES_N])
-        return bytes(res["ticks"]), bytes(res["datas"])
+        # BELEGT live 16.10.2026: is_src=1 = Rohwerte (Skala wie Stock-
+        # READ_PRES, ~-1,428e6), is_src=0 = anderer (kleiner, gefilterter)
+        # Kanal; ch=0; je Abfrage <= 8 Samples aus dem 64er-Ring (idx =
+        # Ringposition) -> 8 Blöcke lesen, merge_ring. Rückgabe: Listen.
+        ts, ds = [], []
+        for idx in range(0, PRES_N, READ_CHUNK):
+            res = self._q_read.send([self.oid, 1, 0, idx, READ_CHUNK])
+            ts += decode_ticks(bytes(res["ticks"]), self.cfg)
+            ds += decode_pres_datas(bytes(res["datas"]), self.cfg)
+        return merge_ring(ts, ds, PRES_N)
 
     def stop_sampling(self, ok=True):
         try:
@@ -804,9 +894,16 @@ class KlippyStepMcu(PrtouchMcuOps):
         self._q_stop = mcu.lookup_query_command(
             CMD_STOP_STEP, RESP_ACK, oid=self.oid)
 
+    def read_swap(self):
+        """Swap-Pegel lesen: stop_prtouch_step (BELEGT per Emulation 16.10.:
+        ack expar0 = gelesener Pegel, expar1 = STEP_VER, live 71)."""
+        r = self._q_stop.send([self.oid])
+        return {"err": int(r.get("err", 0)), "expar0": int(r.get("expar0", 0)),
+                "expar1": int(r.get("expar1", 0))}
+
     def test_swap(self):
         return {"py_ver": HOST_PY_VER, "pres_ver": None, "step_ver": None,
-                "note": "ANNAHME s. KlippyPresMcu"}
+                "note": "s. K2PrtouchController.test_swap"}
 
     def start_sampling(self):
         return self._q_start.send(list(build_start_step_tuple(self.cfg,
@@ -816,8 +913,14 @@ class KlippyStepMcu(PrtouchMcuOps):
         raise NotImplementedError("step-MCU hat kein pres")
 
     def read_step(self):
-        res = self._q_read.send([self.oid, 0, STEP_N])
-        return bytes(res["ticks"]), bytes(res["datas"])
+        # ANNAHME (Main-MCU live noch nicht gelesen): wie pres – <= 8
+        # Samples je Abfrage aus 64er-Ring, gleiche Packung.
+        ts, ds = [], []
+        for idx in range(0, STEP_N, READ_CHUNK):
+            res = self._q_read.send([self.oid, idx, READ_CHUNK])
+            ts += decode_ticks(bytes(res["ticks"]), self.cfg)
+            ds += decode_step_counts(bytes(res["datas"]), self.cfg)
+        return merge_ring(ts, ds, STEP_N)
 
     def stop_sampling(self, ok=True):
         try:
@@ -976,7 +1079,36 @@ class K2PrtouchController:
         return "\n".join(lines)
 
     def test_swap(self):
-        """TEST_SWAP-Äquivalent (BELEGT Versionen PY/PRES/STEP)."""
+        """TEST_SWAP-Äquivalent.
+
+        BELEGT (Emulation des Stock-Moduls 16.10.2026, Stock live
+        „Swap Test Success“): pres sta_swap=0 -> step lesen -> pres
+        sta_swap=1 -> step lesen; Erfolg genau dann, wenn die Main-MCU
+        erst 0, dann 1 meldet (expar0 der step-Antworten). PRES_VER/
+        STEP_VER = expar1 der ersten Antworten (live 71/71).
+        """
+        if hasattr(self.pres, "set_swap") and hasattr(self.step, "read_swap"):
+            try:
+                p0 = self.pres.set_swap(0)
+                s0 = self.step.read_swap()
+                p1 = self.pres.set_swap(1)
+                s1 = self.step.read_swap()
+            except Exception as exc:
+                raise K2PrtouchError("Swap-Test: MCU-Abfrage fehlgeschlagen: %s"
+                                     % exc)
+            ok = int(s0["expar0"]) == 0 and int(s1["expar0"]) == 1
+            info = {"py_ver": HOST_PY_VER, "pres_ver": p0["expar1"],
+                    "step_ver": s0["expar1"], "levels": (s0["expar0"],
+                                                         s1["expar0"]),
+                    "swap_ok": ok}
+            if not ok:
+                raise K2PrtouchError(
+                    "PR_ERR_CODE_SWAP_PIN_DETECTI: The synchronization pin "
+                    "test failed, pres_swap_pin=%s, step_swap_pin=%s "
+                    "(gelesen %s statt (0, 1))."
+                    % (self.cfg["pres_swap_pin"], self.cfg["step_swap_pin"],
+                       info["levels"]))
+            return {"pres": info, "step": info}
         try:
             p = self.pres.test_swap()
         except Exception as exc:
@@ -1151,9 +1283,7 @@ class K2PrtouchController:
                 pt = ticks_to_times(decode_ticks(pt_b, c),
                                     c["clock_freq"])
                 pd = decode_pres_datas(pd_b, c)
-                st = ticks_to_times(
-                    decode_int_list(st_b, c["tick_format"], c["tick_size"]),
-                    c["clock_freq"])
+                st = ticks_to_times(decode_ticks(st_b, c), c["clock_freq"])
                 sd_counts = decode_step_counts(sd_b, c)
                 sd_mm = step_counts_to_mm(sd_counts, c, relative=True)
 
@@ -1384,7 +1514,7 @@ class PrinterK2Prtouch:
         mcu.add_config_cmd(
             "config_prtouch_pres oid=%d idx=%d swp_pin=%d clk_pin=%d "
             "sdo_pin=%d" % (self.pres_oid, int(self.cfg["pres_idx"]),
-                            swp, clk, sdo), is_init=True)
+                            swp, clk, sdo))  # is_init False wie Stock
 
     def _build_step_config(self):
         mcu = self.mcu_step
@@ -1397,8 +1527,7 @@ class PrinterK2Prtouch:
         self._pin_nums.update({"ox": ox, "oy": oy, "oz": oz})
         mcu.add_config_cmd(
             "config_prtouch_step oid=%d oid_xstp=%d oid_ystp=%d "
-            "oid_zstp=%d swp_pin=%d" % (self.step_oid, ox, oy, oz, swp),
-            is_init=True)
+            "oid_zstp=%d swp_pin=%d" % (self.step_oid, ox, oy, oz, swp))
 
     def _stepper_oids(self):
         c = self.cfg
@@ -1410,7 +1539,15 @@ class PrinterK2Prtouch:
         # ANNAHME: Stepper-Objekte tragen ihre MCU-OID (je nach
         # Upstream-Version get_oid()/_oid/oid). Vor Gerätetest prüfen!
         out = []
-        for name in ("stepper_x", "stepper_y", "stepper_z"):
+        # BELEGT per Emulation des Stock-Moduls (16.10.2026): Stock trägt als
+        # oid_zstp den LETZTEN Z-Stepper ein (K2: stepper_z1); z/z1 laufen
+        # synchron. Fallback stepper_z, falls kein stepper_z1 existiert.
+        names = ["stepper_x", "stepper_y", "stepper_z1"]
+        try:
+            self.printer.lookup_object("stepper_z1")
+        except Exception:
+            names[2] = "stepper_z"
+        for name in names:
             try:
                 st = self.printer.lookup_object(name)
             except Exception as exc:

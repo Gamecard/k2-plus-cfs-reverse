@@ -1,4 +1,4 @@
-> **ENTWURF – am echten Gerät UNGETESTET (Stand 16.10.2026).** Klipper-Modul [k2_prtouch] für den eingebauten Kraftsensor. Offline 43/43 + Review-Test. Entwurf durch einen weiteren KI-Agenten, Review durch uns (Fix: max_travel_mm hart ≤ 10 mm). Vor dem ersten echten Test unbedingt die ANNAHMEN-Liste unten am Gerät prüfen, erst mit allow_move: False.
+> **ENTWURF – Sensor-Lesepfad am Gerät GETESTET (16.10.2026, ohne Bewegung, PRTOUCH-LESETEST-BEFUND-2026-10-16.md); Antasten weiter UNGETESTET.** Klipper-Modul [k2_prtouch] für den eingebauten Kraftsensor. Offline 43/43 + Review-Test. Entwurf durch einen weiteren KI-Agenten, Review durch uns (Fix: max_travel_mm hart ≤ 10 mm). Vor dem ersten echten Test unbedingt die ANNAHMEN-Liste unten am Gerät prüfen, erst mit allow_move: False.
 
 # BERICHT – Klipper-Modul [k2_prtouch] (PrTouch v3, K2 Plus)
 
@@ -155,6 +155,17 @@ lmt_dead: 200
 Erstlauf-Reihenfolge: `K2_PRTOUCH_TEST_SWAP` → `K2_PRTOUCH_READ` →
 `K2_PRTOUCH_PROBE DRY_RUN=1` → `allow_move: True` + `K2_PRTOUCH_PROBE` →
 `K2_PRTOUCH_HOME_Z` → `K2_PRTOUCH_MESH COUNT=3`.
+
+## 4a. Stand nach Gerätetest 16.10.2026 (PRTOUCH-LESETEST-BEFUND)
+
+- **1 Datenformat: WIDERLEGT → gepackt** (`packing: packed`, `decode_packed`), live 315+3/318 Pakete exakt.
+- **2 clk/sdo: BELEGT** PB13 = clk, PB14 = sdo (Emulation des Stock-Moduls, wörtlicher `config_prtouch_pres`).
+- **7 read-Args: BELEGT** `is_src=1` = Rohwerte, je Abfrage ≤ 8 Samples aus 64er-Ring (`idx` = Ringposition) → 8 Blöcke + `merge_ring`.
+- **10 Ruhetest:** echte Ruhe-DIF 756–1 292 (64–2 500 Samples) → Schranke 3000 passt.
+- **13 Swap: BELEGT** Ablauf `sta_swap` 0/1 + Rücklesen `expar0` (0, 1) an der Main-MCU; Versionen in `expar1`.
+- **14 Stepper-OIDs:** Stock nimmt den letzten Z-Stepper (`stepper_z1`).
+- **Neu:** Stock nutzt zusätzlich einen normalen Endstop auf `PC7` mit trsync (Z-Stopp über Swap-Leitung) – Pi-Weg über Standard-Probe prüfen (Befund §3).
+- Offen: 3/4/5 (Antast-Parameter-Abbildung), Main-MCU-Lesepfad, PA15-Umschaltung bei Kontakt.
 
 ## 4. ANNAHMEN (vollständig, vor Gerätetest zu klären)
 
