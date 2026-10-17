@@ -70,6 +70,18 @@ Weitere Befehle: `KTWO_BOX_AUTO_REFILL [ENABLE=0|1]` (Laufzeit, Start =
 `CLEAR=1` (nur Box 1, Gruppen ≥ 2 Slots). Status `printer.k2_box`:
 `auto_refill`, `same_material`, `runout_last`.
 
+### 2a. Restmaterial (17.10.2026, README-k2_box.md §12.5)
+
+Läuft die Spule im CFS leer, meldet die Box im Druck Status 0x50, lange
+bevor der Kopfsensor leer wird (der Rest im Schlauch wird weiter gedruckt).
+k2_box merkt das als Restmaterial-Fall (Stock `is_use_ending_material`,
+Status `printer.k2_box.ending_material`). Kommt vorher ein Wechsel (T<n>,
+`M8200 P`) oder das Druckende, wird der Rest **ausgespült** statt
+geschnitten/zurückgezogen (`ending_material_purge`, Default AN). Läuft der
+Rest bis zum Kopfsensor durch, greift wie bisher der Runout oben;
+`KTWO_BOX_RUNOUT` löscht den Merker (Stock `check_material_refill`: kein
+Ausspülen, E30 schiebt den Rest durch).
+
 ## 3. Config (`k2-module.cfg` `[k2_box]`)
 
 | Option | Default | Bedeutung |
@@ -78,6 +90,8 @@ Weitere Befehle: `KTWO_BOX_AUTO_REFILL [ENABLE=0|1]` (Laufzeit, Start =
 | `runout_require_color` | True | RFID-Regel: Farbe muss passen |
 | `runout_resume` | True | nach Erfolg automatisch RESUME |
 | `runout_tail_length` / `_velocity` | 30 / 600 | Stock `G0 E30 F600`; 0 = aus |
+| `ending_material_purge` | True | Restmaterial beim Wechsel/Druckende ausspülen (§2a) |
+| `max_tube_length` / `ending_material_timeout` | 3000 / 3600 | Obergrenze (mm) / Zeitlimit (s) des Ausspülens |
 
 ## 4. Inbetriebnahme
 

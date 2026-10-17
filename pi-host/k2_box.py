@@ -116,6 +116,18 @@ Glied der Makrokette (config-pi/macros.cfg: T0–T15, M8200):
   Änderung; Stock remain_material.save).
 - ``KTWO_BOX_REMAIN [COLOR=] [TYPE=] [TNN=] [CLEAR=1]`` (Nicht-Stock):
   Düsen-Material anzeigen/korrigieren.
+- Restmaterial (17.10.2026, FLUSH-SONDERFAELLE-BEFUND-2026-10-17.md §2,
+  README-k2_box.md §12.5): meldet die Box im Druck Status 0x50 (Spule leer,
+  Rest im Schlauch), spült ``KTWO_BOX_PRE_OPT`` den Rest wie Stock
+  extrusion_all_materials aus (80-mm-Stücke mit max_vol/2,4·60, Blasen +
+  Blech, bis Kopfsensor leer + 1 Stück, max. ``max_tube_length``) statt
+  Schnitt + Rückzug (``ending_material_purge``, Default AN; Kopfsensor
+  unbekannt = Pause, nie blind). ``KTWO_BOX_ENDING [SET=1 SLOT=] [CLEAR=1]
+  [PURGE=1]`` zeigt/setzt/löscht den Fall bzw. spült von Hand.
+- ``KTWO_BOX_END_PRINT [UNLOAD=0|1]`` (= Stock BOX_END, aus END_PRINT):
+  Restmaterial ausspülen; mit ``end_print_unload`` (Default AUS) heizen,
+  schneiden, in die Box zurück. Kein Spülen am Druckende; Fehler nur
+  Meldung (keine Pause, END_PRINT läuft weiter).
 - ``KTWO_BOX_WIPE`` (Abstreifen, Stock-T0-Beispiel 10.1–10.3),
   ``KTWO_BOX_WASTE`` (= M8200 W, hier nur Hinweis),
   ``KTWO_BOX_END_OPT [RETURN=0|1]`` (= M8200 O), ``KTWO_BOX_WAIT``
@@ -374,8 +386,19 @@ CHANGE_DEFAULTS = {
     # Abfallschacht statt am Parkpunkt.
     "runout_tail_length": 30.0,
     "runout_tail_velocity": 600.0,
+    # Restmaterial (FLUSH-SONDERFAELLE-BEFUND-2026-10-17.md §2): Stock
+    # BoxCfg max_tube_length (int, Default 3000 mm) = Obergrenze beim
+    # Ausspülen des Schlauch-Rests; Zeitlimit = Pi-Zusatz (Stock: keins).
+    "max_tube_length": 3000,
+    "ending_material_timeout": 3600.0,
 }
-CHANGE_INT_KEYS = ("wipe_shakes", "max_temp_flush_times")
+CHANGE_INT_KEYS = ("wipe_shakes", "max_temp_flush_times", "max_tube_length")
+# Restmaterial-Ausspülen (Stock BoxAction.extrusion_all_materials Z.1783–
+# 1824): Stücke zu 80 mm (K80 @0x1c781c), danach set_cool_temp (M104 S140,
+# FLUSH-BEFUND §7.2) – Abkühlen nur außerhalb einer Wechselkette (s.
+# PrinterK2Box._ending_purge).
+ENDING_PIECE_MM = 80.0
+ENDING_COOL_TEMP = 140.0
 FLUSH_MODES = ("color", "fixed", "matrix")
 # Düsen-Material persistent (REMAIN-MATERIAL-BEFUND-2026-10-17.md §6):
 # Default-Pfad (leer = aus); Stock: /mnt/UDISK/creality/userdata/box/
@@ -1369,6 +1392,9 @@ def parse_options(opts):
       flush_clean stock|legacy (Default stock), flush_blow (Default True),
       flush_blow_fan (Default fan0), flush_clog_check (Default False) und
       die Stock-[box]-Werte nozzle_volume, flush_multiplier, … (s. oben).
+    - Restmaterial/Druckende (17.10.2026, README-k2_box.md §12.5):
+      ending_material_purge (Default True), max_tube_length (3000 mm),
+      ending_material_timeout (3600 s), end_print_unload (Default False).
     """
     o = {str(k).strip().lower(): v for k, v in dict(opts).items()}
 
@@ -1437,6 +1463,13 @@ def parse_options(opts):
         "flush_blow": _bool("flush_blow", True),
         "flush_blow_fan": _str("flush_blow_fan", "fan0"),
         "flush_clog_check": _bool("flush_clog_check", False),
+        # Restmaterial (Spule im Druck leer, Rest im Schlauch; Stock
+        # is_use_ending_material): beim nächsten Wechsel / M8200 P /
+        # Druckende ausspülen statt Schnitt + Rückzug (Default AN wie Stock).
+        "ending_material_purge": _bool("ending_material_purge", True),
+        # Druckende wie Stock box_end: heizen, schneiden, in die Box zurück
+        # (KTWO_BOX_END_PRINT aus END_PRINT). Default AUS (bisher geladen).
+        "end_print_unload": _bool("end_print_unload", False),
     }
     for key, default in CHANGE_DEFAULTS.items():
         if key in CHANGE_INT_KEYS:
@@ -1476,6 +1509,12 @@ def parse_options(opts):
     if not 0.0 <= cfg["runout_tail_length"] <= 100.0:
         raise ValueError("runout_tail_length muss 0..100 mm sein (Stock 30): %r"
                          % (cfg["runout_tail_length"],))
+    if not 80 <= cfg["max_tube_length"] <= 10000:
+        raise ValueError("max_tube_length muss 80..10000 mm sein (Stock 3000): "
+                         "%r" % (cfg["max_tube_length"],))
+    if not cfg["ending_material_timeout"] > 0:
+        raise ValueError("ending_material_timeout muss > 0 s sein: %r"
+                         % (cfg["ending_material_timeout"],))
     if cfg["change_z_hop"] > 5.0:
         raise ValueError("change_z_hop > 5 mm unplausibel (Stock 0.4): %r"
                          % (cfg["change_z_hop"],))
@@ -1550,7 +1589,7 @@ def parse_klipper_config(config):
                "runout_require_color", "runout_resume",
                "resume_redo_change", "material_database", "flush_mode",
                "remain_material_file", "flush_clean", "flush_blow", "flush_blow_fan",
-               "flush_clog_check")
+               "flush_clog_check", "ending_material_purge", "end_print_unload")
               + tuple(CHANGE_DEFAULTS)):
         if k not in opts:
             v = _g(k, None)
@@ -1708,6 +1747,10 @@ class K2BoxController:
         # Slot (die leere Spule liefert evtl. nur noch "unknown").
         self.print_slot = None
         self.tag_cache = {}
+        # Restmaterial (Stock send_data -> is_use_ending_material): die
+        # Klipper-Hülle wertet jeden 0x0a-Poll aus (Status 0x50 im Druck);
+        # callable(parsed) oder None. Fehler darin stören den Poll nie.
+        self.on_poll = None
 
     class _print_log:
         def info(self, msg):
@@ -1835,6 +1878,11 @@ class K2BoxController:
                 and parsed.get("hub_mask") in SLOT_MASKS:
             self.print_slot = SLOT_LETTERS[SLOT_MASKS.index(
                 parsed.get("hub_mask"))]
+        if self.on_poll is not None:
+            try:
+                self.on_poll(parsed)
+            except Exception:
+                pass
         return parsed
 
     def start_background(self, interval=None):
@@ -2291,6 +2339,20 @@ class PrinterK2Box:
         self.auto_refill = bool(self.cfg.get("runout_refill"))
         self.same_material = []
         self.runout_last = ""
+        # Restmaterial (FLUSH-SONDERFAELLE-BEFUND §2, Stock-Flag
+        # is_use_ending_material): dict slot/tnn/why oder None. Gesetzt aus
+        # dem 0x0a-Poll (Status 0x50 = Einlauf/Hub des Druck-Slots frei) nur
+        # im Druck/in der Pause (_note_ending), gelöscht nach dem Ausspülen,
+        # nach einem erfolgreichen Einzug, im Runout-Nachladen oder per
+        # KTWO_BOX_ENDING CLEAR=1. Nur im Speicher (Stock ebenso).
+        self.ending_material = None
+        self.ending_last = ""
+        # Kein Ausspülen in PRE_OPT (Runout-Nachladen, Nachholen im RESUME):
+        # Grund als Text, "" = erlaubt
+        self._ending_off = ""
+        self._ending_probe = False
+        # KTWO_BOX_END_PRINT läuft: Fehler -> Meldung statt PAUSE (s. _fail)
+        self._end_print = False
         for name, func, desc in (
                 ("KTWO_BOX_PRE_OPT", self.cmd_pre_opt,
                  "Wechsel beginnen (= M8200 P) [TNN=T1A] [Z_HOP=mm]"),
@@ -2335,7 +2397,14 @@ class PrinterK2Box:
                  "[COLOR=0RRGGBB] [TYPE=<id>] [TNN=T1A] [CLEAR=1]"),
                 ("KTWO_BOX_SAME_MATERIAL", self.cmd_same_material,
                  "Gleich-Material-Gruppen (= Stock BOX_UPDATE_SAME_MATERIAL_"
-                 "LIST) [LIST=T1A,T1C/T1B,T1D] [CLEAR=1]")):
+                 "LIST) [LIST=T1A,T1C/T1B,T1D] [CLEAR=1]"),
+                ("KTWO_BOX_ENDING", self.cmd_ending,
+                 "Restmaterial-Fall anzeigen/setzen/löschen bzw. Rest jetzt "
+                 "ausspülen (PURGE=1 = Stock BOX_EXTRUSION_ALL_MATERIALS) "
+                 "[SET=1 SLOT=A] [CLEAR=1] [PURGE=1]"),
+                ("KTWO_BOX_END_PRINT", self.cmd_end_print,
+                 "Druckende (= Stock BOX_END): Restmaterial ausspülen, mit "
+                 "end_print_unload schneiden + in die Box zurück [UNLOAD=0|1]")):
             self.gcode.register_command(name, func, desc=desc)
 
     def _ensure_bus(self):
@@ -2366,6 +2435,7 @@ class PrinterK2Box:
             self.cfg, bus, pause=reactor_sleep(self.reactor),
             logger=self.gcode,
             send_event=getattr(self.printer, "send_event", None))
+        self.controller.on_poll = self._note_ending
         if hasattr(self.reactor, "monotonic"):
             self.controller.clock = self.reactor.monotonic
         return self.controller
@@ -2534,6 +2604,15 @@ class PrinterK2Box:
             "prime_speed": self._prime_speed(),
             "flush_mode": self.cfg.get("flush_mode", "color"),
             "flush_last": self.flush_last or "",
+            # Restmaterial / Druckende (README §12.5): ending_material = Fall
+            # offen (macros.cfg END_PRINT ruft dann KTWO_BOX_END_PRINT)
+            "ending_material": bool(self.ending_material),
+            "ending_material_tnn": (self.ending_material or {}).get("tnn")
+            or "",
+            "ending_material_purge": bool(self.cfg.get(
+                "ending_material_purge")),
+            "ending_last": self.ending_last or "",
+            "end_print_unload": bool(self.cfg.get("end_print_unload")),
         })
         return st
 
@@ -2725,7 +2804,8 @@ class PrinterK2Box:
                 "tnn": "", "start_pos": None, "hop": 0.0,
                 "paused_at_start": False, "source": "",
                 "state_saved": False, "sensor_was_enabled": None,
-                "orig_target": None, "temp_changed": False}
+                "orig_target": None, "temp_changed": False,
+                "ending_purged": False}
 
     def _now(self):
         try:
@@ -3230,7 +3310,11 @@ class PrinterK2Box:
         Wechsel-Temperatur. In einer bestehenden Pause kein CFS_TEMP:
         hotend_temp stammt dort schon aus der ersten Pause."""
         msg = "[k2_box] %s fehlgeschlagen: %s" % (name, text)
-        if self._print_active() and self.cfg.get("pause_on_failure"):
+        # KTWO_BOX_END_PRINT (aus END_PRINT): keine PAUSE am Druckende –
+        # Aufräumen + Fehler, den cmd_end_print abfängt und meldet (END_PRINT
+        # läuft weiter und schaltet die Heizungen aus).
+        if self._print_active() and self.cfg.get("pause_on_failure") \
+                and not self._end_print:
             if not self.chain_error:
                 self.chain_error = msg
             if record:
@@ -3408,9 +3492,35 @@ class PrinterK2Box:
                               "allow_move=%s)" % (ch.get("tnn") or "(ohne TNN)",
                                                   c.get("allow_write"),
                                                   c.get("allow_move")))
-        return self._run_step(gcmd, "PRE_OPT", body, chain_step=False)
+        res = self._run_step(gcmd, "PRE_OPT", body, chain_step=False)
+        # Restmaterial (Stock cmd_CR_BOX_PRE_OPT Z.5761 bzw. Tn_action
+        # Z.4614): Rest ausspülen statt Schnitt + Rückzug
+        if self.chain is ch and ch.get("active") and not ch.get("skip") \
+                and not self.chain_error:
+            self._maybe_ending_purge(gcmd)
+        return res
+
+    def _ending_skip(self, gcmd, name):
+        """CUT/RETRUDE in einer Kette nach dem Restmaterial-Ausspülen: Kopf
+        und Schlauch sind leer -> nichts zu schneiden/zurückzuziehen (Stock
+        Tn_action/box_end: last_cmd None, Kopfsensor leer)."""
+        if self.chain.get("active") and self.chain.get("ending_purged"):
+            gcmd.respond_info("[k2_box] %s übersprungen (Restmaterial "
+                              "ausgespült – Kopf und Schlauch leer)" % (name,))
+            return True
+        if self.ending_material and name == "RETRUDE":
+            gcmd.respond_info(
+                "[k2_box] WARNUNG Restmaterial-Fall offen (%s): der Rückzug "
+                "zieht einen Rest ohne Ende in der Box zurück (ANNAHME: kann "
+                "den Hub verstopfen). Stock spült ihn aus – Kette mit "
+                "KTWO_BOX_PRE_OPT beginnen bzw. KTWO_BOX_ENDING PURGE=1"
+                % (self.ending_material.get("tnn") or "?",))
+        return False
 
     def cmd_cut(self, gcmd):
+        if self._ending_skip(gcmd, "CUT"):
+            return None
+
         def body(gcmd):
             c = self.cfg
             old = self._max_accel()
@@ -3448,6 +3558,9 @@ class PrinterK2Box:
         return self._run_step(gcmd, "SAFE_POS", body)
 
     def cmd_retrude(self, gcmd):
+        if self._ending_skip(gcmd, "RETRUDE"):
+            return None
+
         def body(gcmd):
             c = self.cfg
             slot = gcmd.get("SLOT", None)
@@ -3570,6 +3683,9 @@ class PrinterK2Box:
                 stage7_fn=_stage7, stage7_delay=c["stage7_delay"])
             self._move(gcmd, "Bewegungen abwarten", ["M400"], wrap=False)
             self._remember_tag(ctl, letter)
+            if self.ending_material:
+                # neues Filament bis zum Kopf: der alte Rest ist durch
+                self._ending_clear("Einzug %s erfolgreich" % (tnn,))
             odo = res.get("odo_mm") or []
             gcmd.respond_info("[k2_box] EXTRUDE %s ok (Odometer %s mm, %d Polls)"
                               % (tnn, round(odo[-1], 1) if odo else "?",
@@ -4122,7 +4238,12 @@ class PrinterK2Box:
             "error_resume_process): Schacht, %s °C, Rückzug nur bei belegtem "
             "Hub, Einzug %s, Spülen; danach RESUME wie üblich"
             % (self._abort_text(ab), _n(temp), tnn))
-        self._script(["KTWO_BOX_PRE_OPT TNN=%s Z_HOP=0 SOURCE=T" % (tnn,)])
+        # Stock error_resume_process prüft das Restmaterial-Flag nicht
+        self._ending_off = "Nachholen im RESUME"
+        try:
+            self._script(["KTWO_BOX_PRE_OPT TNN=%s Z_HOP=0 SOURCE=T" % (tnn,)])
+        finally:
+            self._ending_off = ""
         ch = self.chain
         if ch.get("active") and not ch.get("skip") and not self.chain_error:
             def heat(gcmd):
@@ -4325,6 +4446,12 @@ class PrinterK2Box:
         gcmd.respond_info(head)
         temp, tparam = self._runout_temp(gcmd, tnn)
         paused = self._is_paused()
+        if self.ending_material:
+            # Stock check_material_refill: mit Flag -> Kopfsensor aus +
+            # material_auto_refill (kein extrusion_all_materials); der Rest
+            # ist am Kopfsensor vorbei, E30 schiebt ihn hier durch
+            self._ending_clear("Runout-Nachladen %s -> %s (Rest am Kopfsensor "
+                               "vorbei, E30 im Schacht)" % (old_tnn, tnn))
         if plan["clear_error"]:
             try:
                 self._ensure_controller().action.communication_set_box_mode_feed()
@@ -4334,8 +4461,12 @@ class PrinterK2Box:
                 return self._runout_stop(gcmd, "Box-Fehler 0x%02x nicht "
                                          "quittierbar: %s" % (
                                              plan["code"], self._exc_text(exc)))
-        self._script(["KTWO_BOX_PRE_OPT TNN=%s Z_HOP=%s" % (
-            tnn, "0" if paused else _n(c["change_z_hop"]))])
+        self._ending_off = "Runout-Nachladen"
+        try:
+            self._script(["KTWO_BOX_PRE_OPT TNN=%s Z_HOP=%s" % (
+                tnn, "0" if paused else _n(c["change_z_hop"]))])
+        finally:
+            self._ending_off = ""
         if self.chain.get("active") and not self.chain.get("skip"):
             def tail(gcmd):
                 # Stock runout_gcode "G0 E30 F600" (wenn heiß): Rest durch die
@@ -4445,6 +4576,431 @@ class PrinterK2Box:
         groups = self.get_status()["same_material"]
         gcmd.respond_info("[k2_box] Gleich-Material-Gruppen: %s" % (
             groups if groups else "keine (Ersatz per RFID-Vergleich)",))
+
+
+    # =================================================================
+    # Restmaterial („ending material“) + Druckende (17.10.2026,
+    # FLUSH-SONDERFAELLE-BEFUND-2026-10-17.md §2/§3/§8 Vorschlag 1–2,
+    # README-k2_box.md §12.5)
+    # =================================================================
+    # Stock: Box meldet im Druck „Filament-Ende“ (Spule leer, Rest steckt im
+    # Schlauch) -> Flag is_use_ending_material. Beim nächsten Wechsel
+    # (Tn_action Z.4614), bei M8200 P (CR_BOX_PRE_OPT Z.5761) und am
+    # Druckende (box_end Z.5111) wird der Rest dann AUSGESPÜLT
+    # (extrusion_all_materials Z.1783–1824) statt geschnitten und
+    # zurückgezogen – ein Rest ohne Ende in der Box lässt sich nicht sinnvoll
+    # zurückziehen. Pi: Auslöser = 0x0a-Status 0x50 im Druck (_note_ending),
+    # Ausspülen in PRE_OPT (_maybe_ending_purge) bzw. KTWO_BOX_END_PRINT.
+    # Bewusst NICHT übernommen: Stock reactor.pause(t − 0.5) ohne
+    # monotonic() (kehrt sofort zurück, Befund §2.3) – hier wartet je Stück
+    # ein M400; dazu Zeitlimit, Obergrenze ohne Überschreiten, Kopfsensor
+    # unbekannt = Abbruch (Stock fördert dann blind bis 3000 mm).
+    def _note_ending(self, st):
+        """0x0a-Poll -> Restmaterial-Fall merken (Stock BoxAction.send_data
+        Z.2145–2155: Box-Filamentfehler bei print_stats printing/paused und
+        Flag noch nicht gesetzt -> is_use_ending_material = True). Pi-
+        Auslöser: Status 0x50 im PRINT (bzw. gespeicherter Fehler 0x50 im
+        ERROR) = Einlauf oder Hub des Druck-Slots frei (GHIDRA-CFS-BEFUND2
+        §4). Setzt nur den Merker + Meldung, bewegt/sendet nichts."""
+        if self.ending_material is not None or not isinstance(st, dict) \
+                or st.get("kind") != "state":
+            return
+        # Während einer Wechselkette nur der frische Poll aus PRE_OPT
+        # (_maybe_ending_purge): spätere Polls (wait_box_ready vor dem
+        # Einzug) sähen noch das 0x50 des alten Slots.
+        if self.chain.get("active") and not self._ending_probe:
+            return
+        state = st.get("state")
+        if state == _BOX.BOX_STATE_PRINT:
+            code = st.get("frame_status")
+        elif state == _BOX.BOX_STATE_ERROR:
+            code = st.get("error_code")
+        else:
+            return
+        if int(code or 0) != _BOX.STATUS_RUNOUT or not self._print_active():
+            return
+        ctl = self.controller
+        letter = (ctl.print_slot or ctl.loaded_slot) if ctl is not None \
+            else None
+        tnn = ("T%d%s" % (int(self.cfg.get("box_addr", BOX_ADDR_DEFAULT)),
+                          letter)) if letter else ""
+        self.ending_material = {"slot": letter or "", "tnn": tnn,
+                                "why": "Box-Status 0x50 im Druck"}
+        self.ending_last = (
+            "[k2_box] Restmaterial: Spule %s im CFS leer (Box-Status 0x50) – "
+            "der Druck läuft mit dem Rest im Schlauch weiter; beim nächsten "
+            "Wechsel bzw. am Druckende wird der Rest %s" % (
+                tnn or "(Slot unbekannt)",
+                "ausgespült (ending_material_purge)"
+                if self.cfg.get("ending_material_purge") else
+                "wie bisher geschnitten und zurückgezogen "
+                "(ending_material_purge: False)"))
+        try:
+            logging.info(self.ending_last)
+        except Exception:
+            pass
+        try:
+            self.gcode.respond_info(self.ending_last)
+        except Exception:
+            pass
+
+    def _ending_clear(self, why):
+        """Restmaterial-Fall erledigt (Stock Z.3901 Flag = False)."""
+        em = self.ending_material
+        if not em:
+            return
+        self.ending_material = None
+        self.ending_last = "[k2_box] Restmaterial %s erledigt: %s" % (
+            em.get("tnn") or "(Slot unbekannt)", why)
+        try:
+            logging.info(self.ending_last)
+        except Exception:
+            pass
+
+    def _ending_velocity(self, key):
+        """Stock Z.1789–1794: get_material_max_extrusion_speed(last_cmd)·60
+        = max_vol/2,4·60 – OHNE ×0,8 und OHNE 360-Grenze des Normal-
+        Spülens; ohne Wert Tn_extrude_velocity[0] (360). Pi ohne Material-DB
+        bzw. ohne max_vol: Tn_extrude_velocity (bisherige Spülgeschwindig-
+        keit ohne DB). -> (mm/min, Begründung)."""
+        if self.material_db is not None:
+            mp = self._mat(key)
+            if mp.get("vol"):
+                return (float(mp["vol"]) / 2.4 * 60.0,
+                        "max_vol %s/2,4·60, ohne ×0,8 und 360-Grenze"
+                        % _n(mp["vol"]))
+            return (float(self.cfg["tn_extrude_velocity"]),
+                    "Tn_extrude_velocity, Material %s ohne max_vol"
+                    % (key or "unbekannt"))
+        return (float(self.cfg["tn_extrude_velocity"]),
+                "Tn_extrude_velocity, ohne Material-DB")
+
+    def _ending_temp(self, gcmd, key, notes):
+        """Stock Z.1784–1796: get_material_target_temp(last_cmd), in der
+        Pause die gemerkte Drucktemperatur (PRINTER_PARAM.hotend_temp). Pi
+        wie _change_temp: TEMP= fest, sonst max(Basis, Material-Temperatur
+        aus der DB bzw. Tn_extrude_temp); Basis in der Pause _PI_PARAM.
+        hotend_temp, sonst BASE_TEMP= bzw. Extruder-Ziel."""
+        t = gcmd.get_float("TEMP", None, above=0.)
+        if t is not None:
+            return float(t)
+        base = self._runout_base(gcmd) if self._is_paused() \
+            else self._base_temp(gcmd)
+        return max(base, self._db_temp(self._mat(key), "Restmaterial", notes))
+
+    def _ending_purge(self, gcmd, origin):
+        """Rest im Schlauch ausspülen (Stock extrusion_all_materials) ->
+        True = ausgeführt, False = nur Plan (Freigaben fehlen); Fehler ->
+        Ausnahme (Aufrufer: _run_step -> _fail = PAUSE im Druck).
+
+        Ablauf: Kopfsensor aus (in einer Kette schon durch PRE_OPT) ->
+        Schacht -> Heizen -> Schleife: G1 E80 F<v> + M400, Blasen (flush_blow,
+        fan0 flush_blow_time s), Blech OHNE Kreise (bleibt im Schacht) -> Ende,
+        sobald der Kopfsensor nach einem Stück LEER meldet, plus genau ein
+        weiteres Stück (Sensor -> Düse); Obergrenze max_tube_length (letztes
+        Stück gekürzt, nie darüber; Kopf dann noch voll = Fehler);
+        ending_material_timeout = Zeitlimit; Kopfsensor unbekannt (vorher
+        oder unterwegs) = Abbruch, nie blind fördern. Danach: außerhalb
+        einer Kette Abkühlen M104 S140 (Stock set_cool_temp; IN der Kette
+        nicht – EXTRUDE heizt gleich wieder, END_OPT stellt das Ziel zurück),
+        Box 0x04 [00 01] IDLE, Slot vergessen (Stock last_cmd = None).
+        remain_material bleibt (Stock: kein save; in der Düse ist weiter
+        dasselbe Material)."""
+        c = self.cfg
+        em = self.ending_material or {}
+        ch = self.chain
+        in_chain = bool(ch.get("active"))
+        key = self._nozzle_key()
+        if not key and em.get("slot"):
+            tag = self._cached_tag(em["slot"])
+            key = tag[0] if tag else None
+        v, vwhy = self._ending_velocity(key)
+        piece = ENDING_PIECE_MM
+        limit = float(c["max_tube_length"])
+        what = em.get("tnn") or "(Slot unbekannt)"
+        plan = ("Restmaterial %s ausspülen (%s): Kopfsensor aus, Schacht, "
+                "Heizen, je Stück G1 E%s F%s (%s) + Blasen + Blech ohne "
+                "Kreise, bis der Kopfsensor leer meldet + 1 Stück, höchstens "
+                "%s mm; danach %sBox 0x04 [00 01] IDLE, Slot vergessen" % (
+                    what, origin, _n(piece), _n(v), vwhy, _n(limit),
+                    "" if in_chain else "M104 S%s, " % _n(ENDING_COOL_TEMP)))
+        if not self._released():
+            gcmd.respond_info("[k2_box] PLAN %s (allow_write=%s, allow_move=%s"
+                              " – nichts bewegt/gesendet)" % (
+                                  plan, c.get("allow_write"),
+                                  c.get("allow_move")))
+            return False
+        if self._head_filament() is None:
+            raise BoxChangeError(
+                "Restmaterial %s: Kopf-Filamentsensor %s liefert keinen "
+                "Zustand – der Rest wird NICHT blind bis %s mm gefördert. "
+                "Schlauch/Kopf von Hand leeren, dann KTWO_BOX_ENDING CLEAR=1"
+                % (what, c.get("filament_sensor") or "(nicht konfiguriert)",
+                   _n(limit)))
+        gcmd.respond_info("[k2_box] %s" % (plan,))
+        sensor_restore = None
+        if not in_chain:
+            sens = self._obj_status("filament_switch_sensor %s"
+                                    % (c.get("filament_sensor"),))
+            if "enabled" in sens:
+                sensor_restore = bool(sens["enabled"])
+                self._set_head_sensor(False)
+        old_accel = self._max_accel()
+        old_mcr = self._min_cruise_ratio()
+        arcs = self._lookup("gcode_arcs") is not None
+        blow_fan = c.get("flush_blow_fan") if c.get("flush_blow") else ""
+        fan = self._pin(blow_fan) if blow_fan else None
+        length, n, done = 0.0, 0, False
+        t0 = self._now()
+        try:
+            if self._go_extrude_pos(gcmd):
+                self._move(gcmd, "Schacht erreicht", ["M400"], wrap=False)
+            notes = []
+            temp = self._ending_temp(gcmd, key, notes)
+            self._respond_notes(gcmd, notes)
+            self._heat(gcmd, temp)
+            stop_next = False
+            while True:
+                seg = min(piece, limit - length)
+                if seg <= 1e-6:
+                    break
+                self._go_extrude_pos(gcmd)
+                n += 1
+                self._move(gcmd, "Restmaterial %d (%s mm, gesamt %s mm)" % (
+                    n, _n(seg), _n(length + seg)),
+                    gcode_extruder_move(seg, v) + ["M400"])
+                length += seg
+                if fan is not None:
+                    cur = self._pin(blow_fan) or fan
+                    sc = fan[1] or 255.0
+                    self._move(gcmd, "Blasen %d (Stock blow)" % n,
+                               gcode_blow(blow_fan, c["flush_blow_time"],
+                                          cur[0] * sc, sc), wrap=False)
+                self._move(gcmd, "Reinigung %d (Blech, bleibt im Schacht)" % n,
+                           gcode_nozzle_clean(c, False, 0.0, old_accel,
+                                              old_mcr, arcs))
+                if stop_next:
+                    done = True
+                    break
+                if length >= limit - 1e-6:
+                    break
+                if self._now() - t0 > float(c["ending_material_timeout"]):
+                    raise BoxChangeError(
+                        "Restmaterial %s: Zeitlimit %s s überschritten nach "
+                        "%s mm (ending_material_timeout) – abgebrochen"
+                        % (what, _n(c["ending_material_timeout"]),
+                           _n(length)))
+                head = self._head_filament()
+                if head is None:
+                    raise BoxChangeError(
+                        "Restmaterial %s: Kopf-Filamentsensor liefert nach "
+                        "%s mm keinen Zustand mehr – abgebrochen (nicht "
+                        "blind weiter)" % (what, _n(length)))
+                stop_next = head is False
+            if not done:
+                head = self._head_filament()
+                if head is not False:
+                    raise BoxChangeError(
+                        "Restmaterial %s: Obergrenze max_tube_length %s mm "
+                        "erreicht, Kopfsensor meldet %s – Schlauch/Sensor "
+                        "prüfen" % (what, _n(limit), "weiter Filament" if head
+                                    else "keinen Zustand"))
+                gcmd.respond_info(
+                    "[k2_box] WARNUNG Restmaterial %s: Kopfsensor erst an der "
+                    "Obergrenze %s mm leer – das letzte Stück (Sensor -> "
+                    "Düse) fehlt" % (what, _n(limit)))
+        except Exception:
+            if old_accel is not None:
+                try:
+                    self._script([_velocity_limit(old_accel, old_mcr)])
+                except Exception:
+                    pass
+            raise
+        finally:
+            if sensor_restore is not None:
+                self._set_head_sensor(sensor_restore)
+        if not in_chain:
+            self._move(gcmd, "Abkühlen (Stock set_cool_temp)",
+                       ["M104 S%s" % _n(ENDING_COOL_TEMP)], wrap=False)
+        ctl = self._ensure_controller()
+        ctl.action.communication_set_box_mode_feed()   # 0x04 [00 01] IDLE
+        ctl.loaded_slot = None
+        ctl.print_slot = None
+        self._ending_clear("%s mm in %d Stücken ausgespült (%s)" % (
+            _n(length), n, origin))
+        gcmd.respond_info("%s – Box IDLE, Slot vergessen, Düsen-Material "
+                          "unverändert" % (self.ending_last,))
+        return True
+
+    def _maybe_ending_purge(self, gcmd):
+        """Nach PRE_OPT (Kette aktiv, kein Skip/Fehler): Restmaterial-Fall
+        offen -> ausspülen; CUT/RETRUDE der Kette entfallen dann. Vorher ein
+        frischer 0x0a-Poll (lesend, nur im Druck mit Freigaben), damit ein
+        0x50 seit dem letzten Timer-Poll nicht verloren geht."""
+        if self._ending_off:
+            return
+        c = self.cfg
+        if c.get("ending_material_purge") and self._released() \
+                and self._print_active():
+            self._ending_probe = True
+            try:
+                self._ensure_controller().poll_status()
+            except Exception:
+                pass
+            finally:
+                self._ending_probe = False
+        em = self.ending_material
+        if not em:
+            return
+        if not c.get("ending_material_purge"):
+            gcmd.respond_info(
+                "[k2_box] HINWEIS Restmaterial %s: ending_material_purge: "
+                "False – Schnitt + Rückzug wie bisher (Rest ohne Ende in der "
+                "Box wird zurückgezogen)" % (em.get("tnn") or "?",))
+            self._ending_clear("ending_material_purge aus – Schnitt + Rückzug")
+            return
+
+        def body(gcmd):
+            origin = ("Druckende" if self._end_print else "Wechsel %s" % (
+                self.chain.get("tnn") or "M8200 P",))
+            if self._ending_purge(gcmd, origin):
+                self.chain["ending_purged"] = True
+        self._run_step(gcmd, "ENDING_PURGE", body)
+
+    def cmd_ending(self, gcmd):
+        """KTWO_BOX_ENDING [SET=1 [SLOT=A]] [CLEAR=1] [PURGE=1] – Restmaterial-
+        Fall anzeigen, von Hand setzen (Nicht-Stock, z. B. Spule von Hand
+        leer erkannt) bzw. löschen (Stock use_ending_material_flag_clear, dort
+        ohne Aufrufer). PURGE=1 = Stock BOX_EXTRUSION_ALL_MATERIALS (läuft
+        unabhängig vom Merker): nur außerhalb eines Drucks oder in der Pause,
+        nicht während einer Kette; braucht allow_write + allow_move (sonst
+        Plan)."""
+        try:
+            if gcmd.get_int("CLEAR", 0):
+                if self.ending_material:
+                    self._ending_clear("KTWO_BOX_ENDING CLEAR=1 (von Hand)")
+                else:
+                    self.ending_last = ("[k2_box] Restmaterial: kein Fall "
+                                        "offen (CLEAR=1)")
+            elif gcmd.get_int("SET", 0):
+                raw = gcmd.get("SLOT", None)
+                ctl = self.controller
+                letter = parse_slot(raw)[1] if raw else (
+                    ctl.loaded_slot if ctl is not None else None)
+                tnn = ("T%d%s" % (int(self.cfg.get("box_addr", 1)), letter)
+                       if letter else "")
+                self.ending_material = {"slot": letter or "", "tnn": tnn,
+                                        "why": "von Hand (KTWO_BOX_ENDING "
+                                               "SET=1)"}
+                self.ending_last = ("[k2_box] Restmaterial %s von Hand gesetzt"
+                                    % (tnn or "(Slot unbekannt)",))
+        except ValueError as exc:
+            raise gcmd.error("[k2_box] KTWO_BOX_ENDING: %s" % (exc,))
+        if gcmd.get_int("PURGE", 0):
+            if self._print_active() and not self._is_paused():
+                raise gcmd.error("[k2_box] KTWO_BOX_ENDING PURGE=1 nur außerhalb "
+                                 "eines Drucks oder in der Pause")
+            if self.chain.get("active"):
+                raise gcmd.error("[k2_box] KTWO_BOX_ENDING PURGE=1: Wechsel"
+                                 "kette offen (%s)" % (
+                                     self.chain.get("tnn") or "ohne TNN",))
+
+            def body(gcmd):
+                self._ending_purge(gcmd, "KTWO_BOX_ENDING PURGE=1")
+            return self._run_step(gcmd, "ENDING_PURGE", body, chain_step=False)
+        em = self.ending_material
+        gcmd.respond_info(
+            "[k2_box] Restmaterial: %s; ending_material_purge=%s, "
+            "max_tube_length=%s mm%s" % (
+                ("Fall offen %s (%s)" % (em.get("tnn") or "(Slot unbekannt)",
+                                         em.get("why") or "")) if em
+                else "kein Fall offen", bool(self.cfg.get(
+                    "ending_material_purge")),
+                _n(self.cfg["max_tube_length"]),
+                ("; zuletzt: %s" % self.ending_last) if self.ending_last
+                else ""))
+        return None
+
+    def cmd_end_print(self, gcmd):
+        """KTWO_BOX_END_PRINT [UNLOAD=0|1] aus END_PRINT (= Stock BOX_END,
+        box_end Z.5104–5131): offener Restmaterial-Fall -> ausspülen
+        (ending_material_purge); UNLOAD (Default end_print_unload) und Kopf
+        meldet Filament -> Schacht, Heizen (Material-Temperatur), Schneiden,
+        Rückzug in die Box (KTWO_BOX_CUT/RETRUDE), Schacht verlassen. KEIN
+        Spülen am Druckende (Stock ebenso). remain_material bleibt (Düse
+        voll, Stock). Läuft über die vorhandene Kette PRE_OPT Z_HOP=0 …
+        END_OPT RETURN=0. Fehler/fehlende Freigaben -> nur Meldung, NIE
+        PAUSE oder G-Code-Fehler (END_PRINT muss weiterlaufen und die
+        Heizungen ausschalten)."""
+        c = self.cfg
+        try:
+            unload = bool(gcmd.get_int("UNLOAD", 1 if c.get("end_print_unload")
+                                       else 0))
+        except Exception:
+            unload = bool(c.get("end_print_unload"))
+        purge = bool(self.ending_material) and bool(c.get(
+            "ending_material_purge"))
+        tag = "[k2_box] END_PRINT"
+        if not unload and not purge:
+            gcmd.respond_info("%s: nichts zu tun (end_print_unload aus, kein "
+                              "Restmaterial-Fall offen)" % tag)
+            return None
+        if not self._released():
+            gcmd.respond_info("%s: übersprungen – nicht freigegeben "
+                              "(allow_write=%s, allow_move=%s); Filament "
+                              "bleibt im Kopf" % (tag, c.get("allow_write"),
+                                                  c.get("allow_move")))
+            return None
+        if self.chain.get("active") or self.chain_error:
+            gcmd.respond_info("%s: übersprungen – Wechsel aktiv oder "
+                              "Wechsel-Fehler offen (%s)" % (
+                                  tag, self.chain_error
+                                  or self.chain.get("tnn") or "Kette"))
+            return None
+        self._end_print = True
+        try:
+            self._script(["KTWO_BOX_PRE_OPT Z_HOP=0"])
+            ch = self.chain
+            if not ch.get("active") or self.chain_error:
+                raise BoxChangeError("PRE_OPT nicht ausgeführt")
+            if unload and not ch.get("ending_purged"):
+                head = self._head_filament()
+                if head is True:
+                    def heat(g):
+                        # Stock box_end Z.5117/5119: Schacht, dann
+                        # Material-Temperatur, dann schneiden
+                        if self._go_extrude_pos(g):
+                            self._move(g, "Schacht erreicht", ["M400"],
+                                       wrap=False)
+                        self._heat(g, self._change_temp(
+                            g, self._nozzle_key() if self.material_db
+                            is not None else None, "Druckende"))
+                    self._run_step(gcmd, "END_HEAT", heat)
+                    self._script(["KTWO_BOX_CUT", "KTWO_BOX_RETRUDE"])
+                    gcmd.respond_info("%s: geschnitten und in die Box "
+                                      "zurückgezogen (end_print_unload)" % tag)
+                elif head is False:
+                    gcmd.respond_info("%s: Kopf-Filamentsensor leer – nichts "
+                                      "zu entladen" % tag)
+                else:
+                    gcmd.respond_info(
+                        "%s: Kopf-Filamentsensor liefert keinen Zustand – "
+                        "kein Entladen (Stock entlädt nur bei gemeldetem "
+                        "Filament)" % tag)
+            elif unload:
+                gcmd.respond_info("%s: Restmaterial ausgespült – kein "
+                                  "Entladen nötig" % tag)
+            self._script(["KTWO_BOX_END_OPT RETURN=0"])
+        except Exception as exc:
+            self._respond_error(
+                "%s fehlgeschlagen: %s – Druckende läuft weiter (Heizungen "
+                "aus); Kopf/Filament von Hand prüfen" % (tag, self._exc_text(
+                    exc)))
+            if self.chain.get("active"):
+                self._chain_cleanup(gcmd)
+        finally:
+            self._end_print = False
+        return None
 
 
 def load_config(config):

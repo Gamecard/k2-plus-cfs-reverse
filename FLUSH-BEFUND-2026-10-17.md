@@ -264,10 +264,20 @@ Jeder Wert ist exakt `(V + 183) / 2.4`.
 **`get_flush_max_temp`** (@0x12b48c, Z.2893–2899): analog mit `get_material_target_max_temp`.
 
 **`get_material_target_temp`** (@0x131fb0, Z.2777–2809) – B, Zeilen ±2:
-- `int(list[i].kvParam.get('nozzle_temperature', 300))`
+- ~~`int(list[i].kvParam.get('nozzle_temperature', 300))`~~ – **korrigiert 17.10.2026:** `int(list[i].kvParam.get('nozzle_temperature', None))` (s. Kasten unten).
 - Fallback jeweils `boxcfg.Tn_extrude_temp` (220): bei `tnn is None`, bei `material_type == "None"` und bei Datei-/JSON-Fehler.
 
-**`get_material_target_max_temp`** (@0x12f0c0, Z.2814–2846): `int(base.get('maxTemp', 300))`, gleiche Fallbacks.
+**`get_material_target_max_temp`** (@0x12f0c0, Z.2814–2846): ~~`int(base.get('maxTemp', 300))`~~ – **korrigiert 17.10.2026:** `int(base.get('maxTemp', None))`, gleiche Fallbacks.
+
+> **Korrektur 17.10.2026 (Methodenfehler Tupel-Auflösung, B; FLUSH-SONDERFAELLE-BEFUND-2026-10-17.md §7 Nr. 1):**
+> Das Tupel-Skript der Arbeitsdateien übernahm bei `mov r2, r6` einen veralteten Registerwert; r6 ist GOT
+> `_Py_NoneStruct` (0x234f98). Die als `300` aufgelösten **Default-Werte** in `('nozzle_temperature', 300)`,
+> `('maxTemp', 300)`, `('filament_max_volumetric_speed', 300)` (§4 `get_material_max_extrusion_speed`) sowie
+> `('enable', 300)`/`('last_cmd', 300)` (Power-Loss-Pfad) sind in Wahrheit **`None`**. Fehlt das Feld in der
+> Material-DB, folgt `int(None)` → Ausnahme → (V) Fallback `Tn_extrude_temp` bzw. der jeweilige Fehlerzweig –
+> **kein** 300-°C-Default. Echte 300er bleiben: `(-7,300)`, `(3,300)`, `(-3,300)`, `(-5,360)` und
+> `flush_material(velocity=300)`. Auswirkung auf `nachbau/flush.py`/k2_box: keine (beide nutzen bei fehlendem
+> Feld schon den Fallback).
 
 **Max-Temperatur-Spülung**
 - Nur wenn `last_temp >= next_temp`, also beim Wechsel heiß → kalt oder bei gleicher Temperatur (Z.4507).

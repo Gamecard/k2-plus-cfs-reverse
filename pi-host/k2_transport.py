@@ -25,7 +25,10 @@ GLEICHER Schnittstelle::
   (``check_tx_frame``/``build_tx_frame``, aus nachbau/serial485 bzw. lokal
   gleichwertig): max. 100 Datenbytes je Frame (fun 0xF0: 0x80), Empfang
   weiter bis len 255; Broadcast 0xFF/0xFD nie mit fun 0x01 (reboot) oder
-  0x0B (boot), außer 0xFF 0x0B [01] (CFS-Loader->App). Verstoß ->
+  0x0B (boot), außer 0xFF 0x0B [01] (CFS-Loader->App); an Motor-Adressen
+  0x80-0x88/0xFD nie fun 0x03/0x04 (Kalibrierung) und fun 0x07 nur lesend
+  (Sub 02/06) – hart, ohne Override (MOTOR-KALIBRIERUNG-BEFUND §12; Box/
+  Belt nutzen 0x03/0x04/0x07 anders und bleiben frei). Verstoß ->
   ``TxGuardError`` (ValueError), nichts gesendet.
 
 Grundlagen (nur gelesen, nichts gesendet):
@@ -192,6 +195,16 @@ TX_FUNC_REBOOT = 0x01
 TX_FUNC_BOOT = 0x0B
 TX_BOOT_GUARD_ADDRS = frozenset((0xFF, 0xFD))
 TX_LOADER_TO_APP_PAYLOAD = (0x01,)
+# Motor-Kalibrier-/Flash-Sperre (17.10.2026, gleich serial485, Begründung dort
+# und MOTOR-KALIBRIERUNG-BEFUND-2026-10-17.md §12): an Motor-Adressen
+# 0x80-0x88 + Gruppe 0xFD nie 0x03 (encoder_calibrate), 0x04 (elec_offset,
+# auch _ALL), 0x07 nur Sub 02/06 (lesend; 01/03/04/05 ändern Flash/RAM).
+# Box (0x01-0x04/0xFE: 0x03 Restmenge, 0x04 Modus, 0x07 Hauptmotor), Belt
+# (0x21/0x22: 0x04 Flash), Rack und 0xFF bleiben frei.
+TX_MOTOR_GUARD_ADDRS = frozenset(list(range(0x80, 0x89)) + [0xFD])
+TX_MOTOR_BLOCKED_FUNCS = frozenset((0x03, 0x04))
+TX_FUNC_FLASH_PARAM = 0x07
+TX_FLASH_PARAM_READ_SUBS = frozenset((0x02, 0x06))
 
 
 class _LocalTxGuardError(ValueError):
@@ -233,6 +246,18 @@ def _check_tx_frame_local(addr, fun, data=()):
                 "schickt ALLE Motoren in den Bootloader. Erlaubt ist nur "
                 "0xFF 0x0B [01] (CFS-Loader->App); nichts gesendet"
                 % (addr, " ".join("%02x" % b for b in data)))
+    if addr in TX_MOTOR_GUARD_ADDRS:
+        if fun in TX_MOTOR_BLOCKED_FUNCS:
+            raise _LocalTxGuardError(
+                "Sendeschutz: Motor 0x%02x fun 0x%02x (Kalibrierung) gesperrt "
+                "– open-loop ohne Schutz, schreibt Flash/EEPROM; nichts "
+                "gesendet" % (addr, fun))
+        if fun == TX_FUNC_FLASH_PARAM and (
+                not data or data[0] not in TX_FLASH_PARAM_READ_SUBS):
+            raise _LocalTxGuardError(
+                "Sendeschutz: Motor 0x%02x fun 0x07 (flash_param) Sub [%s] "
+                "gesperrt – erlaubt nur lesend Sub 02/06; nichts gesendet"
+                % (addr, " ".join("%02x" % b for b in data[:1])))
     return data
 
 
@@ -270,11 +295,14 @@ else:  # pragma: no cover
     crc8_cal = _crc8_cal
 
 # Sendeschutz: nachbau/serial485 bevorzugt (eine Quelle der Wahrheit); ein
-# älteres serial485 ohne check_tx_frame (Pi-Installation nicht aktualisiert)
-# fällt auf die lokale, gleichwertige Prüfung zurück – nie ohne Schutz.
+# älteres serial485 ohne check_tx_frame ODER ohne Motor-Kalibriersperre
+# (17.10.2026, Merkmal TX_MOTOR_GUARD_ADDRS; Pi-Installation nicht
+# aktualisiert) fällt auf die lokale, gleichwertige Prüfung zurück – nie
+# ohne Schutz.
 if (_nb_s485 is not None and hasattr(_nb_s485, "check_tx_frame")
         and hasattr(_nb_s485, "build_tx_frame")
-        and hasattr(_nb_s485, "TxGuardError")):
+        and hasattr(_nb_s485, "TxGuardError")
+        and hasattr(_nb_s485, "TX_MOTOR_GUARD_ADDRS")):
     check_tx_frame = _nb_s485.check_tx_frame
     build_tx_frame = _nb_s485.build_tx_frame
     TxGuardError = _nb_s485.TxGuardError
@@ -391,8 +419,9 @@ class Rs485Transport:
         """
         _check_addr_fun(addr, fun)
         payload = list(bytes(data) if isinstance(data, (bytes, bytearray)) else data)
-        # Sendeschutz (Länge, Broadcast 0x01/0x0B) VOR dem Bus – unabhängig
-        # davon, ob ``bus`` selbst prüft (z. B. Fremd-/Test-Bus).
+        # Sendeschutz (Länge, Broadcast 0x01/0x0B, Motor 0x03/0x04/0x07) VOR
+        # dem Bus – unabhängig davon, ob ``bus`` selbst prüft (z. B. Fremd-/
+        # Test-Bus).
         payload = check_tx_frame(addr, fun, payload)
         self.sent.append((addr, fun, tuple(payload)))
         full = getattr(self.bus, "transact_full", None)
@@ -448,7 +477,7 @@ class TransparentTransport:
     def transact(self, addr, fun, data, timeout=2.0, retries=0):
         _check_addr_fun(addr, fun)
         payload = list(bytes(data) if isinstance(data, (bytes, bytearray)) else data)
-        # Sendeschutz (Länge, Broadcast 0x01/0x0B) vor jeder MCU-Sendung.
+        # Sendeschutz (Länge, Broadcast, Motor-Kalibrierung) vor jeder MCU-Sendung.
         frame = bytes(build_tx_frame(addr, fun, payload, status=STATUS_OK))
         self.sent.append((addr, fun, tuple(payload)))
         if timeout is None or timeout < 0:

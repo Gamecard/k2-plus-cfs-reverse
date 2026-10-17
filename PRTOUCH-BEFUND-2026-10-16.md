@@ -18,6 +18,12 @@ Raster). Arbeitsdateien und Mitschnitt lokal, nicht im Repo. Unbelegtes = ANNAHM
 - **Der Host berechnet den Kontakt nachträglich** aus Kraftverlauf (Knick/„best_indx“) und Schrittdaten
   (Zuordnung über Zeitstempel) → Korrektur `zoft` (0,010–0,040 mm), Ergebnis = Position + zoft.
 - `apax`: Hilfskanal (vermutl. Pressure-Advance-Erfassung über oid_estp) – für die Bett-Abtastung NICHT nötig.
+  - **Korrektur 17.10.2026 (B, PRTOUCH-APAX-BEFUND-2026-10-17.md Kurzfassung/§2.4/§4):** apax ist ~~nicht im
+    Normalpfad~~ **doch im Normalpfad**: `PRES_CHECK RUN=1/0` (Dehnungsstreifen-Selbsttest beim Düsenabstreifen,
+    s. §2 „Strain gauge dynamic detection passed“) nutzt `start_prtouch_apax`/`stop_prtouch_apax` und läuft bei
+    Stock in **jedem G28 mit Z** (Stock-`[homing_override]` um `BOX_NOZZLE_CLEAN`, wenn Z nicht referenziert;
+    live über die Busrate der Düsen-MCU belegt). „Nur Hilfskanal für PA“ gilt nur für `AUTO_APAX`/`WAVE_APAX`.
+    Für die Bett-Abtastung selbst (Antasten, Mesh, Z-Offset, Z-Homing) bleibt apax **nicht nötig**.
 - MCU-Befehle (Dictionary): `config/start/stop/read/cont_prtouch_step|pres|apax` → `ack_prtouch`,
   `resault_prtouch_pres|step|apax|step_cnt` (Formatstrings in GPIO-PHASE-BEFUND-2026-10-16.md §2).
 

@@ -21,7 +21,9 @@ Grundlagen (nur gelesen, nichts gesendet):
   PRES_N=64/STEP_N=64, SPEED=5mm/s, HUB=5mm, Lüfter 0.6, TEST_SWAP,
   can_brk-Ausreißer T58→T59 versetzt ±0.25mm)
 - Host-Analyse (lokale Arbeitsdatei) (Host-Module, G-Codes, TEST_SWAP/PRES_CHECK,
-  Wellen SRC/FTR/CAL, apax nicht im Normalpfad)
+  Wellen SRC/FTR/CAL; „apax nicht im Normalpfad“ gilt nur für AUTO_APAX/
+  WAVE_APAX – Stock-PRES_CHECK bei G28 Z nutzt den apax-Strom, KORREKTUR
+  PRTOUCH-APAX-BEFUND-2026-10-17.md)
 - MCU-Dictionaries mcu-main-F008-GD32F303RET6.dict.json +
   noz-duese-F008-GD32F303CBT6.dict.json (exakte Formatstrings inkl.
   Creality-Schreibweisen „aqc_tick“, „resault_*“)
@@ -95,6 +97,12 @@ G-Codes (PrinterK2Prtouch):
 - KTWO_PRTOUCH_TEST_SWAP – Sync-/Versionscheck ohne Bewegung.
 - KTWO_PRTOUCH_READ – Sensor lesen ohne Bewegung.
 - KTWO_PRTOUCH_STATUS – letzter Status (auch Moonraker via get_status).
+- KTWO_PRTOUCH_CHECK [DURATION=s | EXTRUDE=mm SPEED=mm/s | MACRO=name]
+  [REQUIRE_DIF=0] [STOP=1] – optionaler Sensor-Selbsttest über den apax-
+  Strom (Ersatz Stock-PRES_CHECK), NUR mit pres_check: True (Default False:
+  kein config_prtouch_apax, kein Befehl). Gegensperre arm() <-> apax,
+  stop_prtouch_apax immer im finally, Fehlschlag = command_error (kein
+  Shutdown). Buslast ≈ 12,4 kB/s (≈ 54 % der Düsenleitung).
 
 ANNAHMEN sind im Code mit „ANNAHME:“ markiert und in BERICHT.md gelistet.
 """
@@ -321,6 +329,42 @@ STEP_SWAP_PIN_DEFAULT = "^!PC7"  # Pull-Up wie Stock-Endzustand (s. README)
 
 HOST_PY_VER = 1  # eigene Host-Version (nicht Stock-78; ANNAHME: nur
 # geloggt, kein exakter Match nötig – FW-Updates ändern PRES/STEP_VER).
+
+# =====================================================================
+# Sensor-Selbsttest KTWO_PRTOUCH_CHECK (Ersatz Stock-PRES_CHECK, optional)
+# =====================================================================
+# Grundlage PRTOUCH-APAX-BEFUND-2026-10-17.md (B = Beobachtung, F =
+# Folgerung): Stock-PRES_CHECK nutzt den apax-Strom – config_prtouch_apax
+# oid=<pres-oid> oid_estp=<Extruder-Stepper> (Config), start_prtouch_apax
+# oid cfg_regs=60 acq_tick=93750 (ack expar1 = acq_tick), Strom
+# resault_prtouch_apax mit der PRES-oid (S[0]), stop_prtouch_apax (ack 0).
+# Jedes CS1237-Rohsample (≈ 1280/s, ohne Filter) + Extruder-Schrittintervall
+# (espd, 0 = steht). GEFAHR (B §1.3): falsches oid_estp -> oid_lookup schlägt
+# beim ERSTEN Sample nach start fehl -> MCU-Shutdown. Daher wird oid_estp
+# NUR über die Klipper-API ermittelt (Stepper-Objekt des Extruders auf
+# derselben MCU), sonst Config-Fehler – nie geraten.
+# Buslast (B §4, live): ≈ 12,4 kB/s ≈ 54 % der 230 400-Bd-Düsenleitung.
+PRES_CHECK_HOLD_DEFAULT = 15000  # ANNAHME Kriterium dif >= pres_chk_hold
+# (Stock live 15000, alle Live-dif 37 535…324 487 bestanden; Kriterium nur
+# aus der Namensspur, Befund §2.2/§7).
+PRES_CHECK_DURATION_DEFAULT_S = 3.0  # reine Messung ohne Last (DURATION=)
+PRES_CHECK_MAX_S_DEFAULT = 15.0  # Strom höchstens so lange (Buslast)
+PRES_CHECK_MAX_S_LIMIT = 60.0  # harte Obergrenze für pres_check_max_s
+PRES_CHECK_EXTRUDE_MAX_DEFAULT = 5.0  # mm, „kleine Menge“
+PRES_CHECK_EXTRUDE_MAX_LIMIT = 20.0
+PRES_CHECK_EXTRUDE_SPEED_DEFAULT = 4.0  # mm/s Filament (Stock AUTO_APAX
+# rechnet mit ≈ 0,9…8,4 mm/s E, Befund §2.3 – ANNAHME)
+PRES_CHECK_EXTRUDE_SPEED_LIMIT = 10.0
+PRES_CHECK_MIN_TEMP_DEFAULT = 170.0  # °C, zusätzlich zu can_extrude
+PRES_CHECK_RATE_TOL = 0.2  # ANNAHME ±20 % (Befund §6.1)
+PRES_CHECK_SKIP = 16  # ANNAHME: erste Samples je Kanal verwerfen
+# (Konfig-Handshake nach start, Befund §1.2/§1.3: start löscht das
+# zurückgelesene CS1237-Register -> Handshake vor den ersten Samples).
+PRES_CHECK_BAD_FRAC = 0.01  # ANNAHME: max. Anteil 0/-1/Sättigung
+PRES_CHECK_MIN_SAMPLES = 256  # ANNAHME: ≈ 0,2 s bei 1280/s
+PRES_CHECK_GUARD_FACTOR = 1.5  # Sample-Obergrenze = max_s × Rate × 1,5
+APAX_BUS_BYTES_PER_S = 12400  # BELEGT live (Befund §4)
+APAX_BUS_BAUD = 230400  # Düsenleitung
 
 
 # =====================================================================
@@ -881,6 +925,60 @@ def parse_options(opts):
 
     cfg["shutdown_on_failure"] = _bool("shutdown_on_failure", False)
 
+    # --- Sensor-Selbsttest KTWO_PRTOUCH_CHECK (Default AUS) ---
+    # pres_check: False -> kein config_prtouch_apax, kein G-Code, keine
+    # Antwortregistrierung (Verhalten exakt wie vorher).
+    cfg["pres_check"] = _bool("pres_check", False)
+    cfg["pres_check_hold"] = _float("pres_check_hold",
+                                    PRES_CHECK_HOLD_DEFAULT)
+    cfg["pres_check_max_s"] = _float("pres_check_max_s",
+                                     PRES_CHECK_MAX_S_DEFAULT)
+    cfg["pres_check_duration_s"] = _float("pres_check_duration_s",
+                                          PRES_CHECK_DURATION_DEFAULT_S)
+    cfg["pres_check_extrude_max_mm"] = _float(
+        "pres_check_extrude_max_mm", PRES_CHECK_EXTRUDE_MAX_DEFAULT)
+    cfg["pres_check_extrude_speed"] = _float(
+        "pres_check_extrude_speed", PRES_CHECK_EXTRUDE_SPEED_DEFAULT)
+    cfg["pres_check_min_temp"] = _float("pres_check_min_temp",
+                                        PRES_CHECK_MIN_TEMP_DEFAULT)
+    cfg["pres_check_rate_tol"] = _float("pres_check_rate_tol",
+                                        PRES_CHECK_RATE_TOL)
+    cfg["pres_check_skip"] = _int("pres_check_skip", PRES_CHECK_SKIP)
+    cfg["pres_check_bad_frac"] = _float("pres_check_bad_frac",
+                                        PRES_CHECK_BAD_FRAC)
+    cfg["pres_check_min_samples"] = _int("pres_check_min_samples",
+                                         PRES_CHECK_MIN_SAMPLES)
+    cfg["pres_check_extruder"] = (_str("pres_check_extruder", "extruder")
+                                  or "extruder")
+    if cfg["pres_check_hold"] <= 0:
+        raise ValueError("pres_check_hold muss > 0 sein")
+    if not 0.0 < cfg["pres_check_max_s"] <= PRES_CHECK_MAX_S_LIMIT + 1e-9:
+        raise ValueError("pres_check_max_s muss in (0, %.0f] sein (Buslast "
+                         "≈ 12,4 kB/s): %r" % (PRES_CHECK_MAX_S_LIMIT,
+                                               o.get("pres_check_max_s")))
+    if not 0.0 < cfg["pres_check_duration_s"] <= cfg["pres_check_max_s"]:
+        raise ValueError("pres_check_duration_s muss in (0, "
+                         "pres_check_max_s] sein: %r"
+                         % (o.get("pres_check_duration_s"),))
+    if not (0.0 < cfg["pres_check_extrude_max_mm"]
+            <= PRES_CHECK_EXTRUDE_MAX_LIMIT + 1e-9):
+        raise ValueError("pres_check_extrude_max_mm muss in (0, %.0f] sein"
+                         % PRES_CHECK_EXTRUDE_MAX_LIMIT)
+    if not (0.0 < cfg["pres_check_extrude_speed"]
+            <= PRES_CHECK_EXTRUDE_SPEED_LIMIT + 1e-9):
+        raise ValueError("pres_check_extrude_speed muss in (0, %.0f] mm/s "
+                         "sein" % PRES_CHECK_EXTRUDE_SPEED_LIMIT)
+    if cfg["pres_check_min_temp"] < 0:
+        raise ValueError("pres_check_min_temp muss >= 0 sein")
+    if not 0.0 < cfg["pres_check_rate_tol"] <= 0.5:
+        raise ValueError("pres_check_rate_tol muss in (0, 0.5] sein")
+    if not 0 <= cfg["pres_check_skip"] <= 1280:
+        raise ValueError("pres_check_skip muss in [0, 1280] sein")
+    if not 0.0 <= cfg["pres_check_bad_frac"] <= 0.5:
+        raise ValueError("pres_check_bad_frac muss in [0, 0.5] sein")
+    if cfg["pres_check_min_samples"] < 2:
+        raise ValueError("pres_check_min_samples muss >= 2 sein")
+
     # --- Kopplungen nach MCU-Befund 17.10.2026 (brauchen alle Werte) ---
     # arm_settle_s >= Totzeit × Reserve (beide Modi, Stock-Werte: 0,15 s).
     validate_arm_settle(cfg)
@@ -968,7 +1066,14 @@ def parse_klipper_config(config):
               # Absicherung MCU-Befund 17.10.2026:
               "rest_filt_max_frac",
               # Rückfallweg-Kontaktkriterium (README B.3):
-              "contact_criterion", "contact_steps", "contact_step_min"):
+              "contact_criterion", "contact_steps", "contact_step_min",
+              # Sensor-Selbsttest KTWO_PRTOUCH_CHECK (APAX-Befund §6):
+              "pres_check", "pres_check_hold", "pres_check_max_s",
+              "pres_check_duration_s", "pres_check_extrude_max_mm",
+              "pres_check_extrude_speed", "pres_check_min_temp",
+              "pres_check_rate_tol", "pres_check_skip",
+              "pres_check_bad_frac", "pres_check_min_samples",
+              "pres_check_extruder"):
         if k not in opts:
             v = _g(k, None)
             if v is not None and str(v) != "":
@@ -2001,7 +2106,8 @@ class K2PrtouchController:
     def _arm_status(phase):
         return {"swap": "swap_error", "start": "start_error",
                 "settle": "start_error", "rest": "rest_error",
-                "pc7": "contact_before_move"}.get(phase, "arm_error")
+                "pc7": "contact_before_move",
+                "apax": "apax_busy"}.get(phase, "arm_error")
 
     def check_temps(self):
         """Temperatur-Empfehlung (S5): nur Warnungen, nie Abbruch/Heizen."""
@@ -2376,6 +2482,12 @@ class K2PrtouchProbeCore:
         # Zuletzt erreichte arm()-Stufe (swap/start/settle/rest/pc7/armed) –
         # der Rückfallweg bildet daraus seinen Status (swap_error, …).
         self.arm_phase = None
+        # Gegensperre zum Sensor-Selbsttest (KTWO_PRTOUCH_CHECK): Callable
+        # -> True, solange der apax-Strom läuft (oder sein Stopp nicht
+        # bestätigt ist). None = pres_check aus (Verhalten wie vorher).
+        # Grund (APAX-Befund §1.3): start_prtouch_apax bei scharfer Düse
+        # löscht deren Puffer/Totzeit; beide Tasks teilen das CS1237-DRDY.
+        self.apax_busy = None
 
     def attach(self, pres, step):
         self.pres, self.step = pres, step
@@ -2436,6 +2548,13 @@ class K2PrtouchProbeCore:
         if self.pres is None or self.step is None:
             raise self.error("[k2_prtouch] noch nicht verbunden "
                              "(klippy:connect abwarten) – keine Bewegung.")
+        if self.apax_busy is not None and self.apax_busy():
+            self.arm_phase = "apax"
+            raise self.error(
+                "[k2_prtouch] Sensor-Selbsttest (KTWO_PRTOUCH_CHECK, apax-"
+                "Strom) läuft noch oder sein Stopp ist unbestätigt – Düse "
+                "wird NICHT scharf geschaltet, keine Bewegung. Ggf. "
+                "KTWO_PRTOUCH_CHECK STOP=1.")
         c = self.cfg
         info = {}
         self.arm_phase = "swap"
@@ -2623,6 +2742,460 @@ class K2PrtouchProbeCore:
     def get_status(self):
         return {"armed": self.armed, "arms": self.arm_count,
                 "disarms": self.disarm_count, "last": self.last}
+
+
+# =====================================================================
+# Sensor-Selbsttest KTWO_PRTOUCH_CHECK (apax-Strom, Ersatz Stock-PRES_CHECK)
+# =====================================================================
+# Ablauf (PRTOUCH-APAX-BEFUND-2026-10-17 §1/§2.2/§6, ANNAHMEN markiert):
+#   nur wenn die Düse NICHT scharf ist -> start_prtouch_apax (Stock-
+#   Parameter, ack expar1 == acq_tick) -> Last (EXTRUDE/MACRO) oder reine
+#   Wartezeit (DURATION) -> stop_prtouch_apax IMMER (finally, auch bei
+#   Fehler/KeyboardInterrupt) -> Auswertung je Kanal wie Stock
+#   (min/max/avg/dif/len, nur laufende Kennwerte, keine Listen).
+
+def build_start_apax_tuple(cfg, oid):
+    """(oid, cfg_regs, acq_tick) für CMD_START_APAX. Stock (B Befund §2.2):
+    cfg_regs = pres_cfg_regs 60, acq_tick = apax_acq_tkms 0,78125 ms ->
+    93750 – identisch mit unseren pres-Werten cfg_regs/acq_tick."""
+    return (int(oid), int(cfg["cfg_regs"]), int(cfg["acq_tick"]))
+
+
+def apax_bus_load(seconds):
+    """Erwartete Busbelastung der Düsenleitung (B Befund §4: ≈ 12,4 kB/s,
+    10 Bit/Byte bei 230 400 Bd ≈ 54 %)."""
+    return {"bytes": int(round(APAX_BUS_BYTES_PER_S * float(seconds))),
+            "bytes_per_s": APAX_BUS_BYTES_PER_S,
+            "line_share": APAX_BUS_BYTES_PER_S * 10.0 / APAX_BUS_BAUD}
+
+
+def pres_check_max_samples(cfg):
+    """Sample-Obergrenze des Wächters: pres_check_max_s × Rate × 1,5."""
+    rate, _pga = cs1237_rate_pga(cfg["cfg_regs"])
+    return int(float(cfg["pres_check_max_s"]) * rate
+               * PRES_CHECK_GUARD_FACTOR) + 64
+
+
+class ApaxStats:
+    """Laufende Kennwerte des apax-Stroms je Kanal (wie Stock
+    _handle_resault/chk_info: min/max/Summe/Anzahl – KEINE Listen).
+
+    Thread-sicher: Klipper ruft Antwort-Handler im serialhdl-Hintergrund-
+    thread auf (serialhdl.py _bg_thread). Die ersten 'skip' Samples je Kanal
+    werden verworfen (ANNAHME Konfig-Handshake nach start). Ungültige
+    Rohwerte (0, -1, 24-Bit-Sättigung, außerhalb 24 Bit) zählen getrennt und
+    gehen NICHT in min/max ein (sonst täuscht ein Ausreißer ein großes dif
+    vor). Überschreitet die Gesamtzahl max_samples, wird on_overrun genau
+    einmal gerufen (Wächter: nicht blockierender Stopp)."""
+
+    def __init__(self, skip=PRES_CHECK_SKIP, freq=CLOCK_FREQ,
+                 max_samples=None, on_overrun=None):
+        import threading
+        self._lock = threading.Lock()
+        self.skip = int(skip)
+        self.freq = float(freq)
+        self.max_samples = max_samples
+        self.on_overrun = on_overrun
+        self.ch = {}
+        self.packets = 0
+        self.total = 0
+        self.decode_errors = 0
+        self.overrun = False
+
+    def _chan(self, ch):
+        c = self.ch.get(ch)
+        if c is None:
+            c = {"recv": 0, "skipped": 0, "len": 0, "valid": 0,
+                 "min": None, "max": None, "sum": 0,
+                 "zero": 0, "stuck": 0, "sat": 0, "out": 0,
+                 "last_tick": None, "tick_span": 0, "tick_n": 0,
+                 "espd_moving": 0}
+            self.ch[ch] = c
+        return c
+
+    def feed(self, ch, ticks, datas, espds=()):
+        """Ein Paket (dekodiert) übernehmen."""
+        if len(ticks) != len(datas):
+            raise ValueError("apax-Paket: %d Ticks, aber %d Werte"
+                             % (len(ticks), len(datas)))
+        fire = False
+        with self._lock:
+            self.packets += 1
+            c = self._chan(int(ch))
+            for t, v in zip(ticks, datas):
+                t = int(t) & 0xFFFFFFFF
+                v = int(v)
+                if c["last_tick"] is not None:
+                    c["tick_span"] += (t - c["last_tick"]) & 0xFFFFFFFF
+                c["last_tick"] = t
+                c["tick_n"] += 1
+                c["recv"] += 1
+                self.total += 1
+                if c["recv"] <= self.skip:
+                    c["skipped"] += 1
+                    continue
+                c["len"] += 1
+                if v == ADC_STUCK_VALUE:
+                    c["stuck"] += 1
+                elif v == 0:
+                    c["zero"] += 1
+                elif v < ADC24_MIN or v > ADC24_MAX:
+                    c["out"] += 1
+                elif v in (ADC24_MIN, ADC24_MAX):
+                    c["sat"] += 1
+                else:
+                    c["valid"] += 1
+                    c["sum"] += v
+                    c["min"] = v if c["min"] is None else min(c["min"], v)
+                    c["max"] = v if c["max"] is None else max(c["max"], v)
+            c["espd_moving"] += sum(1 for e in espds if int(e) != 0)
+            if (self.max_samples is not None and not self.overrun
+                    and self.total > int(self.max_samples)):
+                self.overrun = True
+                fire = True
+        if fire and self.on_overrun is not None:
+            try:
+                self.on_overrun()
+            except Exception:
+                pass
+
+    def feed_params(self, params):
+        """Antwort resault_prtouch_apax (Klipper-params) übernehmen.
+        ticks/datas/espds gepackt wie pres (Packer 0x08006524, B §1.3)."""
+        try:
+            ticks = [t & 0xFFFFFFFF
+                     for t in decode_packed(bytes(params["ticks"]))]
+            datas = decode_packed(bytes(params["datas"]))
+            espds = decode_packed(bytes(params.get("espds", b"") or b""))
+        except Exception:
+            with self._lock:
+                self.decode_errors += 1
+            return
+        self.feed(params.get("ch", 0), ticks, datas, espds)
+
+    def snapshot(self):
+        with self._lock:
+            return {"ch": {k: dict(v) for k, v in self.ch.items()},
+                    "packets": self.packets, "total": self.total,
+                    "decode_errors": self.decode_errors,
+                    "overrun": self.overrun, "freq": self.freq}
+
+
+def evaluate_apax(snap, cfg, duration_s=None, require_dif=True,
+                  expect_moving=False):
+    """Auswertung des Selbsttests -> (ok, info).
+
+    Je Kanal (K2: nur Kanal 0) – alle Grenzen ANNAHME (APAX-Befund §6.1):
+      - mind. pres_check_min_samples Samples nach dem Verwerfen,
+      - Abtastrate aus den MCU-Ticks = Rate(cfg_regs) ± pres_check_rate_tol,
+      - Anzahl passt zur Dauer (± Toleranz, Paketrest/Latenz als Spiel),
+      - Anteil 0/-1/24-Bit-Sättigung/außerhalb <= pres_check_bad_frac,
+      - Rohwerte nicht konstant (dif > 0),
+      - require_dif: dif = max - min >= pres_check_hold (Stock pres_chk_hold
+        15000; ANNAHME Kriterium „dif >= chk_hold“).
+    expect_moving (EXTRUDE): espd nie != 0 -> nur Warnung.
+    """
+    rate_nom, _pga = cs1237_rate_pga(cfg["cfg_regs"])
+    tol = float(cfg.get("pres_check_rate_tol", PRES_CHECK_RATE_TOL))
+    hold = float(cfg.get("pres_check_hold", PRES_CHECK_HOLD_DEFAULT))
+    min_n = int(cfg.get("pres_check_min_samples", PRES_CHECK_MIN_SAMPLES))
+    bad_frac = float(cfg.get("pres_check_bad_frac", PRES_CHECK_BAD_FRAC))
+    freq = float(snap.get("freq") or cfg.get("clock_freq", CLOCK_FREQ))
+    errors, warns, chans = [], [], {}
+    if snap.get("decode_errors"):
+        errors.append("%d apax-Pakete nicht dekodierbar"
+                      % snap["decode_errors"])
+    if snap.get("overrun"):
+        errors.append("Strom-Wächter: mehr als %d Samples (pres_check_max_s "
+                      "überschritten) – nicht blockierend gestoppt"
+                      % pres_check_max_samples(cfg))
+    if not snap.get("ch"):
+        errors.append("keine Daten empfangen (resault_prtouch_apax) – Strom "
+                      "nicht gestartet, Leitung oder oid prüfen")
+    elif 0 not in snap["ch"]:
+        errors.append("Kanal 0 fehlt (nur %s)" % sorted(snap["ch"]))
+    for ch in sorted(snap.get("ch", {})):
+        c = snap["ch"][ch]
+        e = []
+        bad = c["zero"] + c["stuck"] + c["sat"] + c["out"]
+        rate = None
+        if c["tick_n"] > 1 and c["tick_span"] > 0:
+            rate = (c["tick_n"] - 1) / (c["tick_span"] / freq)
+        info = {"len": c["len"], "recv": c["recv"], "valid": c["valid"],
+                "min": c["min"], "max": c["max"],
+                "avg": (c["sum"] / float(c["valid"])) if c["valid"] else None,
+                "dif": ((c["max"] - c["min"]) if c["valid"] else None),
+                "bad": {"zero": c["zero"], "stuck": c["stuck"],
+                        "sat": c["sat"], "out": c["out"]},
+                "rate_hz": rate, "espd_moving": c["espd_moving"]}
+        if c["len"] < min_n:
+            e.append("nur %d Samples (< %d)" % (c["len"], min_n))
+        if rate is None or abs(rate - rate_nom) > tol * rate_nom:
+            e.append("Abtastrate %s statt %.0f Hz ±%d %%"
+                     % ("unbekannt" if rate is None else "%.0f Hz" % rate,
+                        rate_nom, round(tol * 100)))
+        if duration_s is not None and duration_s > 0:
+            lo = (1.0 - tol) * rate_nom * float(duration_s) - 64
+            hi = (1.0 + tol) * rate_nom * (float(duration_s) + 0.25) + 64
+            if not lo <= c["recv"] <= hi:
+                e.append("%d Samples passen nicht zu %.2f s (erwartet "
+                         "%.0f…%.0f)" % (c["recv"], duration_s, max(lo, 0),
+                                         hi))
+        if c["len"] > 0 and bad > bad_frac * c["len"]:
+            e.append("%d von %d Rohwerten ungültig (0: %d, -1: %d, "
+                     "Sättigung: %d, außerhalb 24 Bit: %d) – Sensor "
+                     "abgezogen/DOUT hängt?" % (bad, c["len"], c["zero"],
+                                                c["stuck"], c["sat"],
+                                                c["out"]))
+        if not c["valid"]:
+            e.append("keine gültigen Rohwerte")
+        elif info["dif"] == 0:
+            e.append("Rohwerte konstant (dif=0) – Sensor tot/Leitung prüfen")
+        elif require_dif and info["dif"] < hold:
+            e.append("dif=%d < pres_check_hold %.0f – keine Kraftänderung "
+                     "erkannt (Last beim Test? Kriterium = ANNAHME)"
+                     % (info["dif"], hold))
+        if expect_moving and c["espd_moving"] == 0:
+            warns.append("CH%d: espd immer 0 trotz Extrusion (Extruder stand? "
+                         "oid_estp prüfen)" % ch)
+        info["errors"] = e
+        chans[ch] = info
+        errors += ["CH%d: %s" % (ch, x) for x in e]
+    res = {"channels": chans, "errors": errors, "warnings": warns,
+           "packets": snap.get("packets", 0), "total": snap.get("total", 0),
+           "duration_s": duration_s, "require_dif": bool(require_dif),
+           "hold": hold, "rate_nominal_hz": rate_nom}
+    return (not errors), res
+
+
+def format_check_lines(res):
+    """Stock-ähnliche Zeilen PRES_CHECK_INFO_CH%d min/max/avg/dif/len."""
+    out = []
+    for ch in sorted(res.get("channels", {})):
+        i = res["channels"][ch]
+        out.append("PRES_CHECK_INFO_CH%d min=%s, max=%s, avg=%s, dif=%s, "
+                   "len=%d, rate=%s Hz, espd_moving=%d"
+                   % (ch, i["min"], i["max"],
+                      "-" if i["avg"] is None else "%.0f" % i["avg"],
+                      i["dif"], i["len"],
+                      "-" if i["rate_hz"] is None else "%.0f" % i["rate_hz"],
+                      i["espd_moving"]))
+    return out
+
+
+def format_check_failure(res):
+    """Fehlertext ähnlich Stock key769 (PR_ERR_CODE_PRES_NOT_BE_SENSED) –
+    wird als command_error gemeldet, KEIN Shutdown."""
+    chans = sorted(ch for ch, i in res.get("channels", {}).items()
+                   if i.get("errors")) or [0]
+    return ("[k2_prtouch] PR_ERR_CODE_PRES_NOT_BE_SENSED: The pressure data "
+            "in channel=%s cannot be properly sensed. (KTWO_PRTOUCH_CHECK, "
+            "Ersatz Stock-key769, kein Shutdown) Gründe: %s"
+            % (",".join(str(c) for c in chans),
+               "; ".join(res.get("errors") or ["?"])))
+
+
+class K2PrtouchApaxCheck:
+    """Reiner Ablauf des Selbsttests (ohne Klipper testbar).
+
+    apax: start() -> ack-Dict, stop() -> ack-Dict, stop_nowait() (Wächter).
+    pause(s), clock() -> s. is_armed() -> True, solange die Düse scharf ist
+    (Gegensperre). error: Klipper command_error (kein Shutdown).
+    busy() ist die Gegensperre für K2PrtouchProbeCore.arm(): True ab VOR dem
+    Senden von start bis zum BESTÄTIGTEN stop.
+    """
+
+    def __init__(self, cfg, apax, pause, clock=None, error=K2PrtouchError,
+                 is_armed=None, logger=None):
+        self.cfg = dict(cfg)
+        self.apax = apax
+        self.pause = pause
+        self.clock = clock if clock is not None else time.monotonic
+        self.error = error
+        self.is_armed = is_armed
+        self.log = logger
+        self.active = False
+        self.stats = None
+        self.stray = 0
+        self.runs = 0
+        self.last = None
+
+    def busy(self):
+        return bool(self.active)
+
+    def on_packet(self, params):
+        """Antwort-Handler (serialhdl-Thread): nur Kennwerte nachführen."""
+        st = self.stats
+        if st is None or not self.active:
+            self.stray += 1
+            return
+        st.feed_params(params)
+
+    def _guard(self):
+        try:
+            self.apax.stop_nowait()
+        except Exception:
+            pass
+
+    def stop(self):
+        """stop_prtouch_apax mit ack. -> None oder Fehlertext. active bleibt
+        True (Antasten gesperrt), solange der Stopp nicht bestätigt ist."""
+        try:
+            ack = self.apax.stop()
+        except Exception as exc:
+            return "stop_prtouch_apax: %s" % exc
+        ack = ack if hasattr(ack, "get") else {}
+        if int(ack.get("err", 0) or 0) != 0:
+            return "stop_prtouch_apax ack err=%d" % int(ack.get("err"))
+        self.active = False
+        return None
+
+    def run(self, load=None, duration=None, require_dif=True,
+            expect_moving=False):
+        """Selbsttest ausführen -> (ok, info). Wirft self.error bei
+        Ablauf-/MCU-Fehlern (Auswertungsfehler -> ok False, kein Wurf)."""
+        c = self.cfg
+        if self.active:
+            raise self.error("[k2_prtouch] KTWO_PRTOUCH_CHECK: apax-Strom "
+                             "läuft bereits oder Stopp unbestätigt – erst "
+                             "KTWO_PRTOUCH_CHECK STOP=1.")
+        if self.is_armed is not None and self.is_armed():
+            raise self.error("[k2_prtouch] KTWO_PRTOUCH_CHECK: Düse ist "
+                             "scharf (Antasten läuft) – kein Selbsttest.")
+        max_s = float(c["pres_check_max_s"])
+        dur = None
+        if load is None:
+            dur = float(c["pres_check_duration_s"] if duration is None
+                        else duration)
+            if not 0.0 < dur <= max_s + 1e-9:
+                raise self.error("[k2_prtouch] KTWO_PRTOUCH_CHECK: DURATION "
+                                 "%.2f s außerhalb (0, %.1f] (pres_check_"
+                                 "max_s)" % (dur, max_s))
+        rate, _pga = cs1237_rate_pga(c["cfg_regs"])
+        self.stats = ApaxStats(c.get("pres_check_skip", PRES_CHECK_SKIP),
+                               c.get("clock_freq", CLOCK_FREQ),
+                               pres_check_max_samples(c),
+                               on_overrun=self._guard)
+        last = {"status": "running", "mode": "load" if load else "duration"}
+        self.last = last
+        self.runs += 1
+        pending = None
+        t0 = t1 = None
+        try:
+            # active VOR dem Senden: das finally stoppt in jedem Fall, auch
+            # wenn die ack-Antwort verloren geht (MCU könnte gestartet sein).
+            self.active = True
+            try:
+                ack = _ack_dict(self.apax.start())
+            except Exception as exc:
+                if isinstance(exc, self.error):
+                    raise
+                raise self.error("[k2_prtouch] start_prtouch_apax "
+                                 "fehlgeschlagen: %s" % exc)
+            last["ack"] = ack
+            if ack["err"] != 0 or ack["expar1"] != int(c["acq_tick"]):
+                raise self.error(
+                    "[k2_prtouch] start_prtouch_apax ack err=%d expar1=%d "
+                    "(erwartet err=0 expar1=%d) – Selbsttest abgebrochen."
+                    % (ack["err"], ack["expar1"], int(c["acq_tick"])))
+            t0 = self.clock()
+            if load is not None:
+                try:
+                    load()
+                except Exception as exc:
+                    if isinstance(exc, self.error):
+                        raise
+                    raise self.error("[k2_prtouch] KTWO_PRTOUCH_CHECK Last "
+                                     "(EXTRUDE/MACRO): %s" % exc)
+            else:
+                self.pause(dur)
+            t1 = self.clock()
+        except BaseException as exc:
+            pending = exc
+            last["status"] = "error"
+            last["error"] = str(exc)
+            raise
+        finally:
+            if t0 is not None and t1 is None:
+                t1 = self.clock()
+            serr = self.stop()
+            last["stopped"] = serr is None
+            if serr:
+                last["stop_error"] = serr
+                last["status"] = "error"
+                if pending is None:
+                    raise self.error(
+                        "[k2_prtouch] KTWO_PRTOUCH_CHECK: Stopp "
+                        "fehlgeschlagen (%s) – Antasten bleibt gesperrt; "
+                        "KTWO_PRTOUCH_CHECK STOP=1 oder FIRMWARE_RESTART."
+                        % serr)
+        duration_s = t1 - t0
+        ok, res = evaluate_apax(self.stats.snapshot(), c, duration_s,
+                                require_dif, expect_moving)
+        if duration_s > max_s + 0.5:
+            res["errors"].append("Dauer %.1f s > pres_check_max_s %.1f s"
+                                 % (duration_s, max_s))
+            ok = False
+        res["stray_packets"] = self.stray
+        last.update(res)
+        last["status"] = "ok" if ok else "fail"
+        return ok, res
+
+    def get_status(self):
+        last = self.last or {}
+        return {"active": self.active, "runs": self.runs,
+                "status": last.get("status"),
+                "errors": list(last.get("errors", []) or []),
+                "stray_packets": self.stray}
+
+
+class KlippyApaxMcu:
+    """Klipper-Anbindung des apax-Kanals (Düsen-MCU, gemeinsame PRES-oid wie
+    Stock – B Befund §2.1: PrtouchApax übernimmt oid und mcu von pres; der
+    Strom kommt ohnehin mit S[0] = pres-oid, B §1.3).
+
+    Start/Stopp als Query (ack_prtouch), Wächter-Stopp ohne Warten
+    (lookup_command, aus dem serialhdl-Thread per register_async_callback in
+    den Reactor verschoben). Antwort resault_prtouch_apax über
+    mcu.register_serial_response (Upstream 9cb9975), sonst
+    mcu.register_response (ältere Upstream-Stände)."""
+
+    def __init__(self, mcu, cfg, oid, reactor=None):
+        self.mcu = mcu
+        self.cfg = cfg
+        self.oid = int(oid)
+        self.reactor = reactor
+        self._q_start = self._q_stop = self._c_stop = None
+
+    def handle_connect(self, sink):
+        mcu = self.mcu
+        self._q_start = mcu.lookup_query_command(CMD_START_APAX, RESP_ACK,
+                                                 oid=self.oid)
+        self._q_stop = mcu.lookup_query_command(CMD_STOP_APAX, RESP_ACK,
+                                                oid=self.oid)
+        self._c_stop = mcu.lookup_command(CMD_STOP_APAX)
+        if hasattr(mcu, "register_serial_response"):
+            mcu.register_serial_response(sink, RESP_APAX, self.oid)
+        elif hasattr(mcu, "register_response"):
+            mcu.register_response(sink, "resault_prtouch_apax", self.oid)
+        else:
+            raise RuntimeError("MCU kann keine Antworten registrieren")
+
+    def start(self):
+        return self._q_start.send(list(build_start_apax_tuple(self.cfg,
+                                                              self.oid)))
+
+    def stop(self):
+        return _ack_dict(self._q_stop.send([self.oid]))
+
+    def stop_nowait(self):
+        def _send(eventtime=None):
+            self._c_stop.send([self.oid])
+        r = self.reactor
+        if r is not None and hasattr(r, "register_async_callback"):
+            r.register_async_callback(_send)
+        else:
+            _send()
 
 
 # =====================================================================
@@ -2851,6 +3424,11 @@ class PrinterK2Prtouch:
         self.controller = None
         self.probe = None
         self._pin_nums = {}
+        # Sensor-Selbsttest (pres_check, Default AUS): oid_estp wird in der
+        # Config-Phase über die Klipper-API ermittelt, apax_check bei connect.
+        self.apax_oid_estp = None
+        self.apax_mcu = None
+        self.apax_check = None
         # MCU-Objekte (Upstream-Namen 'mcu' / 'mcu nozzle_mcu'):
         try:
             self.mcu_pres = _lookup_mcu(self.printer, self.cfg["nozzle_mcu"])
@@ -2880,6 +3458,13 @@ class PrinterK2Prtouch:
                 ("KTWO_PRTOUCH_READ", self.cmd_read,
                  "Sensor lesen ohne Bewegung"),
                 ("KTWO_PRTOUCH_STATUS", self.cmd_status, "Letzter Status")]
+        if self.cfg["pres_check"]:
+            # Nur mit pres_check: True (Default False -> Befehl fehlt, alles
+            # exakt wie vorher).
+            cmds.append(("KTWO_PRTOUCH_CHECK", self.cmd_check,
+                         "Sensor-Selbsttest (apax, Ersatz PRES_CHECK) "
+                         "[DURATION=s | EXTRUDE=mm SPEED=mm/s | MACRO=name] "
+                         "[REQUIRE_DIF=0] [STOP=1]"))
         if self.cfg["mode"] == "steps":
             # Nur im Rückfallmodus: eigene Ersatzbefehle für G28 Z / Mesh.
             cmds += [("KTWO_PRTOUCH_HOME_Z", self.cmd_home_z,
@@ -2907,6 +3492,54 @@ class PrinterK2Prtouch:
             "config_prtouch_pres oid=%d idx=%d swp_pin=%s clk_pin=%s "
             "sdo_pin=%s" % (self.pres_oid, int(self.cfg["pres_idx"]),
                             swp, clk, sdo))  # is_init False wie Stock
+        if self.cfg["pres_check"]:
+            # NACH config_prtouch_pres (Stock-Reihenfolge, APAX-Befund §6.1),
+            # gemeinsame pres-oid wie Stock (B §2.1). oid_estp NUR aus dem
+            # Stepper-Objekt des Extruders auf DIESER MCU – falsches oid_estp
+            # = MCU-Shutdown beim ersten Sample (B §1.3), daher nie raten.
+            self.apax_oid_estp = self._extruder_stepper_oid()
+            mcu.add_config_cmd("config_prtouch_apax oid=%d oid_estp=%d"
+                               % (self.pres_oid, self.apax_oid_estp))
+
+    def _extruder_stepper_oid(self):
+        """oid_estp = MCU_stepper.get_oid() des Extruders (Upstream:
+        PrinterExtruder.extruder_stepper.stepper, extruder.py:177-182;
+        stepper.py:33/58/132). Prüft, dass der Stepper auf DERSELBEN MCU
+        liegt wie pres (Objektidentität, kein Namensvergleich) und die oid
+        in %c passt. Sonst Config-Fehler mit klarer Meldung (Klipper meldet
+        ihn als 'Config error', kein Shutdown)."""
+        name = self.cfg["pres_check_extruder"]
+        pre = ("[k2_prtouch] pres_check: oid_estp nicht sicher bestimmbar – "
+               "config_prtouch_apax wird NICHT gesendet (falsches oid_estp = "
+               "MCU-Shutdown beim ersten Sample). ")
+        cerr = getattr(self.printer, "config_error", RuntimeError)
+        try:
+            ext = self.printer.lookup_object(name)
+        except Exception as exc:
+            raise cerr(pre + "Objekt %r nicht gefunden (pres_check_extruder): "
+                       "%s" % (name, exc))
+        es = getattr(ext, "extruder_stepper", None)
+        st = getattr(es, "stepper", None) if es is not None else None
+        if st is None or not hasattr(st, "get_oid") \
+                or not hasattr(st, "get_mcu"):
+            raise cerr(pre + "%r hat keinen Stepper (step_pin fehlt?)" % name)
+        smcu = st.get_mcu()
+        if smcu is not self.mcu_pres:
+            def _n(m):
+                try:
+                    return m.get_name()
+                except Exception:
+                    return repr(m)
+            raise cerr(pre + "Stepper von %r liegt auf MCU %r, der Kraftsensor "
+                       "auf %r (nozzle_mcu) – die Düsen-FW kann nur einen "
+                       "Stepper der EIGENEN MCU nachschlagen. pres_check: False "
+                       "setzen oder [extruder] step_pin prüfen."
+                       % (name, _n(smcu), _n(self.mcu_pres)))
+        oid = int(st.get_oid())
+        if not 0 <= oid <= 255 or oid == self.pres_oid:
+            raise cerr(pre + "unplausible Stepper-oid %d (pres-oid %d)"
+                       % (oid, self.pres_oid))
+        return oid
 
     def _build_step_config(self):
         mcu = self.mcu_step
@@ -2986,6 +3619,39 @@ class PrinterK2Prtouch:
             self.cfg, pres, step, KlippyToolhead(self.printer),
             pause=reactor_sleep(self.reactor),
             logger=self.gcode)
+        if self.cfg["pres_check"] and self.apax_oid_estp is not None:
+            self._setup_apax()
+
+    def _setup_apax(self):
+        """Selbsttest anbinden + Gegensperren (arm <-> apax) setzen."""
+        apax = KlippyApaxMcu(self.mcu_pres, self.cfg, self.pres_oid,
+                             self.reactor)
+        check = K2PrtouchApaxCheck(
+            self.cfg, apax, reactor_sleep(self.reactor),
+            clock=self.reactor.monotonic, error=self.printer.command_error,
+            is_armed=self._any_armed, logger=self.gcode)
+        try:
+            apax.handle_connect(check.on_packet)
+        except Exception as exc:
+            try:
+                self.gcode.respond_info("[k2_prtouch] pres_check: apax-"
+                                        "Lookup fehlgeschlagen: %s" % exc)
+            except Exception:
+                pass
+            return
+        self.apax_mcu, self.apax_check = apax, check
+        if self.probe is not None:
+            self.probe.core.apax_busy = check.busy
+        if self.controller is not None:
+            self.controller.core.apax_busy = check.busy
+
+    def _any_armed(self):
+        for core in ((self.probe.core if self.probe is not None else None),
+                     (self.controller.core if self.controller is not None
+                      else None)):
+            if core is not None and core.armed:
+                return True
+        return False
 
     def _ctl(self):
         if self.controller is None:
@@ -3002,6 +3668,9 @@ class PrinterK2Prtouch:
                 if self.controller else None,
                 "probe": self.probe.core.get_status()
                 if self.probe is not None else None}
+        if self.cfg.get("pres_check"):  # nur dann – sonst exakt wie vorher
+            base["pres_check"] = (self.apax_check.get_status()
+                                  if self.apax_check is not None else None)
         return base
 
     # --- G-Code-Helfer ---
@@ -3168,6 +3837,119 @@ class PrinterK2Prtouch:
                               "Bewegung): rest=%s" % (info.get("rest"),))
         except Exception as exc:
             gcmd.respond_info("[k2_prtouch] READ: %s" % exc)
+
+    def _check_hot(self):
+        """EXTRUDE nur heiß: can_extrude (min_extrude_temp) UND Temperatur
+        >= pres_check_min_temp, aktiver Extruder = pres_check_extruder."""
+        name = self.cfg["pres_check_extruder"]
+        th = self.printer.lookup_object("toolhead")
+        act = th.get_extruder()
+        if act.get_name() != name:
+            raise self.printer.command_error(
+                "[k2_prtouch] KTWO_PRTOUCH_CHECK EXTRUDE: aktiver Extruder "
+                "%r != %r – keine Extrusion." % (act.get_name(), name))
+        heater = self.printer.lookup_object(name).get_heater()
+        temp, _target = heater.get_temp(self.reactor.monotonic())
+        if not heater.can_extrude or temp < self.cfg["pres_check_min_temp"]:
+            raise self.printer.command_error(
+                "[k2_prtouch] KTWO_PRTOUCH_CHECK EXTRUDE: Düse zu kalt "
+                "(%.0f °C, Minimum %.0f °C/min_extrude_temp) – erst heizen. "
+                "Kein Strom gestartet." % (temp,
+                                           self.cfg["pres_check_min_temp"]))
+
+    def _do_extrude(self, mm, speed):
+        self.gcode.run_script_from_command(
+            "SAVE_GCODE_STATE NAME=_k2_prtouch_check\nM83\n"
+            "G1 E%.3f F%.1f\nRESTORE_GCODE_STATE NAME=_k2_prtouch_check"
+            % (mm, speed * 60.0))
+        self.printer.lookup_object("toolhead").wait_moves()
+
+    def _do_macro(self, macro):
+        self.gcode.run_script_from_command(macro)
+        self.printer.lookup_object("toolhead").wait_moves()
+
+    def cmd_check(self, gcmd):
+        """KTWO_PRTOUCH_CHECK – Sensor-Selbsttest über den apax-Strom.
+
+        DURATION=s (Default pres_check_duration_s): nur messen, keine
+          Bewegung (ohne Last schlägt dif fehl -> REQUIRE_DIF=0 prüft nur
+          Strom/Rate/Rohwerte, oder Düse von Hand belasten).
+        EXTRUDE=mm [SPEED=mm/s]: kleine Extrusion während der Messung (nur
+          allow_move, heiß, <= pres_check_extrude_max_mm).
+        MACRO=name: Makro (z. B. Düsenreinigung) während der Messung (nur
+          allow_move; G28/PROBE darin sind durch die Gegensperre gesperrt).
+        STOP=1: nur stop_prtouch_apax wiederholen (Sperre lösen).
+        Fehlschlag -> command_error (Stock-key769-Text), KEIN Shutdown."""
+        cerr = self.printer.command_error
+        check = self.apax_check
+        if check is None:
+            raise cerr("[k2_prtouch] KTWO_PRTOUCH_CHECK nicht bereit "
+                       "(klippy:connect/apax-Lookup fehlgeschlagen).")
+        if gcmd.get_int("STOP", 0):
+            err = check.stop()
+            if err:
+                raise cerr("[k2_prtouch] STOP: %s – Antasten bleibt "
+                           "gesperrt." % err)
+            gcmd.respond_info("[k2_prtouch] apax gestoppt, Sperre gelöst.")
+            return
+        c = self.cfg
+        extrude = gcmd.get_float("EXTRUDE", None)
+        macro = gcmd.get("MACRO", None)
+        duration = gcmd.get_float("DURATION", None)
+        require_dif = bool(gcmd.get_int("REQUIRE_DIF", 1))
+        if extrude is not None and macro is not None:
+            raise cerr("[k2_prtouch] EXTRUDE und MACRO nicht kombinierbar.")
+        load = None
+        expect_moving = False
+        max_s = float(c["pres_check_max_s"])
+        if extrude is not None or macro is not None:
+            if not c.get("allow_move"):
+                raise cerr("[k2_prtouch] KTWO_PRTOUCH_CHECK EXTRUDE/MACRO "
+                           "braucht allow_move: True – nichts bewegt.")
+        if extrude is not None:
+            speed = gcmd.get_float("SPEED", c["pres_check_extrude_speed"])
+            if not 0.0 < extrude <= c["pres_check_extrude_max_mm"] + 1e-9:
+                raise cerr("[k2_prtouch] EXTRUDE=%.3f außerhalb (0, %.1f] mm "
+                           "(pres_check_extrude_max_mm)."
+                           % (extrude, c["pres_check_extrude_max_mm"]))
+            if not 0.0 < speed <= PRES_CHECK_EXTRUDE_SPEED_LIMIT + 1e-9:
+                raise cerr("[k2_prtouch] SPEED=%.2f außerhalb (0, %.0f] mm/s."
+                           % (speed, PRES_CHECK_EXTRUDE_SPEED_LIMIT))
+            if extrude / speed + 1.0 > max_s:
+                raise cerr("[k2_prtouch] EXTRUDE dauert ~%.1f s > "
+                           "pres_check_max_s %.1f s." % (extrude / speed + 1.0,
+                                                          max_s))
+            self._check_hot()
+            load = lambda: self._do_extrude(extrude, speed)
+            expect_moving = True
+        elif macro is not None:
+            import re
+            if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", macro):
+                raise cerr("[k2_prtouch] MACRO=%r ungültig (nur ein "
+                           "Makroname ohne Parameter)." % (macro,))
+            load = lambda: self._do_macro(macro)
+        self.printer.lookup_object("toolhead").wait_moves()
+        gcmd.respond_info("[k2_prtouch] KTWO_PRTOUCH_CHECK: apax-Strom läuft "
+                          "(≈ %.1f kB/s, ≈ %d %% der Düsenleitung)"
+                          % (APAX_BUS_BYTES_PER_S / 1000.0,
+                             round(apax_bus_load(1)["line_share"] * 100)))
+        try:
+            ok, res = check.run(load=load, duration=duration,
+                                require_dif=require_dif,
+                                expect_moving=expect_moving)
+        except cerr:
+            raise
+        except Exception as exc:
+            raise cerr("[k2_prtouch] KTWO_PRTOUCH_CHECK: %s" % exc)
+        for line in format_check_lines(res):
+            gcmd.respond_info(line)
+        for w in res.get("warnings", []):
+            gcmd.respond_info("[k2_prtouch] Warnung: %s" % w)
+        if not ok:
+            raise cerr(format_check_failure(res))
+        gcmd.respond_info("SUCCESS: Strain gauge dynamic detection passed. "
+                          "(KTWO_PRTOUCH_CHECK%s)"
+                          % ("" if require_dif else ", ohne dif-Kriterium"))
 
     def cmd_status(self, gcmd):
         st = self.get_status()

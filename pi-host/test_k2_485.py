@@ -19,6 +19,11 @@ pyserial (Fake-Seriell wird über die echte nachbau/serial485.Serial485 mit
 6. Port fällt im Betrieb aus (OSError) -> RuntimeError, geschlossen, Re-Open;
    TimeoutError (keine Antwort) lässt den Port offen.
 7. Python-3.9-Syntax der Module.
+8. Sendeschutz Motor-Kalibrierung (17.10.2026, MOTOR-KALIBRIERUNG-BEFUND §12):
+   an Motor-Adressen 0x80-0x88/0xFD nie fun 0x03/0x04, fun 0x07 nur Sub 02/06
+   – serial485 und lokaler k2_transport-Fallback gleich, über k2_485,
+   Rs485Transport und TransparentTransport nichts gesendet; Box/Belt/Rack
+   mit denselben fun-Codes unberührt.
 """
 
 import ast
@@ -384,10 +389,153 @@ def test_py39():
     check("Python-3.9-Syntax", not bad, bad)
 
 
+class _FakeTransparent(T.TransparentMcuAdapter):
+    """Zeichnet transparent-Sendungen auf, antwortet nie (b'')."""
+
+    def __init__(self):
+        self.writes = []
+
+    def exchange(self, write, timeout_ms):
+        self.writes.append(bytes(write))
+        return b""
+
+
+def _motor_guard_cases():
+    """(addr, fun, data, erlaubt) – Motor gesperrt/erlaubt, Box/Belt frei."""
+    cases = []
+    for a in list(range(0x80, 0x89)) + [0xFD]:
+        cases += [(a, 0x03, [], False), (a, 0x03, [0x00], False),
+                  (a, 0x04, [0x00], False), (a, 0x04, [], False),
+                  (a, 0x07, [], False), (a, 0x07, [0x00], False),
+                  (a, 0x07, [0x01], False), (a, 0x07, [0x03, 0x00], False),
+                  (a, 0x07, [0x04, 0x00], False),
+                  (a, 0x07, [0x05, 0x14, 0, 0, 0x80, 0x3F], False),
+                  (a, 0x07, [0x07], False),
+                  (a, 0x07, [0x02], True), (a, 0x07, [0x06, 0x14], True)]
+    cases += [(0x81, 0x06, [0x02, 0x46], True), (0x81, 0x0F, [0x01], True),
+              (0x81, 0x05, [0x02], True), (0x81, 0x0E, [0x02], True)]
+    # Box (0x01-0x04, Gruppe 0xFE): 0x03 Restmenge, 0x04 Modus, 0x07 Hauptmotor
+    for a in (0x01, 0x02, 0x03, 0x04, 0xFE):
+        cases += [(a, 0x03, [0x0F], True), (a, 0x04, [0x00, 0x01], True),
+                  (a, 0x04, [0x0F, 0x00], True), (a, 0x07, [0x01], True),
+                  (a, 0x07, [0x02], True), (a, 0x07, [0x00], True)]
+    # Belt (0x21/0x22): 0x04 WRITE_FLASH, 0x02 READ_FLASH; Rack 0x11; 0xFF/0xFC
+    for a in (0x21, 0x22):
+        cases += [(a, 0x04, [0x02, 0, 0, 0, 0x8C], True), (a, 0x02, [0x02], True)]
+    cases += [(0x11, 0x03, [0x01], True), (0xFF, 0x03, [], True),
+              (0xFF, 0x04, [0x00], True), (0xFF, 0x07, [0x05], True),
+              (0xFC, 0x04, [0x00], True)]
+    return cases
+
+
+def test_motor_sendeschutz():
+    cases = _motor_guard_cases()
+    check("Sendeschutz: k2_transport nutzt serial485.check_tx_frame",
+          T.check_tx_frame is S485.check_tx_frame
+          and T.TxGuardError is S485.TxGuardError
+          and hasattr(S485, "TX_MOTOR_GUARD_ADDRS"))
+    check("Sendeschutz: Motor-Adressen identisch (serial485 = lokal)",
+          S485.TX_MOTOR_GUARD_ADDRS == T.TX_MOTOR_GUARD_ADDRS
+          == frozenset(list(range(0x80, 0x89)) + [0xFD])
+          and S485.TX_FLASH_PARAM_READ_SUBS == T.TX_FLASH_PARAM_READ_SUBS
+          == frozenset((0x02, 0x06)))
+    for name, fn in (("serial485", S485.check_tx_frame),
+                     ("lokal", T._check_tx_frame_local)):
+        wrong = []
+        for addr, fun, data, ok in cases:
+            try:
+                fn(addr, fun, data)
+                got = True
+            except ValueError:
+                got = False
+            if got != ok:
+                wrong.append("0x%02X/0x%02X %s" % (addr, fun, data))
+        check("Sendeschutz Matrix %s (%d Fälle)" % (name, len(cases)),
+              not wrong, wrong[:5])
+    try:
+        S485.check_tx_frame(0x83, 0x04, [0x00])
+        msg = ""
+    except S485.TxGuardError as exc:
+        msg = str(exc)
+    check("Sendeschutz: Meldung nennt elec_offset + nichts gesendet",
+          "elec_offset" in msg and "nichts gesendet" in msg, msg)
+
+    # über [k2_485] (echte Serial485 + Fake-Port): gesperrt -> nichts auf dem Draht
+    fac = Factory(FakeSerial([None] * 8))
+    pr, bus = make(factory=fac)
+    pr.send("klippy:connect")
+    ser = fac.instances[0].ser
+    blocked = [c[:3] for c in cases if not c[3]]
+    nraise = 0
+    for addr, fun, data in blocked:
+        try:
+            bus.transact_full(addr, fun, data, timeout=0.01, retries=0)
+        except S485.TxGuardError:
+            nraise += 1
+        except Exception:
+            pass
+    check("k2_485: alle gesperrten Motor-Frames -> TxGuardError, Draht leer",
+          nraise == len(blocked) and ser.written == [], (nraise, len(blocked)))
+    # Box/Belt über denselben Bus: unverändert byte-genau gesendet
+    import k2_belt as KBELT
+    box_req = (0x01, 0x04, [0x00, 0x01])
+    belt_req = (KBELT.ADDR_MDLX, KBELT.FUN_WRITE_FLASH, [0x02, 0, 0, 0, 0x8C])
+    for addr, fun, data in (box_req, belt_req, (0x81, 0x07, [0x06, 0x14])):
+        try:
+            bus.transact_full(addr, fun, data, timeout=0.01, retries=0)
+        except TimeoutError:
+            pass
+    check("k2_485: Box 0x04 / Belt WRITE_FLASH / Motor 0x07 [06] gesendet",
+          ser.written[:1] == [bytes(S485.build_frame(*box_req))]
+          and ser.written[1:2] == [bytes(S485.build_frame(*belt_req))]
+          and ser.written[2:3] == [bytes(S485.build_frame(0x81, 0x07, [0x06, 0x14]))],
+          [w.hex(" ") for w in ser.written])
+    pr.send("klippy:disconnect")
+
+    # Rs485Transport (Weg von [k2_motor]) und TransparentTransport (Extruder 0x81)
+    class _RecBus:
+        def __init__(self):
+            self.calls = []
+
+        def transact_full(self, addr, fun, data, timeout=None, retries=0):
+            self.calls.append((addr, fun, list(data)))
+            raise TimeoutError("still")
+    rb = _RecBus()
+    rs = T.Rs485Transport(rb)
+    mcu = _FakeTransparent()
+    tr = T.TransparentTransport(mcu)
+    nr = nt = 0
+    for addr, fun, data in blocked:
+        try:
+            rs.transact(addr, fun, data, timeout=0.01, retries=0)
+        except T.TxGuardError:
+            nr += 1
+        except TimeoutError:
+            pass
+        try:
+            tr.transact(addr, fun, data, timeout=0.01, retries=0)
+        except T.TxGuardError:
+            nt += 1
+        except TimeoutError:
+            pass
+    check("Rs485Transport/TransparentTransport: gesperrt, nichts gesendet",
+          nr == nt == len(blocked) and rb.calls == [] and rs.sent == []
+          and mcu.writes == [] and tr.sent == [], (nr, nt, rb.calls, mcu.writes))
+    for t in (rs, tr):
+        try:
+            t.transact(0x81, 0x07, [0x02], timeout=0.01, retries=0)
+        except TimeoutError:
+            pass
+    check("Rs485/transparent: Motor 0x07 [02] (lesend) erlaubt",
+          rb.calls == [(0x81, 0x07, [0x02])]
+          and mcu.writes == [bytes(S485.build_frame(0x81, 0x07, [0x02]))],
+          (rb.calls, mcu.writes))
+
+
 def main():
     for fn in (test_laden_und_connect, test_gemeinsam_mit_modulen, test_batch,
                test_port_fehlt, test_ausfall_timeout, test_config_fehler,
-               test_py39):
+               test_py39, test_motor_sendeschutz):
         try:
             fn()
         except Exception as exc:

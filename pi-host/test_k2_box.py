@@ -39,6 +39,12 @@ lesen (ok/fehlt/kaputt/Struktur/Farbe, .defekt-…), atomar schreiben nur
 nach FLUSH + Änderung, flush_mode matrix (Kopf/Ende, 16×16 asymmetrisch,
 TOOL=, nur printing, Rückfälle), Makro M600 -> PAUSE. HOME zeigt im Test
 auf ein Wegwerf-Verzeichnis (Default-Pfad unter ~).
+Restmaterial + Druckende (17.10.2026, FLUSH-SONDERFAELLE-BEFUND §2/§3,
+README-k2_box.md §12.5): Auslöser 0x50 nur im Druck, Stückfolge (Kopf leer
++ 1 Stück), max_tube_length (gekürzt, Kopf voll = Pause), Kopfsensor
+unbekannt -> Pause ohne Förderung, Zeitlimit, Geschwindigkeit mit/ohne DB,
+keine Kreise, kein Schnitt/Rückzug danach, KTWO_BOX_ENDING, end_print_unload
+an/aus (Fehler ohne Pause), END_PRINT-Makro.
 
 Fakes:
 - FakeBoxBus: simuliert Box-Zustände (IDLE/PRELOAD/PRINT/ERROR), Hub-Maske,
@@ -3814,6 +3820,542 @@ def test_makro_m600():
 # Runner
 # =====================================================================
 
+# =====================================================================
+# Restmaterial + Druckende (17.10.2026, FLUSH-SONDERFAELLE-BEFUND-2026-10-17
+# §2/§3/§8, README-k2_box.md §12.5)
+# =====================================================================
+
+import re as _re_end  # noqa: E402
+
+_PIECE_RE = _re_end.compile(r"^G1 E(\d+(?:\.\d+)?) F")
+
+
+def _ending_hull(empty_after=3, hub=0x00, printing=True, **opt):
+    """Druck läuft mit T1A (weiß PLA vol 23 in der Düse), Spule A im CFS
+    leer: Box PRINT + 0x50, Hub leer, Kopf voll. Der Kopfsensor meldet nach
+    ``empty_after`` Ausspül-Stücken LEER (None = nie). Mit fan0 + arcs."""
+    o = dict(allow_write="True")
+    o.update(opt)
+    db = o.pop("db", True)
+    bus, printer, mod = _material_hull(db=db, **o)
+    printer.objects["output_pin fan0"] = _PinObj(0.4, 255.0)
+    printer.objects["gcode_arcs"] = object()
+    ctl = mod._ensure_controller()
+    ctl.get_rfid("A")
+    ctl.loaded_slot = "A"
+    mod.remain_material = {"type": "190001", "color": "0FFFFFF", "tnn": "T1A"}
+    bus.slots["A"]["filament"] = False
+    bus.state, bus.print_frame_status = 2, 0x50
+    bus.hub_mask, bus.head = hub, True
+    bus.head_at_mm = 300.0
+    bus.need_extruder_for_mode7 = True
+    if printing:
+        printer.set_printing(True)
+    printer.target = 210.0
+    printer._refresh()
+    pieces = []
+    orig = printer.sim
+
+    def sim(line):
+        orig(line)
+        m = _PIECE_RE.match(line)
+        if m and line.split()[1] in ("E80", "E40", "E20"):
+            pieces.append(float(m.group(1)))
+            if empty_after is not None and len(pieces) == empty_after:
+                bus.head = False
+    printer.sim = sim
+    bus.calls[:] = []
+    bus.trace = []
+    return bus, printer, mod, ctl, pieces
+
+
+def test_ending_ausloeser():
+    # 1) 0x50 im PRINT während des Drucks -> Merker + Meldung (Stock send_data)
+    bus, printer, mod, ctl, _p = _ending_hull()
+    assert mod.ending_material is None and not mod.get_status()["ending_material"]
+    ctl.poll_status()
+    em = mod.ending_material
+    assert em and em["tnn"] == "T1A" and em["slot"] == "A", em
+    st = mod.get_status()
+    assert st["ending_material"] and st["ending_material_tnn"] == "T1A" \
+        and st["ending_material_purge"] and not st["end_print_unload"], st
+    assert any("Restmaterial: Spule T1A im CFS leer" in m
+               for m in printer.gcode.infos), printer.gcode.infos[-3:]
+    # zweiter Poll: keine zweite Meldung (Flag schon gesetzt)
+    n = len(printer.gcode.infos)
+    ctl.poll_status()
+    assert len(printer.gcode.infos) == n
+    # 2) gespeicherter Fehler 0x50 im ERROR -> ebenso; 0x51/0x52 nicht
+    for state, err, want in ((4, 0x50, True), (4, 0x51, False),
+                             (4, 0x52, False), (0, 0x00, False)):
+        bus, printer, mod, ctl, _p = _ending_hull()
+        bus.state, bus.stored_error = state, err
+        ctl.poll_status()
+        assert bool(mod.ending_material) is want, (state, err)
+    # 3) PRINT ohne 0x50 -> nichts; 0x50 ohne Druck -> nichts (Stock nur
+    #    printing/paused); in der Pause -> ja
+    bus, printer, mod, ctl, _p = _ending_hull()
+    bus.print_frame_status = 0x00
+    ctl.poll_status()
+    assert mod.ending_material is None
+    bus, printer, mod, ctl, _p = _ending_hull(printing=False)
+    ctl.poll_status()
+    assert mod.ending_material is None
+    printer.gcode.run_script_from_command("PAUSE")
+    ctl.poll_status()
+    assert mod.ending_material and mod.ending_material["tnn"] == "T1A"
+    # 4) Poll-Timer (handle_motor_ready) und KTWO_BOX_STATUS werten aus
+    bus, printer, mod, ctl, _p = _ending_hull()
+    mod.cmd_status(FakeGcmd({}))
+    assert mod.ending_material is not None
+    # 5) KTWO_BOX_ENDING: Anzeige / CLEAR / SET SLOT
+    g = FakeGcmd({})
+    mod.cmd_ending(g)
+    assert any("Fall offen T1A" in m for m in g.infos), g.infos
+    mod.cmd_ending(FakeGcmd({"CLEAR": "1"}))
+    assert mod.ending_material is None and "erledigt" in mod.ending_last
+    mod.cmd_ending(FakeGcmd({"SET": "1", "SLOT": "C"}))
+    assert mod.ending_material["tnn"] == "T1C"
+    try:
+        mod.cmd_ending(FakeGcmd({"SET": "1", "SLOT": "X"}))
+    except ValueError as exc:
+        assert "KTWO_BOX_ENDING" in str(exc)
+    else:
+        raise AssertionError("SLOT=X hätte abgelehnt werden müssen")
+    # 5b) PRE_OPT pollt frisch (0x50 seit dem letzten Timer-Poll) und spült;
+    #     Polls WÄHREND einer Kette setzen keinen Merker (altes 0x50)
+    bus, printer, mod, ctl, pieces = _ending_hull(empty_after=1)
+    assert mod.ending_material is None
+    mod.cmd_pre_opt(FakeGcmd({"TNN": "T1B", "SOURCE": "T"}))
+    assert pieces == [80.0, 80.0] and mod.chain["ending_purged"], pieces
+    bus.state, bus.print_frame_status = 2, 0x50
+    ctl.poll_status()
+    assert mod.ending_material is None, "Kette aktiv -> kein Merker"
+    mod.cmd_end_opt(FakeGcmd({"RETURN": "0"}))
+    ctl.poll_status()
+    assert mod.ending_material is not None, "nach der Kette wieder"
+    # 6) Runout-Nachladen löscht den Merker (Rest am Kopfsensor vorbei) und
+    #    spült NICHT (Stock check_material_refill)
+    bus, printer, mod = build_runout()
+    mod._ensure_controller().poll_status()   # 0x50 im Druck/Pause -> Merker
+    assert mod.ending_material is not None
+    n0 = len(printer.gcode.scripts)
+    mod.cmd_runout(FakeGcmd({}))
+    sc = printer.gcode.scripts[n0:]
+    assert mod.ending_material is None and "Runout-Nachladen" in mod.ending_last
+    assert not [l for l in sc if l.startswith("G1 E80")], "kein Ausspülen"
+    assert mod.get_status()["loaded_tnn"] == "T1C" and not printer.paused
+    return ("0x50 im PRINT/ERROR nur im Druck/Pause -> Merker T1A + Meldung "
+            "(einmal); 0x51/0x52/IDLE nicht; ENDING SET/CLEAR; Runout löscht, "
+            "spült nicht")
+
+
+def test_ending_stueckfolge():
+    # Wechsel T1A (leer gelaufen) -> T1B: Kopfsensor leer nach 3 Stücken ->
+    # 4 Stücke (Stock: + 1 Stück), dann kein Schnitt/Rückzug, Einzug B
+    bus, printer, mod, ctl, pieces = _ending_hull(empty_after=3)
+    ctl.poll_status()
+    assert mod.ending_material
+    n0 = len(printer.gcode.scripts)
+    infos = run_chain(mod, "T1B")
+    sc = printer.gcode.scripts[n0:]
+    assert pieces == [80.0] * 4, pieces
+    ext = [l for l in sc if l.startswith("G1 E80")]
+    assert ext == ["G1 E80 F575"] * 4, ext        # 23/2,4·60, ohne ×0,8/360
+    i_off = sc.index("SET_FILAMENT_SENSOR SENSOR=filament_sensor ENABLE=0")
+    i_heat = sc.index("M109 S220")
+    i_first = sc.index("G1 E80 F575")
+    assert i_off < i_heat < i_first, (i_off, i_heat, i_first)
+    last_piece = max(i for i, l in enumerate(sc) if l.startswith("G1 E80"))
+    seg = sc[i_first:last_piece + 40]
+    seg = seg[:next(i for i, l in enumerate(seg) if l.startswith("G1 E30"))] \
+        if any(l.startswith("G1 E30") for l in seg) else seg
+    # je Stück Blasen + Blech, KEINE Kreise, Schacht nicht verlassen
+    assert seg.count("SET_PIN PIN=fan0 VALUE=255") == 4, seg
+    assert seg.count("G4 P5000") == 4
+    assert seg.count("G0 X170 F12000") == 4 and seg.count("G0 X135 F12000") == 4
+    assert not [l for l in seg if l.startswith(("G2", "G3"))], "keine Kreise"
+    assert "G0 Y345 F12000" not in seg[:seg.index("G0 X135 F12000") + 10]
+    assert "M104 S140" not in sc, "in der Kette kein Abkühlen"
+    # kein Schnitt, kein Rückzug, Box IDLE nach dem Ausspülen, dann Einzug B
+    assert "G0 X-7.8 Y200 F30000" not in sc, "kein Schnitt"
+    assert not [c for c in bus.calls if c[1] == 0x11], "kein Rückzug"
+    t = bus.trace
+    i_idle = _idx(t, _b(0x04, (0x00, 0x01)), _idx(t, lambda e: e[0] == "gcode"
+                                                  and e[1] == "G1 E80 F575"))
+    _idx(t, _b(0x10, (0x02, 0x00, 0x00)), i_idle)        # Einzug B danach
+    assert any("CUT übersprungen (Restmaterial" in m for m in infos), infos
+    assert any("RETRUDE übersprungen (Restmaterial" in m for m in infos)
+    st = mod.get_status()
+    assert not st["ending_material"] and "320 mm in 4 Stücken" in st["ending_last"], st
+    assert st["loaded_tnn"] == "T1B" and st["chain_error"] == "" \
+        and not st["chain_active"] and not printer.paused, st
+    # remain_material: Ausspülen speichert nichts, erst FLUSH B (Stock)
+    assert mod.remain_material["tnn"] == "T1B"
+    assert printer.objects["output_pin fan0"].value == 0.4
+    # Kopf schon leer beim Start -> 2 Stücke (Stock: Sensor nach Stück 1)
+    bus, printer, mod, ctl, pieces = _ending_hull(empty_after=None)
+    bus.head = False
+    mod.cmd_ending(FakeGcmd({"SET": "1", "SLOT": "A"}))
+    mod.cmd_pre_opt(FakeGcmd({"TNN": "T1B", "SOURCE": "T"}))
+    assert pieces == [80.0, 80.0], pieces
+    assert mod.chain["ending_purged"] and mod.ending_material is None
+    mod.cmd_end_opt(FakeGcmd({"RETURN": "1"}))
+    return ("Kopf leer nach Stück 3 -> 4×E80 F575, je Blasen + Blech ohne "
+            "Kreise, kein Schnitt/Rückzug, 0x04 IDLE, Einzug B; Kopf leer "
+            "von Anfang an -> 2 Stücke")
+
+
+def test_ending_geschwindigkeit():
+    def first_piece(**kw):
+        bus, printer, mod, ctl, pieces = _ending_hull(empty_after=1, **kw)
+        rm = kw.get("_remain")
+        if rm:
+            mod.remain_material = rm
+        mod.cmd_ending(FakeGcmd({"SET": "1", "SLOT": "A"}))
+        n0 = len(printer.gcode.scripts)
+        mod.cmd_pre_opt(FakeGcmd({"TNN": "T1B"}))
+        sc = printer.gcode.scripts[n0:]
+        mod.cmd_end_opt(FakeGcmd({"RETURN": "0"}))
+        return [l for l in sc if l.startswith("G1 E80")], sc
+    ext, sc = first_piece()
+    assert ext == ["G1 E80 F575"] * 2, ext          # PLA vol 23
+    # PLA vol 14 -> 350 (Flush wäre min(360, 350)·0,8 nicht; hier ohne ×0,8)
+    bus, printer, mod, ctl, pieces = _ending_hull(empty_after=1)
+    mod.remain_material = {"type": "190002", "color": "0CE58F8", "tnn": "T1B"}
+    mod.cmd_ending(FakeGcmd({"SET": "1"}))
+    n0 = len(printer.gcode.scripts)
+    mod.cmd_pre_opt(FakeGcmd({"TNN": "T1C"}))
+    assert [l for l in printer.gcode.scripts[n0:] if l.startswith("G1 E80")] \
+        == ["G1 E80 F350"] * 2
+    mod.cmd_end_opt(FakeGcmd({}))
+    # ohne Material-DB: bisherige Spülgeschwindigkeit Tn_extrude_velocity 360
+    bus, printer, mod, ctl, pieces = _ending_hull(empty_after=1, db=False)
+    mod.cmd_ending(FakeGcmd({"SET": "1"}))
+    n0 = len(printer.gcode.scripts)
+    mod.cmd_pre_opt(FakeGcmd({"TNN": "T1B"}))
+    sc = printer.gcode.scripts[n0:]
+    assert [l for l in sc if l.startswith("G1 E80")] == ["G1 E80 F360"] * 2, sc
+    assert "M109 S220" in sc, "ohne DB: max(Ziel 210, Tn_extrude_temp 220)"
+    mod.cmd_end_opt(FakeGcmd({}))
+    # DB an, Material ohne max_vol (TPU-Eintrag hat vol 2 -> 50) bzw. nicht
+    # in der DB -> Tn_extrude_velocity
+    bus, printer, mod, ctl, pieces = _ending_hull(empty_after=1)
+    mod.remain_material = {"type": "199999", "color": None, "tnn": "T1A"}
+    mod.cmd_ending(FakeGcmd({"SET": "1"}))
+    n0 = len(printer.gcode.scripts)
+    mod.cmd_pre_opt(FakeGcmd({"TNN": "T1B"}))
+    assert [l for l in printer.gcode.scripts[n0:] if l.startswith("G1 E80")] \
+        == ["G1 E80 F360"] * 2
+    mod.cmd_end_opt(FakeGcmd({}))
+    bus, printer, mod, ctl, pieces = _ending_hull(empty_after=1)
+    mod.remain_material = {"type": "190004", "color": None, "tnn": "T1D"}
+    mod.cmd_ending(FakeGcmd({"SET": "1"}))
+    n0 = len(printer.gcode.scripts)
+    mod.cmd_pre_opt(FakeGcmd({"TNN": "T1B"}))
+    assert [l for l in printer.gcode.scripts[n0:] if l.startswith("G1 E80")] \
+        == ["G1 E80 F50"] * 2
+    mod.cmd_end_opt(FakeGcmd({}))
+    # Pause: Temperatur aus _PI_PARAM.hotend_temp (Stock PRINTER_PARAM)
+    bus, printer, mod, ctl, pieces = _ending_hull(empty_after=1)
+    printer.objects["gcode_macro _PI_PARAM"] = _Obj({"hotend_temp": 235.0})
+    printer.gcode.run_script_from_command("PAUSE")
+    printer.target = 140.0
+    printer._refresh()
+    mod.cmd_ending(FakeGcmd({"SET": "1"}))
+    n0 = len(printer.gcode.scripts)
+    mod.cmd_pre_opt(FakeGcmd({"TNN": "T1B"}))
+    assert "M109 S235" in printer.gcode.scripts[n0:]
+    return "PLA23 575, PLA14 350, ohne DB/unbekannt 360, TPU 50, Pause 235 °C"
+
+
+def test_ending_grenzen():
+    # 1) Obergrenze: Kopf bleibt voll -> 80+80+40 = 200 mm, nie darüber,
+    #    dann Fehler -> PAUSE (Druck), Merker bleibt, RESUME gesperrt
+    bus, printer, mod, ctl, pieces = _ending_hull(empty_after=None,
+                                                  max_tube_length="200")
+    ctl.poll_status()
+    mod.cmd_pre_opt(FakeGcmd({"TNN": "T1B", "SOURCE": "T"}))
+    assert pieces == [80.0, 80.0, 40.0], pieces
+    assert printer.paused and mod.ending_material is not None
+    st = mod.get_status()
+    assert "Obergrenze max_tube_length 200 mm" in st["chain_error"], st
+    assert any(m.startswith("!!") and "PAUSIERT" in m for m in printer.gcode.raw)
+    assert not [c for c in bus.calls if c[1] == 0x04], "kein IDLE nach Fehler"
+    infos = []
+    for fn, p in ((mod.cmd_cut, {}), (mod.cmd_retrude, {}),
+                  (mod.cmd_end_opt, {"RETURN": "1"})):
+        g = FakeGcmd(p)
+        fn(g)
+        infos += g.infos
+    assert "G0 X-7.8 Y200 F30000" not in printer.gcode.scripts
+    # Obergrenze, Kopf genau beim letzten Stück leer -> ok + WARNUNG
+    bus, printer, mod, ctl, pieces = _ending_hull(empty_after=3,
+                                                  max_tube_length="200")
+    mod.cmd_ending(FakeGcmd({"SET": "1"}))
+    g = FakeGcmd({"TNN": "T1B"})
+    mod.cmd_pre_opt(g)
+    assert pieces == [80.0, 80.0, 40.0] and mod.ending_material is None
+    assert any("erst an der Obergrenze 200 mm leer" in m for m in g.infos), g.infos
+    mod.cmd_end_opt(FakeGcmd({}))
+    # Default-Obergrenze 3000: 37×80 + 40 (Stock wäre 38×80 = 3040)
+    bus, printer, mod, ctl, pieces = _ending_hull(empty_after=None)
+    mod.cmd_ending(FakeGcmd({"SET": "1"}))
+    mod.cmd_pre_opt(FakeGcmd({"TNN": "T1B"}))
+    assert len(pieces) == 38 and sum(pieces) == 3000.0 and pieces[-1] == 40.0
+    # 2) Kopfsensor unbekannt -> NICHT fördern, PAUSE + Meldung
+    bus, printer, mod, ctl, pieces = _ending_hull()
+    del printer.objects["filament_switch_sensor filament_sensor"]
+    mod.cmd_ending(FakeGcmd({"SET": "1"}))
+    n0 = len(printer.gcode.scripts)
+    mod.cmd_pre_opt(FakeGcmd({"TNN": "T1B", "SOURCE": "T"}))
+    sc = printer.gcode.scripts[n0:]
+    assert not [l for l in sc if l.startswith(("G1 E", "M109"))], sc
+    assert printer.paused and mod.ending_material is not None
+    assert "NICHT blind" in mod.get_status()["chain_error"]
+    assert mod.get_status()["change_aborted"]
+    # 3) Kopfsensor fällt unterwegs aus -> Abbruch nach dem Stück
+    bus, printer, mod, ctl, pieces = _ending_hull(empty_after=None)
+    mod.cmd_ending(FakeGcmd({"SET": "1"}))
+    orig = printer.sim
+    sens = printer.objects["filament_switch_sensor filament_sensor"]
+
+    def sim(line):
+        orig(line)
+        if len(pieces) == 2 and "filament_switch_sensor filament_sensor" \
+                in printer.objects:
+            del printer.objects["filament_switch_sensor filament_sensor"]
+    printer.sim = sim
+    mod.cmd_pre_opt(FakeGcmd({"TNN": "T1B"}))
+    assert pieces == [80.0, 80.0] and printer.paused, pieces
+    assert "keinen Zustand mehr" in mod.get_status()["chain_error"]
+    printer.objects["filament_switch_sensor filament_sensor"] = sens
+    # 4) Zeitlimit -> Abbruch + PAUSE
+    bus, printer, mod, ctl, pieces = _ending_hull(empty_after=None,
+                                                  ending_material_timeout="100")
+    clock = {"t": 0.0}
+
+    def now():
+        clock["t"] += 30.0
+        return clock["t"]
+    mod._now = now
+    mod.cmd_ending(FakeGcmd({"SET": "1"}))
+    mod.cmd_pre_opt(FakeGcmd({"TNN": "T1B"}))
+    assert 1 <= len(pieces) < 10 and printer.paused, pieces
+    assert "Zeitlimit 100 s" in mod.get_status()["chain_error"]
+    # 5) ohne Freigaben (kein Druck): nur PLAN, Merker bleibt
+    bus, printer, mod, ctl, pieces = _ending_hull(allow_move="False",
+                                                  printing=False)
+    mod.cmd_ending(FakeGcmd({"SET": "1"}))
+    g = FakeGcmd({"TNN": "T1B"})
+    mod.cmd_pre_opt(g)
+    assert pieces == [] and mod.ending_material is not None
+    assert any("PLAN Restmaterial T1A ausspülen" in m for m in g.infos), g.infos
+    assert not [c for c in bus.calls if c[1] == 0x04]
+    mod.cmd_end_opt(FakeGcmd({}))
+    #    im Druck ohne allow_move -> PAUSE wie jeder Wechsel (nichts gefördert)
+    bus, printer, mod, ctl, pieces = _ending_hull(allow_move="False")
+    mod.cmd_ending(FakeGcmd({"SET": "1"}))
+    mod.cmd_pre_opt(FakeGcmd({"TNN": "T1B"}))
+    assert pieces == [] and printer.paused
+    # 6) ending_material_purge False -> Schnitt + Rückzug wie bisher
+    bus, printer, mod, ctl, pieces = _ending_hull(ending_material_purge="False",
+                                                  hub=0x01)
+    ctl.poll_status()
+    assert mod.ending_material is not None
+    infos = run_chain(mod, "T1B")
+    assert pieces == [] and "G0 X-7.8 Y200 F30000" in printer.gcode.scripts
+    assert [c for c in bus.calls if c[1] == 0x11], "Rückzug wie bisher"
+    assert any("ending_material_purge: False" in m for m in infos)
+    assert mod.ending_material is None
+    # 7) RETRUDE ohne Kette bei offenem Fall -> WARNUNG
+    bus, printer, mod, ctl, pieces = _ending_hull(printing=False, hub=0x01)
+    mod.cmd_ending(FakeGcmd({"SET": "1"}))
+    g = FakeGcmd({})
+    mod.cmd_retrude(g)
+    assert any("WARNUNG Restmaterial-Fall offen" in m for m in g.infos), g.infos
+    return ("Obergrenze 200 = 80+80+40 -> Pause, beim letzten leer = ok+WARNUNG, "
+            "3000 = 37×80+40; Sensor fehlt/fällt aus -> Pause ohne Förderung; "
+            "Zeitlimit; Plan ohne Freigaben; Option aus = Schnitt+Rückzug")
+
+
+def test_ending_hand_purge():
+    # KTWO_BOX_ENDING PURGE=1 außerhalb eines Drucks (Stock
+    # BOX_EXTRUSION_ALL_MATERIALS): Sensor aus/zurück, M104 S140, IDLE
+    bus, printer, mod, ctl, pieces = _ending_hull(empty_after=2, printing=False)
+    n0 = len(printer.gcode.scripts)
+    g = FakeGcmd({"PURGE": "1"})
+    mod.cmd_ending(g)
+    sc = printer.gcode.scripts[n0:]
+    assert pieces == [80.0] * 3, pieces
+    assert sc[0] == "SET_FILAMENT_SENSOR SENSOR=filament_sensor ENABLE=0", sc[:3]
+    i_cool = sc.index("M104 S140")
+    assert i_cool > max(i for i, l in enumerate(sc) if l.startswith("G1 E80"))
+    assert "SET_FILAMENT_SENSOR SENSOR=filament_sensor ENABLE=1" in sc[i_cool - 3:]
+    assert [c for c in bus.calls if c[1] == 0x04 and c[2] == (0x00, 0x01)]
+    assert ctl.loaded_slot is None
+    # im laufenden Druck abgelehnt
+    bus, printer, mod, ctl, pieces = _ending_hull()
+    try:
+        mod.cmd_ending(FakeGcmd({"PURGE": "1"}))
+    except ValueError as exc:
+        assert "nur außerhalb eines Drucks" in str(exc)
+    else:
+        raise AssertionError("PURGE im Druck hätte abgelehnt werden müssen")
+    assert pieces == []
+    return "PURGE=1: 3 Stücke, Sensor aus/an, M104 S140, IDLE; im Druck abgelehnt"
+
+
+def test_end_print_unload():
+    # 1) Option aus, kein Restmaterial -> nichts
+    bus, printer, mod, ctl, pieces = _ending_hull(hub=0x02)
+    ctl.loaded_slot = "B"
+    n0 = len(printer.gcode.scripts)
+    g = FakeGcmd({})
+    mod.cmd_end_print(g)
+    assert printer.gcode.scripts[n0:] == [] and bus.calls == []
+    assert any("nichts zu tun" in m for m in g.infos), g.infos
+    # 2) end_print_unload an: Schacht, Heizen, Schnitt, Rückzug in die Box,
+    #    Schacht verlassen, KEIN Spülen, keine Pause, remain bleibt
+    bus, printer, mod, ctl, pieces = _ending_hull(hub=0x02,
+                                                  end_print_unload="True")
+    ctl.loaded_slot = "B"
+    bus.slots["A"]["filament"] = True
+    bus.state, bus.print_frame_status = 2, 0x00
+    rm = dict(mod.remain_material)
+    n0 = len(printer.gcode.scripts)
+    g = FakeGcmd({})
+    mod.cmd_end_print(g)
+    sc = printer.gcode.scripts[n0:]
+    t = bus.trace
+    assert sc[0] == "KTWO_BOX_PRE_OPT Z_HOP=0", sc[:2]
+    i_heat = sc.index("M109 S220")
+    i_cut = sc.index("G0 X-7.8 Y200 F30000")
+    assert sc.index("G0 X133 F12000") < i_heat < i_cut
+    p1 = _idx(t, _b(0x11, (0x02, 0x01)))
+    assert _idx(t, _g("G1 E-10 F600")) < p1
+    assert "KTWO_BOX_END_OPT RETURN=0" in sc and "G0 Y345 F12000" in sc
+    assert not [l for l in sc if _PIECE_RE.match(l) and not l.startswith("G1 E-")
+                and l != "G1 E-10 F600"], "kein Spülen/Ausspülen"
+    assert not [l for l in sc if l.startswith("G1 E18")], "kein FLUSH"
+    assert not printer.paused and not mod.get_status()["chain_active"]
+    assert mod.get_status()["loaded_tnn"] == "" and mod.remain_material == rm
+    assert any("geschnitten und in die Box zurückgezogen" in m for m in g.infos)
+    assert "M104 S210" in sc, "END_OPT: Ziel vor dem Druckende zurück"
+    # UNLOAD=0 überstimmt
+    bus, printer, mod, ctl, pieces = _ending_hull(hub=0x02,
+                                                  end_print_unload="True")
+    n0 = len(printer.gcode.scripts)
+    mod.cmd_end_print(FakeGcmd({"UNLOAD": "0"}))
+    assert printer.gcode.scripts[n0:] == []
+    # 3) Kopf leer -> nur Meldung, kein Schnitt
+    bus, printer, mod, ctl, pieces = _ending_hull(hub=0x00,
+                                                  end_print_unload="True")
+    bus.print_frame_status = 0x00
+    bus.head = False
+    g = FakeGcmd({})
+    mod.cmd_end_print(g)
+    assert "G0 X-7.8 Y200 F30000" not in printer.gcode.scripts
+    assert any("Kopf-Filamentsensor leer" in m for m in g.infos), g.infos
+    # 4) nicht freigegeben -> übersprungen, nichts bewegt, keine Pause
+    bus, printer, mod, ctl, pieces = _ending_hull(hub=0x02, allow_move="False",
+                                                  end_print_unload="True")
+    n0 = len(printer.gcode.scripts)
+    g = FakeGcmd({})
+    mod.cmd_end_print(g)
+    assert printer.gcode.scripts[n0:] == [] and not printer.paused
+    assert any("übersprungen – nicht freigegeben" in m for m in g.infos)
+    # 5) Fehler beim Schnitt -> Meldung, KEINE Pause, kein G-Code-Fehler,
+    #    Kette aufgeräumt (END_PRINT läuft weiter)
+    bus, printer, mod, ctl, pieces = _ending_hull(hub=0x02,
+                                                  end_print_unload="True")
+    bus.print_frame_status = 0x00
+    printer.fail_on = "G0 X-7.8"
+    mod.cmd_end_print(FakeGcmd({}))
+    assert not printer.paused and not mod.get_status()["chain_active"]
+    assert mod.get_status()["chain_error"] == ""
+    assert any(m.startswith("!!") and "END_PRINT fehlgeschlagen" in m
+               and "läuft weiter" in m for m in printer.gcode.raw), printer.gcode.raw
+    assert printer.objects["filament_switch_sensor filament_sensor"].enabled
+    # 6) Restmaterial offen, end_print_unload AUS -> am Druckende ausspülen
+    #    (Stock box_end Z.5111), kein Schnitt
+    bus, printer, mod, ctl, pieces = _ending_hull(empty_after=2)
+    ctl.poll_status()
+    mod.cmd_end_print(FakeGcmd({}))
+    assert pieces == [80.0] * 3 and mod.ending_material is None
+    assert "G0 X-7.8 Y200 F30000" not in printer.gcode.scripts
+    assert not printer.paused and not mod.get_status()["chain_active"]
+    #    + Sensor unbekannt am Druckende -> Meldung statt Pause, Merker bleibt
+    bus, printer, mod, ctl, pieces = _ending_hull()
+    del printer.objects["filament_switch_sensor filament_sensor"]
+    mod.cmd_ending(FakeGcmd({"SET": "1"}))
+    mod.cmd_end_print(FakeGcmd({}))
+    assert pieces == [] and not printer.paused and mod.ending_material
+    assert any("NICHT blind" in m for m in printer.gcode.raw), printer.gcode.raw
+    #    + Restmaterial und Unload an -> ausspülen, danach nichts zu entladen
+    bus, printer, mod, ctl, pieces = _ending_hull(empty_after=1,
+                                                  end_print_unload="True")
+    mod.cmd_ending(FakeGcmd({"SET": "1"}))
+    g = FakeGcmd({})
+    mod.cmd_end_print(g)
+    assert pieces == [80.0] * 2 and "G0 X-7.8 Y200 F30000" not in \
+        printer.gcode.scripts
+    assert any("kein Entladen nötig" in m for m in g.infos), g.infos
+    return ("aus = nichts; an = Schacht/M109/Schnitt/E-10+p1/Schacht raus, "
+            "kein Spülen, remain bleibt; UNLOAD=0; Kopf leer; ohne Freigabe; "
+            "Fehler = Meldung ohne Pause; Restmaterial am Druckende ausgespült")
+
+
+def test_ending_config_makro():
+    c = K.parse_options(test_options())
+    assert c["ending_material_purge"] is True and c["end_print_unload"] is False
+    assert c["max_tube_length"] == 3000 and isinstance(c["max_tube_length"], int)
+    assert c["ending_material_timeout"] == 3600.0
+    for bad in ({"max_tube_length": "50"}, {"max_tube_length": "20000"},
+                {"max_tube_length": "3000.5"}, {"ending_material_timeout": "0"},
+                {"ending_material_purge": "vielleicht"}):
+        try:
+            K.parse_options(test_options(**bad))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("Option %r hätte abgelehnt werden müssen" % bad)
+    import configparser
+    cp = configparser.RawConfigParser(strict=False,
+                                      inline_comment_prefixes=("#",))
+    cp.read_string(open(os.path.join(_HERE, "config-pi", "k2-module.cfg"),
+                        encoding="utf-8").read())
+    kb = K.parse_options(dict(cp.items("k2_box")))
+    assert kb["ending_material_purge"] is True and kb["end_print_unload"] \
+        is False and kb["max_tube_length"] == 3000 \
+        and kb["ending_material_timeout"] == 3600.0, kb
+    try:
+        env, macros, kcfg, param = _render_env()
+    except ImportError:
+        return "Optionen ok; Makro SKIP (jinja2 fehlt)"
+
+    def lines(**k2):
+        pr = _rprinter(param, kcfg, k2_box=dict(
+            {"end_print_unload": False, "ending_material": False}, **k2),
+            pause_resume={"is_paused": False})
+        out, _m = _render(env, macros, "END_PRINT", pr)
+        return out
+    assert "KTWO_BOX_END_PRINT" not in lines()
+    out = lines(end_print_unload=True)
+    assert "KTWO_BOX_END_PRINT" in out
+    assert out.index("KTWO_BOX_END_PRINT") < out.index("TURN_OFF_HEATERS"), out
+    assert "KTWO_BOX_END_PRINT" in lines(ending_material=True)
+    assert "KTWO_BOX_END_PRINT" not in lines(end_print_unload=True,
+                                             change_enabled=False)
+    pr = _rprinter(param, kcfg, k2_box={"end_print_unload": True,
+                                        "ending_material": False},
+                   toolhead={"homed_axes": ""})
+    assert "KTWO_BOX_END_PRINT" not in _render(env, macros, "END_PRINT", pr)[0]
+    return ("Defaults purge AN/unload AUS/3000/3600, Grenzen, k2-module.cfg; "
+            "END_PRINT ruft KTWO_BOX_END_PRINT nur mit Option/Restmaterial + "
+            "Freigabe + Referenz, vor TURN_OFF_HEATERS")
+
+
 TESTS = [
     ("kompletter Load-Ablauf (B)", test_load_ok),
     ("Fehlerabbruch 0x0c mit Meldung (A ~245 mm)",
@@ -3883,6 +4425,19 @@ TESTS = [
     ("FLUSH flush_mode matrix (TOOL, nur printing, Rückfälle)",
      test_matrix_flush),
     ("Makro M600 -> PAUSE", test_makro_m600),
+    ("Restmaterial: Auslöser 0x50 im Druck, ENDING, Runout",
+     test_ending_ausloeser),
+    ("Restmaterial: Stückfolge, Ende per Kopfsensor, keine Kreise",
+     test_ending_stueckfolge),
+    ("Restmaterial: Geschwindigkeit mit/ohne DB, Temperatur",
+     test_ending_geschwindigkeit),
+    ("Restmaterial: Obergrenze, Sensor unbekannt, Zeitlimit, Sperren",
+     test_ending_grenzen),
+    ("Restmaterial: KTWO_BOX_ENDING PURGE=1 (von Hand)", test_ending_hand_purge),
+    ("Druckende: end_print_unload an/aus, Fehler ohne Pause",
+     test_end_print_unload),
+    ("Restmaterial/Druckende: Optionen, k2-module.cfg, END_PRINT-Makro",
+     test_ending_config_makro),
     ("Python-3.9-Syntax", test_python39),
 ]
 

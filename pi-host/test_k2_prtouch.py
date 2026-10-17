@@ -1153,7 +1153,10 @@ class _Ev:
         return [cb(*a) for cb in self.handlers.get(ev, [])]
 
 
-def _integration_env(cfg_over=None, z_true=0.0, homing_speed=5.0):
+def _integration_env(cfg_over=None, z_true=0.0, homing_speed=5.0,
+                     extruder=None):
+    """extruder (nur pres_check-Tests): None = kein Extruder-Objekt (wie
+    bisher); dict(mcu='nozzle_mcu'|'mcu', oid=int, stepper=True|False)."""
     import collections
     if UPSTREAM_KLIPPY not in sys.path:
         sys.path.append(UPSTREAM_KLIPPY)
@@ -1206,6 +1209,9 @@ def _integration_env(cfg_over=None, z_true=0.0, homing_speed=5.0):
 
         def get_kinematics(self):
             return Kin()
+
+        def get_extruder(self):
+            return printer.objects.get("extruder")
 
     class Stepper:
         def __init__(self, name, oid):
@@ -1276,6 +1282,18 @@ def _integration_env(cfg_over=None, z_true=0.0, homing_speed=5.0):
         def estimated_print_time(self, t):
             return 0.0
 
+        # nur pres_check (apax): Wächter-Stopp + Antwortregistrierung
+        def lookup_command(self, msgformat, cq=None):
+            name = msgformat.split()[0]
+
+            def fn(d):
+                rec.setdefault("nowait", []).append((name, list(d)))
+                return None
+            return _Q(name, fn)
+
+        def register_serial_response(self, cb, msgformat, oid=None):
+            rec["apax_sink"] = (cb, msgformat, oid, self.name)
+
         def lookup_query_command(self, msgformat, respformat, oid=None,
                                  cq=None, is_async=False):
             name = msgformat.split()[0]
@@ -1309,6 +1327,16 @@ def _integration_env(cfg_over=None, z_true=0.0, homing_speed=5.0):
                 if name == "stop_prtouch_step":
                     step.disarm()
                     return {"err": 0, "expar0": line.level, "expar1": 71}
+                if name == "start_prtouch_apax":
+                    rec.setdefault("apax", []).append(("start", list(d)))
+                    hook = rec.get("on_apax_start")
+                    if hook is not None:
+                        hook(rec["apax_sink"][0])
+                    return {"err": 0, "expar0": 0, "expar1": d[2]}
+                if name == "stop_prtouch_apax":
+                    rec.setdefault("apax", []).append(("stop", list(d)))
+                    return {"err": rec.get("apax_stop_err", 0),
+                            "expar0": 0, "expar1": 0}
                 return {}
             return _Q(name, fn)
 
@@ -1353,6 +1381,9 @@ def _integration_env(cfg_over=None, z_true=0.0, homing_speed=5.0):
 
         def respond_raw(self, msg):
             self.out.append(msg)
+
+        def run_script_from_command(self, script):
+            rec.setdefault("scripts", []).append(script)
 
         def create_gcode_command(self, command, commandline, params):
             return ugcode.GCodeCommand(self, command, commandline, params,
@@ -1444,6 +1475,42 @@ def _integration_env(cfg_over=None, z_true=0.0, homing_speed=5.0):
                  ("mcu", mcu), ("mcu nozzle_mcu", noz),
                  ("homing", Homing())):
         printer.add_object(n, o)
+    if extruder is not None:
+        class _Heater:
+            can_extrude = bool(extruder.get("hot", True))
+
+            def get_temp(self, t):
+                return (float(extruder.get("temp", 220.0)), 220.0)
+
+        class _EStepper:
+            def __init__(self, m, oid):
+                self._m, self._oid = m, oid
+
+            def get_mcu(self):
+                return self._m
+
+            def get_oid(self):
+                return self._oid
+
+        class _ES:
+            pass
+
+        class _Extruder:
+            def __init__(self):
+                self.extruder_stepper = None
+                if extruder.get("stepper", True):
+                    self.extruder_stepper = _ES()
+                    self.extruder_stepper.stepper = _EStepper(
+                        noz if extruder.get("mcu", "nozzle_mcu")
+                        == "nozzle_mcu" else mcu, extruder.get("oid", 7))
+
+            def get_name(self):
+                return "extruder"
+
+            def get_heater(self):
+                return _Heater()
+
+        printer.add_object("extruder", _Extruder())
     opts = {"allow_move": "True", "arm_settle_s": "0.2"}
     opts.update(cfg_over or {})
     zsec = Config("stepper_z", {"position_min": "-5"})
@@ -2626,6 +2693,501 @@ def test_1017_treppe_pure_config():
           "cumulative" in ctl.describe_plan())
 
 
+# =====================================================================
+# Sensor-Selbsttest KTWO_PRTOUCH_CHECK (pres_check, APAX-Befund 17.10.2026)
+# =====================================================================
+
+def _pack_vals(vals):
+    """Gegenstück zu K.decode_packed (Packer der Düse, Befund §1.3):
+    [n][Maske BE][Wert0 absolut][Deltas], je Feld 1-4 Byte LE signed."""
+    n = len(vals)
+    fields, mask = [], 0
+    prev = None
+    for i, v in enumerate(vals):
+        x = int(v) if prev is None else int(v) - prev
+        prev = int(v)
+        x = ((x + (1 << 31)) & 0xFFFFFFFF) - (1 << 31)  # u32-Überlauf
+        for sz in (1, 2, 3, 4):
+            if -(1 << (8 * sz - 1)) <= x < (1 << (8 * sz - 1)):
+                break
+        mask |= (sz - 1) << (2 * i)
+        fields.append(x.to_bytes(sz, "little", signed=True))
+    mb = (n + 3) // 4
+    return bytes([n]) + mask.to_bytes(mb, "big") + b"".join(fields)
+
+
+def _apax_packets(n, value_fn, start_tick=10000000, period=93750,
+                  espd_fn=None, per=6, ch=0, oid=0, start_i=0):
+    """n Samples als resault_prtouch_apax-Pakete (je 'per' Samples)."""
+    out = []
+    i = 0
+    while i < n:
+        k = min(per, n - i)
+        idx = range(start_i + i, start_i + i + k)
+        ticks = [(start_tick + j * period) & 0xFFFFFFFF for j in idx]
+        out.append({"oid": oid, "ch": ch, "len": k,
+                    "ticks": _pack_vals(ticks),
+                    "datas": _pack_vals([value_fn(j) for j in idx]),
+                    "espds": _pack_vals([(espd_fn(j) if espd_fn else 0)
+                                         for j in idx])})
+        i += k
+    return out
+
+
+def _val_good(j):
+    # Ruhe ±300 + Kraftwelle 40 000 Counts (wie Wischen/Extrudieren)
+    return -1428000 + det_noise(j, 300) + (40000 if (j // 200) % 2 else 0)
+
+
+def _val_quiet(j):
+    return -1428000 + det_noise(j, 300)
+
+
+class FakeApax:
+    def __init__(self, ev, rate=1280.0, value_fn=_val_good, period=93750,
+                 espd_fn=None):
+        self.ev = ev
+        self.sink = None
+        self.ack = None
+        self.stop_err = 0
+        self.stop_raise = False
+        self.rate, self.value_fn, self.period = rate, value_fn, period
+        self.espd_fn = espd_fn
+        self.sent = 0
+
+    def deliver(self, seconds):
+        n = int(round(seconds * self.rate))
+        for p in _apax_packets(n, self.value_fn, period=self.period,
+                               espd_fn=self.espd_fn, start_i=self.sent):
+            self.sink(p)
+        self.sent += n
+
+    def start(self):
+        self.ev.append("start")
+        return self.ack or {"err": 0, "expar0": 0, "expar1": 93750}
+
+    def stop(self):
+        self.ev.append("stop")
+        if self.stop_raise:
+            raise RuntimeError("Timeout on wait for 'ack_prtouch'")
+        return {"err": self.stop_err, "expar0": 0, "expar1": 0}
+
+    def stop_nowait(self):
+        self.ev.append("stop_nowait")
+
+
+def make_check(cfg_over=None, armed=False, **apax_kw):
+    base = {"pres_check": True}
+    base.update(cfg_over or {})
+    cfg = K.parse_options(base)
+    ev = []
+    now = [0.0]
+    apax = FakeApax(ev, **apax_kw)
+
+    def pause(s):
+        ev.append("pause")
+        apax.deliver(s)
+        now[0] += float(s)
+
+    chk = K.K2PrtouchApaxCheck(cfg, apax, pause, clock=lambda: now[0],
+                               is_armed=lambda: armed)
+    apax.sink = chk.on_packet
+    return chk, apax, ev, now
+
+
+def test_1017_check_config():
+    c = K.parse_options({})
+    check("(check) pres_check Default False", c["pres_check"] is False)
+    c = K.parse_options({"pres_check": "True"})
+    check("(check) Defaults hold 15000/max 15 s/Dauer 3 s/EXTRUDE max 5 mm",
+          c["pres_check"] and c["pres_check_hold"] == 15000
+          and c["pres_check_max_s"] == 15 and c["pres_check_duration_s"] == 3
+          and c["pres_check_extrude_max_mm"] == 5
+          and c["pres_check_extruder"] == "extruder")
+    check("(check) Stock-Startparameter (oid, 60, 93750)",
+          K.build_start_apax_tuple(c, 4) == (4, 60, 93750))
+    bl = K.apax_bus_load(10)
+    check("(check) Buslast 12,4 kB/s ≈ 54 % der Düsenleitung",
+          bl["bytes"] == 124000 and 0.53 < bl["line_share"] < 0.55)
+    for opts, needle in (({"pres_check_hold": "0"}, "pres_check_hold"),
+                         ({"pres_check_max_s": "61"}, "pres_check_max_s"),
+                         ({"pres_check_duration_s": "20"},
+                          "pres_check_duration_s"),
+                         ({"pres_check_extrude_max_mm": "21"}, "extrude_max"),
+                         ({"pres_check_extrude_speed": "11"}, "extrude_speed"),
+                         ({"pres_check_rate_tol": "0.6"}, "rate_tol"),
+                         ({"pres_check_bad_frac": "0.6"}, "bad_frac"),
+                         ({"pres_check_min_samples": "1"}, "min_samples"),
+                         ({"pres_check": "vielleicht"}, "pres_check")):
+        check("(check) Config abgelehnt: %s" % (opts,), _raises(opts, needle))
+
+    class Cfg(dict):
+        def get_options(self):
+            return list(self.keys())
+    c2 = K.parse_klipper_config(Cfg({"pres_check": "True",
+                                     "pres_check_hold": "20000"}))
+    check("(check) parse_klipper_config übernimmt pres_check*",
+          c2["pres_check"] and c2["pres_check_hold"] == 20000)
+
+
+def test_1017_check_off_unchanged():
+    if not os.path.isdir(os.path.join(UPSTREAM_KLIPPY, "extras")):
+        print("SKIP (check) lokale Upstream-Kopie fehlt")
+        return
+    for ext in (None, {"mcu": "nozzle_mcu", "oid": 7}):
+        env = _integration_env(extruder=ext)
+        obj, rec, gc = env["obj"], env["rec"], env["gcode"]
+        check("(check aus) kein config_prtouch_apax, kein Befehl, keine "
+              "Registrierung (Extruder %s)" % ("da" if ext else "fehlt"),
+              not any("apax" in c for _m, c in rec["config"])
+              and "KTWO_PRTOUCH_CHECK" not in gc.cmds
+              and "apax_sink" not in rec and obj.apax_check is None
+              and obj.probe.core.apax_busy is None
+              and obj.controller.core.apax_busy is None
+              and "pres_check" not in obj.get_status())
+
+
+def test_1017_check_oid_estp():
+    if not os.path.isdir(os.path.join(UPSTREAM_KLIPPY, "extras")):
+        print("SKIP (check) lokale Upstream-Kopie fehlt")
+        return
+    env = _integration_env({"pres_check": "True"},
+                           extruder={"mcu": "nozzle_mcu", "oid": 7})
+    obj, rec, gc = env["obj"], env["rec"], env["gcode"]
+    cfgs = [c for m, c in rec["config"] if m == "nozzle_mcu"]
+    i_pres = [i for i, c in enumerate(cfgs)
+              if c.startswith("config_prtouch_pres")]
+    i_apax = [i for i, c in enumerate(cfgs)
+              if c.startswith("config_prtouch_apax")]
+    want = "config_prtouch_apax oid=%d oid_estp=7" % obj.pres_oid
+    check("(check an) config_prtouch_apax mit pres-oid + Extruder-oid 7",
+          len(i_apax) == 1 and cfgs[i_apax[0]] == want, str(cfgs))
+    check("(check an) Reihenfolge: config_prtouch_apax NACH "
+          "config_prtouch_pres (gleiche MCU)",
+          len(i_pres) == 1 and i_apax and i_apax[0] > i_pres[0]
+          and not any("apax" in c for m, c in rec["config"] if m == "mcu"))
+    sink = rec.get("apax_sink")
+    check("(check an) resault_prtouch_apax mit pres-oid auf nozzle_mcu "
+          "registriert",
+          sink is not None and sink[1] == K.RESP_APAX
+          and sink[2] == obj.pres_oid and sink[3] == "nozzle_mcu")
+    check("(check an) Befehl registriert, Gegensperre in beiden Kernen",
+          "KTWO_PRTOUCH_CHECK" in gc.cmds and obj.apax_check is not None
+          and obj.probe.core.apax_busy == obj.apax_check.busy
+          and obj.controller.core.apax_busy == obj.apax_check.busy
+          and obj.get_status()["pres_check"]["active"] is False)
+    for ext, needle, name in (
+            ({"mcu": "mcu", "oid": 7}, "liegt auf MCU", "falsche MCU"),
+            (None, "nicht gefunden", "kein Extruder"),
+            ({"stepper": False}, "keinen Stepper", "ohne Stepper"),
+            ({"mcu": "nozzle_mcu", "oid": 300}, "unplausible",
+             "oid > 255")):
+        try:
+            _integration_env({"pres_check": "True"}, extruder=ext)
+            ok, msg = False, "kein Fehler"
+        except RuntimeError as exc:  # Fake config_error = RuntimeError
+            msg = str(exc)
+            ok = needle in msg and "NICHT gesendet" in msg
+        check("(check an) oid_estp-Fehler -> Config-Fehler (%s)" % name,
+              ok, msg[:120])
+
+
+def test_1017_check_pure_eval():
+    # gut: Kraftwelle 40 000 > 15 000
+    chk, apax, ev, _ = make_check()
+    ok, res = chk.run(duration=2.0)
+    ch0 = res["channels"][0]
+    check("(check) gut: ok, dif >= 15000, Rate 1280 Hz, len ≈ 2 s × 1280",
+          ok and ch0["dif"] >= 15000 and abs(ch0["rate_hz"] - 1280) < 1
+          and ch0["len"] == 2560 - K.PRES_CHECK_SKIP
+          and ev == ["start", "pause", "stop"] and not chk.busy(),
+          str(res["errors"]))
+    lines = K.format_check_lines(res)
+    check("(check) Stock-ähnliche Ausgabe PRES_CHECK_INFO_CH0 … dif=…",
+          lines and lines[0].startswith("PRES_CHECK_INFO_CH0 min=")
+          and "dif=%d" % ch0["dif"] in lines[0])
+    # schlecht: nur Ruherauschen -> dif < hold
+    chk, apax, ev, _ = make_check(value_fn=_val_quiet)
+    ok, res = chk.run(duration=2.0)
+    check("(check) ohne Last: dif < 15000 -> Fehlschlag, key769-Text",
+          not ok and any("pres_check_hold" in e for e in res["errors"])
+          and "PR_ERR_CODE_PRES_NOT_BE_SENSED" in
+          K.format_check_failure(res) and ev[-1] == "stop")
+    chk, apax, ev, _ = make_check(value_fn=_val_quiet)
+    ok, res = chk.run(duration=2.0, require_dif=False)
+    check("(check) REQUIRE_DIF=0: Strom/Rate/Rohwerte ok -> ok", ok,
+          str(res["errors"]))
+    # tot: Sensor abgezogen (-1), konstant, gesättigt, 0
+    for fn, needle, name in (
+            (lambda j: -1, "ungültig", "-1 (abgezogen)"),
+            (lambda j: -1428000, "konstant", "konstant"),
+            (lambda j: K.ADC24_MAX, "ungültig", "24-Bit-Sättigung"),
+            (lambda j: 0, "ungültig", "0")):
+        chk, apax, ev, _ = make_check(value_fn=fn)
+        ok, res = chk.run(duration=1.0, require_dif=False)
+        check("(check) tot: %s -> Fehlschlag" % name,
+              not ok and any(needle in e for e in res["errors"])
+              and ev[-1] == "stop", str(res["errors"])[:160])
+    # einzelne Ausreißer -1 unter 1 % erlaubt, gehen NICHT in min/max ein
+    chk, apax, ev, _ = make_check(
+        value_fn=lambda j: -1 if j == 500 else _val_good(j))
+    ok, res = chk.run(duration=2.0)
+    check("(check) 1 Ausreißer -1: ok, nicht in min/max",
+          ok and res["channels"][0]["bad"]["stuck"] == 1
+          and res["channels"][0]["max"] < 0)
+    # Ausreißer 0 darf kein großes dif vortäuschen
+    chk, apax, ev, _ = make_check(
+        value_fn=lambda j: 0 if j == 500 else _val_quiet(j))
+    ok, res = chk.run(duration=2.0)
+    check("(check) Ausreißer 0 täuscht kein dif vor -> Fehlschlag",
+          not ok and res["channels"][0]["dif"] < 15000)
+    # keine Daten / falsche Rate / zu wenige Samples
+    chk, apax, ev, _ = make_check(rate=0.0)
+    ok, res = chk.run(duration=1.0)
+    check("(check) keine Pakete -> Fehlschlag 'keine Daten'",
+          not ok and any("keine Daten" in e for e in res["errors"]))
+    chk, apax, ev, _ = make_check(rate=320.0, period=93750 * 4)
+    ok, res = chk.run(duration=2.0)
+    check("(check) Rate 320 Hz statt 1280 -> Fehlschlag (Rate + Anzahl)",
+          not ok and any("Abtastrate" in e for e in res["errors"])
+          and any("passen nicht" in e for e in res["errors"]))
+    chk, apax, ev, _ = make_check()
+    ok, res = chk.run(duration=0.1)
+    check("(check) zu kurz (128 Samples < 256) -> Fehlschlag",
+          not ok and any("Samples (<" in e for e in res["errors"]))
+    # Anzahl passt nicht zur Dauer (MCU liefert nur halb so viel)
+    chk, apax, ev, now = make_check()
+    apax.rate = 640.0
+    ok, res = chk.run(duration=2.0)
+    check("(check) halbe Sample-Anzahl bei richtiger Tickrate -> Fehlschlag",
+          not ok and any("passen nicht" in e for e in res["errors"]))
+    # Wächter: mehr als max_s × Rate × 1,5 Samples -> stop_nowait
+    chk, apax, ev, _ = make_check({"pres_check_max_s": "1",
+                                   "pres_check_duration_s": "1"})
+    ok, res = chk.run(load=lambda: apax.deliver(3.0))
+    check("(check) Wächter: Strom zu lang -> stop_nowait + Fehlschlag",
+          not ok and "stop_nowait" in ev and ev[-1] == "stop"
+          and any("Wächter" in e for e in res["errors"]), str(ev))
+    # espd-Hinweis bei Extrusion ohne Extruderbewegung
+    chk, apax, ev, _ = make_check()
+    ok, res = chk.run(load=lambda: apax.deliver(2.0), expect_moving=True)
+    check("(check) EXTRUDE ohne espd != 0 -> nur Warnung",
+          ok and res["warnings"] and "espd" in res["warnings"][0])
+    chk, apax, ev, _ = make_check(espd_fn=lambda j: -4000)
+    ok, res = chk.run(load=lambda: apax.deliver(2.0), expect_moving=True)
+    check("(check) espd != 0 gezählt, keine Warnung",
+          ok and not res["warnings"]
+          and res["channels"][0]["espd_moving"] == 2560)
+
+
+def test_1017_check_interlock_finally():
+    # Gegensperre 1: Kern scharf -> CHECK startet nichts
+    chk, apax, ev, _ = make_check(armed=True)
+    try:
+        chk.run(duration=1.0)
+        ok = False
+    except K.K2PrtouchError as exc:
+        ok = "scharf" in str(exc)
+    check("(check) Düse scharf -> CHECK abgelehnt, nichts gesendet",
+          ok and ev == [])
+    # Gegensperre 2: apax läuft -> arm() schaltet nicht scharf
+    core, line, desc, waits = make_core()
+    busy = [True]
+    core.apax_busy = lambda: busy[0]
+    res, err = _run(core)
+    check("(check) apax aktiv -> arm() abgelehnt, keine Swap/Start/Fahrt",
+          err is not None and "Selbsttest" in str(err)
+          and not any(x in line.log for x in ("swap0", "start_pres",
+                                              "DESCEND"))
+          and core.arm_phase == "apax", str(line.log))
+    busy[0] = False
+    line.log.clear()
+    res, err = _run(core)
+    check("(check) apax gestoppt -> Antasten wieder normal",
+          err is None and line.log == EXPECT_ORDER, str(err))
+    # Gegensperre 3: während des CHECK ist busy() True
+    chk, apax, ev, _ = make_check()
+    seen = []
+    chk.run(load=lambda: (seen.append(chk.busy()), apax.deliver(1.0)))
+    check("(check) busy() True während des Stroms, danach False",
+          seen == [True] and not chk.busy())
+    # stop im finally: Last wirft
+    chk, apax, ev, _ = make_check()
+
+    def boom():
+        apax.deliver(0.5)
+        raise RuntimeError("Makro kaputt")
+    try:
+        chk.run(load=boom)
+        ok = False
+    except K.K2PrtouchError as exc:
+        ok = "Makro kaputt" in str(exc)
+    check("(check) Fehler in der Last -> command_error + stop im finally",
+          ok and ev == ["start", "stop"] and not chk.busy()
+          and chk.last["status"] == "error")
+    chk, apax, ev, _ = make_check()
+    try:
+        chk.run(load=lambda: (_ for _ in ()).throw(KeyboardInterrupt()))
+        ok = False
+    except KeyboardInterrupt:
+        ok = True
+    check("(check) KeyboardInterrupt -> unverändert weiter, stop im finally",
+          ok and ev == ["start", "stop"] and not chk.busy())
+    # ack-Fehler / falsches expar1 -> stop trotzdem
+    for ack, name in (({"err": 3, "expar0": 0, "expar1": 93750}, "err=3"),
+                      ({"err": 0, "expar0": 0, "expar1": 0}, "expar1=0")):
+        chk, apax, ev, _ = make_check()
+        apax.ack = ack
+        try:
+            chk.run(duration=1.0)
+            ok = False
+        except K.K2PrtouchError as exc:
+            ok = "start_prtouch_apax ack" in str(exc)
+        check("(check) start-ack %s -> Abbruch + stop" % name,
+              ok and ev == ["start", "stop"] and not chk.busy())
+    # stop scheitert -> Sperre bleibt, STOP-Wiederholung löst sie
+    chk, apax, ev, _ = make_check()
+    apax.stop_raise = True
+    try:
+        chk.run(duration=1.0)
+        ok = False
+    except K.K2PrtouchError as exc:
+        ok = "Stopp fehlgeschlagen" in str(exc)
+    check("(check) stop scheitert -> Fehler, busy bleibt True (arm gesperrt)",
+          ok and chk.busy())
+    try:
+        chk.run(duration=1.0)
+        ok = False
+    except K.K2PrtouchError as exc:
+        ok = "STOP=1" in str(exc)
+    check("(check) zweiter CHECK bei unbestätigtem Stopp abgelehnt",
+          ok and ev.count("start") == 1)
+    apax.stop_raise = False
+    check("(check) stop()-Wiederholung löst die Sperre",
+          chk.stop() is None and not chk.busy())
+    apax.stop_err = 5
+    chk.active = True
+    check("(check) stop ack err != 0 -> Sperre bleibt",
+          chk.stop() is not None and chk.busy())
+    # Pakete außerhalb des CHECK werden ignoriert
+    chk, apax, ev, _ = make_check()
+    apax.deliver(0.1)
+    check("(check) Pakete ohne laufenden CHECK -> ignoriert (stray)",
+          chk.stray > 0 and chk.stats is None)
+
+
+def test_1017_check_upstream_cmd():
+    if not os.path.isdir(os.path.join(UPSTREAM_KLIPPY, "extras")):
+        print("SKIP (check) lokale Upstream-Kopie fehlt")
+        return
+    env = _integration_env({"pres_check": "True"},
+                           extruder={"mcu": "nozzle_mcu", "oid": 7})
+    obj, rec, gc, ug = env["obj"], env["rec"], env["gcode"], env["ugcode"]
+    oid = obj.pres_oid
+
+    def run(params, value_fn=_val_good, n=2560):
+        rec["apax"] = []
+        rec["scripts"] = []
+        rec["on_apax_start"] = (
+            (lambda sink: [sink(p) for p in _apax_packets(n, value_fn,
+                                                          oid=oid)])
+            if n else None)
+        gc.out[:] = []
+        line = "KTWO_PRTOUCH_CHECK " + " ".join(
+            "%s=%s" % kv for kv in params.items())
+        gcmd = gc.create_gcode_command("KTWO_PRTOUCH_CHECK", line,
+                                       dict(params))
+        try:
+            gc.cmds["KTWO_PRTOUCH_CHECK"](gcmd)
+            return None
+        except ug.CommandError as exc:
+            return str(exc)
+
+    err = run({"DURATION": "2"})
+    check("(check upstream) gut: SUCCESS, start [oid,60,93750] + stop [oid]",
+          err is None and any("SUCCESS" in o for o in gc.out)
+          and rec["apax"] == [("start", [oid, 60, 93750]),
+                              ("stop", [oid])], str(err))
+    check("(check upstream) Buslast-Hinweis + PRES_CHECK_INFO_CH0",
+          any("kB/s" in o for o in gc.out)
+          and any(o.startswith("PRES_CHECK_INFO_CH0") for o in gc.out))
+    err = run({"DURATION": "2"}, value_fn=_val_quiet)
+    check("(check upstream) schlecht: command_error key769-Text, stop gesendet",
+          err is not None and "PR_ERR_CODE_PRES_NOT_BE_SENSED" in err
+          and rec["apax"][-1] == ("stop", [oid]))
+    err = run({"DURATION": "1"}, value_fn=lambda j: -1)
+    check("(check upstream) tot (-1): Fehler, kein Shutdown (CommandError)",
+          err is not None and "ungültig" in err)
+    err = run({"DURATION": "99"})
+    check("(check upstream) DURATION > pres_check_max_s -> Fehler ohne start",
+          err is not None and rec["apax"] == [])
+    err = run({"EXTRUDE": "2"})
+    check("(check upstream) EXTRUDE=2: SAVE/M83/G1 E2 F240/RESTORE im Strom",
+          err is None and rec["scripts"]
+          and "M83\nG1 E2.000 F240.0" in rec["scripts"][0]
+          and rec["scripts"][0].startswith("SAVE_GCODE_STATE")
+          and rec["scripts"][0].endswith(
+              "RESTORE_GCODE_STATE NAME=_k2_prtouch_check")
+          and [a[0] for a in rec["apax"]] == ["start", "stop"], str(err))
+    err = run({"EXTRUDE": "6"})
+    check("(check upstream) EXTRUDE > max 5 mm -> abgelehnt, nichts gesendet",
+          err is not None and rec["apax"] == [] and rec["scripts"] == [])
+    err = run({"MACRO": "_PI_NOZZLE_CLEAN"})
+    check("(check upstream) MACRO: Makro während des Stroms",
+          err is None and rec["scripts"] == ["_PI_NOZZLE_CLEAN"]
+          and [a[0] for a in rec["apax"]] == ["start", "stop"], str(err))
+    err = run({"MACRO": "G28;X"})
+    check("(check upstream) MACRO mit Sonderzeichen abgelehnt",
+          err is not None and rec["apax"] == [])
+    err = run({"EXTRUDE": "1", "MACRO": "FOO"})
+    check("(check upstream) EXTRUDE+MACRO abgelehnt", err is not None
+          and rec["apax"] == [])
+    err = run({"STOP": "1"}, n=0)
+    check("(check upstream) STOP=1 sendet nur stop_prtouch_apax",
+          err is None and rec["apax"] == [("stop", [oid])])
+    # kalt -> EXTRUDE abgelehnt
+    env2 = _integration_env({"pres_check": "True"},
+                            extruder={"mcu": "nozzle_mcu", "oid": 7,
+                                      "temp": 25.0, "hot": False})
+    gcmd = env2["gcode"].create_gcode_command(
+        "KTWO_PRTOUCH_CHECK", "KTWO_PRTOUCH_CHECK EXTRUDE=2",
+        {"EXTRUDE": "2"})
+    try:
+        env2["gcode"].cmds["KTWO_PRTOUCH_CHECK"](gcmd)
+        ok = False
+    except env2["ugcode"].CommandError as exc:
+        ok = "zu kalt" in str(exc)
+    check("(check upstream) EXTRUDE kalt -> abgelehnt, kein Strom",
+          ok and "apax" not in env2["rec"])
+    # allow_move False -> EXTRUDE/MACRO gesperrt, DURATION erlaubt
+    env3 = _integration_env({"pres_check": "True", "allow_move": "False"},
+                            extruder={"mcu": "nozzle_mcu", "oid": 7})
+    gcmd = env3["gcode"].create_gcode_command(
+        "KTWO_PRTOUCH_CHECK", "KTWO_PRTOUCH_CHECK MACRO=FOO",
+        {"MACRO": "FOO"})
+    try:
+        env3["gcode"].cmds["KTWO_PRTOUCH_CHECK"](gcmd)
+        ok = False
+    except env3["ugcode"].CommandError as exc:
+        ok = "allow_move" in str(exc)
+    check("(check upstream) MACRO ohne allow_move -> abgelehnt",
+          ok and "apax" not in env3["rec"])
+    # Gegensperre in der Hülle: G28/PROBE während aktivem apax
+    obj.apax_check.active = True
+    try:
+        obj.probe.core.arm()
+        ok = False
+    except ug.CommandError as exc:
+        ok = "Selbsttest" in str(exc)
+    obj.apax_check.active = False
+    check("(check upstream) arm() bei aktivem apax -> CommandError", ok)
+    obj.probe.core.armed = True
+    err = run({"DURATION": "1"})
+    obj.probe.core.armed = False
+    check("(check upstream) CHECK bei scharfer Düse -> abgelehnt",
+          err is not None and "scharf" in err and rec["apax"] == [])
+
+
 def main():
     test_live_ring_read()
     test_swap_mechanism()
@@ -2664,6 +3226,12 @@ def main():
     test_1017_treppe_cumulative()
     test_1017_treppe_robust()
     test_1017_treppe_pure_config()
+    test_1017_check_config()
+    test_1017_check_off_unchanged()
+    test_1017_check_oid_estp()
+    test_1017_check_pure_eval()
+    test_1017_check_interlock_finally()
+    test_1017_check_upstream_cmd()
     print("\n%d bestanden, %d fehlgeschlagen" % (len(PASS), len(FAIL)))
     if FAIL:
         print("FEHLER:", FAIL)

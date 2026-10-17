@@ -557,6 +557,7 @@ sonst `go_to_extrude_pos` → `box_retrude_material` → `box_extrude_material`
 | `flush_clog_check` / `flush_clog_min_mm` | `False` / 10 | Stock key845 (Messrad-Summe < 10 mm) – hier nur WARNUNG |
 | `box_wait_timeout` | **380** (vorher 200) | = `preload_force_timeout(1 Slot)` (N6) |
 | `Tn_extrude` | 140 | jetzt genutzt: Stock-Fallback der Spülmenge |
+| `ending_material_purge`, `max_tube_length`, `ending_material_timeout`, `end_print_unload` | True, 3000, 3600, False | Restmaterial / Druckende – §12.5 |
 
 ### 12.2 Verhalten
 
@@ -684,3 +685,97 @@ Druck; sonst nur Meldung (kein Parken außerhalb eines Drucks). Kein
 sichtbar, Inhalt), Zeilenform der Orca-Matrix in einer echten Mehrfarbdatei
 und Spülmengen gegen Orca-Anzeige, `M600` aus einer Orca-Datei (Pause,
 RESUME), Stock-Datei als Startwert nach `install.sh --remain-material`.
+
+### 12.5 Restmaterial („ending material“) + Druckende (Ergänzung 17.10.2026)
+
+> **ENTWURF – am Gerät UNGETESTET.** Belege: `FLUSH-SONDERFAELLE-BEFUND-
+> 2026-10-17.md` §2 (Flag `is_use_ending_material`, `extrusion_all_materials`
+> Z.1783–1824), §3 (`box_end` Z.5104–5131), §8 Vorschläge 1–2;
+> `GHIDRA-CFS-BEFUND2-2026-10-16.md` §4 (Status 0x50). Offline:
+> `test_k2_box.py` 59/59; Batch `upstream-test/flush-material` 34/34
+> (neuer Lauf `lauf-fm-ending`).
+
+**Optionen `[k2_box]`** (in `k2-module.cfg` kommentiert)
+
+| Option | Default | Wirkung |
+|---|---|---|
+| `ending_material_purge` | `True` (= Stock) | Restmaterial-Fall beim nächsten Wechsel / `M8200 P` / Druckende ausspülen statt Schnitt + Rückzug; `False` = bisher (Schnitt + Rückzug, Hinweis) |
+| `max_tube_length` | 3000 (int, 80..10000) | Stock-`BoxCfg`-Obergrenze in mm; das letzte Stück wird gekürzt (Stock: 38 × 80 = 3040) |
+| `ending_material_timeout` | 3600 s | Zeitlimit des Ausspülens (Pi-Zusatz, Stock: keins) |
+| `end_print_unload` | `False` | Druckende wie Stock `box_end`: heizen, schneiden, in die Box zurück |
+
+**Auslöser (Stock `send_data` Z.2145–2155):** Jeder 0x0a-Poll (Timer ~4 s,
+`KTWO_BOX_STATUS`, Box-Warten) mit Status **0x50** im PRINT (bzw. gespeichert
+im ERROR) = Einlauf oder Hub des Druck-Slots frei setzt – nur bei
+`print_stats` printing/paused – den Merker (`printer.k2_box.ending_material`,
+`ending_material_tnn`, Meldung einmal). `PRE_OPT` pollt vorher noch einmal
+frisch (lesend, nur im Druck mit beiden Freigaben). Polls während einer
+laufenden Kette setzen ihn nicht (sie sähen das 0x50 des alten Slots).
+Gelöscht nach dem Ausspülen, nach erfolgreichem `EXTRUDE`, in
+`KTWO_BOX_RUNOUT` (Rest ist am Kopfsensor vorbei; Stock
+`check_material_refill` spült dann nicht) und per `KTWO_BOX_ENDING
+CLEAR=1`. Nur im Speicher (Stock ebenso). `KTWO_BOX_RUNOUT` und das
+Nachholen im RESUME (`resume_redo_change`) spülen nie aus.
+
+**Ausspülen (Stock `extrusion_all_materials`)** – nach `KTWO_BOX_PRE_OPT`
+(Kette aktiv, kein Skip) als eigener Schritt `ENDING_PURGE`:
+
+1. nur mit `allow_write` UND `allow_move` (sonst PLAN, im Druck PAUSE wie
+   jeder Wechsel); Kopfsensor ohne Zustand → **Abbruch, PAUSE + Meldung,
+   nichts gefördert** (Stock förderte blind bis 3000 mm);
+2. Kopfsensor aus (PRE_OPT), Schacht, Heizen auf max(Basis, Material-
+   Temperatur) (Basis in der Pause `_PI_PARAM.hotend_temp`, Stock
+   PRINTER_PARAM; ohne DB `Tn_extrude_temp` 220);
+3. Schleife: `G1 E80 F<v>` + `M400` (statt Stock `reactor.pause(t − 0.5)`
+   **ohne** `monotonic()` – Creality-Fehler, nicht übernommen), Blasen
+   (`flush_blow`, fan0 5 s), Blech **ohne** Kreise (bleibt im Schacht);
+   `v` = `max_vol/2,4·60` des Materials in der Düse (Hyper PLA 575, PLA14
+   350) **ohne ×0,8, ohne 360-Grenze**; ohne DB bzw. ohne `max_vol`
+   `Tn_extrude_velocity` 360 (= bisherige Spülgeschwindigkeit ohne DB);
+4. Ende: Kopfsensor meldet nach einem Stück LEER → genau **ein** weiteres
+   Stück (Stock; Kopf schon beim Start leer → 2 Stücke). Obergrenze
+   erreicht und Kopf noch voll → Fehler/PAUSE (Stock: Warnung + weiter);
+   erst an der Grenze leer → WARNUNG. Sensor fällt unterwegs aus oder
+   Zeitlimit → Fehler/PAUSE. Merker bleibt bei jedem Fehler;
+5. danach: Box `0x04 [00 01]` IDLE, `loaded_slot` vergessen (Stock
+   `last_cmd = None`), Merker gelöscht. In der Kette entfallen `CUT` und
+   `RETRUDE` („übersprungen (Restmaterial ausgespült)“), `EXTRUDE` lädt das
+   neue Filament. **Kein Abkühlen in der Kette** (Stock `set_cool_temp`
+   M104 S140 – hier nur beim Ausspülen von Hand; in der Kette heizt
+   EXTRUDE gleich wieder und END_OPT stellt das Ziel zurück).
+   `remain_material` bleibt (Stock: kein `save`; in der Düse ist weiter
+   dasselbe Material).
+
+`CUT`/`RETRUDE` ohne Kette bei offenem Fall: nur WARNUNG (Rückzug eines
+Rests ohne Ende in der Box, ANNAHME Hub-Verstopfung).
+
+**`KTWO_BOX_ENDING [SET=1 SLOT=A] [CLEAR=1] [PURGE=1]`** (Nicht-Stock
+außer PURGE): Anzeige; Merker von Hand setzen/löschen (Stock
+`use_ending_material_flag_clear` hat keinen Aufrufer); `PURGE=1` = Stock
+`BOX_EXTRUSION_ALL_MATERIALS` (unabhängig vom Merker, nur außerhalb eines
+Drucks oder in der Pause, nicht während einer Kette; Sensor aus/zurück,
+danach M104 S140, Kopf bleibt im Schacht wie Stock).
+
+**Druckende `KTWO_BOX_END_PRINT [UNLOAD=0|1]`** (= Stock `BOX_END`, aus
+`END_PRINT` in `macros.cfg`, nur bei `change_enabled` UND
+(`end_print_unload` ODER `ending_material`) UND referenzierten Achsen, nach
+Rückzug/Z-Anhebung, vor `TURN_OFF_HEATERS`): Kette `PRE_OPT Z_HOP=0` →
+(offener Fall: Ausspülen) → mit `UNLOAD` (Default `end_print_unload`) und
+Kopfsensor „Filament“: Schacht, Heizen auf die Material-Temperatur, `CUT`,
+`RETRUDE` (Box 0x11 p0×4 + E−10 + p1) → `END_OPT RETURN=0` (Schacht
+verlassen, Ziel zurück). Kopf leer/unbekannt → kein Entladen (Meldung).
+**Kein Spülen am Druckende** (Stock ebenso). `remain_material` bleibt.
+Fehler (auch Kopfsensor unbekannt beim Ausspülen) → nur `!!`-Meldung,
+Kette aufgeräumt, **keine PAUSE, kein G-Code-Fehler** – `END_PRINT` läuft
+weiter und schaltet die Heizungen aus. Ohne Freigaben bzw. bei offener
+Kette/offenem Fehler: übersprungen mit Meldung.
+
+**Status** neu: `ending_material`, `ending_material_tnn`,
+`ending_material_purge`, `ending_last`, `end_print_unload`.
+
+**Offen / am Gerät:** echtes 0x50 im Druck (Zeitpunkt, Slot im Poll),
+Länge Kopfsensor → Düse (< 80 mm? sonst reicht das Zusatzstück nicht),
+Ausspülen einer leer gelaufenen Spule beim nächsten T<n> (Menge, Abfall im
+Schacht, Box nach IDLE), Entladen am Druckende (Schnitt + Rückzug,
+Rückzugslänge bis in die Box), mechanische Folge des bisherigen Rückzugs
+bei leerem Einlauf (Vergleich).

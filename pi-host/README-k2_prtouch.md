@@ -4,6 +4,8 @@
 
 > **Nachtrag 17.10.2026 (3): Vorabtest am Gerät + Treppen-Kriterium** – neues Geräteskript `prtouch_vorabtest.py` bildet `KTWO_PRTOUCH_READ` (Vorabprüfung) **ohne Klipper** nach, mit dem echten Kern-Code, nur Düsen-MCU, keine Bewegung (Abschnitt **A.9**, Tests `test_prtouch_vorabtest.py` 39/39). Rückfallweg `mode: steps`: optionales Host-Kriterium `contact_criterion: cumulative` gegen den Treppen-Effekt (Default `window` = unverändert, **ANNAHME**, Abschnitt **B.3**). Offline-Tests 303/303 + Review-Test.
 
+> **Nachtrag 17.10.2026 (4): optionaler Sensor-Selbsttest `KTWO_PRTOUCH_CHECK`** (Ersatz Stock-`PRES_CHECK` über den apax-Strom, PRTOUCH-APAX-BEFUND-2026-10-17) – Default **aus** (`pres_check: False`, dann alles exakt wie vorher). An: `config_prtouch_apax` nach `config_prtouch_pres`, `oid_estp` nur über die Klipper-API (Extruder-Stepper auf nozzle_mcu, sonst Config-Fehler), Gegensperre arm ↔ apax, Stopp immer im `finally`, Fehlschlag = command_error (kein Shutdown). Nicht in G28 eingebunden. Abschnitt **A.10**. Offline-Tests 372/372 + Review-Test.
+
 > **ENTWURF – Stand 16.10.2026 abends.** Sensor-Lesepfad und Swap-Leitung am Gerät GETESTET (ohne Bewegung, PRTOUCH-LESETEST-BEFUND-2026-10-16.md, Fingerdruck-Test 19/19). **Hauptweg ist jetzt eine normale Upstream-Klipper-Probe** auf `!PC7` (wie Stock). Antasten mit Bewegung ist weiterhin **UNGETESTET**. Offline-Tests: 138/138 + Review-Test (davon 21 gegen die echten Upstream-Dateien `probe.py`/`homing.py`/`manual_probe.py`/`gcode.py`/`pins.py`). Vor der ersten echten Fahrt: Abschnitt A.5 (ANNAHMEN P1–P6) und A.6 (Erstlauf) beachten, erst mit `allow_move: False`.
 
 # [k2_prtouch] – Kraftsensor-Düse des K2 Plus unter Upstream-Klipper
@@ -474,6 +476,100 @@ Notabbruch direkt und per echtem SIGALRM; Geräteteil mit Fake-`serialhdl`/
 `clocksync`/`reactor` (Konfig-Folge, reset im `finally`, Reset-Pfad bei
 konfigurierter MCU); Python-3.9-Syntax.
 
+### A.10 Optionaler Sensor-Selbsttest `KTWO_PRTOUCH_CHECK` (Ersatz Stock-`PRES_CHECK`, 17.10.2026)
+
+Grundlage: `PRTOUCH-APAX-BEFUND-2026-10-17.md` (§1 MCU-Befehle, §2.2 PRES_CHECK, §4 Buslast, §6 Vorschläge).
+Stock macht `PRES_CHECK RUN=1/0` in **jedem G28 mit Z** um `BOX_NOZZLE_CLEAN` herum: der apax-Strom
+liefert jedes CS1237-Rohsample (≈ 1280/s, ungefiltert) plus das Schrittintervall des Extruders (`espd`);
+geprüft wird, ob der Kraftsensor beim Abstreifen **überhaupt reagiert** (dynamischer Test – erkennt einen
+toten/abgezogenen Sensor, den der Ruhetest nicht sicher sieht).
+
+**Default AUS** (`pres_check: False`): kein `config_prtouch_apax`, kein G-Code, keine Antwortregistrierung,
+`KTWO_PRTOUCH_STATUS`/`get_status` ohne `pres_check`-Eintrag – exakt wie vorher (Batch F/G/H unverändert).
+
+**Config-Phase (nur `pres_check: True`):** `config_prtouch_apax oid=<pres-oid> oid_estp=<oid>` direkt
+**nach** `config_prtouch_pres` (gleicher Config-Callback der Düsen-MCU).
+- `oid` = die eigene pres-oid wie Stock (B §2.1: `PrtouchApax` übernimmt oid/mcu von pres; der Strom
+  `resault_prtouch_apax` kommt ohnehin mit der pres-oid S[0], B §1.3). Eine extra `create_oid()` brächte
+  nichts – die Düsen-FW legt für apax keine oid an.
+- `oid_estp` = `printer.lookup_object(pres_check_extruder).extruder_stepper.stepper.get_oid()` (Upstream
+  `extruder.py:177-182`, `stepper.py:33/58/132`). Geprüft: Objekt vorhanden, hat Stepper,
+  `stepper.get_mcu() is <nozzle_mcu>` (Objektidentität), oid in 0…255 und ≠ pres-oid. Sonst
+  **Config-Fehler** mit Klartext, `config_prtouch_apax` wird nicht gesendet. Grund (B §1.3): die FW prüft
+  `oid_estp` bei `config` nicht; ein falscher Wert führt erst beim **ersten Sample** nach `start` zum
+  MCU-Shutdown (`oid_lookup` → `sched_shutdown`). Batch-Beleg lauf-J: `config_prtouch_apax oid=4
+  oid_estp=3` ↔ `config_stepper oid=3 step_pin=PB5` (Extruder auf nozzle_mcu); lauf-K (Extruder testweise
+  auf der Main-MCU) → `Config error … liegt auf MCU 'mcu'`, kein Internal error.
+
+**Ablauf `KTWO_PRTOUCH_CHECK`** (nur auf ausdrücklichen Aufruf):
+
+```
+Düse scharf? -> Abbruch (Gegensperre)        apax läuft/Stopp unbestätigt? -> Abbruch
+toolhead.wait_moves()
+active = True (VOR dem Senden)
+start_prtouch_apax oid cfg_regs=60 acq_tick=93750   ack: err == 0 UND expar1 == acq_tick
+  Last: DURATION=s (nur warten) | EXTRUDE=mm [SPEED=mm/s] | MACRO=name  (+ wait_moves)
+finally: stop_prtouch_apax (ack err 0) -> active = False   (auch bei Fehler/KeyboardInterrupt)
+Auswertung je Kanal -> PRES_CHECK_INFO_CH0 min/max/avg/dif/len/rate/espd_moving
+ok  -> "SUCCESS: Strain gauge dynamic detection passed."
+nok -> command_error "PR_ERR_CODE_PRES_NOT_BE_SENSED: The pressure data in channel=0 cannot be
+       properly sensed. (… Ersatz Stock-key769, kein Shutdown) Gründe: …"
+```
+
+| Parameter | Bedeutung |
+|---|---|
+| `DURATION=s` | nur messen (Default `pres_check_duration_s` 3 s, ≤ `pres_check_max_s`), keine Bewegung |
+| `EXTRUDE=mm [SPEED=mm/s]` | kleine Extrusion im Strom (`SAVE_GCODE_STATE`/`M83`/`G1 E… F…`/`RESTORE_GCODE_STATE`); nur `allow_move: True`, aktiver Extruder = `pres_check_extruder`, `can_extrude` UND Temperatur ≥ `pres_check_min_temp` (170 °C); ≤ `pres_check_extrude_max_mm` (5, hart 20), SPEED ≤ 10 mm/s, geschätzte Dauer ≤ `pres_check_max_s` |
+| `MACRO=name` | ein Makro (z. B. `_PI_NOZZLE_CLEAN`) im Strom; nur `allow_move: True`, nur ein Makroname ohne Parameter. G28/PROBE darin werden durch die Gegensperre abgelehnt |
+| `REQUIRE_DIF=0` | dif-Kriterium aus (prüft nur Strom/Rate/Rohwerte – sinnvoll ohne Last) |
+| `STOP=1` | nur `stop_prtouch_apax` wiederholen (löst die Sperre, falls ein Stopp unbestätigt blieb) |
+
+**Warum Last nötig ist:** Stock misst während der Düsenreinigung (Extruder fördert, Düse streift ab). In
+Ruhe liegt `dif` bei ≈ 750–1 300 Counts (Live-Ruhetests) und damit weit unter 15 000 → `DURATION` ohne
+Last **schlägt am dif-Kriterium fehl** (gewollt; Düse von Hand belasten oder `REQUIRE_DIF=0`). Extrusion
+erzeugt Gegendruck an der Düse (Stock-AUTO_APAX erwartet beim Extrudieren > 50 000 Counts, B §2.3) –
+**ANNAHME**, dass 2–5 mm bei 4 mm/s für dif ≥ 15 000 reichen; am Gerät erst `EXTRUDE` testen.
+
+**Auswertung (alle Grenzen ANNAHME, Optionen in Klammern):** erste 16 Samples je Kanal verworfen
+(`pres_check_skip`, Konfig-Handshake nach `start`); mind. 256 Samples (`pres_check_min_samples`);
+Abtastrate aus den MCU-Ticks = 1280 Hz (aus `cfg_regs`) ± 20 % (`pres_check_rate_tol`); Anzahl passt zur
+Dauer (± 20 %, Paketrest/Latenz als Spiel); Anteil Rohwerte 0/−1/24-Bit-Sättigung/außerhalb 24 Bit
+≤ 1 % (`pres_check_bad_frac`) – diese Werte gehen **nicht** in min/max ein (ein Ausreißer täuscht sonst
+ein großes dif vor); Rohwerte nicht konstant; `dif = max − min ≥ pres_check_hold` (15 000 = Stock
+`pres_chk_hold`; Kriterium `dif ≥ chk_hold` nur aus der Namensspur, **ANNAHME**). Bei `EXTRUDE` und
+`espd` immer 0 nur Warnung. Es werden nur laufende Kennwerte geführt (min/max/Summe/Anzahl), keine Listen.
+
+**Gegensperre:** `K2PrtouchProbeCore.arm()` (Probe-Weg UND Rückfall `mode: steps`) lehnt ab, solange der
+apax-Strom läuft oder sein Stopp unbestätigt ist (`apax_busy`), bevor irgendein MCU-Befehl gesendet wird
+(das übliche Entschärfen im `finally` von `run_probe` sendet danach wie immer `stop_prtouch_step`/
+`stop_prtouch_pres sta_swap=1` – berührt apax nicht, B §1.2). Umgekehrt startet `KTWO_PRTOUCH_CHECK` nicht,
+solange eine Düse scharf ist. Grund (B §1.3): `start_prtouch_apax` bei scharfer Düse löscht deren Puffer
+und startet die Totzeit neu; beide Tasks teilen sich das DRDY-Sample.
+
+**Buslast:** ≈ 12,4 kB/s auf der Düsenleitung (B §4, live 11 217–12 488 B/s) ≈ **54 %** von 230 400 Bd
+(10 Bit/Byte), 13 901 Samples in ≈ 10,9 s. Deshalb: nur kurz (`pres_check_max_s` 15 s, hart 60 s), nicht
+parallel zu Antasten oder Druck. **Wächter:** überschreitet die Sample-Zahl `pres_check_max_s × 1280 × 1,5`,
+wird `stop_prtouch_apax` sofort ohne Warten gesendet (aus dem serialhdl-Thread über
+`reactor.register_async_callback`), der Test gilt als fehlgeschlagen. Der Antwort-Handler läuft im
+serialhdl-Hintergrundthread und führt nur Zähler unter Lock nach.
+
+**Nicht automatisch in G28.** Vorschlag (bewusst NICHT umgesetzt, `homing.cfg`/`macros.cfg` unverändert):
+im Z-Homing-Ablauf vor dem ersten Z-Antasten, wenn Z noch nicht referenziert ist,
+`KTWO_PRTOUCH_CHECK MACRO=_PI_NOZZLE_CLEAN` statt `_PI_NOZZLE_CLEAN` aufrufen (Stock-Muster
+`PRES_CHECK RUN=1 / BOX_NOZZLE_CLEAN / PRES_CHECK RUN=0`, `sensorless.cfg:221-227`). Ein `RUN=1/RUN=0`-
+Paar wie Stock gibt es absichtlich nicht: mit `MACRO=` bleibt der Stopp im `finally` garantiert.
+
+**Tests:** `test_k2_prtouch.py` Abschnitt „(check …)“, 69 Prüfungen: Config an/aus (aus = kein apax-
+Befehl/G-Code/Status), oid_estp-Ermittlung inkl. falsche MCU/kein Extruder/kein Stepper/oid > 255 →
+Config-Fehler, Reihenfolge `config_prtouch_apax` nach `config_prtouch_pres`, Gegensperre arm ↔ apax,
+`stop` im `finally` (Fehler in der Last, `KeyboardInterrupt`, ack-Fehler, Stopp scheitert → Sperre bleibt,
+`STOP=1` löst), Auswertung gut/ohne Last/tot (−1, 0, konstant, Sättigung)/keine Daten/falsche Rate/zu kurz/
+Wächter, G-Code gegen die echte Upstream-`GCodeCommand` (DURATION/EXTRUDE/MACRO/STOP, kalt, ohne
+`allow_move`). Batch: lauf-J (an) / lauf-K (Extruder falsche MCU) in `lauf-modulfix.sh`.
+
+**Offen am Gerät:** Kriterium und Schwelle 15 000, Wirkung von `EXTRUDE` auf dif, Paketgröße/Rate des
+Stroms, Vorzeichen von `espd`.
+
 ### Tests gegen echte Upstream-Dateien
 
 `KLIPPER_SRC=/pfad/zu/klipper python3 test_k2_prtouch.py` – ohne die Variable werden die 21 Upstream-Prüfungen übersprungen (geprüft gegen Upstream-Commit 9cb9975).
@@ -684,8 +780,12 @@ printer.cfg [k2_prtouch]
   `KTWO_PRTOUCH_MESH [COUNT]`, `KTWO_PRTOUCH_TEST_SWAP`, `KTWO_PRTOUCH_READ`,
   `KTWO_PRTOUCH_STATUS`. `get_status()` für Moonraker (allow_move, step,
   letztes Ergebnis – kein Bus-Poll).
-- `apax` ist bewusst NICHT enthalten (BELEGT 0 Treffer in 11532 Log-Zeilen,
-  Host-Befund: separates Aux-Modul, für Z-Probe entbehrlich).
+- `apax` war hier bewusst NICHT enthalten. **KORREKTUR 17.10.2026**
+  (PRTOUCH-APAX-BEFUND-2026-10-17): „0 Treffer“ galt nur für `AUTO_APAX`/
+  `WAVE_APAX`. Stock nutzt den apax-Strom bei **jedem G28 Z** über
+  `PRES_CHECK` (Dehnungsstreifen-Selbsttest beim Düsenabstreifen, live
+  ≈ 12,4 kB/s). Für Antasten/Mesh/Z-Offset bleibt apax entbehrlich; der
+  Selbsttest ist jetzt optional als `KTWO_PRTOUCH_CHECK` (Teil A.10).
 
 ## 2. Sicherheitskonzept (S1–S5, im Code + Tests)
 

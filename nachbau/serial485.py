@@ -3,10 +3,10 @@
 
 Ersetzt: serial_485_wrapper.cpython-39.so (armhf, CPython 3.9, proprietär).
 
-Belege (alle in <projekt>/ dokumentiert):
+Belege (alle im Repo-Wurzelordner dokumentiert):
 - Frame-Format + Func-Codes: PROTOKOLL-485.md, PROTOKOLL-GESAMT.md
 - CRC-Algorithmus: auto_addr_wrapper.py (Quelle, POLY=0x07)
-  (Klartextquelle auto_addr_wrapper.py, crc8_cal/cal_pack_crc)
+  (auto_addr_wrapper-live.py, crc8_cal/cal_pack_crc)
 - Retry/Timeout-Verhalten: klippy.log-Mitschnitte (retries=4, Timeouts je Command)
 - Empfangs-Validierung: belt_mdl.py recv_sensor_data (head/addr/len/fun-Prüfung)
 
@@ -144,6 +144,38 @@ TX_FUNC_REBOOT = 0x01
 TX_FUNC_BOOT = CMD_LOADER_TO_APP           # 0x0B (Motor: boot)
 TX_BOOT_GUARD_ADDRS = frozenset((BROADCAST_ALL, BROADCAST_CLM))
 TX_LOADER_TO_APP_PAYLOAD = (0x01,)         # einzig erlaubt: 0xFF 0x0B [01]
+# Motor-Kalibrier-/Flash-Sperre (17.10.2026, MOTOR-KALIBRIERUNG-BEFUND-
+# 2026-10-17.md §3/§4/§7/§12, B) – HART, ohne Override:
+# - 0x03 encoder_calibrate_official: open-loop bis ~63 Umdrehungen, Schutz
+#   und Regel-IRQ aus, EN/Bus wirkungslos (~40 s), brennt phase_order_invert
+#   (MCU-Flash) + 2x Encoder-IC-EEPROM.
+# - 0x04 elec_offset_calibrate (auch die _ALL-Variante = je Motor unicast):
+#   ±1 Umdrehung open-loop ohne Schutz, schreibt phase_order_invert immer,
+#   bei Pass alle Parameter + Werks-Sicherungs-Record.
+# - 0x07 flash_param: erlaubt NUR die lesenden Subs 02 (Flash-Prüfsumme
+#   neu berechnen/vergleichen) und 06 (Flash-Wert einer ID lesen) – beide
+#   ohne Schreibzugriff und ohne Regelungs-Eingriff (§7.2). Gesperrt:
+#   01 Werksreset (Flash) + Neustart, 03 alle Parameter in den Flash
+#   (Regelung kurz aus), 05 RAM-Wert setzen (Regelung aus/Neu-Init),
+#   04 „alle Parameter aus dem Flash laden“: schreibt zwar keinen Flash,
+#   überschreibt aber die RAM-Werte, die der Boot per 0x06 abgeglichen hat
+#   (MOTOR-INIT §4) – Zustandsänderung am laufenden Regler, daher gesperrt.
+#   Sub 00/>=07 (wirkungslos) und leere Payload: gesperrt (Whitelist).
+# GILT NUR für Motor-Adressen: 0x80-0x88 (Host-Tabelle Motor_Addr NUM 0-8,
+# X/Y/Z/Z1 = 0x81-0x84; Extruder transparent ebenfalls 0x81) und die
+# Motor-Gruppenadresse 0xFD. Dieselben fun-Codes haben an anderen Geräten
+# eine ANDERE, benutzte Bedeutung und bleiben frei: CFS-Box (0x01-0x04,
+# 0xFE) 0x03 GET_REMAIN_LEN, 0x04 SET_BOX_MODE, 0x07 Hauptmotor
+# (PROTOKOLL-485.md Func-Tabelle); Belt (0x21/0x22) 0x04 WRITE_FLASH
+# (k2_belt); Rack 0x11. 0xFF bleibt frei: die Motor-App ignoriert
+# 0x03/0x04/0x07 per Broadcast (kein Broadcast-Flag, Befund §2, B).
+TX_MOTOR_GUARD_ADDRS = frozenset(list(range(0x80, 0x89)) + [BROADCAST_CLM])
+TX_FUNC_ENCODER_CALIBRATE = 0x03
+TX_FUNC_ELEC_OFFSET_CALIBRATE = 0x04
+TX_FUNC_FLASH_PARAM = 0x07
+TX_MOTOR_BLOCKED_FUNCS = frozenset((TX_FUNC_ENCODER_CALIBRATE,
+                                    TX_FUNC_ELEC_OFFSET_CALIBRATE))
+TX_FLASH_PARAM_READ_SUBS = frozenset((0x02, 0x06))   # einzig erlaubt bei 0x07
 
 import logging
 import threading
@@ -205,6 +237,9 @@ def check_tx_frame(addr, fun, data=()):
     2. Broadcast: an 0xFF/0xFD nie fun 0x01 (reboot) und nie fun 0x0B
        (boot) – einzige Ausnahme 0xFF 0x0B [01] (CFS-Loader->App, live
        belegt; Motor-App ignoriert [01]). Belege s. TX_BOOT_GUARD_ADDRS.
+    3. Motor (0x80-0x88, 0xFD): nie fun 0x03/0x04 (Kalibrierung), fun 0x07
+       nur mit Sub 02/06 (lesend). Box/Belt/Rack unberührt. Belege s.
+       TX_MOTOR_GUARD_ADDRS. Kein Override.
     Verstoß -> TxGuardError (ValueError). Rückgabe: Daten als Liste.
     """
     data = list(data)
@@ -234,6 +269,24 @@ def check_tx_frame(addr, fun, data=()):
                 "Haltemoment weg). Erlaubt ist nur 0xFF 0x0B [01] "
                 "(CFS-Loader->App); nichts gesendet"
                 % (addr, " ".join("%02x" % b for b in data)))
+    if addr in TX_MOTOR_GUARD_ADDRS:
+        if fun in TX_MOTOR_BLOCKED_FUNCS:
+            raise TxGuardError(
+                "Sendeschutz: Motor 0x%02x fun 0x%02x (%s) gesperrt – "
+                "open-loop-Bewegung ohne Schutz/Not-Aus, schreibt "
+                "phase_order_invert/Encoder-EEPROM dauerhaft "
+                "(MOTOR-KALIBRIERUNG-BEFUND §12); nichts gesendet"
+                % (addr, fun, "encoder_calibrate"
+                   if fun == TX_FUNC_ENCODER_CALIBRATE
+                   else "elec_offset_calibrate"))
+        if fun == TX_FUNC_FLASH_PARAM and (
+                not data or data[0] not in TX_FLASH_PARAM_READ_SUBS):
+            raise TxGuardError(
+                "Sendeschutz: Motor 0x%02x fun 0x07 (flash_param) Sub [%s] "
+                "gesperrt – erlaubt nur lesend Sub 02/06 (01 Werksreset, "
+                "03 Flash schreiben, 04 Flash->RAM laden, 05 RAM schreiben); "
+                "nichts gesendet"
+                % (addr, " ".join("%02x" % b for b in data[:1])))
     return data
 
 
@@ -1833,6 +1886,53 @@ def selftest():
         print("auto_addr-Pfad: %r" % (e,))
         ok14c = False
     check2("auto_addr Loader->App (0xFF 0x0B [01]) über Wrapper unverändert", ok14c)
+
+    # 15. Motor-Kalibrier-/Flash-Sperre 17.10.2026 (MOTOR-KALIBRIERUNG §12)
+    mot_blocked = []
+    for a in sorted(TX_MOTOR_GUARD_ADDRS):
+        mot_blocked += [(a, 0x03, []), (a, 0x03, [0x00]), (a, 0x04, [0x00]),
+                        (a, 0x04, []), (a, 0x07, []), (a, 0x07, [0x00])]
+        mot_blocked += [(a, 0x07, [sub, 0x14]) for sub in (1, 3, 4, 5, 7, 0xFF)]
+    bus15 = Serial485("/dev/ttyFAKE1", ser=FakeSerial([]))
+    wrap15 = Serial_485_Wrapper(bus=bus15)
+    ok15 = len(TX_MOTOR_GUARD_ADDRS) == 10 and 0xFD in TX_MOTOR_GUARD_ADDRS
+    for a, f, d in mot_blocked:
+        ok15 &= _raises_tx(check_tx_frame, a, f, d)
+        ok15 &= _raises_tx(bus15.transact, a, f, d, timeout=0.01, retries=0)
+        ok15 &= _raises_tx(bus15.transact_full, a, f, d, timeout=0.01, retries=0)
+        ok15 &= _raises_tx(bus15.raw_send, a, f, d, expect_response=False)
+        ok15 &= _raises_tx(wrap15.add_send_data,
+                           bytes([a, len(d) + 3, 0, f] + list(d)))
+    check2("Motor 0x80-0x88/0xFD: 0x03/0x04 + 0x07 Sub 01/03/04/05 gesperrt",
+           ok15 and bus15.ser.written == [] and bus15.stats()["sent"] == 0
+           and wrap15.stats()["queue_len"] == 0)
+    try:
+        check_tx_frame(0x81, 0x07, [0x05, 0x14, 0, 0, 0, 0])
+        msg15 = ""
+    except TxGuardError as e:
+        msg15 = str(e)
+    check2("Fehlermeldung Motor-0x07 nennt erlaubte Subs 02/06",
+           "02/06" in msg15 and "0x81" in msg15)
+    # erlaubt: lesend 0x07 Sub 02/06 an Motoren; gleiche fun-Codes an
+    # Box (0x01-0x04, 0xFE), Belt (0x21/0x22), Rack (0x11) und 0xFF frei
+    allowed15 = [(0x81, 0x07, [0x02]), (0x84, 0x07, [0x06, 0x14]),
+                 (0xFD, 0x07, [0x06, 0x08]), (0x81, 0x06, [0x02, 0x46])]
+    for a in (0x01, 0x02, 0x03, 0x04, 0xFE):
+        allowed15 += [(a, 0x03, [0x0F]), (a, 0x04, [0x00, 0x01]),
+                      (a, 0x04, [0x0F, 0x00]), (a, 0x07, [0x01]),
+                      (a, 0x07, [0x00])]
+    for a in (0x21, 0x22):
+        allowed15 += [(a, 0x04, [0x02, 0, 0, 0, 0x8C]), (a, 0x02, [0x02])]
+    allowed15 += [(0x11, 0x03, [0x01]), (0xFF, 0x03, []), (0xFF, 0x04, [0]),
+                  (0xFF, 0x07, [0x05]), (0xFC, 0x04, [0x00])]
+    ok15b = all(check_tx_frame(a, f, d) == list(d) for a, f, d in allowed15)
+    bus15b = Serial485("/dev/ttyFAKE1", ser=FakeSerial([]))
+    bus15b.raw_send(0x01, 0x04, [0x00, 0x01], expect_response=False)
+    bus15b.raw_send(0x21, 0x04, [0x02, 0, 0, 0, 0x8C], expect_response=False)
+    bus15b.raw_send(0x81, 0x07, [0x06, 0x14], expect_response=False)
+    check2("Erlaubt: Motor 0x07 Sub 02/06; Box/Belt/Rack/0xFF mit 0x03/0x04/0x07",
+           ok15b and len(bus15b.ser.written) == 3
+           and bus15b.ser.written[0] == build_frame(0x01, 0x04, [0x00, 0x01]))
 
     print("SELBSTTEST: %d/%d ok" % (total - fails, total))
     return fails

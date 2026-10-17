@@ -285,12 +285,19 @@ In den vorhandenen Live-Logs kommt keine dieser Zeilen vor. Auch `flush; last_tn
 | `RESUME_EXTERNAL` am Ende | ST:939 |
 | `CALIBRATE_CUT_POS` | ST:795/800 |
 | `END_PRINT` (`RESTORE_LIMITS`) | ST:632 |
-| BW `BoxAction.set_flushing_sign` | Z.1278 `M400`, Z.1279 `SET_LIMITS` |
-| BW `BoxAction.reset_flushing_sign` | Z.1283 `M400`, Z.1284 `RESTORE_LIMITS` |
+| BW `BoxAction.set_flushing_sign` | ~~Z.1278 `M400`, Z.1279 `SET_LIMITS`~~ – **korr. 17.10.2026:** Z.1277 `M400`, Z.1278 `SET_LIMITS`, Z.1279 `M400` |
+| BW `BoxAction.reset_flushing_sign` | ~~Z.1283 `M400`, Z.1284 `RESTORE_LIMITS`~~ – **korr. 17.10.2026:** Z.1282 `M400`, Z.1283 `RESTORE_LIMITS`, Z.1284 `M400` |
 
 Die BW-Stellen sind String-Xrefs im Disassembly. Weitere Strings finden sich in `prtouch_v3_wrapper.so`.
 
-Damit ist der offene Punkt „`set_flushing_sign`-Rumpf“ aus FLUSH-BEFUND §9 teilweise geklärt. Der Rumpf besteht aus `M400` + `SET_LIMITS`, dazu kommt die Datei `flushing_sign` (`has_flushing_sign` Z.1270/1271: `os.path.exists`/`os.remove`).
+~~Damit ist der offene Punkt „`set_flushing_sign`-Rumpf“ aus FLUSH-BEFUND §9 teilweise geklärt. Der Rumpf besteht aus `M400` + `SET_LIMITS`, dazu kommt die Datei `flushing_sign` (`has_flushing_sign` Z.1270/1271: `os.path.exists`/`os.remove`).~~
+
+> **Korrektur 17.10.2026 (B, FLUSH-SONDERFAELLE-BEFUND-2026-10-17.md §1.1/§1.3/§7 Nr. 2):** Der Rumpf ist damit
+> **vollständig** geklärt. `set_flushing_sign` = genau drei Befehle `M400` (Z.1277) + `SET_LIMITS` (Z.1278) +
+> `M400` (Z.1279); `reset_flushing_sign` analog `M400` (Z.1282) + `RESTORE_LIMITS` (Z.1283) + `M400` (Z.1284)
+> (Fehlerpfad-Zeilen `movw r7,#0x4fd–0x4ff` bzw. `#0x502–0x504`). **Keine Datei:** Beide schreiben/löschen nichts;
+> die Datei `flushing_sign` taucht nur in `__init__` (Pfad-Attribut) und in `has_flushing_sign` (Z.1270/1271:
+> `os.path.exists`/`os.remove`) auf, und `has_flushing_sign` hat im Modul keinen Aufrufer.
 
 **V:** Stock hält im Druck engere X/Y-Grenzen und weitet sie für Schacht/Schneiden auf den Config-Bereich (Y bis 400).
 

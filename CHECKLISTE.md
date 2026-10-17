@@ -623,8 +623,9 @@ box 179 · boxmini 17 · cfsseq 28 · motor 134 · motor_mini 43 · auto_addr 33
 - [ ] Am Gerät (Pi): remain_material erste Speicherung + Neustart; Stock-Datei per install.sh --remain-material als Startwert;
   Orca-Mehrfarbdatei: Zeilenform flush_volumes_matrix (ANNAHME) + Spülmengen vs. Orca-Anzeige, erst dann flush_mode: matrix;
   M600 aus Orca-Datei → PAUSE/RESUME.
-- [ ] Vorschläge aus der Vormerk-Runde: (a) check_tx_frame hart sperren: Motor 0x03, 0x04, 0x07 Sub 01/03/05;
+- [x] UMGESETZT 17.10.2026 spät (test_k2_485 41/41, test_k2_box 59/59, test_k2_prtouch 372/372, flush-material 34/34): (a) check_tx_frame hart sperren: Motor 0x03, 0x04, 0x07 Sub 01/03/05;
   (b) k2_box `ending_material_purge` (Restmaterial-Fall 0x50 ausspülen statt Cut/Rückzug); (c) optional `end_print_unload`
   (Default aus); (d) optional `KTWO_PRTOUCH_CHECK` (PRES_CHECK-Ersatz über apax); (e) Doku: FLUSH-BEFUND §5 (Tupel-None≠300),
   SDCARD-Zeilen set_flushing_sign (3× M400), README-k2_prtouch §1 + PRTOUCH-BEFUND Z.20 (apax doch im Normalpfad).
-
+- [ ] Am Gerät (Pi): Restmaterial-Fall (kommt 0x50 im Druck? Weg Kopfsensor→Düse < 80 mm? Menge/Abfall), end_print_unload
+  (Schnitt + Rückzug bis Box), KTWO_PRTOUCH_CHECK mit EXTRUDE (dif ≥ 15000 ANNAHME, espd-Vorzeichen).

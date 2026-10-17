@@ -49,6 +49,20 @@ M8200-Kette macht `PRE_OPT` keinen Z-Hop (`Z_HOP=0`) und `END_OPT` keine
 Rückfahrt (`RETURN=0`) – das erledigt der Slicer wie im Stock-Beispiel.
 Abweichung vom Stock: `M8200 F … L…` löst KEINEN zusätzlichen Einzug aus.
 
+**Restmaterial + Druckende** (17.10.2026, README-k2_box.md §12.5,
+FLUSH-SONDERFAELLE-BEFUND §2/§3): Meldet die Box im Druck Status 0x50
+(Spule leer, Rest im Schlauch), spült der nächste `PRE_OPT` (T<n> bzw.
+`M8200 P`) den Rest aus statt zu schneiden und zurückzuziehen: Schacht,
+Heizen, je 80 mm mit `max_vol/2,4·60` (ohne DB 360), Blasen + Blech ohne
+Kreise, bis Kopfsensor leer + 1 Stück, max. `max_tube_length` 3000 mm;
+danach Box IDLE, `CUT`/`RETRUDE` der Kette entfallen, `EXTRUDE` lädt neu
+(`ending_material_purge`, Default AN; Kopfsensor ohne Zustand → Pause,
+nie blind). Am Druckende ruft `END_PRINT` `KTWO_BOX_END_PRINT`, wenn ein
+solcher Fall offen ist oder `end_print_unload` (Default AUS) an ist:
+dann heizen, schneiden, in die Box zurück – kein Spülen, Fehler nur
+Meldung (keine Pause). Von Hand: `KTWO_BOX_ENDING [SET=1 SLOT=] [CLEAR=1]
+[PURGE=1]`.
+
 ## 2. Inbetriebnahme (Reihenfolge, Hand am Not-Aus)
 
 Voraussetzung: Homing + Bewegung freigegeben (README.md §4), `[k2_485]`
@@ -181,5 +195,9 @@ mit echtem Port, `KTWO_BOX_STATUS` liefert Zustand/Hub/Temp.
   (Nicht-Stock).
 - **M600** aus der Druckdatei → `PAUSE` (Makro in `macros.cfg`, wie Stock
   `virtual_sdcard`), außerhalb eines Drucks nur Meldung.
+- **Restmaterial/Druckende** (README §12.5): Auslöser 0x50 aus dem 0x0a-Poll
+  (Timer ~4 s + frischer Poll in PRE_OPT) statt Stock-`send_data`-Ereignis;
+  mechanische Folge eines Rückzugs mit leerem Einlauf (Hub-Verstopfung?)
+  und Lage des Kopfsensors (Sensor -> Düse < 80 mm?) am Gerät unbelegt.
 - **Auto-Nachladen** (Stock `BOX_CHECK_MATERIAL_REFILL`): **umgesetzt 16.10.2026** als
   `KTWO_BOX_RUNOUT` (Default aus, `runout_refill`), siehe `NOTIZ-runout.md`.
