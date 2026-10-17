@@ -317,7 +317,7 @@ Lüfter, Rückfahrt.
 | `KTWO_BOX_GO_EXTRUDE_POS` / `KTWO_BOX_SAFE_POS` | BOX_GO_TO_EXTRUDE_POS / BOX_MOVE_TO_SAFE_POS | T0-Beispiel Schritt 6 / 11 |
 | `KTWO_BOX_RETRUDE [SLOT=] [LENGTH=]` | M8200 R [E] | Schacht, M109 (nur mit Filament am Kopf), Box bereit abwarten, Slot aus Hub-Sensor, `do_retrude(after_p0=…)`: p0 → E-10 F600 → … → p1 |
 | `KTWO_BOX_EXTRUDE TNN=\|SLOT=` | M8200 L I | Hub frei/gleicher Slot prüfen, Kopf leer prüfen, M109, `do_extrude(sensor_fn, stage7_fn)`: m5 alle 2 s bis Kopfsensor (max 90 s), m6, Extruder `G1 E30 F360` (ohne M400), 2 s, m7 p3, PRINT |
-| `KTWO_BOX_FLUSH [TNN=] [LENGTH=] [VELOCITY=] [TEMP=]` | M8200 F | Abschnitte 90 + 70 mm, je 20 %/80 %, danach Abstreifen |
+| `KTWO_BOX_FLUSH [TNN=] [LENGTH=] [VELOCITY=] [TEMP=\|BASE_TEMP=]` | M8200 F | seit 17.10. abends wie Stock (§12): Menge farbabhängig (unbekannt 90 + 70 mm), je 20 % v / 80 % 1,2·v, Blasen + Blech je Abschnitt, Silikon-Kreise nur am Ende |
 | `KTWO_BOX_WIPE`, `KTWO_BOX_WASTE` | T0-Bsp. 10.1–10.3, M8200 W | Abstreifen; WASTE = nur Hinweis (Stock-Kamera fehlt) |
 | `KTWO_BOX_END_OPT [RETURN=0\|1]` | M8200 O | Schacht verlassen, ggf. Rückfahrt XY + Z, Zieltemperatur zurück, Zustand/Kopfsensor zurück |
 | `KTWO_BOX_WAIT [TIMEOUT=]` | BOX_MODE_WAIT | 0x0a bis IDLE/PRINT, ERROR → Fehler |
@@ -380,12 +380,12 @@ kein Shutdown; T5 → „Box 2 … nur Box 1“.
 
 Stage-7-Extruderlänge (`buffer_empty_len` 30) + `stage7_delay` 2 s,
 Rückweg-Geschwindigkeit nach dem Schnitt, `cut_dwell` 0,1 s (Input-Shaper),
-Bedeutung des Schneidhebel-Sensors, Material-Temperaturen (Stock: RFID;
-hier `max(Ziel, 220)`), Spül-Erhöhung auf Max-Temperatur/×1,2 entfällt,
-`box_wait_timeout` 200 s, Verhalten bei Sensor-Timeout (0x04 IDLE),
-`safe_pos_x` 225 ungenutzt, Box 2–4, Lüfter fan0/„Blasen“ beim Spülen
-nicht nachgebaut, Z nach RESUME mitten im Wechsel. Details:
-`config-pi/NOTIZ-cfs.md`.
+Bedeutung des Schneidhebel-Sensors, ~~Material-Temperaturen (hier
+`max(Ziel, 220)`), Spül-Erhöhung auf Max-Temperatur/×1,2 entfällt,
+`box_wait_timeout` 200 s, Lüfter fan0/„Blasen“ beim Spülen nicht
+nachgebaut~~ (seit 17.10.2026 abends umgesetzt, §12), Verhalten bei
+Sensor-Timeout (0x04 IDLE), `safe_pos_x` 225 ungenutzt, Box 2–4, Z nach
+RESUME mitten im Wechsel. Details: `config-pi/NOTIZ-cfs.md`.
 
 ## 9. Auto-Nachladen bei Runout (A7, Ergänzung 17.10.2026)
 
@@ -505,7 +505,8 @@ sonst `go_to_extrude_pos` → `box_retrude_material` → `box_extrude_material`
 - **Nachholen** (`resume_redo_change: True` + `allow_write` + `allow_move`
   + `MOVE=1` + Herkunft T + Ziel bekannt + Kette geschlossen +
   referenziert): `PRE_OPT TNN=<Ziel> Z_HOP=0 SOURCE=T` → Schacht + `M400` +
-  Heizen (max(Drucktemperatur vor der Pause, 220)) → `RETRUDE` (nur bei
+  Heizen (max(Drucktemperatur vor der Pause, Material-DB bzw. 220); EXTRUDE/
+  FLUSH mit `BASE_TEMP=`, §12) → `RETRUDE` (nur bei
   belegtem Hub) → `EXTRUDE` → `WASTE` → `FLUSH` → `END_OPT RETURN=0`; kein
   Schnitt; danach muss der Kopfsensor Filament melden; weiter mit dem
   normalen RESUME (Schacht/Vorextrusion/Rückfahrt). Fehler → `chain_error`,
@@ -528,3 +529,71 @@ sonst `go_to_extrude_pos` → `box_retrude_material` → `box_extrude_material`
   aktuelles Ziel + Meldung). Abbruch einer Wiederholung IN der Pause: keine
   neue PAUSE (`hotend_temp` der ersten bleibt), Düse zurück auf das Ziel vor
   diesem Wechsel (Pausentemperatur).
+
+## 12. Spülen wie Stock + Material-Datenbank + Preload-Schutz (Ergänzung 17.10.2026 abends)
+
+> **ENTWURF – am Gerät UNGETESTET.** Belege: `FLUSH-BEFUND-2026-10-17.md`,
+> `PAUSE-RESUME-MATERIAL-BEFUND-2026-10-17.md` (§C P1–P3), `BOOTLOADER-HOST-
+> NACHTRAG-2026-10-17.md` (N2/N3/N6). Ablauf/Stock-Vergleich:
+> `config-pi/NOTIZ-reinigung-resume.md` §7. Rechnung über `nachbau/flush.py`
+> und `nachbau/material_db.py` (in `extras/k2_nachbau/`, weich importiert:
+> fehlen sie, gilt das bisherige Verhalten). Offline: `test_k2_box.py` 47/47.
+
+### 12.1 Neue Optionen `[k2_box]` (Defaults; alle in `k2-module.cfg` kommentiert)
+
+| Option | Default | Wirkung / Fallback |
+|---|---|---|
+| `material_database` | leer (aus) | Pfad zur Creality-`material_database.json` (Zielpfad von `install.sh`: `~/printer_data/config/k2/material_database.json`, nicht im Repo). Leer/fehlt/kaputt → bisheriges Verhalten + Meldung beim Connect, kein Config-Fehler |
+| `flush_mode` | `color` | `color` = Stock-Spülmenge aus alter/neuer RFID-Farbe (unbekannt → `Tn_extrude` 140 → 90 + 70 mm = bisher), `LENGTH=` über `cal_flush_list`; `fixed` = immer `box_first + box_need`, `LENGTH=` in 90er-Stücken (Stand bis 17.10.) |
+| `flush_clean` | `stock` | `stock` = Blech zwischen den Abschnitten, Silikon-Kreise + Schacht verlassen nur am Ende; `legacy` = volles Abstreifen (`gcode_wipe`) nach jedem Abschnitt |
+| `flush_wipe_offset` | 3 | Kreisstart-Versatz `monotonic() % 3` mm (Stock `clean_offset_pos`); 0 = immer dieselbe Stelle (Tests) |
+| `wipe_minimum_cruise_ratio` | 0 | Upstream-Ersatz für Stock `ACCEL_TO_DECEL=ACCEL` (9cb9975 kennt nur `MINIMUM_CRUISE_RATIO`); danach alter Wert, nur wenn lesbar |
+| `flush_blow` / `flush_blow_fan` | `True` / `fan0` | Stock `M106 P0 S50` zu Beginn, je Abschnitt Lüfter `flush_blow_time` s voll, am Ende Lüfter (+ `<fan>_en`) wie vorher; ohne `[output_pin <fan>]` übersprungen |
+| `flush_fan_start` / `flush_blow_time` | 50 / 5 s | Stock-Werte |
+| `flush_velocity_factor` | 1,2 | 80 %-Teil jedes Abschnitts außer dem letzten; 1 = eine Geschwindigkeit (bisher) |
+| `max_temp_flush_times` | 3 | Stock: Index des letzten Abschnitts (Faktor 1, Temperatur zurück) |
+| `box_need_clean_length_max`, `nozzle_volume`, `flush_multiplier`, `diff_material_type_min_flush_len`, `baseline_nozzle_diameter` | 100, 183, 1, 370, 0,4 | Stock-`[box]`-Defaults (FLUSH-BEFUND §7.3) |
+| `flush_clog_check` / `flush_clog_min_mm` | `False` / 10 | Stock key845 (Messrad-Summe < 10 mm) – hier nur WARNUNG |
+| `box_wait_timeout` | **380** (vorher 200) | = `preload_force_timeout(1 Slot)` (N6) |
+| `Tn_extrude` | 140 | jetzt genutzt: Stock-Fallback der Spülmenge |
+
+### 12.2 Verhalten
+
+- **Temperaturen** (`_change_temp`, P1): `TEMP=` fest; sonst
+  `max(Basis, Material-Temperatur)` – Basis = `BASE_TEMP=` (Nachholen/
+  Runout: Drucktemperatur vor der Pause) bzw. Extruder-Ziel; Material =
+  `kvParam.nozzle_temperature` der DB, Schlüssel = RFID-`material_type` des
+  Slots (Rückzug: Material in der Düse, Einzug: Ziel). Ohne DB/unbekannt:
+  `Tn_extrude_temp` 220 (+ `HINWEIS` mit DB). Kappung `[extruder] max_temp − 10`.
+  Kommentar korrigiert: die Temperatur steht nicht im RFID-Tag.
+- **Spülen** (`cmd_flush`): Menge `plan_flush_lengths`, Geschwindigkeit
+  `min(360, vol/2,4·60)·Düse/0,4` (ohne DB `Tn_extrude_velocity`),
+  Temperatur `max(Basis, T_alt, T_neu)`, mit DB bei `T_alt ≥ T_neu` Spitze
+  `max(maxTemp)` (`M104` + `TEMPERATURE_WAIT MINIMUM=max−5`, zurück im
+  letzten Abschnitt), Abschnitte `flush_segment_lines`, Blasen
+  `gcode_blow`, Reinigung `gcode_nozzle_clean` (G2/G3 mit `[gcode_arcs]`,
+  sonst 16-Eck). Nach ausgeführtem Spülen `remain_material` = Ziel
+  (Typ/Farbe, nur im Speicher – nach Neustart unbekannt → 90 + 70 mm).
+- **RESUME-Vorextrusion** (P2): Status `prime_speed` = `vol/2,4·60·0,8` des
+  Materials in der Düse (unbekannt 288), 0 ohne DB → `_PI_RESUME_PRIME`
+  nimmt dann `resume_prime_speed` 460.
+- **Stage-7-Greifen** (P3, Pi-Erweiterung): mit DB
+  `min(Tn_extrude_velocity, vol/2,4·60)` (TPU 50 mm/min).
+- **Preload** (`KTWO_BOX_PRELOAD … [FORCE=1]`, N2/N3): op 2/3 nur bei
+  leerem Kopfsensor, Druck/Pause nur mit `FORCE=1`, Maske 0 bei op 2/3
+  abgelehnt (`preload_block_reason`) – gesperrt = nichts gesendet.
+  N5 (`0x0d [0f 01]` beim Connect) bewusst NICHT eingebaut – offener Gerätetest.
+- **Status** neu: `material_db`, `material_db_info`, `remain_material`,
+  `prime_speed`, `flush_mode`, `flush_last`.
+
+### 12.3 Offen / am Gerät
+
+- Spülbahn am Gerät (Blech ohne Kreise zwischen den Abschnitten, Kreise am
+  Ende, 5-s-Blasen), DB-Temperaturen (PETG 250, PLA→PLA Spitze 240).
+- `remain_material` wird nicht persistiert (Stock: Datei) – erster Wechsel
+  nach Klipper-Start spült 90 + 70 mm.
+- Slicer-Spülmatrix im Druck (`flush_volumes_matrix`) nicht umgesetzt.
+- `KTWO_BOX_WIPE`/`_PI_NOZZLE_CLEAN` (G28/START_PRINT/G29/RESUME) unverändert
+  (erstes X 160 statt Stock 170, ohne Versatz) – Bahn bleibt == `_PI_CLEAN_PATH`.
+- N5 (Preload-Freigabe `[0f 01]` nach Box-Reset) am Gerät prüfen.
+

@@ -25,14 +25,20 @@ Ablauf eines T-Befehls (= Stock-T0-Beispiel aus box.cfg):
 1. `PRE_OPT`: schon geladen? (Hub-Sensor 0x08 [01] + Kopfsensor) → fertig.
    Sonst Kopfsensor sperren, G-Code-Zustand sichern, Z +0,4.
 2. `CUT`: X10 Y200 → ACCEL 5000 → X −7,80 (F30000) → 0,1 s halten → X10.
-3. `RETRUDE`: Schacht (Y345 → X139 → Y378 → X133), 220 °C, Box bereit,
+3. `RETRUDE`: Schacht (Y345 → X139 → Y378 → X133), Wechsel-Temperatur
+   (max(Ziel, 220) bzw. mit Material-DB die des Materials in der Düse), Box bereit,
    0x11 p0 → E −10 F600 (3×) → p0 → p1 (Hub frei; live bis 23 s).
 4. `EXTRUDE`: Box fördert, bis der Kopfsensor anspricht (m5 alle 2 s, max.
    90 s), Box-Buffer (m6), Extruder greift `E+30 F360`, Box prüft (m7),
    Box PRINT.
 5. `WASTE`: nur Hinweis (Stock: Kamera prüft den Abfallschacht).
-6. `FLUSH`: 90 mm + 70 mm (je 20/80 %), nach jedem Abschnitt Abstreifen
-   (Blech X160→X135, Kreise am Silikon, 3× Schütteln).
+6. `FLUSH` (seit 17.10.2026 abends wie Stock, NOTIZ-reinigung-resume.md
+   §7): Menge aus alter/neuer RFID-Farbe (unbekannt → 90 + 70 mm),
+   Abschnitte `cal_flush_list`, je 20 % v + 80 % 1,2·v (letzter ×1),
+   `M106 P0 S50`, nach jedem Abschnitt fan0 5 s voll + Blech (X170→X135,
+   3× Schütteln, bleibt im Schacht); Silikon-Kreise + Schacht verlassen
+   nur nach dem letzten. Temperatur/Geschwindigkeit mit Material-DB aus
+   `material_database.json`.
 7. `END_OPT`: Schacht verlassen (X160 → Y345), zurück auf Start-XY, Z
    runter, Zieltemperatur zurück, Kopfsensor + Zustand zurück.
 
@@ -122,13 +128,22 @@ mit echtem Port, `KTWO_BOX_STATUS` liefert Zustand/Hub/Temp.
   X −7,69 um). Schneidhebel-Sensor (`switch_pin` !nozzle_mcu:PB9) nur
   optional über einen eigenen `[filament_switch_sensor]` (`cut_sensor:`),
   Pegelbedeutung unbelegt.
-- **Temperaturen:** Stock nimmt Material-Temperaturen aus dem RFID-Tag
-  (live 220, Spülen bis 240 °C, Geschwindigkeit ×1,2) – hier
-  `max(Ziel, Tn_extrude_temp 220)` bzw. `TEMP=`; keine Erhöhung beim Spülen.
-- **Lüfter:** nur fan2 aus/zurück (Stock LOAD_MATERIAL_CLOSE_FAN2); das
-  Blasen beim Spülen (live 2× SET_PIN) ist nicht nachgebaut.
-- **Wartezeiten:** `box_wait_timeout` 200 s (Preload ≤ ~3 min/Slot),
-  Sensor-Timeout 90 s (live) → Box per 0x04 [00 01] auf IDLE.
+- **Temperaturen (17.10.2026 abends):** Stock nimmt die Material-
+  Temperatur aus `material_database.json` (Schlüssel = RFID-
+  `material_type`, NICHT die Temperatur aus dem Etikett; live 220, Spülen
+  bis maxTemp 240). Pi: mit `[k2_box] material_database` ebenso
+  (max(Ziel, DB)), ohne DB weiter `max(Ziel, Tn_extrude_temp 220)` bzw.
+  `TEMP=`; Spül-Spitze maxTemp nur mit DB. Geschwindigkeit ×1,2 beim
+  Spülen jetzt wie Stock (`flush_velocity_factor`).
+- **Lüfter:** fan2 aus/zurück (Stock LOAD_MATERIAL_CLOSE_FAN2); Blasen
+  beim Spülen seit 17.10.2026 abends wie Stock (`flush_blow`).
+- **Wartezeiten:** `box_wait_timeout` 380 s (= `preload_force_timeout`
+  eines Slots, Box-Auto-Preload bis 364 s, BOOTLOADER-HOST-NACHTRAG N6;
+  vorher 200 s), Sensor-Timeout 90 s (live) → Box per 0x04 [00 01] auf IDLE.
+- **Preload `KTWO_BOX_PRELOAD`:** op 2/3 nur bei leerem Kopfsensor, im
+  Druck/Pause nur mit `FORCE=1` (Stock force), Maske 0 abgelehnt
+  (NACHTRAG N2/N3). Offen am Gerät (N5, nicht eingebaut): Stock sendet nach
+  jedem (Re-)Connect `0x0d [0f 01]`.
 - **Positionen:** `safe_pos_x` 225 ungenutzt (Stock-Beispiel verlässt den
   Schacht nur über X160/Y345); `extrude_entry_pos_x` 139 aus dem Beispiel.
 - **Z-Hop 0,4 mm** wie Stock-Beispiel – bei hohen Objekten nahe Y200/X10
@@ -143,9 +158,12 @@ mit echtem Port, `KTWO_BOX_STATUS` liefert Zustand/Hub/Temp.
   quittiert im RESUME selbst).
 - **Kopfsensor nach Abbruch:** dass PA11 „leer“ meldet, sobald der Faden aus
   dem Kopf ist, ist ANNAHME (Lage relativ zu Schneider/Zahnrädern unbelegt);
-  Nachhol-Temperatur max(Drucktemperatur vor der Pause, 220) statt RFID.
+  Nachhol-Temperatur max(Drucktemperatur vor der Pause, Material-DB bzw.
+  220) – EXTRUDE/FLUSH bekommen `BASE_TEMP=` (NOTIZ-reinigung-resume §7).
 - **Reactor:** lange Box-Antworten laufen über `ReactorBusProxy` in einem
   Hilfs-Thread; am Gerät prüfen, dass Heizung/MCU dabei stabil bleiben.
-- **Mehrere Boxen**, WASTE-Prüfung, RFID-basierte Spülmengen: nicht umgesetzt.
+- **Mehrere Boxen**, WASTE-Prüfung, Slicer-Spülmatrix (`flush_volumes_matrix`
+  im G-Code-Kopf, Stock im Druck): nicht umgesetzt. Farbabhängige
+  Spülmengen (RFID-Farbe): seit 17.10.2026 abends umgesetzt.
 - **Auto-Nachladen** (Stock `BOX_CHECK_MATERIAL_REFILL`): **umgesetzt 16.10.2026** als
   `KTWO_BOX_RUNOUT` (Default aus, `runout_refill`), siehe `NOTIZ-runout.md`.

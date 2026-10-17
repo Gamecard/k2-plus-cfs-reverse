@@ -259,7 +259,11 @@ Sub 0x02 (1B)  = update_end (Zustand 10, Timeout 500 ms – ERGÄNZT 15.10.2026,
                   Länge 1, Func 0xF0, mov r7,#500 → Timeout; String "update_end")
 Ende            = "update end, wait to startup app" / "startup slave"
 Retries         = max. 3 Versuche (`cmp r6,#3` @0x1562c/0x15b78) → serial485 retries=2
-Sector-Size     = signed Byte (`ldrsb [r4,#40]` @0x15560, ≤0 → Fehlerpfad) → 1..127
+Sector-Size     = signed Byte (`ldrsb [r4,#40]` @0x15560): 0 → 'invalid sector size!';
+                  < 0 → Chunk = (s·252)&0xFF (0xE0 → 128 = Bootloader-Blockgröße);
+                  > 0 → Chunk 0 → keine Daten (latenter Host-Bug). NACHTRAG 17.10.2026
+                  (KORRIGIERT, bisher „≤0 → Fehlerpfad → 1..127“ = falsch;
+                  Beleg BOOTLOADER-HOST-NACHTRAG-2026-10-17.md §3a–3c)
 ```
 
 Plus: `duplicate uuid, skip!` (UUID-Dedupe), `-f --force` (alle updaten),

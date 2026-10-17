@@ -1289,8 +1289,17 @@ class BoxAction:
 
         mask = Slotmaske 0x00..0x0f, action = PRELOAD_DISABLE/ENABLE/
         FORCE_READ/FORCE_TENSION_ONLY (Belege s. Konstanten).
-        TODO: .so-Parameter action/num/force-Abbild (num=15 Default,
-        force=False) – hier explizit (mask, action), nichts erfunden.
+        ~~TODO: .so-Parameter action/num/force-Abbild~~ GEKLÄRT 17.10.2026
+        (BOOTLOADER-HOST-NACHTRAG-2026-10-17.md §1b, N1): Stock-Signatur
+        (addr, action, num=15, force=False); num = Slotmaske 0..15
+        (G-Code NUM, get_int minval 0/maxval 15, Default 0), geht 1:1 als
+        1. Datenbyte auf den Draht (Py 5297/5325, 5076) – entspricht
+        hier mask (Wire-identisch). OPEN/CLOSE (op 1/0) sendet der Stock
+        an ALLE verbundenen Boxen (ADDR ignoriert); RUN/TIGHT (op 2/3)
+        nur an ADDR. Maske 0 ist ein Fehlgebrauch (NUM als Slotindex
+        „A“ gemeint, UI/Makro BOX_INFO_REFRESH) und Ursache der
+        [00 02]-Bursts (NACHTRAG §1c); der Stock-Erstpreload sendet nie
+        Maske 0. force ist hier nicht abgebildet.
         ~~TODO bei echtem Preload ggf. länger wählen~~ ERLEDIGT 15.10.2026
         (Ghidra FUN_0800f0da/FUN_08004ec4/FUN_08004e80): bei op 2/3 kommt die
         Antwort erst NACH dem Vorgang (~3 min je Slot, + Vorlauf). Daher

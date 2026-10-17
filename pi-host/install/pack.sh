@@ -53,6 +53,9 @@ cp "$REPO"/nachbau/ref-hi/* "$P/nachbau/ref-hi/"                      # Testvekt
 cp "$REPO/belt_mdl-live.py" "$P/"                                     # Original (GPLv3) für test_k2_belt-Vergleich
 for d in $DICT_DATEIEN; do cp "$DICTS/$d" "$P/mcu-dicts/"; done
 for x in $AUSGESCHLOSSEN; do rm -f "$P/pi-host/$x"; done
+# Creality-Materialdatenbank NIE ins Paket (Firmware-Datei bzw. Benutzer-Kopie mit
+# Cloud-Kennungen) – install.sh --material-db holt sie getrennt vom Drucker.
+find "$P" -iname '*material_database*' -print -delete | sed 's#^#  ausgeschlossen: #'
 find "$P" -name '__pycache__' -prune -exec rm -rf {} +
 [ -f "$P/pi-host/k2_motor_init.py" ] || fehler "pi-host/k2_motor_init.py fehlt"
 
@@ -69,6 +72,11 @@ else
 fi
 if grep -rnIiE "$MUSTER" "$P"; then
   fehler "Leak-Muster im Paketinhalt (oben) – Paket NICHT gebaut"
+fi
+# Material-DB: weder dem Namen noch dem Inhalt nach (Kennfelder der Creality-DB in JSON)
+if find "$P" -iname '*material_database*' | grep .; then fehler "Material-DB im Paket (oben) – Paket NICHT gebaut"; fi
+if find "$P" -type f -iname '*.json' -exec grep -lE '"(meterialType|printerIntName|kvParam)"' {} + | grep .; then
+  fehler "JSON mit Material-DB-Inhalt im Paket (oben) – Paket NICHT gebaut"
 fi
 for f in "$P"/*.md "$P"/pi-host/*.md "$P"/pi-host/config-pi/*.md; do
   case "$(basename "$f")" in [U]EBERGABE*|CHECKLISTE*|PI-ZUGANG*|PROTOKOLL*) fehler "unerwünschte Datei $f";; esac
@@ -106,6 +114,9 @@ fi
 ( cd "$P" && find . -type f ! -name SHA256SUMS | sed 's#^\./##' | LC_ALL=C sort | xargs sha256sum > SHA256SUMS )
 mkdir -p "$OUT"
 tar --sort=name --owner=0 --group=0 --numeric-owner -czf "$OUT/$NAME.tar.gz" -C "$TMP" "$NAME"
+if tar -tzf "$OUT/$NAME.tar.gz" | grep -i 'material_database'; then
+  rm -f "$OUT/$NAME.tar.gz"; fehler "Material-DB im Tarball (oben) – Paket gelöscht"
+fi
 ( cd "$OUT" && sha256sum "$NAME.tar.gz" > "$NAME.tar.gz.sha256" )
 
 echo

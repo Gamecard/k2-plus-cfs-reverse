@@ -450,6 +450,17 @@ class _SensorObj:
                 "enabled": self.enabled}
 
 
+class _PinObj:
+    """[output_pin] wie Upstream: get_status value = VALUE/scale."""
+
+    def __init__(self, value=0.0, scale=255.0):
+        self.value = float(value)
+        self.scale = float(scale)
+
+    def get_status(self, eventtime=None):
+        return {"value": self.value}
+
+
 class FakePrinter:
     def __init__(self, bus, with_motion=False):
         self.reactor = FakeReactor()
@@ -525,6 +536,10 @@ class FakePrinter:
             self.relative = self.saved.get(args["NAME"], self.relative)
         elif cmd == "SET_FILAMENT_SENSOR":
             self.sensor.enabled = bool(int(args["ENABLE"]))
+        elif cmd == "SET_PIN" and ("output_pin %s" % args.get("PIN")) \
+                in self.objects:
+            pin = self.objects["output_pin %s" % args["PIN"]]
+            pin.value = float(args["VALUE"]) / pin.scale
         elif cmd == "PAUSE":
             self.paused = True
             self.print_state = "paused"
@@ -1189,8 +1204,8 @@ def test_wechsel_kette_voll():
     i10 = _idx(t, _b(0x10, (0x02, 0x07, 0x03)), i9)       # mode 7
     i11 = _idx(t, _b(0x04, (0x02, 0x00)), i10)            # PRINT
     i12 = _idx(t, _g("G1 E18 F360"), i11)
-    i13 = _idx(t, _g("G1 E72 F360"), i12)
-    i14 = _idx(t, _g("G0 X135 F12000"), i13)              # Abstreifen 1
+    i13 = _idx(t, _g("G1 E72 F432"), i12)                 # 80 % ×1,2 (Stock)
+    i14 = _idx(t, _g("G0 X135 F12000"), i13)              # Blech 1
     i15 = _idx(t, _g("G1 E14 F360"), i14)
     i16 = _idx(t, _g("G1 E56 F360"), i15)
     i17 = _idx(t, _g("G0 X135 F12000"), i16)              # Abstreifen 2
@@ -2625,6 +2640,559 @@ def test_runout_config():
 
 
 # =====================================================================
+# Material-DB, Spülen wie Stock, Preload-Sperren (17.10.2026)
+# Belege: FLUSH-BEFUND-2026-10-17.md, PAUSE-RESUME-MATERIAL-BEFUND-2026-
+# 10-17.md, BOOTLOADER-HOST-NACHTRAG-2026-10-17.md (N2/N3/N6)
+# =====================================================================
+
+def _mtag(mat, col):
+    """Synthetisches 40-Zeichen-RFID-vender (box.RFID_VENDOR_FIELDS)."""
+    t = "10126000000" + mat + col + "0330000000000000"
+    assert len(t) == 40, t
+    return t
+
+
+def _mini_material_db():
+    """Synthetische Mini-DB (Format result.list wie Creality, KEINE echten
+    Inhalte): IDs 9000x, Werte im Stil der Stock-Default-DB (Befund B.3)."""
+    def e(dbid, mtype, temp, tmax, vol):
+        return {"base": {"id": dbid, "name": "Test " + mtype,
+                         "meterialType": mtype, "maxTemp": tmax},
+                "kvParam": {"nozzle_temperature": temp,
+                            "filament_max_volumetric_speed": vol}}
+    lst = [e("90001", "PLA", "220", 240, "23"),
+           e("90002", "PLA", "220", 240, "14"),
+           e("90003", "PETG", "250", 270, "16"),
+           e("90004", "TPU", None, 240, "2")]
+    return {"code": 0, "msg": "ok", "result": {"list": lst, "count": len(lst)}}
+
+
+T_PLA23 = _mtag("190001", "0FFFFFF")    # weiß, vol 23
+T_PLA14 = _mtag("190002", "0CE58F8")    # violett, vol 14
+T_PETG = _mtag("190003", "026EEEE")     # türkis, PETG 250/270
+T_TPU = _mtag("190004", "0000000")      # TPU ohne nozzle_temperature
+T_FREMD = _mtag("199999", "0FFFFFF")    # nicht in der DB
+
+
+def _with_db(mod):
+    mod.material_db = K._MDB.MaterialDB(_mini_material_db())
+    mod.material_db_info = "Test-DB"
+    return mod
+
+
+def _material_hull(tags=None, db=True, **opt):
+    o = dict(allow_write="True")
+    o.update(opt)
+    bus, printer, mod = build_hull(**o)
+    for letter, tag in zip("ABCD", tags or (T_PLA23, T_PLA14, T_PETG, T_TPU)):
+        bus.slots[letter]["rfid"] = tag
+    if db:
+        _with_db(mod)
+    return bus, printer, mod
+
+
+def test_material_db_laden():
+    import json
+    import tempfile
+    assert K.load_material_db("") == (None, "")
+    db, info = K.load_material_db("/nicht/da/material_database.json")
+    assert db is None and "nicht ladbar" in info and "Fallback" in info, info
+    d = tempfile.mkdtemp(prefix="k2box-mdb-")
+    good = os.path.join(d, "material_database.json")
+    with open(good, "w") as fh:
+        json.dump(_mini_material_db(), fh)
+    bad = os.path.join(d, "kaputt.json")
+    with open(bad, "w") as fh:
+        fh.write("{kein json")
+    db, info = K.load_material_db(good)
+    assert db is not None and len(db) == 4 and "4 Einträge" in info, info
+    db2, info2 = K.load_material_db(bad)
+    assert db2 is None and "nicht ladbar" in info2, info2
+    # Klipper-Hülle: Option -> geladen; kaputt -> Fallback, KEIN Config-Fehler
+    bus = FakeBoxBus()
+    printer = FakePrinter(bus, with_motion=True)
+    mod = K.PrinterK2Box(FakeConfig(printer, test_options(
+        material_database=good)))
+    st = mod.get_status()
+    assert st["material_db"] is True and "geladen" in st["material_db_info"]
+    printer.fire("klippy:connect")
+    assert any("geladen" in m for m in printer.gcode.infos), printer.gcode.infos
+    mod = K.PrinterK2Box(FakeConfig(FakePrinter(FakeBoxBus(), True),
+                                    test_options(material_database=bad)))
+    assert mod.material_db is None and mod.get_status()["material_db"] is False
+    # Default aus
+    mod = K.PrinterK2Box(FakeConfig(FakePrinter(FakeBoxBus(), True),
+                                    test_options()))
+    assert mod.material_db is None and mod.get_status()["prime_speed"] == 0.0
+    # Abfragen (Stock-Semantik, Fallback Tn_extrude_temp)
+    mdb = K._MDB.MaterialDB(_mini_material_db())
+    p = K.material_params(mdb, "190003", 220.0)
+    assert p["known"] and p["temp"] == 250.0 and p["max_temp"] == 270.0 \
+        and p["vol"] == 16.0 and p["mtype"] == "PETG", p
+    p = K.material_params(mdb, "190004", 220.0)    # nozzle_temperature null
+    assert p["known"] and not p["temp_known"] and p["temp"] == 220.0 \
+        and p["max_temp"] == 240.0 and p["vol"] == 2.0, p
+    for key in ("199999", None, "", "-1"):
+        p = K.material_params(mdb, key, 220.0)
+        assert not p["known"] and p["temp"] == 220.0 and p["vol"] is None, p
+    p = K.material_params(None, "190003", 215.0)
+    assert not p["known"] and p["temp"] == 215.0
+    return ("leer = aus, fehlt/kaputt -> None + Meldung (kein Config-Fehler), "
+            "Mini-DB 4 Einträge, PETG 250/270/16, TPU null -> 220")
+
+
+def test_material_temperaturen():
+    # 1) DB an: Einzug PETG-Slot C -> M109 S250 (Ziel 0, Stock-Material-
+    #    Temperatur statt max(Ziel, 220)); Einzug TPU (null) -> 220 + Hinweis
+    bus, printer, mod = _material_hull()
+    printer.target = 0.0
+    printer._refresh()
+    g = FakeGcmd({"TNN": "T1C"})
+    bus.head_at_mm = 100.0
+    mod.cmd_extrude(g)
+    sc = printer.gcode.scripts
+    assert "M109 S250" in sc and "M109 S220" not in sc, sc
+    assert "G1 E30 F360" in sc, "Greifen: min(360, 16/2,4·60=400) = 360"
+    bus, printer, mod = _material_hull()
+    bus.head_at_mm = 100.0
+    g = FakeGcmd({"TNN": "T1D"})
+    mod.cmd_extrude(g)
+    sc = printer.gcode.scripts
+    assert "M109 S220" in sc and "G1 E30 F50" in sc, sc   # TPU: Greifen 2/2,4·60
+    assert any("HINWEIS" in m and "190004 ohne nozzle_temperature" in m
+               and "220" in m for m in g.infos), g.infos
+    # unbekanntes Material (nicht in DB) -> 220 + Hinweis; Druckziel höher bleibt
+    bus, printer, mod = _material_hull(tags=(T_FREMD,) * 4)
+    bus.head_at_mm = 100.0
+    printer.target = 230.0
+    printer._refresh()
+    g = FakeGcmd({"TNN": "T1A"})
+    mod.cmd_extrude(g)
+    assert "M109 S230" in printer.gcode.scripts, printer.gcode.scripts
+    assert any("199999 nicht in der Material-DB" in m for m in g.infos), g.infos
+    # TEMP= bleibt fest
+    bus, printer, mod = _material_hull()
+    bus.head_at_mm = 100.0
+    mod.cmd_extrude(FakeGcmd({"TNN": "T1C", "TEMP": "235"}))
+    assert "M109 S235" in printer.gcode.scripts
+    # 2) DB aus: bisheriges Verhalten max(Ziel, 220), kein RFID-Lesen dafür
+    bus, printer, mod = _material_hull(db=False)
+    bus.head_at_mm = 100.0
+    bus.calls[:] = []
+    mod.cmd_extrude(FakeGcmd({"TNN": "T1C"}))
+    sc = printer.gcode.scripts
+    assert "M109 S220" in sc and "G1 E30 F360" in sc, sc
+    first02 = [i for i, c in enumerate(bus.calls) if c[1] == 0x02]
+    first10 = [i for i, c in enumerate(bus.calls) if c[1] == 0x10]
+    assert not first02 or first02[0] > first10[0], "DB aus: RFID erst nach dem Einzug"
+    # 3) Rückzug heizt auf das Material IN der Düse (remain_material)
+    bus, printer, mod = _material_hull()
+    bus.hub_mask, bus.head = 0x04, True
+    mod.remain_material = {"type": "190003", "color": "026EEEE", "tnn": "T1C"}
+    mod.cmd_retrude(FakeGcmd({}))
+    assert "M109 S250" in printer.gcode.scripts, printer.gcode.scripts
+    # 4) Kappung an [extruder] max_temp − 10
+    bus, printer, mod = _material_hull()
+    printer.objects["configfile"] = _Obj({"settings": {"extruder": {
+        "max_temp": 255.0, "nozzle_diameter": 0.4}}})
+    bus.head_at_mm = 100.0
+    g = FakeGcmd({"TNN": "T1C"})
+    mod.cmd_extrude(g)
+    assert "M109 S245" in printer.gcode.scripts and any(
+        "max_temp" in m for m in g.infos), g.infos
+    return ("DB: PETG 250, TPU null -> 220 + Hinweis, fremd -> max(Ziel, 220) "
+            "+ Hinweis, TEMP= fest, Rückzug = Material in der Düse, Kappung; "
+            "DB aus = bisher (220, F360, kein RFID-Lesen)")
+
+
+def test_flush_farbvolumen():
+    """Farb-Spülmenge gegen die Live-Werte (flush.py-Selbsttest, Log 12./13.10.)."""
+    F = K._FLUSH
+    c = K.parse_options(test_options())
+    W, V, C = "0FFFFFF", "0CE58F8", "026EEEE"
+    for src, dst, vol in ((W, W, 60), (W, V, 165), (W, C, 193), (C, W, 367)):
+        assert F.flushing_volume(F.parse_color_value(src),
+                                 F.parse_color_value(dst)) == vol
+    cases = [((W, W, False), [90.0, 70.0], "Volumen 60"),        # 101.25 -> 160
+             ((W, V, False), [90.0, 70.0], "Volumen 165"),        # 145 -> 160
+             ((C, W, False), [90.0, 70.0, 70.0], "Volumen 367"),  # 229.17
+             ((W, V, True), None, "×2"),                          # 290 -> 370
+             ((None, V, False), [90.0, 70.0], "Farbe alt unbekannt"),
+             ((W, "-1", False), [90.0, 70.0], "Farbe neu unbekannt"),
+             ((W, "0ZZZZZZ", False), [90.0, 70.0], "Farbe neu unbekannt")]
+    for (src, dst, diff), want, why_part in cases:
+        segs, why = K.plan_flush_lengths(c, None, src, dst, diff)
+        if want is None:
+            assert abs(sum(segs) - 370.0) < 1e-9 \
+                and segs == F.cal_flush_list(370.0, K.flush_cfg(c)), segs
+        else:
+            assert segs == want, (src, dst, segs)
+        assert why_part in why, (why_part, why)
+    # anderes Material + große Menge: türkis -> weiß ×2 = 458,33
+    segs, _w = K.plan_flush_lengths(c, None, C, W, True)
+    assert abs(sum(segs) - 458.3333333) < 1e-6, segs
+    # LENGTH= -> cal_flush_list (Stock), fixed -> bisherige 90er-Stücke
+    assert K.plan_flush_lengths(c, 200)[0] == [100.0, 100.0]
+    assert K.plan_flush_lengths(c, 160)[0] == [90.0, 70.0]
+    assert K.plan_flush_lengths(c, 0)[0] == []
+    cf = K.parse_options(test_options(flush_mode="fixed"))
+    assert K.plan_flush_lengths(cf, None, C, W, True)[0] == [90.0, 70.0]
+    assert K.plan_flush_lengths(cf, 200)[0] == [90.0, 90.0, 20.0]
+    # box_need_clean_length 0 -> keine Endlosschleife, fest
+    c0 = K.parse_options(test_options(box_need_clean_length="0"))
+    assert K.plan_flush_lengths(c0, None, C, W)[0] == [90.0]
+    for bad in ({"flush_mode": "farbe"}, {"flush_clean": "x"},
+                {"flush_velocity_factor": "0.5"}, {"nozzle_volume": "400"},
+                {"wipe_minimum_cruise_ratio": "1"}):
+        try:
+            K.parse_options(test_options(**bad))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("hätte abgelehnt werden müssen: %r" % bad)
+    return ("Volumen 60/165/193/367 (live), [90,70]/[90,70,70], ×2 min 370, "
+            "unbekannt/ungültig -> [90,70], LENGTH -> cal_flush_list, fixed = bisher")
+
+
+def test_flush_geschwindigkeit_abschnitte():
+    c = K.parse_options(test_options())
+    vb = K.flush_velocity_base
+    assert vb(c, 23) == 360 and vb(c, 14) == 350.00000000000006 \
+        and vb(c, None) == 360.0 and abs(vb(c, 23, 0.6) - 540) < 1e-9 \
+        and abs(vb(c, 2) - 50.0) < 1e-9
+    # Live 12.10. 00:26: [90, 70], 18@360, 72@432 (Spitze 240, warten 235),
+    # dann „restore target temp“ 220, 14@360, 56@360
+    l0 = K.flush_segment_lines(c, 90.0, 0, 2, 360.0, 220.0, 240.0)
+    l1 = K.flush_segment_lines(c, 70.0, 1, 2, 360.0, 220.0, 240.0)
+    assert l0 == ["M104 S240", "TEMPERATURE_WAIT SENSOR=extruder MINIMUM=235",
+                  "G91", "G1 E18 F360", "G1 E72 F432", "G90"], l0
+    assert l1 == ["M104 S220", "G91", "G1 E14 F360", "G1 E56 F360", "G90"], l1
+    # Gegenprobe flush.flush_plan (Selbsttest-Vektor)
+    F = K._FLUSH
+    _segs, plan = F.flush_plan(160, [360.0], 220, 240, F.LIVE_BOX_CFG)
+    assert [st for st in plan[0][1] if st[0] == "E"] == [("E", 18.0, 360.0),
+                                                         ("E", 72.0, 432.0)]
+    # ohne Spitze (max == temp): keine Temperaturzeilen
+    assert K.flush_segment_lines(c, 90.0, 0, 2, 360.0, 250.0, 250.0) == [
+        "G91", "G1 E18 F360", "G1 E72 F432", "G90"]
+    # 4 Abschnitte: Faktor 1,2 / 1,2 / 1,2 / 1 (letzter = max_temp_flush_times)
+    feeds = [K.flush_segment_lines(c, s, i, 4, 360.0, 220.0, 220.0)[2]
+             for i, s in enumerate([90.0, 70.0, 70.0, 79.17])]
+    assert [f.split("F")[1] for f in feeds] == ["432", "432", "432", "360"], feeds
+    # flush_velocity_factor 1 = eine Geschwindigkeit (bisher)
+    c1 = K.parse_options(test_options(flush_velocity_factor="1"))
+    assert K.flush_segment_lines(c1, 90.0, 0, 2, 360.0, 220.0, 220.0)[2] \
+        == "G1 E72 F360"
+    return "v 360/350/50/540, 18@360 72@432 (240/235) | 220 14@360 56@360 == live, 4 Abschnitte 1,2/1,2/1,2/1"
+
+
+def test_flush_reinigung_stock():
+    c = K.parse_options(test_options())
+    mid = K.gcode_nozzle_clean(c, False, 0.0, 20000.0, 0.5)
+    assert mid[:4] == ["G90", "SET_VELOCITY_LIMIT ACCEL=5000 MINIMUM_CRUISE_RATIO=0",
+                       "G0 X170 F12000", "G0 X135 F12000"], mid[:4]
+    assert mid[4:10] == ["G0 X160 Y378 F12000", "G0 X133 Y378 F12000"] * 3
+    assert mid[-2:] == ["M400", "SET_VELOCITY_LIMIT ACCEL=20000 MINIMUM_CRUISE_RATIO=0.5"]
+    assert not [l for l in mid if l.startswith(("G2", "G3", "G1"))] \
+        and "G0 Y345 F12000" not in mid, "Zwischenabschnitt: kein Kreis, bleibt im Schacht"
+    end = K.gcode_nozzle_clean(c, True, 1.5, 20000.0, None)
+    assert end[1] == "SET_VELOCITY_LIMIT ACCEL=5000", end[1]   # MCR unbekannt
+    assert end[4:8] == ["G0 X161.5 Y374 F12000", "G2 I4 J0 F10000",
+                        "G0 X168.5 Y374 F10000", "G3 I-4 J0 F10000"], end[4:8]
+    assert end[-5:] == ["G0 X133 Y378 F12000", "G0 X160 F12000",
+                        "G0 Y345 F12000", "M400",
+                        "SET_VELOCITY_LIMIT ACCEL=20000"], end[-5:]
+    # ohne [gcode_arcs]: 16-Eck um dieselben Mittelpunkte (165,5 / 164,5)
+    poly = K.gcode_nozzle_clean(c, True, 1.5, None, None, arcs=False)
+    assert not [l for l in poly if l.startswith(("G2", "G3"))]
+    g1 = [l for l in poly if l.startswith("G1 ")]
+    assert len(g1) == 32
+    for l, cx in [(x, 165.5) for x in g1[:16]] + [(x, 164.5) for x in g1[16:]]:
+        pr = dict((t[0], float(t[1:])) for t in l.split()[1:])
+        assert abs(math.hypot(pr["X"] - cx, pr["Y"] - 374.0) - 4.0) < 0.01
+    # Blasen (Stock blow)
+    assert K.gcode_blow("fan0", 5.0, 70.0) == [
+        "SET_PIN PIN=fan0 VALUE=255", "G4 P5000", "M400", "SET_PIN PIN=fan0 VALUE=70"]
+    return "Blech X170->X135 + 3× Schütteln (Zwischen), Kreise G2/G3 I±4 + Versatz + Ausfahrt (Ende), MCR 0/zurück, 16-Eck-Fallback, blow"
+
+
+def _flush_hull(**opt):
+    bus, printer, mod = _material_hull(**opt)
+    printer.objects["output_pin fan0"] = _PinObj(0.4, 255.0)
+    printer.objects["output_pin fan0_en"] = _PinObj(1.0, 1.0)
+    printer.objects["gcode_arcs"] = object()
+    printer.objects["toolhead"].status["minimum_cruise_ratio"] = 0.5
+    orig = printer._refresh
+
+    def refresh():
+        orig()
+        printer.objects["toolhead"].status["minimum_cruise_ratio"] = 0.5
+    printer._refresh = refresh
+    mod._now = lambda: 1000.5             # Stock-Versatz monotonic % 3 = 1,5
+    ctl = mod._ensure_controller()
+    return bus, printer, mod, ctl
+
+
+def test_flush_ablauf_stock():
+    # weiß (A) in der Düse -> türkis PETG (C): anderes Material, Farbe
+    bus, printer, mod, ctl = _flush_hull()
+    mod.remain_material = {"type": "190001", "color": "0FFFFFF", "tnn": "T1A"}
+    ctl.loaded_slot = "C"
+    printer.target = 0.0
+    printer._refresh()
+    bus.trace = []
+    n0 = len(printer.gcode.scripts)
+    g = FakeGcmd({"TNN": "T1C"})
+    mod.cmd_flush(g)
+    sc = printer.gcode.scripts[n0:]
+    t = bus.trace
+    # Menge: 193 mm³ -> 156,67 mm ×2 = 313,33 (anderes Material, > 370? nein -> 370)
+    F = K._FLUSH
+    want = F.cal_flush_list(370.0, K.flush_cfg(mod.cfg))
+    assert any("FLUSH-Plan T1C: 370 mm" in m and "Volumen 193" in m
+               for m in g.infos), g.infos
+    ext = [l for l in sc if l.startswith("G1 E")]
+    assert len(ext) == 2 * len(want), (ext, want)
+    # Temperatur: max(0, 220, 250) = 250, alt (220) < neu -> keine Spitze;
+    # Geschwindigkeit PETG 16 mm³/s -> min(360, 400) = 360, 80 % ×1,2
+    assert "M109 S250" in sc and "TEMPERATURE_WAIT SENSOR=extruder MINIMUM=265" not in sc
+    assert ext[0] == "G1 E18 F360" and ext[1] == "G1 E72 F432" \
+        and ext[-1].endswith("F360"), ext
+    # Reihenfolge: M106 S50 -> M109 -> je Abschnitt Extrusion -> Blasen ->
+    # Reinigung; Kreise NUR nach dem letzten
+    i_fan = sc.index("M106 P0 S50")
+    assert i_fan < sc.index("M109 S250"), sc[:12]
+    g2 = [i for i, l in enumerate(sc) if l.startswith("G2 ")]
+    last_e = max(i for i, l in enumerate(sc) if l.startswith("G1 E"))
+    assert len(g2) == 1 and g2[0] > last_e, (g2, last_e)
+    assert sc.count("G3 I-4 J0 F10000") == 1
+    assert sc.count("G0 X170 F12000") == len(want), "Blech nach jedem Abschnitt"
+    assert sc.count("SET_PIN PIN=fan0 VALUE=255") == len(want)
+    assert sc.count("G4 P5000") == len(want)
+    assert "G0 X161.5 Y374 F12000" in sc, "Kreisstart 160 + 1,5 (monotonic % 3)"
+    assert sc.count("SET_VELOCITY_LIMIT ACCEL=5000 MINIMUM_CRUISE_RATIO=0") == len(want)
+    assert sc[-1].startswith("SET_PIN PIN=fan0 VALUE="), sc[-3:]
+    assert printer.objects["output_pin fan0"].value == 0.4, "Lüfter zurück"
+    assert printer.accel == 20000.0 and printer.pos[:2] == [160.0, 345.0], printer.pos
+    # remain_material = neues Material (Stock remain_material.save)
+    assert mod.remain_material == {"type": "190003", "color": "026EEEE",
+                                   "tnn": "T1C"}, mod.remain_material
+    assert not [e for e in t if e[0] == "bus" and e[1] == 0x0E], "clog aus: kein Messrad"
+    # 2) gleiche Farbe/Material (PETG -> PETG): Spitze maxTemp 270 im 1.
+    #    Abschnitt, zurück auf 250 im letzten
+    n0 = len(printer.gcode.scripts)
+    mod.cmd_flush(FakeGcmd({"TNN": "T1C"}))
+    sc = printer.gcode.scripts[n0:]
+    assert sc.index("M104 S270") < sc.index("TEMPERATURE_WAIT SENSOR=extruder "
+                                             "MINIMUM=265") < sc.index("M104 S250"), sc
+    assert [l for l in sc if l.startswith("G1 E")] == [
+        "G1 E18 F360", "G1 E72 F432", "G1 E14 F360", "G1 E56 F360"], sc
+    # 3) Geschwindigkeit aus der DB: PLA vol 14 -> 350 / 420
+    n0 = len(printer.gcode.scripts)
+    mod.cmd_flush(FakeGcmd({"TNN": "T1B"}))
+    sc = printer.gcode.scripts[n0:]
+    assert "G1 E18 F350" in sc and "G1 E72 F420" in sc, sc
+    # 4) DB aus + unbekannte Farben = bisherige Menge/Temperatur
+    bus, printer, mod, ctl = _flush_hull(db=False, tags=("TAG",) * 4)
+    n0 = len(printer.gcode.scripts)
+    printer.target = 0.0
+    printer._refresh()
+    mod.cmd_flush(FakeGcmd({"TNN": "T1B"}))
+    sc = printer.gcode.scripts[n0:]
+    assert "M109 S220" in sc and [l for l in sc if l.startswith("G1 E")] == [
+        "G1 E18 F360", "G1 E72 F432", "G1 E14 F360", "G1 E56 F360"], sc
+    assert mod.remain_material["type"] is None
+    # 5) legacy + ohne Blasen + ohne Versatz: volles Abstreifen je Abschnitt
+    bus, printer, mod, ctl = _flush_hull(flush_clean="legacy", flush_blow="False")
+    n0 = len(printer.gcode.scripts)
+    mod.cmd_flush(FakeGcmd({"TNN": "T1B"}))
+    sc = printer.gcode.scripts[n0:]
+    assert not [l for l in sc if l.startswith(("M106", "SET_PIN", "G2", "G3"))]
+    assert sc.count("G0 X160 Y374 F12000") == 2, "Kreise nach jedem Abschnitt"
+    bus, printer, mod, ctl = _flush_hull(flush_wipe_offset="0")
+    n0 = len(printer.gcode.scripts)
+    mod.cmd_flush(FakeGcmd({"TNN": "T1B"}))
+    assert "G0 X160 Y374 F12000" in printer.gcode.scripts[n0:]
+    # 6) ohne [gcode_arcs]: 16-Eck statt G2/G3
+    bus, printer, mod, ctl = _flush_hull()
+    del printer.objects["gcode_arcs"]
+    n0 = len(printer.gcode.scripts)
+    mod.cmd_flush(FakeGcmd({"TNN": "T1B"}))
+    sc = printer.gcode.scripts[n0:]
+    assert not [l for l in sc if l.startswith(("G2", "G3"))] \
+        and len([l for l in sc if l.startswith("G1 X")]) == 32
+    # 7) Plan ohne allow_move: nichts bewegt, remain_material unverändert
+    bus, printer, mod, ctl = _flush_hull(allow_move="False")
+    n0 = len(printer.gcode.scripts)
+    g = FakeGcmd({"TNN": "T1C"})
+    mod.cmd_flush(g)
+    assert not [l for l in printer.gcode.scripts[n0:]
+                if l.split()[0] in ("G0", "G1", "M109", "SET_PIN")]
+    assert mod.remain_material["type"] is None and any("PLAN" in m for m in g.infos)
+    return ("Farbe+Material: 370 mm, M106 S50, M109 250, 18@360/72@432, Blasen + "
+            "Blech je Abschnitt, Kreise nur am Ende (Versatz 1,5), Lüfter/ACCEL/"
+            "MCR zurück, remain_material; PETG->PETG Spitze 270; PLA14 350/420; "
+            "DB aus = bisher; legacy/ohne arcs/ohne allow_move")
+
+
+def test_flush_verstopfung():
+    bus, printer, mod, ctl = _flush_hull(flush_clog_check="True")
+    g = FakeGcmd({"TNN": "T1B"})
+    bus.trace = []
+    mod.cmd_flush(g)
+    n_wheel = len([e for e in bus.trace if e[0] == "bus" and e[1] == 0x0E])
+    assert n_wheel == 3, n_wheel                    # vorher + 2 Abschnitte
+    assert any("WARNUNG FLUSH: Messrad" in m and "key845" in m
+               for m in g.infos), g.infos
+    st = mod.get_status()
+    assert st["chain_error"] == "" and not printer.paused, "nur Warnung"
+    # Messrad bewegt sich (> 10 mm): keine Warnung
+    bus, printer, mod, ctl = _flush_hull(flush_clog_check="True")
+    orig = ctl.get_wheel
+    ticks = iter([0.0, -60.0, -110.0])
+    ctl.get_wheel = lambda: next(ticks)
+    g = FakeGcmd({"TNN": "T1B"})
+    mod.cmd_flush(g)
+    assert not any("WARNUNG FLUSH" in m for m in g.infos), g.infos
+    ctl.get_wheel = orig
+    return "Messrad < 10 mm -> nur Warnung (key845), kein Fehler/Pause; Default aus"
+
+
+def test_prime_speed_status_und_makro():
+    bus, printer, mod = _material_hull()
+    mod._ensure_controller()
+    st = mod.get_status
+    mod.remain_material = {"type": "190001", "color": None, "tnn": ""}
+    assert st()["prime_speed"] == 460.0
+    mod.remain_material = {"type": "190002", "color": None, "tnn": ""}
+    assert st()["prime_speed"] == 280.00000000000006
+    mod.remain_material = {"type": "199999", "color": None, "tnn": ""}
+    assert abs(st()["prime_speed"] - 288.0) < 1e-9
+    mod.remain_material = {"type": None, "color": None, "tnn": ""}
+    ctl = mod.controller
+    ctl.loaded_slot = "D"
+    ctl.tag_cache["D"] = T_TPU
+    assert abs(st()["prime_speed"] - 40.0) < 1e-9, "geladener Slot (Cache) TPU"
+    bus.calls[:] = []
+    st()
+    assert bus.calls == [], "get_status ohne Bus"
+    mod.material_db = None
+    assert st()["prime_speed"] == 0.0
+    try:
+        env, macros, kcfg, param = _render_env()
+    except ImportError:
+        return "Status ok, Makro SKIP (jinja2 fehlt)"
+    pos = {"gcode_position": {"x": 133.0, "y": 378.0, "z": 50.0, "e": 0.0}}
+    for kb, want in (({"prime_speed": 280.00000000000006}, "F280.00000000000006"),
+                     ({"prime_speed": 0.0}, "F460.0"), ({}, "F460.0")):
+        pr = _rprinter(param, kcfg, gcode_move=pos, k2_box=kb)
+        lines, msgs = _render(env, macros, "_PI_RESUME_PRIME", pr)
+        assert "G1 E82.0 %s" % want in lines, (kb, lines)
+    pr = _rprinter(param, kcfg, gcode_move=pos)
+    del pr["k2_box"]
+    lines, _m = _render(env, macros, "_PI_RESUME_PRIME", pr)
+    assert "G1 E82.0 F460.0" in lines, lines
+    return "prime_speed 460/280/288/TPU 40/DB aus 0 (ohne Bus); Makro nimmt prime_speed > 0, sonst 460"
+
+
+def test_runout_redo_basistemperatur():
+    # Nachladen/Nachholen geben BASE_TEMP (Drucktemperatur vor der Pause)
+    # weiter, EXTRUDE/FLUSH rechnen dann selbst mit der Material-DB
+    bus, printer, mod = build_runout()
+    mod.cmd_runout(FakeGcmd({}))
+    sc = printer.gcode.scripts
+    assert "KTWO_BOX_EXTRUDE TNN=T1C BASE_TEMP=235" in sc \
+        and "KTWO_BOX_FLUSH TNN=T1C BASE_TEMP=235" in sc, sc
+    bus, printer, mod = build_runout()
+    mod.cmd_runout(FakeGcmd({"TEMP": "240"}))
+    assert "KTWO_BOX_FLUSH TNN=T1C TEMP=240" in printer.gcode.scripts
+    # mit DB + PETG-Ersatzslot: Heizen max(235, 250)
+    bus, printer, mod = build_runout()
+    for letter, tag in zip("ABCD", (T_PETG, T_PLA23, T_PETG, T_PETG)):
+        bus.slots[letter]["rfid"] = tag
+    ctl = mod._ensure_controller()
+    bus.slots["A"]["filament"] = True
+    ctl.get_rfid("A")
+    bus.slots["A"]["filament"] = False
+    _with_db(mod)
+    mod.cmd_runout(FakeGcmd({}))
+    assert "M109 S250" in printer.gcode.scripts, printer.gcode.scripts
+    return "Runout/Nachholen: BASE_TEMP=Drucktemperatur (TEMP= bleibt fest), DB: PETG 250"
+
+
+def test_preload_sperren():
+    R = K.preload_block_reason
+    assert "Maske 0" in R(2, 0, False, False) and "Maske 0" in R(3, 0, False, True)
+    assert R(1, 0, True, False) is None, "op 0/1: Maske/Kopf egal"
+    assert "FORCE=1" in R(1, 1, False, True) and R(1, 1, False, True, True) is None
+    assert "meldet Filament" in R(2, 1, True, False)
+    assert "unbekannt" in R(2, 1, None, False)
+    assert "unbekannt" in R(2, 1, None, True, True), "FORCE hebt die Kopfregel nicht auf"
+    assert R(2, 1, False, False) is None and R(3, 4, False, True, True) is None
+    # Klipper-Hülle KTWO_BOX_PRELOAD
+    def run(params, head=False, printing=False, sensor=True):
+        bus, printer, mod = build_hull(allow_write="True")
+        bus.head = head
+        if not sensor:
+            mod.cfg["filament_sensor"] = ""
+        printer.set_printing(printing)
+        bus.calls[:] = []
+        g = FakeGcmd(params)
+        mod.cmd_preload(g)
+        return [c for c in bus.calls if c[1] == 0x0D], g.infos
+    sent, infos = run({"SLOT": "B", "OP": "2"})
+    assert len(sent) == 1 and tuple(sent[0][2]) == (0x02, 0x02) \
+        and sent[0][3]["timeout"] >= 380, sent
+    for params, kw, txt in (({"SLOT": "B", "OP": "2"}, {"head": True}, "meldet Filament"),
+                            ({"SLOT": "B", "OP": "3"}, {"sensor": False}, "unbekannt"),
+                            ({"SLOT": "B", "OP": "2"}, {"printing": True}, "FORCE=1"),
+                            ({"SLOT": "B", "OP": "1"}, {"printing": True}, "FORCE=1"),
+                            ({"SLOT": "B", "OP": "2", "FORCE": "1"},
+                             {"printing": True, "head": True}, "meldet Filament")):
+        sent, infos = run(params, **kw)
+        assert sent == [] and any("gesperrt" in m and txt in m and
+                                  "nichts gesendet" in m for m in infos), (params, infos)
+    sent, _i = run({"SLOT": "B", "OP": "2", "FORCE": "1"}, printing=True)
+    assert len(sent) == 1, "FORCE=1 im Druck bei leerem Kopf"
+    sent, _i = run({"SLOT": "B", "OP": "1"})
+    assert len(sent) == 1
+    # Controller mit guard
+    cfg, bus, ctl = build_system()
+    try:
+        ctl.do_preload("A", 2, guard={"head": True, "printing": False})
+    except PermissionError as exc:
+        assert "nichts gesendet" in str(exc)
+    else:
+        raise AssertionError("guard hätte sperren müssen")
+    assert not [c for c in bus.calls if c[1] == 0x0D]
+    return "Maske 0 abgelehnt (N2), op 2/3 nur Kopf leer, Druck nur mit FORCE=1 (N3), sonst nichts gesendet"
+
+
+def test_box_wait_timeout():
+    import configparser
+    assert K.CHANGE_DEFAULTS["box_wait_timeout"] == 380.0 \
+        == float(BOX.preload_force_timeout(0x01)), K.CHANGE_DEFAULTS["box_wait_timeout"]
+    c = K.parse_options(test_options())
+    assert c["box_wait_timeout"] >= 380.0
+    cp = configparser.RawConfigParser(strict=False, inline_comment_prefixes=("#",))
+    cp.read_string(open(os.path.join(_HERE, "config-pi", "k2-module.cfg"),
+                        encoding="utf-8").read())
+    kb = dict(cp.items("k2_box"))
+    assert float(kb["box_wait_timeout"]) >= 380.0, kb["box_wait_timeout"]
+    assert "material_database" not in kb, "Auslieferung: DB auskommentiert"
+    assert kb["flush_mode"] == "color" and kb["flush_clog_check"] == "False"
+    cfg = K.parse_options(kb)
+    assert cfg["material_database"] == "" and cfg["flush_blow"] is True
+    txt = open(os.path.join(_HERE, "config-pi", "k2-module.cfg"),
+               encoding="utf-8").read()
+    assert "#material_database: ~/printer_data/config/k2/material_database.json" in txt
+    import inspect
+    sig = inspect.signature(K.K2BoxController.wait_box_ready)
+    assert sig.parameters["timeout"].default == 380.0
+    return "box_wait_timeout 380 = preload_force_timeout(1 Slot) (Default, k2-module.cfg, wait_box_ready)"
+
+
+# =====================================================================
 # Runner
 # =====================================================================
 
@@ -2675,6 +3243,19 @@ TESTS = [
     ("Runout: Pausenpfade + Sperren", test_runout_pausenpfade),
     ("Runout: AUTO_REFILL/SAME_MATERIAL", test_runout_befehle),
     ("Runout: printer.cfg/k2-module.cfg", test_runout_config),
+    ("Material-DB laden (an/aus/kaputt) + Abfragen", test_material_db_laden),
+    ("Material-Temperaturen (DB an/aus, unbekannt, Kappung)",
+     test_material_temperaturen),
+    ("Spülmenge Farbvolumen == Live (flush.py)", test_flush_farbvolumen),
+    ("Spül-Geschwindigkeit + Abschnitte 20/80 ×1,2", test_flush_geschwindigkeit_abschnitte),
+    ("Reinigung Stock (Blech / Kreise am Ende / blow)", test_flush_reinigung_stock),
+    ("FLUSH-Ablauf wie Stock (Hülle)", test_flush_ablauf_stock),
+    ("FLUSH Verstopfungsprüfung nur Warnung", test_flush_verstopfung),
+    ("RESUME-Vorextrusion prime_speed (Status + Makro)",
+     test_prime_speed_status_und_makro),
+    ("Runout/Nachholen BASE_TEMP + DB", test_runout_redo_basistemperatur),
+    ("Preload-Sperren (Kopf, Druck/FORCE, Maske 0)", test_preload_sperren),
+    ("box_wait_timeout >= 380 s", test_box_wait_timeout),
     ("Python-3.9-Syntax", test_python39),
 ]
 

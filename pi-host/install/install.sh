@@ -27,6 +27,12 @@ BATCH=1
 ARCH_EGAL=0
 DIENST=""
 SET_ARGS=()
+MATDB_QUELLE=""
+# Materialdatenbank (Creality, NICHT im Paket): fester Zielpfad, den [k2_box]
+# in k2-module.cfg liest. Quelle am Stock-Drucker siehe MATDB_STOCK_*.
+MATDB_REL=k2/material_database.json
+MATDB_STOCK_BENUTZER=/mnt/UDISK/creality/userdata/box/material_database.json
+MATDB_STOCK_DEFAULT=/etc/sysConfig/defData/material/material_database.json
 
 hilfe() {
   cat <<'EOF'
@@ -40,6 +46,10 @@ Aufruf: ./install.sh [Optionen]
   --main-serial PFAD         /dev/serial/by-id/... der Main-MCU   -> [mcu] serial
   --duese-serial PFAD        /dev/serial/by-id/... der Düsen-MCU  -> [mcu nozzle_mcu] serial
   --rs485-serial PFAD        /dev/serial/by-id/... des USB-RS485   -> [k2_485] serial
+  --material-db DATEI        Creality-Materialdatenbank (JSON, vorher vom Stock-Drucker geholt)
+                             nach CONFIG_DIR/k2/material_database.json kopieren
+                             (geprüft: JSON + Struktur; vorhandene Datei kommt ins Backup).
+                             Ohne Option bleibt eine vorhandene Datei unverändert.
   --dienst NAME              systemd-Dienst (Standard: klipper, automatisch erkannt)
   --starten                  Klipper-Dienst am Ende starten (Standard: bleibt gestoppt)
   --ohne-tests               Offline-Tests überspringen
@@ -59,6 +69,7 @@ while [ $# -gt 0 ]; do
     --main-serial)  [ $# -ge 2 ] || { echo "FEHLER: $1 braucht einen Wert" >&2; exit 2; }; SET_ARGS+=(--set "mcu=$2"); shift ;;
     --duese-serial) [ $# -ge 2 ] || { echo "FEHLER: $1 braucht einen Wert" >&2; exit 2; }; SET_ARGS+=(--set "mcu nozzle_mcu=$2"); shift ;;
     --rs485-serial) [ $# -ge 2 ] || { echo "FEHLER: $1 braucht einen Wert" >&2; exit 2; }; SET_ARGS+=(--set "k2_485=$2"); shift ;;
+    --material-db)  [ $# -ge 2 ] || { echo "FEHLER: $1 braucht einen Wert" >&2; exit 2; }; MATDB_QUELLE=$2; shift ;;
     --dienst)       [ $# -ge 2 ] || { echo "FEHLER: $1 braucht einen Wert" >&2; exit 2; }; DIENST=$2; shift ;;
     --starten)      STARTEN=1 ;;
     --ohne-tests)   TESTS=0 ;;
@@ -105,6 +116,30 @@ git -C "$KLIPPER_DIR" rev-parse --git-dir >/dev/null 2>&1 || fehler "$KLIPPER_DI
 ok "Klipper unter $KLIPPER_DIR"
 [ -d "$CONFIG_DIR" ] || fehler "Config-Ordner fehlt: $CONFIG_DIR"
 ok "Config-Ordner $CONFIG_DIR"
+MATDB_ZIEL=$CONFIG_DIR/$MATDB_REL
+
+# Materialdatenbank prüfen: Exit 0 = ok, Ausgabe = Zählwerte (material_db.py --struktur)
+matdb_pruefen() {
+  python3 -I -m json.tool "$1" >/dev/null 2>&1 || { echo "kein gültiges JSON"; return 1; }
+  local r
+  r=$(python3 -I "$PKG/nachbau/material_db.py" --struktur "$1" 2>&1) \
+    || { echo "Struktur ungültig: $(printf '%s\n' "$r" | tail -1)"; return 1; }
+  local n; n=$(printf '%s\n' "$r" | sed -n 's/^eintraege: //p')
+  [ -n "$n" ] && [ "$n" -gt 0 ] 2>/dev/null || { echo "result.list leer"; return 1; }
+  printf '%s\n' "$r"
+}
+matdb_wert() { printf '%s\n' "$1" | sed -n "s/^$2: //p"; }
+
+command -v python3 >/dev/null || fehler "python3 fehlt (für k2cfg.py / Material-DB-Prüfung)"
+if [ -n "$MATDB_QUELLE" ]; then
+  [ -f "$MATDB_QUELLE" ] && [ -r "$MATDB_QUELLE" ] || fehler "--material-db: Datei nicht lesbar: $MATDB_QUELLE"
+  MATDB_QUELLE=$(cd "$(dirname "$MATDB_QUELLE")" && pwd)/$(basename "$MATDB_QUELLE")
+  MATDB_REP=$(matdb_pruefen "$MATDB_QUELLE") || fehler "--material-db $MATDB_QUELLE: $MATDB_REP – nichts verändert"
+  ok "Material-DB $MATDB_QUELLE: $(matdb_wert "$MATDB_REP" eintraege) Einträge, $(matdb_wert "$MATDB_REP" ids_doppelt) Doppel-IDs"
+  [ "$(matdb_wert "$MATDB_REP" keine_objekte)" = 0 ] || warn "Material-DB: $(matdb_wert "$MATDB_REP" keine_objekte) Listeneinträge sind keine Objekte (werden ignoriert)"
+  [ "$(matdb_wert "$MATDB_REP" unlesbar_kv.nozzle_temperature)" = 0 ] \
+    || info "Material-DB: $(matdb_wert "$MATDB_REP" unlesbar_kv.nozzle_temperature) Einträge ohne lesbare nozzle_temperature (Stock-Fallback 220 °C)"
+fi
 
 FREI=$(df -Pk "$HOME" | awk 'NR==2 {print $4}')
 [ "$FREI" -ge "$MIN_FREI_KB" ] || fehler "zu wenig Platz in $HOME: $((FREI/1024)) MB frei, nötig $((MIN_FREI_KB/1024)) MB"
@@ -113,7 +148,6 @@ ok "freier Platz $((FREI/1024)) MB"
 if [ -x "$KLIPPY_ENV/bin/python" ]; then PY=$KLIPPY_ENV/bin/python
 else PY=$(command -v python3) || fehler "kein Python gefunden"; warn "kein $KLIPPY_ENV – nutze $PY (Batch braucht Klipper-Abhängigkeiten)"; fi
 ok "Python $("$PY" -c 'import sys; print(sys.version.split()[0])') ($PY)"
-command -v python3 >/dev/null || fehler "python3 fehlt (für k2cfg.py)"
 
 sudo -n true 2>/dev/null || fehler "sudo ohne Passwort nicht möglich (nötig für systemctl stop/start)"
 if [ -z "$DIENST" ]; then
@@ -125,6 +159,9 @@ ok "Dienst $DIENST.service"
 
 STAMP=$(date +%Y%m%d-%H%M%S)
 BK=$BACKUP_ROOT/$STAMP
+# zwei Läufe in derselben Sekunde dürfen sich das Backup nicht teilen
+N_BK=1; while [ -e "$BK" ]; do N_BK=$((N_BK+1)); BK=$BACKUP_ROOT/$STAMP-$N_BK; done
+STAMP=$(basename "$BK")
 mkdir -p "$BK"
 cp "$PKG/uninstall.sh" "$BK/uninstall.sh"
 {
@@ -250,6 +287,38 @@ fi
 if [ "$PZIEL" = printer.cfg ] && [ -e "$CONFIG_DIR/printer-k2.cfg" ]; then
   info "printer-k2.cfg aus einem früheren Lauf liegt noch daneben (wird nicht geladen, kann gelöscht werden)"
 fi
+# Materialdatenbank (nie im Paket; nur mit --material-db kopiert)
+MATDB_STATUS=fehlt
+if [ -e "$MATDB_ZIEL" ]; then
+  mkdir -p "$BK/material-db"
+  cp -a "$MATDB_ZIEL" "$BK/material-db/material_database.json"
+  echo "MATDB_BACKUP=1" >> "$BK/state.env"
+fi
+if [ -n "$MATDB_QUELLE" ]; then
+  if [ -f "$MATDB_ZIEL" ] && cmp -s "$MATDB_QUELLE" "$MATDB_ZIEL"; then
+    MATDB_STATUS=unveraendert; chmod 0644 "$MATDB_ZIEL"
+    ok "Material-DB $MATDB_REL identisch mit --material-db – unverändert"
+  else
+    [ -e "$MATDB_ZIEL" ] && MATDB_STATUS=ersetzt || MATDB_STATUS=neu
+    mkdir -p "$(dirname "$MATDB_ZIEL")"
+    install -m 0644 "$MATDB_QUELLE" "$MATDB_ZIEL.k2tmp"
+    mv -f "$MATDB_ZIEL.k2tmp" "$MATDB_ZIEL"
+    cmp -s "$MATDB_QUELLE" "$MATDB_ZIEL" || fehler "Kopie Material-DB fehlerhaft"
+    echo "$MATDB_REL" >> "$BK/config-installiert.txt"
+    ok "Material-DB -> $MATDB_REL ($MATDB_STATUS$([ $MATDB_STATUS = ersetzt ] && echo ", alte Datei: $BK/material-db/"), 0644)"
+  fi
+elif [ -e "$MATDB_ZIEL" ]; then
+  MATDB_STATUS=vorhanden
+  if R=$(matdb_pruefen "$MATDB_ZIEL"); then
+    ok "Material-DB $MATDB_REL vorhanden, bleibt ($(matdb_wert "$R" eintraege) Einträge)"
+  else
+    MATDB_STATUS=defekt
+    warn "Material-DB $MATDB_REL vorhanden, aber unbrauchbar ($R) – k2_box nutzt dann Festwerte. Neu holen, s. Zusammenfassung"
+  fi
+else
+  info "keine Material-DB ($MATDB_REL) – k2_box nutzt Festwerte; Holen s. Zusammenfassung"
+fi
+echo "MATDB_STATUS=$MATDB_STATUS" >> "$BK/state.env"
 if [ -e "$CONFIG_DIR/mainsail.cfg" ]; then
   info "mainsail.cfg vorhanden, wird von der K2-printer.cfg absichtlich NICHT eingebunden"
   info "(eigene PAUSE/RESUME/CANCEL_PRINT + [virtual_sdcard]/[pause_resume]/[display_status] in der K2-Config)"
@@ -318,6 +387,7 @@ ZUSAMMENFASSUNG
   Klipper:   $(git -C "$KLIPPER_DIR" rev-parse --short=9 HEAD) (Ziel ${ZIEL_COMMIT:0:9})$([ $GEAENDERT -eq 1 ] && echo ", umgestellt von ${HEAD_VORHER:0:9}")
   Module:    $E/k2_*.py + k2_nachbau/
   Config:    $CONFIG_DIR (Hauptdatei $PZIEL)
+  Mat.-DB:   $MATDB_REL: $MATDB_STATUS
   Backup:    $BK   (Rückbau: $BK/uninstall.sh  bzw.  ./uninstall.sh)
   Prüfungen: Tests $([ $TESTS -eq 1 ] && echo grün || echo übersprungen), Batch $([ $BATCH -eq 1 ] && echo 'EXIT 0' || echo übersprungen)
   Dienst:    $([ $STARTEN -eq 1 ] && echo gestartet || echo gestoppt)
@@ -340,6 +410,16 @@ else
              (Werte bleiben bei späteren Läufen erhalten), baud bleibt 230400.
 EOF
 fi
+case "$MATDB_STATUS" in fehlt|defekt)
+  cat <<EOF
+
+Material-DB ($MATDB_STATUS): wird NICHT mitgeliefert (Creality-Datei). Vom Stock-Drucker
+holen (solange das Stock-Upper-Board läuft), dann erneut installieren:
+  scp root@<drucker>:$MATDB_STOCK_BENUTZER .
+  ./install.sh --material-db material_database.json [übrige Optionen]
+  Fehlt dort die Benutzer-Kopie: Firmware-Default $MATDB_STOCK_DEFAULT
+EOF
+;; esac
 cat <<'EOF'
 
 NÄCHSTE SCHRITTE (pi-host/config-pi/README.md §4 – zuerst OHNE Bewegung):

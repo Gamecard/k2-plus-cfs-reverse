@@ -104,8 +104,12 @@ Glied der Makrokette (config-pi/macros.cfg: T0–T15, M8200):
   dazwischen Extruder-Rückzug Tn_retrude (live 3× −10 mm).
 - ``KTWO_BOX_EXTRUDE TNN=T1A|SLOT=A`` (= M8200 L I0): Box-Einzug bis zum
   Kopfsensor, Stage 7 (Extruder greift), Box PRINT.
-- ``KTWO_BOX_FLUSH [TNN=] [LENGTH=] [VELOCITY=] [TEMP=]`` (= M8200 F):
-  Spülen in Abschnitten (live 90 + 70 mm) mit Abstreifen.
+- ``KTWO_BOX_FLUSH [TNN=] [LENGTH=] [VELOCITY=] [TEMP=|BASE_TEMP=]``
+  (= M8200 F): Spülen wie Stock (17.10.2026, FLUSH-BEFUND-2026-10-17.md):
+  Menge farbabhängig (nachbau/flush.py, unbekannt -> 90 + 70 mm),
+  Abschnitte cal_flush_list, 20 % v + 80 % 1,2·v, Temperatur/Geschwindig-
+  keit aus der Material-DB (``material_database``, aus = bisher), Blasen,
+  Blech nach jedem Abschnitt, Silikon-Kreise nur am Ende (README §12).
 - ``KTWO_BOX_WIPE`` (Abstreifen, Stock-T0-Beispiel 10.1–10.3),
   ``KTWO_BOX_WASTE`` (= M8200 W, hier nur Hinweis),
   ``KTWO_BOX_END_OPT [RETURN=0|1]`` (= M8200 O), ``KTWO_BOX_WAIT``
@@ -164,6 +168,7 @@ in einem Hilfs-Thread, der Reactor pausiert derweil (ReactorBusProxy).
 
 import logging
 import math
+import os
 import struct
 import threading
 import time
@@ -223,6 +228,21 @@ try:
 except Exception:  # pragma: no cover
     _S485 = None
     _HAVE_S485 = False
+
+# Spül-Rechnung + Material-DB (17.10.2026, FLUSH-BEFUND-2026-10-17.md,
+# PAUSE-RESUME-MATERIAL-BEFUND-2026-10-17.md). WEICH importiert: fehlen sie
+# (alte Installation), gilt das bisherige Verhalten (feste Spülmenge
+# [90, 70], max(Ziel, Tn_extrude_temp), feste Geschwindigkeiten) + Meldung.
+try:
+    import flush as _FLUSH  # noqa: F401
+    _K2T.check_nachbau_module(_FLUSH)
+except Exception:  # pragma: no cover
+    _FLUSH = None
+try:
+    import material_db as _MDB  # noqa: F401
+    _K2T.check_nachbau_module(_MDB)
+except Exception:  # pragma: no cover
+    _MDB = None
 
 # =====================================================================
 # Konstanten (Belege s. Docstring; Werte aus box.py/cfsseq.py wiederverwendet)
@@ -284,8 +304,10 @@ CHANGE_DEFAULTS = {
     # Extruder (box.cfg)
     "tn_retrude": -10.0,         # mm je Schritt (live 3x)
     "tn_retrude_velocity": 600.0,
-    "tn_extrude_temp": 220.0,
-    "tn_extrude": 140.0,         # Stock: Vorheiz-/Einzugswert, hier nur Doku
+    "tn_extrude_temp": 220.0,    # Fallback-Temperatur (Stock Tn_extrude_temp)
+    # Stock-Fallback der Spülmenge ohne bekannte Farben (get_flush_len gibt
+    # Tn_extrude ROH zurück, cal_flush_list(140) = [90, 70], FLUSH-BEFUND §2)
+    "tn_extrude": 140.0,
     "tn_extrude_velocity": 360.0,
     "buffer_empty_len": 30.0,    # Schneide -> Extruderzahnrad
     # Schacht / Abstreifer (box.cfg + T0-Beispiel Schritt 6, 10, 11)
@@ -308,6 +330,25 @@ CHANGE_DEFAULTS = {
     "wipe_shakes": 3,            # T0-Beispiel 10.3 (3x 160 <-> 133)
     "box_first_clean_length": 90.0,  # live "length: [90, 70]" (mockconfig 90)
     "box_need_clean_length": 70.0,
+    # Spülen wie Stock (FLUSH-BEFUND-2026-10-17.md §2/§4/§6, BoxCfg-Defaults
+    # §7.3): cal_flush_list-Höchstlänge je Abschnitt, Düsenvolumen, Faktoren
+    "box_need_clean_length_max": 100.0,
+    "nozzle_volume": 183.0,
+    "flush_multiplier": 1.0,
+    "diff_material_type_min_flush_len": 370.0,
+    "flush_velocity_factor": 1.2,    # 80 %-Teil je Abschnitt (außer letzter)
+    "max_temp_flush_times": 3,
+    "baseline_nozzle_diameter": 0.4,
+    # Bauteillüfter beim Spülen (Stock M106 P0 S50 + blow: fan0 5 s voll)
+    "flush_fan_start": 50.0,         # M106 P0 S<..> zu Beginn
+    "flush_blow_time": 5.0,          # s
+    # Reinigung (Stock nozzle_clean): Kreis-Startversatz monotonic() % 3,
+    # SET_VELOCITY_LIMIT ACCEL=5000 ACCEL_TO_DECEL=5000 -> Upstream-
+    # Äquivalent MINIMUM_CRUISE_RATIO=0 (accel_to_decel == accel)
+    "flush_wipe_offset": 3.0,        # mm, 0 = immer dieselbe Stelle
+    "wipe_minimum_cruise_ratio": 0.0,
+    # Verstopfungsprüfung (Stock key845, |Messrad-Summe| < |diff_length|)
+    "flush_clog_min_mm": 10.0,
     "travel_velocity": 12000.0,  # T0-Beispiel F12000
     "z_velocity": 600.0,         # T0-Beispiel G0 Z.. F600
     "change_z_hop": 0.4,         # T0-Beispiel "G0 Z50.4" bei Z50
@@ -315,7 +356,9 @@ CHANGE_DEFAULTS = {
     "extrude_sensor_timeout": 90.0,  # live "timeout = 90"
     "extrude_poll_interval": 2.0,    # live 0x10 mode 5 alle ~2 s
     "stage7_delay": 2.0,             # ANNAHME (live 3,7-3,8 s bis mode 7)
-    "box_wait_timeout": 200.0,       # ANNAHME (Preload <= ~3 min/Slot)
+    # = preload_force_timeout(1 Slot) 380 s (BOOTLOADER-HOST-NACHTRAG N6:
+    # Box-Auto-Preload 1 Slot bis 364 s; vorher 200 s = zu kurz)
+    "box_wait_timeout": float(_BOX.preload_force_timeout(0x01)),
     "box_wait_interval": 1.0,
     # Auto-Nachladen bei Runout (A7, config-pi/NOTIZ-runout.md): Stock-
     # printer.cfg runout_gcode "G91 / G0 E30 F600 / G90" (nur wenn heiß) –
@@ -324,7 +367,13 @@ CHANGE_DEFAULTS = {
     "runout_tail_length": 30.0,
     "runout_tail_velocity": 600.0,
 }
-CHANGE_INT_KEYS = ("wipe_shakes",)
+CHANGE_INT_KEYS = ("wipe_shakes", "max_temp_flush_times")
+FLUSH_MODES = ("color", "fixed")
+FLUSH_CLEAN_MODES = ("stock", "legacy")
+# Stock-Fallback der RESUME-Vorextrusion ohne Materialdaten:
+# [filament_rack] velocity 360 (OHNE ·60) · 0,8 = 288 mm/min (B.3/B.5)
+PRIME_FALLBACK_VELOCITY = 360.0
+TEMP_LIMIT_MARGIN = 10.0  # K unter [extruder] max_temp (DB-Werte kappen)
 
 # Box-Fehler, die nach einem Runout erwartet und vor dem Nachladen per
 # 0x04 [00 01] (IDLE, löscht ERROR – live belegt) quittiert werden dürfen:
@@ -498,13 +547,285 @@ def flush_segments(c, length=None):
     return out
 
 
-def gcode_flush_segment(length, velocity):
-    """Ein Spül-Abschnitt, live 20 %/80 % geteilt (18+72 bzw. 14+56 mm)."""
+def gcode_flush_segment(length, velocity, factor=1.0):
+    """Ein Spül-Abschnitt, live 20 %/80 % geteilt (18+72 bzw. 14+56 mm);
+    der 80 %-Teil mit velocity·factor (Stock flush_velocity_factor 1.2)."""
     first = round(float(length) * 0.2, 3)
     return ["G91",
             "G1 E%s F%s" % (_n(first), _n(velocity)),
-            "G1 E%s F%s" % (_n(float(length) - first), _n(velocity)),
+            "G1 E%s F%s" % (_n(float(length) - first),
+                            _n(float(velocity) * float(factor))),
             "G90"]
+
+
+# ---------------------------------------------------------------------
+# Material-DB + Spülen wie Stock (17.10.2026) – reine Bausteine
+# ---------------------------------------------------------------------
+# Belege: FLUSH-BEFUND-2026-10-17.md (§2 Menge, §4 Geschwindigkeit, §5
+# Temperatur, §6 Abschnitte/Ablauf, §7 Reinigung/Blasen) und
+# PAUSE-RESUME-MATERIAL-BEFUND-2026-10-17.md §B (DB-Felder). Rechnung über
+# nachbau/flush.py bzw. nachbau/material_db.py (nur importiert).
+
+def load_material_db(path):
+    """material_database.json laden -> (MaterialDB oder None, Meldung).
+
+    Leerer Pfad = aus (None, ""). Fehlende Datei/kaputtes JSON/fehlendes
+    material_db-Modul -> None + Meldung; der Aufrufer nutzt dann das
+    bisherige Verhalten (Tn_extrude_temp, feste Geschwindigkeiten)."""
+    raw = str(path or "").strip()
+    if not raw:
+        return None, ""
+    p = os.path.expanduser(raw)
+    if _MDB is None:
+        return None, ("Material-DB %s: nachbau/material_db.py fehlt – "
+                      "Fallback Tn_extrude_temp/feste Geschwindigkeiten" % p)
+    try:
+        db = _MDB.MaterialDB.load(p)
+    except Exception as exc:
+        return None, ("Material-DB %s nicht ladbar (%s) – Fallback "
+                      "Tn_extrude_temp/feste Geschwindigkeiten" % (
+                          p, exc.__class__.__name__ + ": " + str(exc)))
+    return db, "Material-DB %s geladen (%d Einträge)" % (p, len(db))
+
+
+def material_params(db, key, fallback_temp):
+    """Stock-Abfragen für einen Material-Schlüssel (RFID mat_id, 6-stellig,
+    DB-ID = mat_id[1:6], material_db.db_id_from_key) -> dict.
+
+    known = Eintrag gefunden; temp/max_temp = int(kvParam.nozzle_temperature)
+    bzw. int(base.maxTemp), nicht lesbar/unplausibel -> fallback_temp (Stock
+    Tn_extrude_temp 220, temp_known/max_known False); vol =
+    kvParam.filament_max_volumetric_speed (mm³/s) oder None; mtype =
+    base.meterialType; name nur für Meldungen."""
+    fb = float(fallback_temp)
+    out = {"key": key, "known": False, "temp": fb, "temp_known": False,
+           "max_temp": fb, "max_known": False, "vol": None, "mtype": None,
+           "name": None}
+    if db is None or not key:
+        return out
+    entry = db.find(key)
+    if entry is None:
+        return out
+    out["known"] = True
+
+    def _plaus(t):
+        return t is not None and 100 <= t <= 450
+
+    t = db.nozzle_temp(key, fallback=None)
+    if _plaus(t):
+        out["temp"], out["temp_known"] = float(t), True
+    mt = db.max_temp(key, fallback=None)
+    if _plaus(mt):
+        out["max_temp"], out["max_known"] = float(mt), True
+    vol = db.max_volumetric_speed(key)
+    if vol is not None and vol > 0:
+        out["vol"] = float(vol)
+    out["mtype"] = db.material_type(key)
+    try:
+        nm = entry.get("base", {}).get("name")
+        out["name"] = nm if isinstance(nm, str) else None
+    except Exception:
+        out["name"] = None
+    return out
+
+
+def flush_cfg(c):
+    """k2_box-Optionen -> Schlüssel von nachbau/flush.py (Stock-[box]-Namen)."""
+    return {
+        "nozzle_volume": float(c["nozzle_volume"]),
+        "flush_multiplier": float(c["flush_multiplier"]),
+        "diff_material_type_min_flush_len":
+            float(c["diff_material_type_min_flush_len"]),
+        "box_first_clean_length": float(c["box_first_clean_length"]),
+        "box_need_clean_length": float(c["box_need_clean_length"]),
+        "box_need_clean_length_max": float(c["box_need_clean_length_max"]),
+        "Tn_extrude": float(c["tn_extrude"]),
+        "Tn_extrude_velocity": [float(c["tn_extrude_velocity"])],
+        "max_temp_flush_times": int(c["max_temp_flush_times"]),
+        "flush_velocity_factor": float(c["flush_velocity_factor"]),
+    }
+
+
+def plan_flush_lengths(c, length=None, src_color=None, dst_color=None,
+                       different=False):
+    """Spül-Abschnitte -> (Liste mm, Begründung).
+
+    flush_mode color (Stock MCMBW.get_flush_len + BoxAction.get_flush_len +
+    cal_flush_list): Farbvolumen get_flushing_volume(alt, neu) + nozzle_volume
+    -> /2,4 · flush_multiplier; anderes Material ×2, mindestens
+    diff_material_type_min_flush_len (370); sonst mindestens box_first +
+    box_need (160). Farbe alt oder neu unbekannt -> Tn_extrude ROH (140,
+    Stock) -> cal_flush_list -> [90, 70] = bisheriges Ergebnis. LENGTH> 0 ->
+    cal_flush_list(LENGTH) (Stock teilt jede Länge so).
+    flush_mode fixed (bzw. flush.py fehlt / box_*_clean_length 0): wie bis
+    17.10. (flush_segments)."""
+    mode = c.get("flush_mode", "color")
+    first = float(c["box_first_clean_length"])
+    need = float(c["box_need_clean_length"])
+    if mode != "color" or _FLUSH is None or first <= 0 or need <= 0:
+        if mode != "color":
+            why = "flush_mode fixed"
+        elif _FLUSH is None:
+            why = "nachbau/flush.py fehlt – fest"
+        else:
+            why = "box_first/need_clean_length 0 – fest"
+        return flush_segments(c, length), why
+    fc = flush_cfg(c)
+    if length is not None:
+        if float(length) <= 0:
+            return [], "LENGTH=0"
+        return ([float(x) for x in _FLUSH.cal_flush_list(float(length), fc)],
+                "LENGTH=%s (cal_flush_list)" % _n(length))
+
+    def _parse(cv):
+        try:
+            return _FLUSH.parse_color_value(cv)
+        except (TypeError, ValueError):  # Stock convert_scv -> False
+            return None
+
+    scv, tcv = _parse(src_color), _parse(dst_color)
+    if scv is None or tcv is None:
+        total = fc["Tn_extrude"]
+        why = ("Farbe %s unbekannt -> Tn_extrude %s mm (Stock-Fallback)" % (
+            "alt" if scv is None else "neu", _n(total)))
+    else:
+        vol, fl = _FLUSH.color_flush_len(scv, tcv, fc)
+        total = _FLUSH.finish_flush_len(fl, bool(different), fc)
+        why = ("Farbe %s -> %s: Volumen %d mm³ + Düse %s -> %s mm%s -> %s mm"
+               % (src_color, dst_color, vol, _n(fc["nozzle_volume"]), _n(fl),
+                  " (anderes Material: ×2, min %s)" % _n(
+                      fc["diff_material_type_min_flush_len"])
+                  if different else "", _n(total)))
+    return [float(x) for x in _FLUSH.cal_flush_list(float(total), fc)], why
+
+
+def flush_velocity_base(c, vol=None, nozzle=None):
+    """Stock get_flush_velocity: min(360, vol/2,4·60) (vol = Material-
+    max_volumetric_speed; ohne -> Tn_extrude_velocity) · Düse/0,4 -> mm/min."""
+    base = float(c["baseline_nozzle_diameter"])
+    nz = float(nozzle) if nozzle else base
+    if _FLUSH is None:
+        return float(c["tn_extrude_velocity"])
+    v, _p = _FLUSH.flush_velocity(vol, nz, base, cfg=flush_cfg(c))
+    return float(v[0])
+
+
+def flush_segment_lines(c, seg, i, n, velocity, temp, max_temp):
+    """Ein Spül-Abschnitt wie Stock check_flush_temp_and_extrude (Z.1336–
+    1359, Rechnung flush.segment_plan): Index = i, letzter Abschnitt (n > 1)
+    = max_temp_flush_times; Index 0 + max_temp > temp: M104 S<max> +
+    TEMPERATURE_WAIT MINIMUM=<max-5> (Stock quickly_wait_heating(max-5),
+    Upstream-M109 würde beim Abkühlen warten); Index == max_temp_flush_times
+    -> M104 S<temp> („restore target temp“) und Faktor 1, sonst
+    20 % · v + 80 % · v · flush_velocity_factor."""
+    fc = flush_cfg(c)
+    idx = fc["max_temp_flush_times"] if (i != 0 and i == n - 1) else i
+    boost = float(max_temp) > float(temp) + 0.01
+    if _FLUSH is not None:
+        steps = _FLUSH.segment_plan(float(seg), idx, float(temp),
+                                    float(max_temp), [float(velocity)], fc)
+    else:  # pragma: no cover - bisheriges Profil
+        steps = [("E", float(seg) * 0.2, float(velocity)),
+                 ("E", float(seg) * 0.8, float(velocity))]
+    lines, moves = [], []
+    for st in steps:
+        if st[0] == "WAIT":
+            if boost:
+                lines += ["M104 S%s" % _n(max_temp),
+                          "TEMPERATURE_WAIT SENSOR=extruder MINIMUM=%s"
+                          % _n(float(max_temp) - 5.0)]
+        elif st[0] == "M104":
+            if boost and abs(float(st[1]) - float(max_temp)) > 0.01:
+                lines.append("M104 S%s" % _n(st[1]))
+        else:
+            moves.append("G1 E%s F%s" % (_n(st[1]), _n(st[2])))
+    return lines + ["G91"] + moves + ["G90"]
+
+
+def gcode_blow(fan, seconds, restore_value, full=255.0):
+    """Stock BoxAction.blow (Z.2733–2740): fan0 5 s voll, dann alter Wert."""
+    return ["SET_PIN PIN=%s VALUE=%s" % (fan, _n(full)),
+            "G4 P%s" % _n(float(seconds) * 1000.0), "M400",
+            "SET_PIN PIN=%s VALUE=%s" % (fan, _n(restore_value))]
+
+
+def _velocity_limit(accel, mcr=None):
+    line = "SET_VELOCITY_LIMIT ACCEL=%s" % _n(accel)
+    if mcr is not None:
+        line += " MINIMUM_CRUISE_RATIO=%s" % _n(mcr)
+    return line
+
+
+def gcode_nozzle_clean(c, circle, offset=0.0, restore_accel=None,
+                       restore_mcr=None, arcs=True):
+    """Stock BoxAction.nozzle_clean(circle) (Z.3149–3182, FLUSH-BEFUND §7.1)
+    ab extrude_pos: ACCEL wipe_accel (+ MINIMUM_CRUISE_RATIO, Upstream-
+    Ersatz für ACCEL_TO_DECEL=ACCEL, nur wenn der alte Wert bekannt ist) ->
+    Blech X clean_pos_right_x (170) -> X clean_left_pos_x (135) -> nur mit
+    circle: Silikon-Kreise ab X clean_pos_left_x + offset bzw.
+    clean_pos_right_x − offset (Y clean_pos_middle_y, G2 I+r / G3 I−r J0;
+    ohne [gcode_arcs] 16-Eck) -> 3× X clean_right_pos_x/Y clean_right_pos_y
+    <-> X extrude_pos_x/Y clean_left_pos_y -> nur mit circle: Schacht
+    verlassen X clean_right_pos_x -> Y safe_pos_y -> M400 -> alte Werte.
+    Ohne circle bleibt die Düse im Schacht (extrude_pos). Der Stock-Zweig
+    „Kopf außerhalb (Y < safe_pos_y)“ entfällt: k2_box fährt vorher immer
+    in den Schacht."""
+    cv = _n(c["clean_velocity"])
+    r = float(c["wipe_circle_radius"])
+    wv = c["wipe_circle_velocity"]
+    my = c["clean_pos_middle_y"]
+    mcr = c.get("wipe_minimum_cruise_ratio") if restore_mcr is not None \
+        else None
+    lines = ["G90", _velocity_limit(c["wipe_accel"], mcr),
+             "G0 X%s F%s" % (_n(c["clean_pos_right_x"]), cv),
+             "G0 X%s F%s" % (_n(c["clean_left_pos_x"]), cv)]
+    if circle:
+        sx = float(c["clean_pos_left_x"]) + float(offset)
+        ex = float(c["clean_pos_right_x"]) - float(offset)
+        lines.append("G0 X%s Y%s F%s" % (_n(sx), _n(my),
+                                         _n(c["travel_velocity"])))
+        if arcs:
+            lines.append("G2 I%s J0 F%s" % (_n(r), _n(wv)))
+        else:
+            lines += gcode_circle(sx, my, r, r, True, wv)
+        lines.append("G0 X%s Y%s F%s" % (_n(ex), _n(my), _n(wv)))
+        if arcs:
+            lines.append("G3 I%s J0 F%s" % (_n(-r), _n(wv)))
+        else:
+            lines += gcode_circle(ex, my, -r, r, False, wv)
+    for _ in range(int(c["wipe_shakes"])):
+        lines.append("G0 X%s Y%s F%s" % (_n(c["clean_right_pos_x"]),
+                                         _n(c["clean_right_pos_y"]), cv))
+        lines.append("G0 X%s Y%s F%s" % (_n(c["extrude_pos_x"]),
+                                         _n(c["clean_left_pos_y"]), cv))
+    if circle:
+        lines.append("G0 X%s F%s" % (_n(c["clean_right_pos_x"]), cv))
+        lines.append("G0 Y%s F%s" % (_n(c["safe_pos_y"]), cv))
+    lines.append("M400")
+    if restore_accel is not None:
+        lines.append(_velocity_limit(restore_accel, restore_mcr))
+    return lines
+
+
+def preload_block_reason(op, mask, head, printing, force=False):
+    """Stock-Schutz von communication_set_pre_loading (BOOTLOADER-HOST-
+    BEFUND §3, NACHTRAG N2/N3) -> None = senden erlaubt, sonst Klartext.
+    - op 2/3 mit Maske 0: Fehlgebrauch (NUM als Slotindex, [00 02]-Bursts).
+    - Druck läuft/pausiert: nichts senden, außer force (Stock force=True).
+    - op 2/3 nur bei LEEREM Kopf-Filamentsensor (head False); Filament oder
+      unbekannt (kein Sensor) -> nein (Stock: get_filament_sensor_detect)."""
+    force_op = op in (PRELOAD_FORCE_READ, PRELOAD_FORCE_TENSION_ONLY)
+    if force_op and int(mask) == 0:
+        return ("Maske 0 bei op %d abgelehnt (Fehlgebrauch NUM=0 als Slot – "
+                "Stock-[00 02]-Bursts, NACHTRAG N2)" % op)
+    if printing and not force:
+        return ("Druck läuft/pausiert – Preload nur mit FORCE=1 (Stock "
+                "force=True)")
+    if force_op and head is not False:
+        return ("op %d nur bei leerem Kopf-Filamentsensor (Kopfsensor %s; "
+                "Stock sendet bei Filament im Kopf nicht)" % (
+                    op, "meldet Filament" if head else "unbekannt"))
+    return None
 
 
 def retrude_extruder_steps(c, length=None):
@@ -714,6 +1035,11 @@ def parse_options(opts):
       Geschwindigkeiten; cut_pos_x Default = SAVE_CONFIG -7.80).
     - Runout/RESUME: runout_refill, runout_require_color, runout_resume,
       resume_redo_change (Default False, s. cmd_resume_check).
+    - Material/Spülen (17.10.2026, README-k2_box.md §12): material_database
+      (Pfad, Default leer = aus), flush_mode color|fixed (Default color),
+      flush_clean stock|legacy (Default stock), flush_blow (Default True),
+      flush_blow_fan (Default fan0), flush_clog_check (Default False) und
+      die Stock-[box]-Werte nozzle_volume, flush_multiplier, … (s. oben).
     """
     o = {str(k).strip().lower(): v for k, v in dict(opts).items()}
 
@@ -765,6 +1091,19 @@ def parse_options(opts):
         # (cmd_resume_check); wirkt zusätzlich nur mit allow_write UND
         # allow_move.
         "resume_redo_change": _bool("resume_redo_change", False),
+        # Material-DB (Creality material_database.json, NICHT im Repo; von
+        # install.sh vom Drucker kopiert). Leer = aus: bisheriges Verhalten.
+        "material_database": _str("material_database", ""),
+        # Spülmenge: color = Stock (Farbvolumen flush.py, unbekannte Farben
+        # -> Tn_extrude 140 -> [90, 70] wie bisher); fixed = immer
+        # [box_first, box_need] bzw. LENGTH= in box_first-Stücken (bis 17.10.)
+        "flush_mode": _str("flush_mode", "color").lower(),
+        # Reinigung je Abschnitt: stock = Blech zwischen den Abschnitten,
+        # Silikon-Kreise nur am Ende; legacy = volles Abstreifen nach jedem
+        "flush_clean": _str("flush_clean", "stock").lower(),
+        "flush_blow": _bool("flush_blow", True),
+        "flush_blow_fan": _str("flush_blow_fan", "fan0"),
+        "flush_clog_check": _bool("flush_clog_check", False),
     }
     for key, default in CHANGE_DEFAULTS.items():
         if key in CHANGE_INT_KEYS:
@@ -807,6 +1146,33 @@ def parse_options(opts):
     if cfg["change_z_hop"] > 5.0:
         raise ValueError("change_z_hop > 5 mm unplausibel (Stock 0.4): %r"
                          % (cfg["change_z_hop"],))
+    if cfg["flush_mode"] not in FLUSH_MODES:
+        raise ValueError("flush_mode muss %s sein: %r" % (
+            "|".join(FLUSH_MODES), cfg["flush_mode"]))
+    if cfg["flush_clean"] not in FLUSH_CLEAN_MODES:
+        raise ValueError("flush_clean muss %s sein: %r" % (
+            "|".join(FLUSH_CLEAN_MODES), cfg["flush_clean"]))
+    # Stock-Grenzen (BoxCfg.__init__ getX min/max, FLUSH-BEFUND §7.3)
+    for key, lo, hi in (("nozzle_volume", 0.0, 300.0),
+                        ("flush_multiplier", 0.0, 10.0),
+                        ("flush_velocity_factor", 1.0, 5.0),
+                        ("max_temp_flush_times", 0, 10),
+                        ("diff_material_type_min_flush_len", 0.0, 1000.0),
+                        ("box_need_clean_length_max", 0.0, 600.0),
+                        ("tn_extrude", 0.0, 200.0),
+                        ("flush_fan_start", 0.0, 255.0),
+                        ("flush_blow_time", 0.0, 30.0),
+                        ("flush_wipe_offset", 0.0, 10.0),
+                        ("flush_clog_min_mm", 0.0, 100.0)):
+        if not lo <= cfg[key] <= hi:
+            raise ValueError("%s muss %s..%s sein: %r" % (key, lo, hi, cfg[key]))
+    if not 0.0 <= cfg["wipe_minimum_cruise_ratio"] < 1.0:
+        raise ValueError("wipe_minimum_cruise_ratio muss 0..<1 sein (Upstream "
+                         "MINIMUM_CRUISE_RATIO): %r"
+                         % (cfg["wipe_minimum_cruise_ratio"],))
+    if not cfg["baseline_nozzle_diameter"] > 0:
+        raise ValueError("baseline_nozzle_diameter muss > 0 sein: %r"
+                         % (cfg["baseline_nozzle_diameter"],))
     return cfg
 
 
@@ -849,7 +1215,9 @@ def parse_klipper_config(config):
                "poll_interval", "allow_move", "pause_on_failure",
                "filament_sensor", "cut_sensor", "runout_refill",
                "runout_require_color", "runout_resume",
-               "resume_redo_change")
+               "resume_redo_change", "material_database", "flush_mode",
+               "flush_clean", "flush_blow", "flush_blow_fan",
+               "flush_clog_check")
               + tuple(CHANGE_DEFAULTS)):
         if k not in opts:
             v = _g(k, None)
@@ -1218,12 +1586,21 @@ class K2BoxController:
         return self.action.communication_measuring_wheel()
 
     # --- A3 Preload -------------------------------------------------------
-    def do_preload(self, slot, op, timeout=None, dry_run=False):
+    def do_preload(self, slot, op, timeout=None, dry_run=False, guard=None):
         """0x0d [Maske][op] (op 0-3, Beleg GHIDRA §3).
+        ANMERKUNG N5 (BOOTLOADER-HOST-NACHTRAG): Stock sendet nach jedem
+        (Re-)Connect 0x0d [0f 01]/[0f 00] (preloading_en) – hier bewusst
+        NICHT (offener Gerätetest: Auto-Preload nach Box-Reset ohne Host-
+        [0f 01]?).
 
         op 2/3: Antwort erst nach dem Vorgang → langer Timeout
         (preload_force_timeout) + retries=0 (kein Burst, Beleg BEFUND2 §5).
         Schreibend → allow_write nötig (auch op 0/1 ändern PRE[1] global).
+        guard (17.10.2026, Stock-Schutz, s. preload_block_reason): dict
+        head (Kopfsensor True/False/None), printing (Druck/Pause), force
+        (FORCE=1) – gesperrt -> PermissionError, NICHTS gesendet. Die
+        Klipper-Hülle (KTWO_BOX_PRELOAD) übergibt es immer; ohne guard
+        (Controller-Tests, Werkzeuge) nur die Maske-0-Sperre.
         """
         idx, letter, mask = parse_slot(slot)
         op = parse_preload_op(op)
@@ -1233,6 +1610,14 @@ class K2BoxController:
                         "plan": "0x0d [%02x %02x] (%s)" % (
                             mask, op, PRELOAD_OP_NAMES[op])}
             self._require_write("Preload SLOT=%s OP=%d" % (letter, op))
+        g = dict(guard) if guard is not None else {"head": False,
+                                                   "printing": False}
+        why = preload_block_reason(op, mask, g.get("head"),
+                                   bool(g.get("printing")),
+                                   bool(g.get("force")))
+        if why:
+            raise PermissionError("Preload SLOT=%s OP=%d gesperrt: %s – "
+                                  "nichts gesendet" % (letter, op, why))
         check_not_forbidden(_BOX.FUNC_SET_PRE_LOADING)
         raw = self.action.communication_set_pre_loading(mask, op,
                                                        timeout=timeout)
@@ -1419,7 +1804,8 @@ class K2BoxController:
         """Hub-Sensor (0x08 [01] = Sensor B, live auch 0x0a b4) – lesend."""
         return int(self.get_sensor(0x01)) & MASK_ALL
 
-    def wait_box_ready(self, timeout=200.0, interval=1.0):
+    def wait_box_ready(self, timeout=CHANGE_DEFAULTS["box_wait_timeout"],
+                       interval=1.0):
         """Box-Zustand abwarten (Stock BOX_MODE_WAIT): 0x0a pollen, bis
         IDLE oder PRINT. PRELOAD/RELOAD/0x30-Ereignis -> weiter warten
         (Preload live 31–37 s je Slot); ERROR -> CfsStatusError mit
@@ -1492,6 +1878,21 @@ class PrinterK2Box:
             self.cfg = parse_klipper_config(config)
         except Exception as exc:
             raise config.error("[k2_box] Config-Fehler: %s" % exc)
+        # Material-DB (17.10.2026): Fehler beim Laden = KEIN Config-Fehler,
+        # sondern Fallback auf das bisherige Verhalten + Meldung (Connect).
+        self.material_db, self.material_db_info = load_material_db(
+            self.cfg.get("material_database"))
+        if self.material_db_info:
+            try:
+                (logging.info if self.material_db is not None
+                 else logging.warning)("[k2_box] %s" % self.material_db_info)
+            except Exception:
+                pass
+        # Material in der Düse (Stock box_action.remain_material: color/type
+        # nach jedem erfolgreichen Spülen, remain_material.save). Nur im
+        # Speicher (Stock persistiert) – nach dem Start unbekannt.
+        self.remain_material = {"type": None, "color": None, "tnn": ""}
+        self.flush_last = ""
         self._bus = None  # ANNAHME: geteilte ttyS5-Instanz (s. _ensure_bus)
         self.controller = None
         self.printer.register_event_handler("klippy:connect",
@@ -1509,7 +1910,8 @@ class PrinterK2Box:
         self.gcode.register_command("KTWO_BOX_UNLOAD", self.cmd_unload,
                                     desc="K2-Box-Unload SLOT=A..D [DRY_RUN=1]")
         self.gcode.register_command("KTWO_BOX_PRELOAD", self.cmd_preload,
-                                    desc="K2-Box-Preload SLOT=A..D OP=0..3")
+                                    desc="K2-Box-Preload SLOT=A..D OP=0..3 "
+                                         "[FORCE=1] (op 2/3 nur Kopf leer)")
         # Filamentwechsel (T0–T15 / M8200-Kette, s. Modul-Docstring)
         self.chain = self._new_chain()
         self.chain_error = ""
@@ -1630,6 +2032,11 @@ class PrinterK2Box:
                     "[k2_box] bereit (warte auf k2_motor:ready für Auto-Addr)")
             except Exception:
                 pass
+        if self.material_db_info:
+            try:
+                self.gcode.respond_info("[k2_box] %s" % self.material_db_info)
+            except Exception:
+                pass
 
     def handle_motor_ready(self, *args):
         try:
@@ -1698,6 +2105,15 @@ class PrinterK2Box:
             "same_material": [["T%d%s" % (self.cfg.get("box_addr", 1), x)
                                for x in g] for g in self.same_material],
             "runout_last": self.runout_last or "",
+            # Material/Spülen (17.10.2026): prime_speed > 0 = RESUME-
+            # Vorextrusion aus der Material-DB (macros.cfg _PI_RESUME_PRIME),
+            # 0 = Makro-Wert resume_prime_speed (DB aus)
+            "material_db": self.material_db is not None,
+            "material_db_info": self.material_db_info or "",
+            "remain_material": dict(self.remain_material),
+            "prime_speed": self._prime_speed(),
+            "flush_mode": self.cfg.get("flush_mode", "color"),
+            "flush_last": self.flush_last or "",
         })
         return st
 
@@ -1849,7 +2265,15 @@ class PrinterK2Box:
                                   "nur gelesen, nichts geschrieben.")
             return
         try:
-            res = ctl.do_preload(slot, op)
+            force = bool(gcmd.get_int("FORCE", 0))
+        except Exception:
+            force = False
+        # Stock-Schutz (preload_block_reason): op 2/3 nur bei leerem
+        # Kopfsensor, im Druck/Pause nur mit FORCE=1
+        guard = {"head": self._head_filament(),
+                 "printing": self._print_active(), "force": force}
+        try:
+            res = ctl.do_preload(slot, op, guard=guard)
         except CfsStatusError as exc:
             gcmd.respond_info("[k2_box] Preload abgebrochen: Box-Status 0x%02x "
                               "(%s)" % (exc.status, exc.name))
@@ -2001,18 +2425,168 @@ class PrinterK2Box:
         except Exception:
             return None
 
-    def _change_temp(self, gcmd):
-        """Wechsel-Temperatur: TEMP= oder max(Ziel, Tn_extrude_temp 220).
-        ANNAHME: Stock nimmt Material-Temperaturen aus dem RFID-Tag
-        (live "get next material temp: 220", max 240) – hier nicht verfügbar."""
-        t = gcmd.get_float("TEMP", None)
-        if t is None:
+    # --- Material (RFID-Etikett -> Material-DB), 17.10.2026 -------------
+    def _cached_tag(self, letter):
+        """(mat_id, col) aus dem Etikett-Cache, OHNE Bus (get_status)."""
+        ctl = self.controller
+        if ctl is None or not letter:
+            return None
+        m = rfid_material(ctl.tag_cache.get(letter))
+        if m is None:
+            m = rfid_material((ctl.slot_cache.get(letter) or {}).get("rfid"))
+        return m
+
+    def _slot_tag(self, letter):
+        """(mat_id, col) des Slots: Cache, sonst RFID lesen (0x02, lesend);
+        None = unbekannt (kein Bus, kein/kaputtes Etikett)."""
+        if not letter:
+            return None
+        m = self._cached_tag(letter)
+        if m is not None:
+            return m
+        try:
+            return rfid_material(self._ensure_controller().get_rfid(letter))
+        except Exception:
+            return None
+
+    def _nozzle_key(self):
+        """Material in der Düse: remain_material.type (Stock, nach dem
+        letzten Spülen), sonst Etikett des geladenen Slots (Cache)."""
+        if self.remain_material.get("type"):
+            return self.remain_material["type"]
+        ctl = self.controller
+        m = self._cached_tag(ctl.loaded_slot) if ctl is not None else None
+        return m[0] if m else None
+
+    def _mat(self, key):
+        return material_params(self.material_db, key,
+                               self.cfg["tn_extrude_temp"])
+
+    def _temp_limit(self):
+        """[extruder] max_temp − 10 K (DB-Temperaturen kappen), None = ?"""
+        try:
+            mt = float(self._obj_status("configfile")["settings"]
+                       ["extruder"]["max_temp"])
+        except Exception:
+            return None
+        return mt - TEMP_LIMIT_MARGIN
+
+    def _base_temp(self, gcmd):
+        """Basis der Wechsel-Temperatur: BASE_TEMP= (Nachholen/Runout:
+        Drucktemperatur vor der Pause) oder aktuelles Extruder-Ziel."""
+        b = gcmd.get_float("BASE_TEMP", None, minval=0.)
+        if b is not None:
+            return float(b)
+        try:
+            return float(self._obj_status("extruder").get("target") or 0.0)
+        except Exception:
+            return 0.0
+
+    def _db_temp(self, mp, label, notes, field="temp"):
+        """Material-Temperatur aus der DB (gekappt), sonst Tn_extrude_temp
+        (Stock-Fallback) + Hinweis in notes (nur mit geladener DB)."""
+        fb = float(self.cfg["tn_extrude_temp"])
+        if self.material_db is None:
+            return fb
+        ok = mp.get("temp_known") if field == "temp" else mp.get("max_known")
+        if not ok:
+            notes.append("%s: Material %s – Fallback Tn_extrude_temp %s °C "
+                         "(Stock)" % (label, (
+                             "unbekannt (kein RFID-Etikett)" if not mp.get("key")
+                             else "%s nicht in der Material-DB" % mp["key"]
+                             if not mp.get("known") else
+                             "%s ohne %s" % (mp["key"], "nozzle_temperature"
+                                             if field == "temp" else "maxTemp")),
+                             _n(fb)))
+            return fb
+        t = float(mp[field])
+        lim = self._temp_limit()
+        if lim is not None and t > lim:
+            notes.append("%s: DB-Temperatur %s °C über [extruder] max_temp−%s "
+                         "-> %s °C" % (label, _n(t), _n(TEMP_LIMIT_MARGIN),
+                                       _n(lim)))
+            t = lim
+        return t
+
+    def _respond_notes(self, gcmd, notes):
+        for n in notes:
             try:
-                target = float(self._obj_status("extruder").get("target") or 0.0)
+                gcmd.respond_info("[k2_box] HINWEIS %s" % (n,))
             except Exception:
-                target = 0.0
-            t = max(target, float(self.cfg["tn_extrude_temp"]))
-        return float(t)
+                pass
+
+    def _change_temp(self, gcmd, key=None, label="Wechsel"):
+        """Wechsel-Temperatur (Rückzug/Einzug): TEMP= (fest) oder
+        max(Basis, Material-Temperatur). Basis = BASE_TEMP= bzw. aktuelles
+        Extruder-Ziel; Material-Temperatur = kvParam.nozzle_temperature aus
+        der Material-DB ([k2_box] material_database), Schlüssel = RFID-
+        material_type (mat_id) des Slots (Stock get_material_target_temp,
+        live „get next material temp: 220“). Ohne DB bzw. unbekanntes
+        Material: Tn_extrude_temp 220 (Stock-Fallback, mit DB + Hinweis).
+        Die Temperatur steht NICHT im RFID-Etikett – nur der Schlüssel."""
+        t = gcmd.get_float("TEMP", None)
+        if t is not None:
+            return float(t)
+        notes = []
+        mt = self._db_temp(self._mat(key), label, notes)
+        self._respond_notes(gcmd, notes)
+        return max(self._base_temp(gcmd), mt)
+
+    def _prime_speed(self):
+        """RESUME-Vorextrusion wie Stock RESUME_EXTERNAL
+        (remain_material_velocity · 0,8 = vol/2,4·60·0,8, live 460 / 280):
+        nur mit Material-DB; unbekanntes Material -> 360·0,8 = 288 (Stock-
+        Fallback). 0.0 = DB aus -> macros.cfg resume_prime_speed (460)."""
+        if self.material_db is None:
+            return 0.0
+        mp = self._mat(self._nozzle_key())
+        if mp.get("vol"):
+            return float(mp["vol"]) / 2.4 * 60.0 * 0.8
+        return PRIME_FALLBACK_VELOCITY * 0.8
+
+    def _grab_velocity(self, key):
+        """Stage-7-Greifen (Extruder buffer_empty_len): tn_extrude_velocity,
+        mit DB gedeckelt auf vol/2,4·60 (PAUSE-RESUME-MATERIAL-BEFUND C P3,
+        TPU 50 mm/min). Pi-Erweiterung – Stock-Geschwindigkeit unbelegt."""
+        v = float(self.cfg["tn_extrude_velocity"])
+        if self.material_db is None:
+            return v
+        mp = self._mat(key)
+        if mp.get("vol"):
+            return min(v, float(mp["vol"]) / 2.4 * 60.0)
+        return v
+
+    def _nozzle_diameter(self):
+        try:
+            return float(self._obj_status("configfile")["settings"]
+                         ["extruder"]["nozzle_diameter"])
+        except Exception:
+            return float(self.cfg["baseline_nozzle_diameter"])
+
+    def _min_cruise_ratio(self):
+        try:
+            v = self._obj_status("toolhead").get("minimum_cruise_ratio")
+            return None if v is None else float(v)
+        except Exception:
+            return None
+
+    def _pin(self, name):
+        """[output_pin <name>] -> (Wert 0..1, scale) oder None (fehlt)."""
+        if not name:
+            return None
+        obj = self._lookup("output_pin %s" % (name,))
+        if obj is None:
+            return None
+        try:
+            val = float(obj.get_status(self._now()).get("value") or 0.0)
+        except Exception:
+            val = 0.0
+        scale = getattr(obj, "scale", None)
+        try:
+            scale = float(scale) if scale else None
+        except Exception:
+            scale = None
+        return val, scale
 
     def _extruder_target(self):
         """Aktuelles Extruder-Ziel in °C, None = nicht lesbar."""
@@ -2147,10 +2721,11 @@ class PrinterK2Box:
         im LAUFENDEN Druck -> (temp, hinweis).
 
         Hintergrund: das PAUSE-Makro merkt ``printer.extruder.target`` als
-        hotend_temp (wie Stock PAUSE, config/F008/gcode_macro.cfg:738) und
-        RESUME heizt darauf (macros.cfg _PI_RESUME_PREPARE M109, Stock RESUME
-        gcode_macro.cfg:836-842). Hat der Wechsel schon geheizt (_heat ->
-        M109 Wechsel-Temperatur max(Ziel, tn_extrude_temp)), wäre das die
+        hotend_temp (wie Stock PAUSE_EXTERNAL, live
+        config/F008_CR0CN240319C13/gcode_macro.cfg:761) und RESUME heizt
+        darauf (macros.cfg _PI_RESUME_PREPARE M109, Stock RESUME_EXTERNAL
+        ebd. :885-892). Hat der Wechsel schon geheizt (_heat -> M109
+        Wechsel-Temperatur max(Ziel, Material-/Tn_extrude_temp)), wäre das die
         Wechsel- statt der Drucktemperatur. temp = Ziel vor dem ersten
         Heizen (Kette: orig_target; Einzelschritt: _step_target), None =
         kein CFS_TEMP nötig/möglich:
@@ -2461,7 +3036,10 @@ class PrinterK2Box:
             vel = c["tn_retrude_velocity"]
             self._go_extrude_pos(gcmd)
             if self._head_filament() is not False:  # Stock: nur mit Filament
-                self._heat(gcmd, self._change_temp(gcmd))
+                # Material in der Düse (remain_material bzw. geladener Slot)
+                self._heat(gcmd, self._change_temp(
+                    gcmd, self._nozzle_key() if self.material_db is not None
+                    else None, "Rückzug"))
 
             def _extr(i):
                 if i < len(steps):
@@ -2513,10 +3091,16 @@ class PrinterK2Box:
             else:
                 raise ValueError("TNN=T1A..T1D oder SLOT=A..D fehlt")
             mask = SLOT_MASKS[idx]
+            # Ziel-Material nur mit Material-DB nachschlagen (sonst kein
+            # zusätzlicher RFID-Lesezugriff, Verhalten wie bisher)
+            key = None
+            if self.material_db is not None:
+                tag = self._slot_tag(letter)
+                key = tag[0] if tag else None
             self._go_extrude_pos(gcmd)
-            self._heat(gcmd, self._change_temp(gcmd))
+            self._heat(gcmd, self._change_temp(gcmd, key, "Einzug %s" % tnn))
             grab = gcode_extruder_move(c["buffer_empty_len"],
-                                       c["tn_extrude_velocity"])
+                                       self._grab_velocity(key))
             if not c.get("allow_write"):
                 self._box_plan(gcmd, "EXTRUDE %s" % tnn, (
                     "0x04 [00 01] -> 0x0f [01] -> 0x08 [00] -> 0x10 [%02x 00 00] "
@@ -2572,22 +3156,201 @@ class PrinterK2Box:
                                  len(odo)))
         return self._run_step(gcmd, "EXTRUDE", body)
 
+    # --- Spülen wie Stock (17.10.2026, FLUSH-BEFUND-2026-10-17.md) -------
+    # Stock MCMBW.material_change_flush (Z.4494–4517): M106 P0 S50 ->
+    # Spülmenge get_flush_len -> Geschwindigkeit get_flush_velocity ->
+    # Temperaturen get_flush_temp/get_flush_max_temp -> quickly_wait_heating
+    # -> Tn_Extrude: je Abschnitt (cal_flush_list) Extrusion 20 %/80 % ->
+    # blow -> nozzle_clean(circle=False), letzter Abschnitt nozzle_clean()
+    # mit Kreisen -> Messrad-Prüfung (key845) -> remain_material.save.
+    def _flush_target(self, gcmd):
+        """Ziel-Slot des Spülens: TNN= oder zuletzt geladener Slot."""
+        raw = gcmd.get("TNN", None)
+        if raw:
+            _b, _idx, letter, tnn = self._check_tnn(raw)
+            return letter, tnn
+        ctl = self.controller
+        letter = ctl.loaded_slot if ctl is not None else None
+        if letter:
+            return letter, "T%d%s" % (int(self.cfg.get("box_addr", 1)), letter)
+        return None, ""
+
+    def _flush_plan(self, gcmd, letter, length, velocity):
+        """Spül-Plan (rein rechnend + RFID lesen) -> dict."""
+        c = self.cfg
+        db = self.material_db
+        notes = []
+        new_tag = self._slot_tag(letter) if (
+            letter and (c["flush_mode"] == "color" or db is not None)) else None
+        new_key = new_tag[0] if new_tag else None
+        new_col = new_tag[1] if new_tag else None
+        old_key = self.remain_material.get("type")
+        old_col = self.remain_material.get("color")
+        new_p, old_p = self._mat(new_key), self._mat(old_key)
+        different = False
+        if db is not None and old_key and new_key:
+            try:
+                different = bool(db.is_different_type(old_key, new_key))
+            except Exception:
+                different = False
+        segs, why = plan_flush_lengths(c, length, old_col, new_col, different)
+        # Geschwindigkeit (Stock get_flush_velocity, Material = neu)
+        if velocity is not None:
+            v = float(velocity)
+            vwhy = "VELOCITY="
+        else:
+            vol = new_p.get("vol") if db is not None else None
+            v = flush_velocity_base(c, vol, self._nozzle_diameter())
+            vwhy = ("min(360, %s/2,4·60)" % _n(vol)) if vol else (
+                "Tn_extrude_velocity, max 360")
+            if db is not None and not vol:
+                notes.append("Spülen: Geschwindigkeit des Materials %s "
+                             "unbekannt – %s mm/min (Stock-Fallback)"
+                             % (new_key or "(ohne Etikett)", _n(v)))
+        # Temperaturen (Stock get_flush_temp/get_flush_max_temp, Z.4507)
+        t_param = gcmd.get_float("TEMP", None)
+        if t_param is not None:
+            temp = max_temp = float(t_param)
+            twhy = "TEMP= (fest, ohne maxTemp-Stufe)"
+        else:
+            base = self._base_temp(gcmd)
+            t_old = self._db_temp(old_p, "Spülen alt", notes)
+            t_new = self._db_temp(new_p, "Spülen neu", notes)
+            temp = max(base, t_old, t_new)
+            max_temp = temp
+            if db is not None and t_old >= t_new:
+                mx_old = self._db_temp(old_p, "Spülen alt", [], "max_temp")
+                mx_new = self._db_temp(new_p, "Spülen neu", [], "max_temp")
+                max_temp = max(temp, mx_old, mx_new)
+            twhy = ("max(Ziel %s, alt %s, neu %s)%s" % (
+                _n(base), _n(t_old), _n(t_new),
+                (", Spitze maxTemp %s (alt >= neu)" % _n(max_temp))
+                if max_temp > temp + 0.01 else ""))
+        return {"segs": segs, "why": why, "v": v, "vwhy": vwhy,
+                "temp": temp, "max_temp": max_temp, "twhy": twhy,
+                "new_key": new_key, "new_col": new_col, "different": different,
+                "notes": notes}
+
     def cmd_flush(self, gcmd):
         def body(gcmd):
             c = self.cfg
             length = gcmd.get_float("LENGTH", None, minval=0.)
-            vel = gcmd.get_float("VELOCITY", c["tn_extrude_velocity"], above=0.)
-            segs = flush_segments(c, length)
+            vel = gcmd.get_float("VELOCITY", None, above=0.)
+            letter, tnn = self._flush_target(gcmd)
+            pl = self._flush_plan(gcmd, letter, length, vel)
+            segs, v, temp, max_temp = (pl["segs"], pl["v"], pl["temp"],
+                                       pl["max_temp"])
+            n = len(segs)
+            factor = float(c["flush_velocity_factor"])
+            legacy = c["flush_clean"] == "legacy"
+            self._respond_notes(gcmd, pl["notes"])
+            gcmd.respond_info(
+                "[k2_box] FLUSH-Plan %s: %s mm (%s; %s), F%s (%s, 80 %%-Teil "
+                "×%s außer dem letzten), %s °C (%s)" % (
+                    tnn or "(Ziel unbekannt)", _n(sum(segs)),
+                    " + ".join(_n(x) for x in segs) or "-", pl["why"], _n(v),
+                    pl["vwhy"], _n(factor), _n(temp), pl["twhy"]))
+            if not segs:
+                return
             self._go_extrude_pos(gcmd)
-            self._heat(gcmd, self._change_temp(gcmd))
-            old = self._max_accel()
-            for i, seg in enumerate(segs):
-                self._move(gcmd, "Spülen %d/%d (%s mm)" % (i + 1, len(segs), _n(seg)),
-                           gcode_flush_segment(seg, vel) + ["M400"])
-                self._move(gcmd, "Abstreifen %d/%d" % (i + 1, len(segs)),
-                           gcode_wipe(c, old))
+            blow_fan = c.get("flush_blow_fan") if c.get("flush_blow") else ""
+            fan = self._pin(blow_fan) if blow_fan else None
+            if blow_fan and fan is None and c.get("allow_move"):
+                gcmd.respond_info("[k2_box] FLUSH: Blasen übersprungen – "
+                                  "[output_pin %s] fehlt" % (blow_fan,))
+            fan_en = self._pin(blow_fan + "_en") if fan is not None else None
+            if fan is not None and c["flush_fan_start"] > 0:
+                self._move(gcmd, "Bauteillüfter (Stock M106 P0 S50)",
+                           ["M106 P0 S%s" % _n(c["flush_fan_start"]), "M400"],
+                           wrap=False)
+            self._heat(gcmd, temp)
+            old_accel = self._max_accel()
+            old_mcr = self._min_cruise_ratio()
+            arcs = self._lookup("gcode_arcs") is not None
+            clog = (c.get("flush_clog_check") and c.get("allow_move")
+                    and c.get("allow_write"))
+            wheel_sum, wheel_last, ran = 0.0, None, False
+            if clog:
+                try:
+                    wheel_last = float(self._ensure_controller().get_wheel())
+                except Exception as exc:
+                    clog = False
+                    gcmd.respond_info("[k2_box] FLUSH: Messrad nicht lesbar "
+                                      "(%s) – keine Verstopfungsprüfung"
+                                      % (self._exc_text(exc),))
+            try:
+                for i, seg in enumerate(segs):
+                    last = i == n - 1
+                    ran |= bool(self._move(
+                        gcmd, "Spülen %d/%d (%s mm)" % (i + 1, n, _n(seg)),
+                        flush_segment_lines(c, seg, i, n, v, temp, max_temp)
+                        + ["M400"]))
+                    if clog:
+                        cur = float(self._ensure_controller().get_wheel())
+                        wheel_sum += cur - wheel_last
+                        wheel_last = cur
+                    if fan is not None:
+                        # Stock: alter Wert = fan0.last_value · scale
+                        # (nach M106 P0 S50), voll = scale (Pi 255)
+                        cur = self._pin(blow_fan) or fan
+                        sc = fan[1] or 255.0
+                        self._move(gcmd, "Blasen %d/%d (Stock blow)" % (i + 1, n),
+                                   gcode_blow(blow_fan, c["flush_blow_time"],
+                                              cur[0] * sc, sc), wrap=False)
+                    if legacy:
+                        self._move(gcmd, "Abstreifen %d/%d" % (i + 1, n),
+                                   gcode_wipe(c, old_accel))
+                        continue
+                    off = 0.0
+                    if last and c["flush_wipe_offset"] > 0:
+                        # Stock clean_offset_pos = reactor.monotonic() % 3
+                        off = self._now() % float(c["flush_wipe_offset"])
+                    self._move(gcmd, "Reinigung %d/%d (%s)" % (
+                        i + 1, n, "Blech + Silikon-Kreise, Versatz %s mm"
+                        % _n(off) if last else "Blech, bleibt im Schacht"),
+                        gcode_nozzle_clean(c, last, off, old_accel, old_mcr,
+                                           arcs))
+                if max_temp > temp + 0.01 and n == 1:
+                    # nur ein Abschnitt: Stock stellt nie zurück -> hier wie
+                    # bei mehreren Abschnitten auf die Spültemperatur
+                    self._move(gcmd, "Spültemperatur zurück",
+                               ["M104 S%s" % _n(temp)], wrap=False)
+            except Exception:
+                if c.get("allow_move") and old_accel is not None:
+                    try:
+                        self._script([_velocity_limit(old_accel, old_mcr)])
+                    except Exception:
+                        pass
+                raise
+            finally:
+                if fan is not None and c.get("allow_move"):
+                    # Stock material_flush -> box_save.restore_fan
+                    lines = []
+                    if fan_en is not None:
+                        lines.append("SET_PIN PIN=%s VALUE=%s" % (
+                            blow_fan + "_en", _n(fan_en[0] * (fan_en[1] or 1.0))))
+                    lines.append("SET_PIN PIN=%s VALUE=%s" % (
+                        blow_fan, _n(fan[0] * (fan[1] or 255.0))))
+                    try:
+                        self._move(gcmd, "Bauteillüfter zurück", lines,
+                                   wrap=False)
+                    except Exception:
+                        pass
+            if clog and ran and abs(wheel_sum) < abs(c["flush_clog_min_mm"]):
+                gcmd.respond_info(
+                    "[k2_box] WARNUNG FLUSH: Messrad bewegte sich nur %s mm "
+                    "(< %s mm) – Düse verstopft? (Stock key845 „the nozzle is "
+                    "blocked“; hier nur Warnung, flush_clog_check)" % (
+                        _n(wheel_sum), _n(c["flush_clog_min_mm"])))
+            if ran:
+                # Stock remain_material.save(color, type) nach Erfolg
+                self.remain_material = {"type": pl["new_key"],
+                                        "color": pl["new_col"], "tnn": tnn}
+            self.flush_last = ("%s: %s mm (%s), F%s, %s °C" % (
+                tnn or "?", _n(sum(segs)), " + ".join(_n(x) for x in segs),
+                _n(v), _n(temp)))
             gcmd.respond_info("[k2_box] FLUSH %s mm (%s) mit F%s ok%s" % (
-                _n(sum(segs)), " + ".join(_n(x) for x in segs), _n(vel),
+                _n(sum(segs)), " + ".join(_n(x) for x in segs), _n(v),
                 self._plan_note()))
         return self._run_step(gcmd, "FLUSH", body)
 
@@ -2839,7 +3602,7 @@ class PrinterK2Box:
     def _redo_change(self, gcmd, ab):
         c = self.cfg
         tnn = ab["tnn"]
-        temp = self._runout_temp(gcmd)
+        temp, tparam = self._runout_temp(gcmd, tnn)
         gcmd.respond_info(
             "[k2_box] RESUME: Kopf leer nach abgebrochenem Wechsel (%s) – "
             "Wechsel wird NACHGEHOLT (resume_redo_change, Stock "
@@ -2860,9 +3623,9 @@ class PrinterK2Box:
             self._run_step(gcmd, "REDO_HEAT", heat)
         self._script([
             "KTWO_BOX_RETRUDE",
-            "KTWO_BOX_EXTRUDE TNN=%s TEMP=%s" % (tnn, _n(temp)),
+            "KTWO_BOX_EXTRUDE TNN=%s %s" % (tnn, tparam),
             "KTWO_BOX_WASTE",
-            "KTWO_BOX_FLUSH TNN=%s TEMP=%s" % (tnn, _n(temp)),
+            "KTWO_BOX_FLUSH TNN=%s %s" % (tnn, tparam),
             "KTWO_BOX_END_OPT RETURN=0"])
         if self.chain_error:
             raise gcmd.error(
@@ -2918,13 +3681,9 @@ class PrinterK2Box:
             raise gcmd.error(msg)
         raise RuntimeError(msg)
 
-    def _runout_temp(self, gcmd):
-        """Lade-/Spültemperatur: TEMP= oder max(Drucktemperatur vor der Pause
-        (_PI_PARAM.hotend_temp, macros.cfg PAUSE), sonst Ziel, Tn_extrude_temp).
-        ANNAHME: Stock nimmt die Materialtemperatur aus RFID/Datenbank."""
-        t = gcmd.get_float("TEMP", None, above=0.)
-        if t is not None:
-            return float(t)
+    def _runout_base(self, gcmd):
+        """Drucktemperatur vor der Pause (_PI_PARAM.hotend_temp, macros.cfg
+        PAUSE), sonst aktuelles Ziel – Basis für Nachholen/Runout."""
         base = 0.0
         try:
             base = float(self._obj_status("gcode_macro _PI_PARAM")
@@ -2936,7 +3695,33 @@ class PrinterK2Box:
                 base = float(self._obj_status("extruder").get("target") or 0.0)
             except Exception:
                 base = 0.0
-        return max(base, float(self.cfg["tn_extrude_temp"]))
+        return base
+
+    def _runout_temp(self, gcmd, tnn=None):
+        """Lade-/Heiztemperatur (Nachholen/Runout) -> (temp, Kettenparameter).
+
+        TEMP= -> fest (an EXTRUDE/FLUSH als TEMP= weitergereicht). Sonst
+        max(_runout_base, Material-Temperatur des Ziels) wie _change_temp
+        (Material-DB, sonst Tn_extrude_temp 220); EXTRUDE/FLUSH bekommen
+        dann BASE_TEMP=<Basis>, damit sie selbst wie Stock rechnen (FLUSH:
+        max(alt, neu) + maxTemp-Stufe). Ohne DB ergibt das wie bisher
+        max(Drucktemperatur, 220)."""
+        t = gcmd.get_float("TEMP", None, above=0.)
+        if t is not None:
+            return float(t), "TEMP=%s" % _n(t)
+        base = self._runout_base(gcmd)
+        key = None
+        if self.material_db is not None and tnn:
+            try:
+                tag = self._slot_tag(parse_tnn(tnn)[2])
+            except ValueError:
+                tag = None
+            key = tag[0] if tag else None
+        notes = []
+        mt = self._db_temp(self._mat(key), "Nachladen %s" % (tnn or "?"),
+                           notes)
+        self._respond_notes(gcmd, notes)
+        return max(base, mt), "BASE_TEMP=%s" % _n(base)
 
     def _runout_analyse(self, gcmd):
         """Nur lesend: darf/kann nachgeladen werden? -> Plan-Dict, sonst
@@ -3025,7 +3810,7 @@ class PrinterK2Box:
             gcmd.respond_info(head + " – DRY_RUN: nichts bewegt/gesendet")
             return None
         gcmd.respond_info(head)
-        temp = self._runout_temp(gcmd)
+        temp, tparam = self._runout_temp(gcmd, tnn)
         paused = self._is_paused()
         if plan["clear_error"]:
             try:
@@ -3051,9 +3836,9 @@ class PrinterK2Box:
             if c["runout_tail_length"] > 0:
                 self._run_step(gcmd, "RUNOUT_TAIL", tail)
         self._script([
-            "KTWO_BOX_EXTRUDE TNN=%s TEMP=%s" % (tnn, _n(temp)),
+            "KTWO_BOX_EXTRUDE TNN=%s %s" % (tnn, tparam),
             "KTWO_BOX_WASTE",
-            "KTWO_BOX_FLUSH TNN=%s TEMP=%s" % (tnn, _n(temp)),
+            "KTWO_BOX_FLUSH TNN=%s %s" % (tnn, tparam),
             "KTWO_BOX_END_OPT RETURN=1"])
         if self.chain_error:
             self.runout_last = ("[k2_box] RUNOUT: Nachladen %s -> %s "

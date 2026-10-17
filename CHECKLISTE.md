@@ -601,7 +601,11 @@ box 179 · boxmini 17 · cfsseq 28 · motor 134 · motor_mini 43 · auto_addr 33
   (Stock-DB 56 Einträge ≥ 220 °C; Stock liest userdata/box-Kopie; resume_err sperrt nur einmal)
 - [x] Bootloader-Reste: BOOTLOADER-HOST-NACHTRAG-2026-10-17.md (NUM = Slotmaske 0..15, UI sendet NUM=0 →
   [00 02]-Bursts; Erst-Preload-Maske; 0xE0 = −32 → 128-Byte-Chunk, PROTOKOLL-GESAMT §1.7 „1..127“ falsch)
-- [ ] pi-host umsetzen (Vorschläge aus den 3 Befunden): Wechsel-/Spültemperatur aus Material-DB statt max(Ziel,220);
+- [x] UMGESETZT 17.10.2026 spät (2 Agents; test_k2_box 47/47, flush-material-Batch 11/11, resumecut 151/151, a45 0 Fehler;
+  README-k2_box §12, NOTIZ-reinigung-resume §7; install.sh --material-db, matdb-test 14/14). Ursprünglich offen: Wechsel-/Spültemperatur aus Material-DB statt max(Ziel,220);
   Prime-/Spül-Speed aus DB (vol/2,4·60, ·0,8 / ·1,2); Spülmenge per flush.py statt fest [90,70]; Wischen nur am Ende mit
   Kreisen, blow, ACCEL_TO_DECEL; Preload nur bei leerem Kopf/außerhalb Druck, Maske 0 ablehnen; box_wait_timeout ≥ 380 s;
   [k2_box] material_database (DB beim Installieren vom Drucker kopieren, nicht ins Repo); Doku-Korrekturen (Zeilen live-cfg).
+- [ ] Am Gerät (Pi): Spülbahn (Blech zwischen Abschnitten, Kreise nur am Ende, 5 s Blasen), DB-Temperaturen (PETG 250,
+  PLA→PLA-Spitze 240), Prime-Speed aus DB, Preload-Sperren, N5 ([0f 01] nach Box-Reset). Bekannt: remain_material nur im
+  Speicher → erster Wechsel nach Klipper-Neustart spült 90+70; Slicer-Spülmatrix nicht umgesetzt.

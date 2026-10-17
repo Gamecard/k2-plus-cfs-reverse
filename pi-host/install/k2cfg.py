@@ -9,6 +9,10 @@ Unterbefehle:
         * die ``serial:``-Zeilen der Abschnitte [mcu], [mcu nozzle_mcu], [k2_485]:
           Vorrang hat --set, sonst der Wert aus ALT (bereits installierte Datei),
           sofern er kein Platzhalter (``ANNAHME``) ist;
+        * die Zeile ``material_database:`` im Abschnitt [k2_box] (Pfad der
+          Creality-Materialdatenbank): steht sie in NEU und ALT aktiv und
+          weicht ALT ab (von Hand angepasst), bleibt der Wert aus ALT;
+          eine in ALT auskommentierte/fehlende Zeile übernimmt den Paketwert;
         * den SAVE_CONFIG-Block aus ALT (Kalibrierwerte), wenn ALT eine
           K2-Konfiguration ist und der Block abweicht – außer mit
           --save-config-aus-paket.
@@ -29,6 +33,57 @@ PLACEHOLDER = "ANNAHME"
 
 _SEC_RE = re.compile(r"^\[([^\]]+)\]\s*$")
 _SERIAL_RE = re.compile(r"^(serial\s*[:=]\s*)(\S.*?)\s*$")
+# Weitere Optionen, deren Wert bei Wiederholung aus ALT erhalten bleibt
+KEEP_OPTIONS = (("k2_box", "material_database"),)
+
+
+def _opt_re(key):
+    return re.compile(r"^(" + re.escape(key) + r"\s*[:=]\s*)(\S.*?)\s*$")
+
+
+def options(text, wanted=KEEP_OPTIONS):
+    """{(abschnitt, schlüssel): wert} der ersten aktiven Zeile (nur Hauptteil)."""
+    body, _ = split_save_config(text)
+    res = {}
+    sec = None
+    for line in body.splitlines():
+        m = _SEC_RE.match(line)
+        if m:
+            sec = m.group(1).strip()
+            continue
+        for wsec, key in wanted:
+            if sec == wsec and (wsec, key) not in res:
+                m = _opt_re(key).match(line)
+                if m:
+                    res[(wsec, key)] = m.group(2)
+    return res
+
+
+def set_options(text, values):
+    """Ersetzt je (abschnitt, schlüssel) die erste aktive Zeile; (text, geändert)."""
+    body, save = split_save_config(text)
+    out = []
+    sec = None
+    done = set()
+    changed = []
+    for line in body.splitlines(True):
+        m = _SEC_RE.match(line.rstrip("\n"))
+        if m:
+            sec = m.group(1).strip()
+        else:
+            for (wsec, key), new in values.items():
+                if sec != wsec or (wsec, key) in done:
+                    continue
+                m2 = _opt_re(key).match(line.rstrip("\n"))
+                if m2:
+                    done.add((wsec, key))
+                    if m2.group(2) != new:
+                        nl = "\n" if line.endswith("\n") else ""
+                        line = m2.group(1) + new + nl
+                        changed.append((wsec, key))
+                    break
+        out.append(line)
+    return "".join(out) + save, changed
 
 
 def _read(path):
@@ -134,6 +189,16 @@ def cmd_merge(args):
             continue
         print("  serial [%s] <- %s (%s)" % (sec, values[sec], src))
     text, _changed = set_serials(text, values)
+
+    if alt_text is not None:
+        neu_opts = options(text)
+        keep = {}
+        for k, old in options(alt_text).items():
+            if k in neu_opts and old != neu_opts[k] and PLACEHOLDER not in old:
+                keep[k] = old
+                print("  [%s] %s <- %s (bisherige Datei, Paket: %s)"
+                      % (k[0], k[1], old, neu_opts[k]))
+        text, _changed = set_options(text, keep)
 
     if alt_text is not None and is_k2_config(alt_text):
         _b, save_alt = split_save_config(alt_text)

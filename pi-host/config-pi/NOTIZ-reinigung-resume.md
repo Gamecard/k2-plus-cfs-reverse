@@ -21,6 +21,17 @@
 > `error_resume_process`. Bewusste Abweichungen vom Stock mit Belegen aus
 > `BOOTLOADER-HOST-BEFUND-2026-10-17.md` §5: §6a.8. Offline: resumecut-Batch
 > 11 Läufe / 151 Prüfungen, a45-Batch 0 Fehler, `test_k2_box.py` 34/34.
+>
+> **Ergänzung 17.10.2026 abends (§7):** Spülen beim CFS-Wechsel wie Stock
+> (Farbvolumen, Abschnitte, 20/80 % mit ×1,2, Blech zwischen den
+> Abschnitten, Silikon-Kreise nur am Ende, Blasen) und Material-DB
+> (`[k2_box] material_database`, Default aus) für Wechsel-/Spültemperatur,
+> Geschwindigkeiten und RESUME-Vorextrusion. Offline: `test_k2_box.py` 47/47.
+>
+> **Zeilenverweise:** `…/gcode_macro.cfg:<n>` meint die LIVE-Stock-Datei
+> `config/F008_CR0CN240319C13/gcode_macro.cfg` (md5-gleich mit
+> `live-logs-2026-10-16/config-aktuell/gcode_macro.cfg`), nicht den älteren
+> Stand `config/F008/gcode_macro.cfg` (PAUSE-RESUME-MATERIAL-BEFUND §A.5).
 
 ## 1. Was wo passiert
 
@@ -138,7 +149,7 @@ kein Gegenstück und entfällt.
 
 | Fundstelle | Inhalt |
 |---|---|
-| `…/gcode_macro.cfg:882-942` `RESUME_EXTERNAL` | Temperatur zurück (`M109`, wenn kälter), Lüfter, `BOX_GO_TO_EXTRUDE_POS` (903), Z-Rücknahme `z_safe-2` (Zeile auskommentiert → wirkungslos), `E = PAUSE.extrude + 80.0` (913), `E_VELOCITY = filament_rack.remain_material_velocity * 0.8` (914), `M106 S0`, `G1 E{E} F{E_VELOCITY}` (932), `M106 S127` (934), `G4 P3000` (935), `BOX_NOZZLE_CLEAN` (936), Lüfter zurück, `SET_LIMITS`, `extruder_fan` an; danach `RESUME_BASE` |
+| `…/gcode_macro.cfg:882-942` `RESUME_EXTERNAL` | Temperatur zurück (`M109`, wenn kälter, 885-892), Lüfter, `BOX_GO_TO_EXTRUDE_POS` (903), Z-Rücknahme `z_safe-2` (Zeile auskommentiert → wirkungslos), `E = PAUSE.extrude + 80.0` (913), `E_VELOCITY = filament_rack.remain_material_velocity * 0.8` (914; = `max_volumetric_speed/2,4·60·0,8` des Materials in der Düse, PAUSE-RESUME-MATERIAL-BEFUND §B.3), `M106 S0`, `G1 E{E} F{E_VELOCITY}` (932), `M106 S127` (934), `G4 P3000` (935), `BOX_NOZZLE_CLEAN` (936), Lüfter zurück, `SET_LIMITS`, `extruder_fan` an; danach `RESUME_BASE` |
 | `…/gcode_macro.cfg:737-783` `PAUSE_EXTERNAL` | Rückzug `E-1 F180` + `E-{extrude 2} F360`, `M104 S140`, Z-Hub (`z_safe`), Schacht + `BOX_NOZZLE_CLEAN` + `BOX_MOVE_TO_SAFE_POS` |
 | `klippy.log.2026-10-05:66250` ff. | RESUME live: `velocity: 460.0`, `Extruder not hot enough, SET M109 S220` (02:17:01,9), Heizen bis ≈02:17:45, dann Vorextrusion + 3 s, `BOX_NOZZLE_CLEAN` 02:17:55,7 |
 | `klippy.log.2026-10-12` 00:10/00:14/00:16, 02:35 | `velocity: 460.0` (3×), `velocity: 280.00…` (1×, anderes Material) |
@@ -184,8 +195,9 @@ danach neu gesetzt (§6a); Ziel am Schneidhebel → RESUME verweigert.
    3. `_PI_RESUME_PRIME` – nur wenn die Düse **im Schacht** steht (±0,5 mm,
       sonst nie: Meldung) und `can_extrude` UND Temperatur ≥
       max(`resume_prime_min_temp` 180, `min_extrude_temp`); dann `M107 P0`,
-      `G1 E{pause_extrude + resume_prime_extra} F{resume_prime_speed}`
-      (= 82 mm mit 460 mm/min), `M106 P0 S127`, `G4 P3000`.
+      `G1 E{pause_extrude + resume_prime_extra} F{…}` (= 82 mm; F =
+      `printer.k2_box.prime_speed` mit Material-DB, sonst
+      `resume_prime_speed` 460 mm/min, §7), `M106 P0 S127`, `G4 P3000`.
    4. `_PI_NOZZLE_CLEAN` – Abstreifen + Schacht verlassen.
    5. `_PI_RESUME_RETURN` – §4.2 (bricht ab, wenn ein CFS-Schritt der
       Vorbereitung `chain_error` gesetzt hat).
@@ -225,12 +237,18 @@ paused“) + `KTWO_BOX_RESUME_FIX` – keine Lüfter-/Extruderaktion.
 
 ## 6. ANNAHMEN / offen
 
-- **Prime-Geschwindigkeit** fest 460 mm/min (Stock materialabhängig aus
-  `filament_rack.remain_material_velocity · 0,8`, live 460 bzw. 280).
+- ~~**Prime-Geschwindigkeit** fest 460 mm/min~~ – seit 17.10.2026 abends
+  wie Stock `remain_material_velocity · 0,8` = **`vol/2,4·60·0,8`**
+  (`kvParam.filament_max_volumetric_speed` des Materials in der Düse; live
+  460 = Hyper PLA 23 mm³/s, 280 = Generic PLA 14 mm³/s; unbekannt 288 =
+  Stock-Fallback 360·0,8), aber nur mit `[k2_box] material_database`
+  (`k2_box.prime_speed`); ohne DB weiter 460 (§7).
 - **`resume_prime_min_temp` 180 °C** – eigene Schranke, kein Stock-Wert.
-- **Abstreif-Versatz:** Stock verschiebt die Wischstelle offenbar um
-  `temp_pos` 0…3 mm (`clean_offset_pos`; Werte sehen nach `monotonic % 3` aus);
-  hier immer dieselbe Stelle (k2_box-Bahn). Silikon nutzt sich ggf. punktuell ab.
+- **Abstreif-Versatz:** Stock verschiebt den Kreisstart um `clean_offset_pos
+  = reactor.monotonic() % 3` (FLUSH-BEFUND §7.1, B). Beim **Spülen** seit
+  17.10.2026 abends ebenso (`flush_wipe_offset`, §7); `_PI_NOZZLE_CLEAN`/
+  `KTWO_BOX_WIPE` (G28/START_PRINT/G29/RESUME) wischen weiter an derselben
+  Stelle (Bahn == `_PI_CLEAN_PATH`, a45-Batch).
 - **Reinigung beim ersten G28 ohne Heizen** wie Stock; ob Rückstände an einer
   kalten Düse das Antasten stören, ist am Gerät zu beobachten (START_PRINT/G29
   reinigen ohnehin noch einmal bei 140 °C vor dem maßgeblichen `G28 Z`).
@@ -443,17 +461,22 @@ Wechsel in diesem Fall selbst nach (BOOTLOADER-HOST-BEFUND §5.2).
    `allow_move` UND `MOVE=1` UND Herkunft T UND Ziel-TNN bekannt UND keine
    offene Kette UND referenziert – sonst Sperre wie 4. mit Grund):
    `KTWO_BOX_PRE_OPT TNN=<Ziel> Z_HOP=0 SOURCE=T` → Schacht + `M400` +
-   Heizen (TEMP = max(Drucktemperatur vor der Pause, `Tn_extrude_temp` 220),
-   wie Runout) → `KTWO_BOX_RETRUDE` (nur wenn der Hub belegt ist; heiße Düse
+   Heizen (max(Drucktemperatur vor der Pause, Material-Temperatur des
+   Ziels aus der Material-DB bzw. `Tn_extrude_temp` 220), wie Runout; seit
+   17.10. abends bekommen EXTRUDE/FLUSH `BASE_TEMP=<Drucktemperatur>` statt
+   `TEMP=`, §7) → `KTWO_BOX_RETRUDE` (nur wenn der Hub belegt ist; heiße Düse
    für die E−10-Schritte) → `KTWO_BOX_EXTRUDE` → `KTWO_BOX_WASTE` →
    `KTWO_BOX_FLUSH` → `KTWO_BOX_END_OPT RETURN=0`. Kein Schnitt (Kopf ist
    leer – Stock ebenso). Danach muss der Kopfsensor Filament melden; dann
    weiter wie jedes RESUME (`_PI_RESUME_PREPARE`: Schacht, M109,
    Vorextrusion, Abstreifen, Rückfahrt, Rebase = Stock `RESUME_EXTERNAL`).
    Jeder Fehler → `chain_error` (keine zweite Pause), `RESUME gesperrt:
-   Nachholen des Wechsels … fehlgeschlagen … keine Rückfahrt` (= Stock
-   `resume_err`); Merker bleibt, das nächste RESUME holt nach
-   `KTWO_BOX_ERROR_CLEAR` erneut nach.
+   Nachholen des Wechsels … fehlgeschlagen … keine Rückfahrt` (Wirkung =
+   Stock `resume_err`, **Lebensdauer verschieden:** Stock-`resume_err` ist
+   ein EINMAL-Flag – `RESUME_BASE` setzt es zurück und das nächste RESUME
+   versucht neu, `pause_resume.py` CR:195-199; Pi sperrt bis
+   `KTWO_BOX_ERROR_CLEAR`, PAUSE-RESUME-MATERIAL-BEFUND §A.3/§A.5); Merker
+   bleibt, das nächste RESUME holt nach `KTWO_BOX_ERROR_CLEAR` erneut nach.
 6. Nebenbei korrigiert: Anleitung in der `_fail`-Meldung und in der
    `chain_error`-Sperre des RESUME-Makros – richtig ist **erst
    `KTWO_BOX_ERROR_CLEAR`, dann `T<n>`**, dann RESUME (PRE_OPT lehnt ein
@@ -476,7 +499,7 @@ nachholbar (bewusst): M8200-Kette (die Datei schickt nach RESUME selbst
 | Ausstieg Schneidbereich | kein Sonderfall: Z zuerst zurück auf Druck-Z, dann **Y zuerst**, dann X (§5.1/§5.4) | Schneidbereich (X < `pre_cut_pos_x` 10) **nur in X**, vor Rückzug und Z-Hub | Einziger Beleg zum Hebel ist `box.cfg:13` `pre_cut_pos_x` „预撞刀的位置，保证垂直撞刀“ (Hebel senkrecht anfahren) + Schnitt-Rückweg `G0 X10`; eine Y-Fahrt am Hebel ist unbelegt (§5.4: „im Stock-Fehlerpfad kein Beleg“) → vorsichtiger. |
 | Ausstieg Schacht | Z-Hop zurück auf Druck-Z, dann Y345, X225 (§5.1) | erst Z-Hub (Pausenhöhe), dann X160 → Y345 (T0-Beispiel 11), dann Park | Kopf nie auf Druck-Z quer über das Bett. |
 | Nachholen | **automatisch** in `RESUME` → `BOX_ERROR_RESUME_PROCESS` (`error_resume_process` @`0x7cd28`): CFS an, pausiert, `resume_tnn` gesetzt, Kopfsensor **leer** → `go_to_extrude_pos`, `box_retrude_material`, `box_extrude_material`, `extruder_extrude`, `material_change_flush`; Kopfsensor belegt → nichts (live `12:88007`); Fehler → `resume_err` (§5.2, B) | Kopf leer → **RESUME gesperrt** (Default); Nachholen nur mit `resume_redo_change: True` + Freigaben (§6a.7) | Default aus wie jede neue Bewegungsfunktion bis zur Gerätefreigabe; die Sperre allein verhindert schon den Druck ohne Filament (BEFUND §5.4 Empfehlung 4). |
-| Fehler quittieren | `error_resume_process` Schritt 5 `clear_err()` – RESUME quittiert selbst (§5.2) | `KTWO_BOX_ERROR_CLEAR` bleibt Pflicht vor RESUME | bewusste Quittung nach Ursachenbehebung (Box-Fehler 0x04 [00 01]). |
+| Fehler quittieren | `error_resume_process` Schritt 5 `clear_err()` – RESUME quittiert selbst (§5.2); `resume_err` sperrt nur EINMAL (`RESUME_BASE` setzt es zurück, CR:195-199) | `KTWO_BOX_ERROR_CLEAR` bleibt Pflicht vor RESUME; `chain_error` sperrt bis dahin dauerhaft | bewusste Quittung nach Ursachenbehebung (Box-Fehler 0x04 [00 01]). |
 | Nachholen-Umfang | nur T<n>-Pfad (`resume_tnn` nur, wenn der Fehler nicht in `macro_error_list` steht = M8200-Kette) (§5.1, B) | gleich: nur Herkunft `SOURCE=T`; M8200-Kette/Runout/Einzelschritt nur Sperre | M8200: die Datei schickt nach RESUME die restlichen Kettenbefehle selbst. |
 | Kopfsensor unbekannt | unbelegt (Stock hat ihn immer) | gesperrt bis `KTWO_BOX_ERROR_CLEAR HEAD_LOADED=1` | sicherer Default (§6a.7 Punkt 4). |
 
@@ -507,8 +530,10 @@ nachholbar (bewusst): M8200-Kette (die Datei schickt nach RESUME selbst
   dem Abbruch aus dem Kopf ist; nach einem Schnitt OHNE Rückzug steckt das
   obere Stück noch im Sensor → „voll“ → RESUME frei (wie Stock §5.2
   Schritt 6). Lage des Sensors relativ zu Schneider/Zahnrädern unbelegt.
-- **ANNAHME:** Nachhol-Temperatur max(Drucktemperatur vor der Pause, 220)
-  statt Stock-Materialtemperatur aus RFID; Rückzug nur bei belegtem Hub
+- ~~**ANNAHME:** Nachhol-Temperatur max(Drucktemperatur vor der Pause, 220)
+  statt Stock-Materialtemperatur aus RFID~~ – seit 17.10.2026 abends mit
+  `[k2_box] material_database` max(Drucktemperatur, Material-DB-Temperatur
+  des Ziels; Schlüssel = RFID-`material_type`), ohne DB wie bisher (§7); Rückzug nur bei belegtem Hub
   (Stock ruft `box_retrude_material` immer – bei leerem Hub gleichwertig).
 - **ANNAHME:** Kopf voll ≠ Ziel-Filament geladen (z. B. Schnitt gescheitert):
   RESUME druckt mit dem alten Filament weiter (Stock ebenso) – vorher von
@@ -525,9 +550,12 @@ nachholbar (bewusst): M8200-Kette (die Datei schickt nach RESUME selbst
 ### 6a.10 Temperatur nach abgebrochenem Wechsel: `PAUSE CFS_TEMP` (17.10.2026 spät)
 
 **Problem:** `PAUSE` merkt wie Stock das aktuelle Extruder-Ziel als
-`hotend_temp` (Stock `config/F008/gcode_macro.cfg:738`, Pi `macros.cfg`
-PAUSE), RESUME heizt darauf (Stock `gcode_macro.cfg:836-842`, Pi
-`_PI_RESUME_PREPARE` `M109 S{hotend_temp}`). Bricht ein Wechsel im Druck ab,
+`hotend_temp` (Stock `PAUSE_EXTERNAL`, live
+`config/F008_CR0CN240319C13/gcode_macro.cfg:761`, Pi `macros.cfg`
+PAUSE), RESUME heizt darauf (Stock `RESUME_EXTERNAL` ebd. `:885-892`, Pi
+`_PI_RESUME_PREPARE` `M109 S{hotend_temp}`). (Bis 17.10. abends stand hier
+der ältere Stand `config/F008/gcode_macro.cfg:738` bzw. `:836-842` –
+Semantik gleich, PAUSE-RESUME-MATERIAL-BEFUND §A.5.) Bricht ein Wechsel im Druck ab,
 nachdem `RETRUDE`/`EXTRUDE`/`FLUSH` schon auf die Wechsel-Temperatur geheizt
 hatten (`k2_box._heat` → `M109 S{max(Ziel, tn_extrude_temp 220)}`,
 `_change_temp`), ist das Ziel beim `PAUSE` die Wechsel- statt der
@@ -577,3 +605,78 @@ Ziel 140; nach RESUME Ziel 200.0; zweiter Abbruch in der Pause:
 
 **Am Gerät:** Druck mit < 220 °C, Abbruch im Schacht provozieren → Meldung
 `CFS_TEMP`, nach RESUME `M105`/Moonraker: Ziel = Drucktemperatur.
+
+## 7. Spülen beim CFS-Wechsel wie Stock + Material-Datenbank (17.10.2026 abends)
+
+> **ENTWURF – am Gerät UNGETESTET.** Belege: `FLUSH-BEFUND-2026-10-17.md`
+> (§2 Menge, §4 Geschwindigkeit, §5 Temperatur, §6 Ablauf, §7 Reinigung),
+> `PAUSE-RESUME-MATERIAL-BEFUND-2026-10-17.md` (§B DB-Felder, §C P1–P7),
+> `BOOTLOADER-HOST-NACHTRAG-2026-10-17.md` (N2/N3/N6). Rechnung über
+> `nachbau/flush.py` und `nachbau/material_db.py` (nur importiert).
+> Optionen/Defaults: `README-k2_box.md` §12, `k2-module.cfg`.
+
+### 7.1 `KTWO_BOX_FLUSH` (= Stock `material_change_flush` → `Tn_Extrude`)
+
+| Schritt | Stock (Beleg) | Pi (`k2_box.cmd_flush`) |
+|---|---|---|
+| Start | `M106 P0 S50`, `M400` (Z.4495/4496) | gleich, nur wenn `[output_pin <flush_blow_fan>]` existiert und `flush_blow: True`; Lüfterwerte werden gemerkt |
+| Menge | `get_flush_len`: Farbvolumen `get_flushing_volume(alt, neu)` (60…800 mm³) + `nozzle_volume` 183 → /2,4 · `flush_multiplier`; anderes Material ×2, min 370; sonst min 160; Farbe unbekannt → `Tn_extrude` 140 roh (§2) | `plan_flush_lengths` (= flush.py). Alte Farbe = `remain_material.color` (nach jedem erfolgreichen Spülen gesetzt, nur im Speicher), neue = RFID-`col` des Ziel-Slots. „Anderes Material“ nur mit Material-DB (`is_different_type`: `meterialType` oder \|ΔT\| > 10). `LENGTH=` → `cal_flush_list(LENGTH)`. `flush_mode: fixed` = bisher |
+| Abschnitte | `cal_flush_list` 90/70…, Rest verteilt (max 100) (§6.1) | gleich (`box_need_clean_length_max` 100) |
+| Geschwindigkeit | `min(360, vol/2,4·60)` · Düse/0,4, Material = neu (§4) | gleich; ohne DB `Tn_extrude_velocity` (360); `VELOCITY=` ersetzt v |
+| Temperatur | `flush_temp = max(T_alt, T_neu)`; bei `T_alt ≥ T_neu` Spitze `max(maxTemp)`: warten bis max−5, `M104 max`; letzter Abschnitt `M104 flush_temp`; am Ende `M104 S<T_neu>` (§5, §6.2) | `max(Ziel bzw. BASE_TEMP, T_alt, T_neu)` (DB, sonst 220); Spitze nur mit DB als `M104 S<max>` + `TEMPERATURE_WAIT SENSOR=extruder MINIMUM=<max−5>` (Upstream-`M109` würde beim Abkühlen warten); zurück im letzten Abschnitt (bei nur einem Abschnitt am Ende); danach bleibt die Spültemperatur – `END_OPT` stellt das Ziel vor dem Wechsel her. `TEMP=` = fest, ohne Spitze |
+| je Abschnitt | 20 % · v + 80 % · v · 1,2 (letzter ×1, Index `max_temp_flush_times`) (§6.2) | gleich (`flush_segment_lines` = `flush.segment_plan`) |
+| danach | `blow`: fan0 5 s 255 → alter Wert (§7.2) | gleich (`flush_blow_time`, Wert/Skala aus `[output_pin fan0]`) |
+| Reinigung | Zwischenabschnitte `nozzle_clean(circle=False)`: ACCEL 5000/ACCEL_TO_DECEL 5000, X170 → X135, 3× X160/Y378 ↔ X133/Y378, bleibt im Schacht; letzter `nozzle_clean()`: zusätzlich Kreise ab X160+o / X170−o (Y374, `G2 I4`/`G3 I-4 J0 P1`, o = monotonic % 3), raus X160 → Y345 (§7.1) | `gcode_nozzle_clean` gleich; `ACCEL_TO_DECEL` gibt es in Upstream 9cb9975 nicht mehr (`toolhead.py` kennt nur `MINIMUM_CRUISE_RATIO`) – Stock `accel_to_decel = accel` ≙ `MINIMUM_CRUISE_RATIO=0` (`wipe_minimum_cruise_ratio`), danach alter Wert (nur wenn lesbar); Kreise als `G2/G3 I±4 J0` ohne `P1` (Upstream-`gcode_arcs` macht bei Start = Ziel einen Vollkreis, `[gcode_arcs]` steht in printer.cfg), ohne `[gcode_arcs]` 16-Eck. Koordinaten aus `[k2_box]`. `flush_clean: legacy` = bisher (volles Abstreifen nach jedem Abschnitt) |
+| Verstopfung | Messrad-Summe < \|diff_length\| 10 → key845, Fehler (§6) | nur **Warnung** (`flush_clog_check`, Default AUS) – live 2× ausgelöst trotz Spülen, Ursache offen |
+| Ende | `move_to_safe_pos` (Y345 → X225), `restore_fan`, `remain_material.save` | Lüfter zurück (auch bei Fehler), `remain_material` nur nach ausgeführtem Spülen (`allow_move`); Schacht verlassen hat schon die letzte Reinigung erledigt, Rückfahrt macht `END_OPT` |
+
+Nicht übernommen: Slicer-Matrix `flush_volumes_matrix` im Druck (Creality-
+`virtual_sdcard`, §3), `flushing_sign`/Stromausfall-Reinigung,
+`set_cool_temp` (140 °C nach `BOX_MATERIAL_CHANGE_FLUSH`).
+
+### 7.2 Material-Datenbank (`[k2_box] material_database`)
+
+- Datei = Creality-`material_database.json` (Format `result.list[]`); wird
+  von `install.sh` vom Drucker nach `~/printer_data/config/k2/
+  material_database.json` kopiert, **nicht im Repo**. In `k2-module.cfg`
+  auskommentiert ausgeliefert. Fehlt/kaputt → bisheriges Verhalten + Meldung
+  beim Connect (kein Config-Fehler).
+- Schlüssel: RFID-`material_type` (`mat_id`, 6-stellig) des Slots → DB-ID
+  `mat_id[1:6]` (Stock `type[1:]`). Genutzt wie Stock nur
+  `kvParam.nozzle_temperature`, `base.maxTemp`,
+  `kvParam.filament_max_volumetric_speed`, `base.meterialType`.
+- Wirkung: Rückzug heizt auf das Material **in der Düse**
+  (`remain_material`, sonst geladener Slot), Einzug auf das **Ziel**,
+  Spülen s. 7.1, Stage-7-Greifen `min(Tn_extrude_velocity, vol/2,4·60)`
+  (Pi-Erweiterung, TPU), RESUME-Vorextrusion `vol/2,4·60·0,8` (Status
+  `prime_speed`, `_PI_RESUME_PRIME`), Nachholen/Runout über `BASE_TEMP`.
+  Unbekanntes Material/Feld → 220 °C bzw. 360 mm/min (Stock-Fallback) +
+  `HINWEIS`. DB-Temperaturen werden auf `[extruder] max_temp − 10` gekappt.
+- Die Temperatur steht NICHT im RFID-Etikett (korrigierter Kommentar in
+  `_change_temp`), nur der Schlüssel.
+
+### 7.3 Preload (`KTWO_BOX_PRELOAD`)
+
+Stock-Schutz von `communication_set_pre_loading` (BOOTLOADER-HOST-BEFUND
+§3, NACHTRAG N2/N3): op 2/3 nur bei **leerem** Kopf-Filamentsensor (Filament
+oder kein Sensor → gesperrt, auch mit FORCE), im Druck/Pause nur mit
+`FORCE=1`, Maske 0 bei op 2/3 abgelehnt. Gesperrt = nichts gesendet,
+Meldung. `box_wait_timeout` 380 s = `preload_force_timeout` eines Slots
+(N6, vorher 200 s). **N5 nicht eingebaut:** Stock sendet nach jedem
+(Re-)Connect `0x0d [0f 01]` – ob die Box ohne diese Freigabe nach einem
+Reset noch selbst preloadet, ist ein offener Gerätetest.
+
+### 7.4 Nachweis (offline) und am Gerät
+
+- `pi-host/test_k2_box.py` 47/47 (11 neue Prüfungen: DB laden an/aus/
+  kaputt, Temperaturen inkl. unbekannt/Kappung, Farbvolumen gegen die
+  Live-Werte 60/165/193/367 und Listen [90,70]/[90,70,70], Abschnitts-
+  geschwindigkeiten 18@360/72@432 – 14@360/56@360 mit 240/235/220, Wischfolge
+  nur am Ende, Blasen/Lüfter zurück, Verstopfung nur Warnung, prime_speed +
+  Makro, BASE_TEMP, Preload-Sperren, Timeout). Bestehende Kettentests: nur
+  `G1 E72 F360` → `F432` (Stock-Faktor 1,2) angepasst.
+- **Am Gerät (Hand am Not-Aus):** `KTWO_BOX_FLUSH TNN=…` einzeln bei
+  `allow_move` – Blech ohne Kreise zwischen den Abschnitten, Kreise am
+  Ende auf dem Silikon (Versatz 0–3 mm), Lüfter 5 s; dann mit DB:
+  PETG-Slot → 250 °C, PLA→PLA → Spitze 240 (Hyper PLA).
+

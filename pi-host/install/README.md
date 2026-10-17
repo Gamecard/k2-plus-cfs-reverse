@@ -22,7 +22,7 @@ pi-host/install/pack.sh -o /pfad   # anderer Ausgabeordner
 ```
 
 Inhalt: `pi-host/k2_*.py`, `pi-host/test_k2_*.py` (+ `prtouch_mcu_formats.json`, Modul-READMEs), `pi-host/config-pi/` (cfg + Notizen), `nachbau/` (+ `ref-hi/`), `belt_mdl-live.py` (GPLv3-Original für den Belt-Vergleichstest), `mcu-dicts/` (F008-Dictionaries Main/Düse für Batch + lis2dw-Test), Skripte, `PAKET-INFO.txt`, `SHA256SUMS`.
-**Nicht** enthalten: Geräteskripte fürs Stock-Gerät (`bustest_lesend.py`, `emu_prtouch_stock.py`, `prtouch_lesetest.py`, `prtouch_fingertest.py`, `prtouch_vorabtest.py`), Logs, Befunde, Übergabe-/Zugangsnotizen. `pack.sh` bricht bei Zugangsdaten-/IP-Mustern im Inhalt ab.
+**Nicht** enthalten: Geräteskripte fürs Stock-Gerät (`bustest_lesend.py`, `emu_prtouch_stock.py`, `prtouch_lesetest.py`, `prtouch_fingertest.py`, `prtouch_vorabtest.py`), Logs, Befunde, Übergabe-/Zugangsnotizen, **Creality-Materialdatenbank** (`material_database*.json`, s. §4a). `pack.sh` bricht bei Zugangsdaten-/IP-Mustern im Inhalt ab, ebenso wenn eine Material-DB dem Namen nach (Paketordner und Tarball) oder dem Inhalt nach (JSON mit `meterialType`/`printerIntName`/`kvParam`) hineingeriete.
 
 ## 3. Auf den Pi kopieren und starten
 
@@ -49,15 +49,15 @@ sudo systemctl start klipper                     # oder gleich mit --starten
 
 | Schritt | Inhalt | Abbruch bei |
 |---|---|---|
-| 1 Vorprüfungen | nicht root, `aarch64`, `SHA256SUMS`, `~/klipper` ist git-Checkout, `~/printer_data/config` da, ≥ 200 MB frei, Python (`~/klippy-env`), `sudo -n`, Dienst `klipper.service`; Backup-Ordner `~/k2-pi-backup/<stamp>/` | jeder Fehlschlag |
+| 1 Vorprüfungen | nicht root, `aarch64`, `SHA256SUMS`, `~/klipper` ist git-Checkout, `~/printer_data/config` da, ≥ 200 MB frei, Python (`~/klippy-env`), `sudo -n`, Dienst `klipper.service`; mit `--material-db`: Datei lesbar, gültiges JSON, Struktur (`nachbau/material_db.py --struktur`, ≥ 1 Eintrag); Backup-Ordner `~/k2-pi-backup/<stamp>/` | jeder Fehlschlag (vor jeder Änderung) |
 | 2 Klipper | HEAD ≠ `9cb9975` → nur bei **sauberem** Checkout `git checkout --detach 9cb9975` (fehlt der Commit: `git fetch origin`); eigene Dateien zählen nicht als Änderung. `.git/info/exclude` bekommt `klippy/extras/k2_*.py` + `k2_nachbau/` (Moonraker sieht den Checkout als sauber). | lokale Änderungen (Liste wird gezeigt) |
 | 3 Dienst | `sudo systemctl stop klipper` (Zustand gemerkt) | stop scheitert |
 | 4 Module | Backup vorhandener `extras/k2_*.py` + `k2_nachbau/`; `pi-host/k2_*.py` → `extras/` (**`k2_motor_init.py` → `k2_motor.py`**, Dateiname = Abschnitt `[k2_motor]`), `nachbau/*.py` → `extras/k2_nachbau/`; jede Kopie per `cmp` geprüft. Mitinstalliert werden auch `k2_lis2dw.py` (Pflicht, `[k2_lis2dw]` in printer.cfg) und `k2_zalign.py` (nur aktiv, wenn `[k2_zalign]` in zalign.cfg einkommentiert wird) | Kopierfehler |
-| 5 Config | `~/printer_data/config` **komplett** als `config.tar.gz` gesichert; alle `config-pi/*.cfg` außer `printer.cfg` kopiert; `printer.cfg`: keine vorhanden → wird `printer.cfg`; vorhanden → nur mit `--printer-cfg-ersetzen` ersetzt, sonst `printer-k2.cfg` daneben + Hinweis | – |
+| 5 Config | `~/printer_data/config` **komplett** als `config.tar.gz` gesichert; alle `config-pi/*.cfg` außer `printer.cfg` kopiert; `printer.cfg`: keine vorhanden → wird `printer.cfg`; vorhanden → nur mit `--printer-cfg-ersetzen` ersetzt, sonst `printer-k2.cfg` daneben + Hinweis; Material-DB s. §4a | – |
 | 6 Prüfung | alle `test_k2_*.py` (mit `KLIPPER_SRC=~/klipper`), nachbau-Selbsttests, Batch-Lauf `klippy.py <cfg> -i /dev/null -d <dicts>` wie `lauf-modulfix.sh` (Lauf F) gegen die **installierten** Module + Config; Logs in `<backup>/tests/`, `<backup>/batch/` | ein Test rot / Batch ≠ EXIT 0 → Dienst bleibt gestoppt |
 | 7 Abschluss | Dienst nur mit `--starten`; Zusammenfassung, `ls -l /dev/serial/by-id/`, verbleibende Platzhalter, nächste Schritte §4 | – |
 
-**Erneut ausführen** ist ausdrücklich vorgesehen (z. B. nach neuem Paket): eingetragene `serial:`-Pfade (`[mcu]`, `[mcu nozzle_mcu]`, `[k2_485]`) werden aus den bisherigen Dateien übernommen; beim Ersetzen einer bisherigen K2-`printer.cfg` bleibt deren SAVE_CONFIG-Block (Kalibrierung) erhalten, außer mit `--save-config-aus-paket`. Jeder Lauf legt ein neues Backup an.
+**Erneut ausführen** ist ausdrücklich vorgesehen (z. B. nach neuem Paket): eingetragene `serial:`-Pfade (`[mcu]`, `[mcu nozzle_mcu]`, `[k2_485]`) werden aus den bisherigen Dateien übernommen; beim Ersetzen einer bisherigen K2-`printer.cfg` bleibt deren SAVE_CONFIG-Block (Kalibrierung) erhalten, außer mit `--save-config-aus-paket`. Jeder Lauf legt ein neues Backup an (zwei Läufe in derselben Sekunde: Suffix `-2`, `-3` …; vor dem 17.10.2026 überschrieb der zweite das erste).
 
 ### Optionen
 
@@ -67,6 +67,7 @@ sudo systemctl start klipper                     # oder gleich mit --starten
 | `--printer-cfg-ersetzen` | vorhandene `printer.cfg` ersetzen (Original im Backup) |
 | `--save-config-aus-paket` | SAVE_CONFIG-Block des Pakets statt des bisherigen |
 | `--main-serial` / `--duese-serial` / `--rs485-serial PFAD` | by-id-Pfade direkt eintragen |
+| `--material-db DATEI` | Creality-Materialdatenbank nach `~/printer_data/config/k2/material_database.json` kopieren (§4a) |
 | `--dienst NAME` | anderer systemd-Dienst als `klipper` |
 | `--starten` | Klipper am Ende starten |
 | `--ohne-tests` / `--ohne-batch` | Prüfungen auslassen |
@@ -84,6 +85,25 @@ Umgebungsvariablen für abweichende Installationen: `KLIPPER_DIR`, `CONFIG_DIR`,
 
 `baud: 230400` bleibt überall. Welcher UART welche MCU ist: nacheinander anstecken und `ls -l /dev/serial/by-id/` vergleichen.
 
+## 4a. Materialdatenbank (`material_database.json`)
+
+`[k2_box]` liest Temperatur/Geschwindigkeit je Material aus der Creality-Datenbank (Befund `PAUSE-RESUME-MATERIAL-BEFUND-2026-10-17.md` §B, Vorschlag P4). Die Datei ist eine Creality-Datei bzw. eine Benutzer-Kopie mit Cloud-Kennungen und kommt deshalb **nie ins Paket/Repo**. Sie wird einmal vom Stock-Drucker geholt (solange das Stock-Upper-Board noch läuft) und bei der Installation mitgegeben:
+
+```bash
+# am Arbeits-PC oder Pi, Stock-Drucker im Netz:
+scp root@<drucker>:/mnt/UDISK/creality/userdata/box/material_database.json .
+#   (diese Benutzer-Kopie liest der Stock-Host-Code; fehlt sie, den Firmware-Default
+#    /etc/sysConfig/defData/material/material_database.json holen)
+./install.sh --material-db material_database.json [übrige Optionen]
+```
+
+- Ziel fest: `~/printer_data/config/k2/material_database.json` (Rechte 0644, Ordner `k2/` wird bei Bedarf angelegt). Diesen Pfad trägt `k2-module.cfg` bei `[k2_box]` ein.
+- Prüfung in Schritt 1, also **vor jeder Änderung**: gültiges JSON, Struktur über `nachbau/material_db.py --struktur` (`result.list` vorhanden, ≥ 1 Eintrag); Zählwerte (Einträge, Doppel-IDs, Einträge ohne `nozzle_temperature`) werden angezeigt. Kaputte Datei → Abbruch, nichts verändert.
+- Eine vorhandene DB wird nach `<backup>/material-db/` gesichert (zusätzlich zu `config.tar.gz`); identische Datei → bleibt unverändert.
+- **Ohne** `--material-db` bleibt eine vorhandene DB unverändert (sie wird nur geprüft, kaputt → Warnung). Fehlt sie, meldet die Zusammenfassung den `scp`-Befehl; `k2_box` arbeitet dann mit den Festwerten.
+- Ein von Hand geänderter Wert `material_database:` in `[k2_box]` (`k2-module.cfg`) bleibt bei Wiederholung erhalten (`k2cfg.py`), solange die Paket-Datei die Zeile aktiv enthält.
+- Rückbau: Die DB wird auf den Stand des gewählten Backups gebracht – gesicherte Datei zurück, bzw. entfernt (+ leerer Ordner `k2/`), wenn es sie vor diesem Lauf nicht gab (auch mit `--aelteste`).
+
 ## 5. Rückbau
 
 ```bash
@@ -99,4 +119,4 @@ Stoppt Klipper, entfernt alle `extras/k2_*.py` + `k2_nachbau/` und spielt die ge
 - `mainsail.cfg` wird von der K2-`printer.cfg` **nicht** eingebunden (eigene PAUSE/RESUME/CANCEL_PRINT, `[virtual_sdcard]`, `[pause_resume]`, `[display_status]`). Doppelte Makro-Abschnitte würden sich still vermischen.
 - Detached HEAD: Moonraker meldet Klipper als „detached“; ein Update über den Update-Manager verlässt den geprüften Stand – danach `install.sh` erneut laufen lassen (Module bleiben als ungetrackte Dateien erhalten).
 - `~/k2-test` (alter Testordner) wird nicht benutzt.
-- Geprüft (17.10.2026) nur in einer Attrappe auf x86_64 (`--arch-egal`): Fake-HOME mit Klon des Upstream-Klippers (Fake-Commit über 9cb9975 als „Image-Stand“), Fake-`systemctl`/`sudo` über PATH, Klipper-venv des Batch-Aufbaus. Abgedeckt: Erstinstallation, Wiederholung mit `--printer-cfg-ersetzen` + serial-Optionen, Übernahme von Hand-Einträgen + SAVE_CONFIG, Batch-Fehler wird erkannt, dirty Checkout / falsche Prüfsumme / root / Architektur brechen ab, Rückbau `letzte` und `--aelteste` → Config, extras, `.git/info/exclude` und HEAD/Branch identisch zum Ausgangszustand. Auf dem echten Pi noch nicht gelaufen.
+- Geprüft (17.10.2026) nur in einer Attrappe auf x86_64 (`--arch-egal`): Fake-HOME mit Klon des Upstream-Klippers (Fake-Commit über 9cb9975 als „Image-Stand“), Fake-`systemctl`/`sudo` über PATH, Klipper-venv des Batch-Aufbaus. Abgedeckt: Erstinstallation, Wiederholung mit `--printer-cfg-ersetzen` + serial-Optionen, Übernahme von Hand-Einträgen + SAVE_CONFIG, Batch-Fehler wird erkannt, dirty Checkout / falsche Prüfsumme / root / Architektur brechen ab, Rückbau `letzte` und `--aelteste` → Config, extras, `.git/info/exclude` und HEAD/Branch identisch zum Ausgangszustand. Material-DB (17.10.2026, synthetische Mini-DB): Neuanlage, Ersetzen mit Backup, unverändert ohne Option, identische Datei, kaputtes JSON / falsche Struktur / fehlende Datei → Abbruch ohne Änderung, Rückbau `letzte`/`--aelteste`, `pack.sh` schließt DB aus. Auf dem echten Pi noch nicht gelaufen.
