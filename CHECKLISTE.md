@@ -593,3 +593,15 @@ box 179 · boxmini 17 · cfsseq 28 · motor 134 · motor_mini 43 · auto_addr 33
   + k2_transport (≤ 100 Datenbytes, fun 0xF0 ≤ 0x80, len ≤ 0xFC, RX 255; nie 0xFF/0xFD mit 0x01/0x0B außer FF 0B [01]);
   preload_force_timeout = max(180+200·n, 300·n) = 380/600/900/1200 s, retries 0; cfswatch: 0x05 [01]/[02] erwartet stumm,
   [04] ohne Antwort = Fehler; idx 15/16 benannt (encoder_single_turn/encoder_fdb). serial485 111/111, alle Selbsttests grün.
+
+## RE-Runde 17.10.2026 abends (3 Claude-Agents mit REA/Ghidra, Stichproben selbst geprüft)
+- [x] Spül-Logik statisch + live bestätigt: FLUSH-BEFUND-2026-10-17.md, nachbau/flush.py 44/44 (Farbvolumen
+  get_flushing_volume 60…800 mm³, Länge (V+183)/2.4, cal_flush_list 90/70…, 20 %·v + 80 %·1,2v, Wischen, blow, key845)
+- [x] pause_resume + Material-DB: PAUSE-RESUME-MATERIAL-BEFUND-2026-10-17.md, nachbau/material_db.py 40/40
+  (Stock-DB 56 Einträge ≥ 220 °C; Stock liest userdata/box-Kopie; resume_err sperrt nur einmal)
+- [x] Bootloader-Reste: BOOTLOADER-HOST-NACHTRAG-2026-10-17.md (NUM = Slotmaske 0..15, UI sendet NUM=0 →
+  [00 02]-Bursts; Erst-Preload-Maske; 0xE0 = −32 → 128-Byte-Chunk, PROTOKOLL-GESAMT §1.7 „1..127“ falsch)
+- [ ] pi-host umsetzen (Vorschläge aus den 3 Befunden): Wechsel-/Spültemperatur aus Material-DB statt max(Ziel,220);
+  Prime-/Spül-Speed aus DB (vol/2,4·60, ·0,8 / ·1,2); Spülmenge per flush.py statt fest [90,70]; Wischen nur am Ende mit
+  Kreisen, blow, ACCEL_TO_DECEL; Preload nur bei leerem Kopf/außerhalb Druck, Maske 0 ablehnen; box_wait_timeout ≥ 380 s;
+  [k2_box] material_database (DB beim Installieren vom Drucker kopieren, nicht ins Repo); Doku-Korrekturen (Zeilen live-cfg).
