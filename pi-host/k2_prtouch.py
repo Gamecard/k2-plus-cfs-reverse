@@ -207,6 +207,21 @@ STOCK_REST_MAX_DIF = 3000  # ANNAHME: gleiche Schwelle für Ruhetest
 STOCK_RETRY_DX = -0.25  # BELEGT T58→T59: 132.5→132.25
 STOCK_RETRY_DY = 0.25  # BELEGT T58→T59: 47.5→47.75
 
+# Host-Kontaktkriterium im Rückfallweg (mode steps), README-k2_prtouch B.2/B.3.
+# 'window' (Default, bisher): Nullpunkt = Median der ersten 32 Samples des
+#   JEWEILIGEN Fensters, Kontakt = rest_min_consec Samples > contact_thresh.
+# 'cumulative' (optional, ANNAHME): zusätzlich (ODER) die „Treppe“ über
+#   mehrere Schritte – je Schritt ein Stufenpegel (Median der jüngsten
+#   CONTACT_TAIL_N Rohwerte nach M400), Kontakt, wenn mind. contact_steps
+#   aufeinanderfolgende Stufen gleichsinnig um je >= contact_step_min steigen
+#   und die Summe seit der letzten unbelasteten Stufe > contact_thresh ist.
+#   Begründung/Herleitung: README B.3 (Treppen-Effekt B.2 Punkt 5).
+CONTACT_CRITERIA = ("window", "cumulative")
+CONTACT_TAIL_N = 16  # ANNAHME: 16 Samples ≈ 12,5 ms jüngster Ruhezustand
+CONTACT_STEPS_DEFAULT = 2  # ANNAHME (s. README B.3)
+CONTACT_STEPS_MIN, CONTACT_STEPS_MAX = 2, 10
+CONTACT_STEP_MIN_DEFAULT = 250.0  # ANNAHME: Counts je Schritt (Rauschboden)
+
 # Harte Sicherheits-Maxima (verbindlich, S1):
 STEP_MM_DEFAULT = 0.02
 STEP_MM_MAX = 0.05
@@ -672,6 +687,19 @@ def parse_options(opts):
                                      STOCK_EMERGENCY_THRESH)
     cfg["rest_max_dif"] = _float("rest_max_dif", STOCK_REST_MAX_DIF)
     cfg["rest_min_consec"] = _int("rest_min_consec", 2)
+    # Host-Kontaktkriterium (nur mode steps), Default = bisheriges Verhalten.
+    cfg["contact_criterion"] = (_str("contact_criterion", "window")
+                                or "window").lower()
+    if cfg["contact_criterion"] not in CONTACT_CRITERIA:
+        raise ValueError("contact_criterion muss 'window' oder 'cumulative' "
+                         "sein: %r" % (o.get("contact_criterion"),))
+    cfg["contact_steps"] = _int("contact_steps", CONTACT_STEPS_DEFAULT)
+    if not CONTACT_STEPS_MIN <= cfg["contact_steps"] <= CONTACT_STEPS_MAX:
+        raise ValueError("contact_steps muss in [%d, %d] sein: %r"
+                         % (CONTACT_STEPS_MIN, CONTACT_STEPS_MAX,
+                            o.get("contact_steps")))
+    cfg["contact_step_min"] = _float("contact_step_min",
+                                     CONTACT_STEP_MIN_DEFAULT)
     if not 0.0 < cfg["step_mm"] <= STEP_MM_MAX + 1e-12:
         raise ValueError("step_mm muss in (0, %.2f] sein (S1): %r"
                          % (STEP_MM_MAX, o.get("step_mm")))
@@ -691,6 +719,9 @@ def parse_options(opts):
     if cfg["emergency_thresh"] <= cfg["contact_thresh"]:
         raise ValueError("emergency_thresh muss > contact_thresh sein "
                          "(sonst löst jeder Kontakt die Notgrenze aus)")
+    if not 0.0 < cfg["contact_step_min"] < cfg["contact_thresh"]:
+        raise ValueError("contact_step_min muss in (0, contact_thresh) "
+                         "liegen: %r" % (o.get("contact_step_min"),))
 
     # --- Betriebsart + Probe-Hauptweg (Upstream-[probe]-Ersatz) ---
     cfg["mode"] = (_str("mode", "probe") or "probe").lower()
@@ -935,7 +966,9 @@ def parse_klipper_config(config):
               "stepper_x_oid", "stepper_y_oid", "stepper_z_oid",
               "can_brk_min_best", "can_brk_min_step", "can_brk_max_zoft",
               # Absicherung MCU-Befund 17.10.2026:
-              "rest_filt_max_frac"):
+              "rest_filt_max_frac",
+              # Rückfallweg-Kontaktkriterium (README B.3):
+              "contact_criterion", "contact_steps", "contact_step_min"):
         if k not in opts:
             v = _g(k, None)
             if v is not None and str(v) != "":
@@ -1331,6 +1364,73 @@ def detect_contact(pres_datas, pres_times, step_mms, step_times, cfg):
             "step_bst_time": float(step_times[bi]) - float(step_times[-1]),
             "tri_pose": float(tri_pose), "bst_pose": float(bst_pose),
             "zoft": float(zoft)}
+
+
+def step_level(pres_datas, n=CONTACT_TAIL_N):
+    """Stufenpegel eines Schritts: Median der jüngsten n Rohwerte (Fenster
+    nach M400 gelesen, nach Tick sortiert). Median statt Mittel: einzelne
+    Störspitzen (B.2 Punkt 4) verschieben ihn nicht."""
+    vals = [int(v) for v in pres_datas][-int(n):]
+    if not vals:
+        raise ValueError("leere pres-Daten für den Stufenpegel")
+    return median_int(vals)
+
+
+def detect_contact_cumulative(levels, depths, cfg):
+    """Treppen-Kriterium über mehrere Schritte (contact_criterion
+    'cumulative', ANNAHME, README B.3).
+
+    levels[0] = Ruhe-Nullpunkt vor dem ersten Schritt (Median des
+    Ruhetests), levels[j] = Stufenpegel nach Schritt j (step_level);
+    depths[j] = Fahrweg ab Start in mm (depths[0] = 0, steigend).
+    Kontakt, wenn die letzten L >= contact_steps Stufen gleichsinnig um je
+    >= contact_step_min gestiegen sind (Richtung egal, wie die Düse B §3.3)
+    UND |levels[i] - levels[s-1]| > contact_thresh (s = erste Stufe der
+    Folge, levels[s-1] = letzte unbelastete Stufe). Bezug ist damit die
+    Stufe VOR dem Anstieg – nicht der feste Ruhe-Nullpunkt (Drift, s. B.3).
+    Kontakttiefe: Gerade durch (depth, |level - Bezug|) der Stufen s..i
+    (kleinste Quadrate, ANNAHME lineare Federkennlinie), Nullstelle, auf
+    [depths[s-1], depths[s]] begrenzt (Kontakt zwischen letzter unbelasteter
+    und erster belasteter Stufe).
+    """
+    k_need = int(cfg.get("contact_steps", CONTACT_STEPS_DEFAULT))
+    floor = float(cfg.get("contact_step_min", CONTACT_STEP_MIN_DEFAULT))
+    thresh = float(cfg["contact_thresh"])
+    if len(levels) != len(depths):
+        raise ValueError("levels/depths ungleich lang")
+    i = len(levels) - 1
+    if i < k_need:
+        return {"contact": False}
+    d = [float(levels[j]) - float(levels[j - 1]) for j in range(1, i + 1)]
+    sign = 1.0 if d[-1] > 0 else -1.0
+    s = i  # erste Stufe der gleichsinnigen Folge (Index in levels)
+    while s >= 1 and d[s - 1] * sign >= floor:
+        s -= 1
+    s += 1
+    run = i - s + 1
+    if run < k_need:
+        return {"contact": False, "run_len": max(run, 0)}
+    base = float(levels[s - 1])
+    total = abs(float(levels[i]) - base)
+    if total <= thresh:
+        return {"contact": False, "run_len": run, "total": total}
+    xs = [float(depths[j]) for j in range(s, i + 1)]
+    ys = [abs(float(levels[j]) - base) for j in range(s, i + 1)]
+    n = float(len(xs))
+    mx, my = sum(xs) / n, sum(ys) / n
+    sxx = sum((x - mx) ** 2 for x in xs)
+    slope = (sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / sxx
+             if sxx > 0 else 0.0)
+    lo, hi = float(depths[s - 1]), float(depths[s])
+    if slope > 0:
+        dc = mx - my / slope  # Nullstelle der Geraden
+        dc = min(max(dc, lo), hi)
+    else:
+        dc = lo
+    return {"contact": True, "run_start": int(s), "run_len": int(run),
+            "baseline": base, "total": float(total),
+            "slope_per_mm": float(slope), "contact_depth": float(dc),
+            "sign": int(sign)}
 
 
 def check_can_brk(best_indx, step_bst_indx, zoft, cfg):
@@ -1785,6 +1885,15 @@ class K2PrtouchController:
                      "(alle ANNAHME, s. BERICHT)" % (
                          c["contact_thresh"], c["emergency_thresh"],
                          c["rest_max_dif"]))
+        if c.get("contact_criterion", "window") == "cumulative":
+            lines.append("Kontaktkriterium: window ODER cumulative (Treppe: "
+                         ">= %d Stufen je >= %.0f, Summe > %.0f; ANNAHME, "
+                         "README B.3)" % (c["contact_steps"],
+                                          c["contact_step_min"],
+                                          c["contact_thresh"]))
+        else:
+            lines.append("Kontaktkriterium: window (Fenster-Median, "
+                         "README B.2)")
         lines.append("Ablauf pro Punkt: Signalweg-Test → cont_step → "
                      "start_pres/start_step (ack) → %.3fs Totzeit → Ruhetest "
                      "(roh+gefiltert) → tri_chxs=0 → Schritte %.3fmm@%.1fmm/s "
@@ -2054,6 +2163,11 @@ class K2PrtouchController:
                            "warnings": warns}
                     return res, False
                 baseline0 = median_int(d0)
+            cumulative = c.get("contact_criterion", "window") == "cumulative"
+            if cumulative:
+                # Treppen-Kriterium (README B.3): Stufe 0 = Ruhe-Nullpunkt.
+                z_start = float(self.tool.get_z())
+                levels, depths = [float(baseline0)], [0.0]
             while True:
                 if total + step_mm > float(c["max_travel_mm"]) + 1e-9:
                     res = {"status": "max_travel",
@@ -2104,9 +2218,33 @@ class K2PrtouchController:
                            "tri_pose": det["tri_pose"],
                            "bst_pose": det["bst_pose"],
                            "can_brk": bool(can), "can_reason": reason,
+                           "criterion": "window",
                            "mcu_triggered": bool(tri),
                            "swap": arm_info.get("swap"), "rest": rest}
                     break
+                if cumulative:
+                    levels.append(step_level(pd))
+                    depths.append(total)
+                    cum = detect_contact_cumulative(levels, depths, c)
+                    if cum.get("contact"):
+                        A = float(self.tool.get_z())
+                        zc = z_start - float(cum["contact_depth"])
+                        res = {"status": "ok", "z": float(zc), "A": A,
+                               "zoft": float(zc - A),
+                               "criterion": "cumulative",
+                               "best_indx": None, "step_bst_indx": None,
+                               "cum_run_len": cum["run_len"],
+                               "cum_total": cum["total"],
+                               "cum_slope_per_mm": cum["slope_per_mm"],
+                               "cum_levels": [float(v) for v in levels],
+                               # can_brk-Schranken beziehen sich auf
+                               # best_indx im Fenster -> hier nicht anwendbar.
+                               "can_brk": True,
+                               "can_reason": "cumulative: can_brk entfällt "
+                                             "(ANNAHME, README B.3)",
+                               "mcu_triggered": bool(tri),
+                               "swap": arm_info.get("swap"), "rest": rest}
+                        break
                 if tri:
                     # Düse hat nach ihrer eigenen Logik ausgelöst (B §3.3,
                     # Puffer eingefroren), das Host-Kriterium aber nicht ->

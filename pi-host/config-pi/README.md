@@ -114,6 +114,8 @@ mkdir -p $E/k2_nachbau && cp nachbau/*.py $E/k2_nachbau/
 # cp pi-host/k2_zalign.py $E/
 ```
 
+**Ein-Schritt-Installation (17.10.2026):** `pi-host/install/` baut mit `pack.sh` ein Paket und richtet den Pi mit `install.sh` genau nach diesem Abschnitt ein (Klipper-Checkout 9cb9975, Module inkl. `k2_lis2dw.py`/`k2_zalign.py`, Config mit Backup, Offline-Tests + Batch wie §5, Dienst bleibt gestoppt); Rückbau `uninstall.sh`. Bedienung: `pi-host/install/README.md`.
+
 1. **Module** wie oben. `k2_transport.py` und `k2_nachbau/` sind keine Abschnitte, sondern Helfer.
 2. **`nachbau/` = `klippy/extras/k2_nachbau/`** (Festlegung 16.10.2026). Pflicht für `[k2_485]` und `[k2_box]` (serial485, box, cfsseq, auto_addr; motor optional). Suchreihenfolge in `k2_transport.find_nachbau_dir()` (erster Ordner mit `serial485.py`): `$K2_NACHBAU_DIR` → `<extras>/k2_nachbau/` → `<extras>/../nachbau/` (Repo-Layout `pi-host/../nachbau`, Offline-Tests) → `<extras>/../../nachbau/` (alter Weg `~/klipper/nachbau/`, weiter gültig). Der Ordner wird nur **angehängt** (`sys.path.append`), die Module fügen ihren eigenen Ordner **nie** in `sys.path` ein (Geschwister per `from . import k2_transport`); `import_nachbau`/`check_nachbau_module` brechen mit klarer Meldung ab, falls ein gleichnamiges Fremdmodul (z. B. pip-Paket `box`) gefunden wird. Batch-Lauf F/I: `serial485`, `box`, `cfsseq`, `auto_addr`, `motor` laut `python -v` aus `extras/k2_nachbau/`, `statistics` aus der Standardbibliothek.
 3. **pyserial** muss im Klipper-venv vorhanden sein (Upstream-Abhängigkeit, i. d. R. schon installiert); fehlt es, meldet `[k2_485]` das beim Connect (kein Absturz).

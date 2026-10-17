@@ -1,7 +1,7 @@
 # GHIDRA-CFS-BEFUND 15.10.2026 – CFS-Firmware cfs0_000_153: RS485-Dispatcher und Payload-Semantik (Ghidra, 15.10.2026)
 
-> Kopie des Ghidra-Befunds (Original: Arbeitsdatei lokal `/tmp/claude-0/ghidra-cfs/BEFUND.md`,
-> flüchtig). Alle Pfade unter `/tmp/claude-0/ghidra-cfs/` sind **Arbeitsdateien lokal**
+> Kopie des Ghidra-Befunds (Original: Arbeitsdatei lokal `<arbeitsordner>/ghidra-cfs/BEFUND.md`,
+> flüchtig). Alle Pfade unter `<arbeitsordner>/ghidra-cfs/` sind **Arbeitsdateien lokal**
 > (Ghidra-Projekte, Dekompilate) und NICHT Teil des Projekts/Repos. Längere
 > Dekompilat-Auszüge wurden bewusst auf Belegzeilen mit Adresse gekürzt – im Repo sollen
 > keine größeren Rekonstruktionen von Creality-Code landen.
@@ -15,7 +15,7 @@
 
 Ziel: `fw/cfs/cfs0_050_G32-cfs0_000_153.bin` (GD32F303VET6, Cortex-M4/Thumb, RT-Thread 5.0.2).
 Nebenziele: `cfs0_050_G30-cfs0_000_150.bin` (Gegenprobe) und `cfs6_100_G31-cfs6_222_000.bin`.
-Werkzeug: Ghidra 12.1.4 headless, Projekte unter `/tmp/claude-0/ghidra-cfs/{proj,verify}` (Arbeitsdateien lokal).
+Werkzeug: Ghidra 12.1.4 headless, Projekte unter `<arbeitsordner>/ghidra-cfs/{proj,verify}` (Arbeitsdateien lokal).
 
 Belegstärke in diesem Dokument:
 - **B** = im Dekompilat oder in der Disassembly belegt (Adresse angegeben)
@@ -38,10 +38,10 @@ Rezept, getestet als Frischimport:
 ```
 export GHIDRA_HEADLESS_MAXMEM=4G      # 30 GB RAM, 25 GB frei; pro Lauf reichen 4G (~15 s Analyse)
 S=<projekt>/ghidra-scripts
-/opt/ghidra/ghidra_12.1.4_PUBLIC/support/analyzeHeadless /tmp/claude-0/ghidra-cfs/verify v0 \
+/opt/ghidra/ghidra_12.1.4_PUBLIC/support/analyzeHeadless <arbeitsordner>/ghidra-cfs/verify v0 \
   -import fw/cfs/cfs0_050_G32-cfs0_000_153.bin -loader BinaryLoader -processor "ARM:LE:32:Cortex" \
   -preScript SetCfsBase.java \
-  -postScript CfsDispatch.java out=/tmp/claude-0/ghidra-cfs/verify/disp_cfs0.c \
+  -postScript CfsDispatch.java out=<arbeitsordner>/ghidra-cfs/verify/disp_cfs0.c \
   -postScript CfsDetail.java -scriptPath $S -overwrite
 ```
 Speicherblöcke nach `SetCfsBase`: `bootloader` (0x08000000, uninit.), `flash` (Image, r-x), `flash_rest` (bis 0x08080000), `sram` 0x20000000/64 KiB, `periph` 0x40000000/256 MiB (volatile), `periph_ahb3` 0x60000000, `exmc_regs` 0xA0000000, `ppb` 0xE0000000/1 MiB (volatile). Die Vektortabelle (84 Einträge) wird als Pointer definiert, Handler werden als Funktionen angelegt (`reset_handler`, `vec_NN`).
@@ -311,7 +311,7 @@ Gesamt: Strings mit XRef 538 → 930, XRefs 812 → 1464, Funktionen 927 → 106
 
 ## 8. Skript-Änderungen (`<projekt>/ghidra-scripts/`, chown pro:pro)
 
-- **SetCfsBase.java** (neu geschrieben, Diff: `/tmp/claude-0/ghidra-cfs/skripte.diff`):
+- **SetCfsBase.java** (neu geschrieben, Diff: `<arbeitsordner>/ghidra-cfs/skripte.diff`):
   - Basis per Argument (`0x…`) oder Dateiname (cfs0→0x08003000, cfs6→0x08004000).
   - Alte Konstante 0x08000000 und der Reset-Hack `base.add(0x4144)` sind als „KORRIGIERT 15.10.2026“ kommentiert.
   - `moveBlock` statt eines zweiten `createInitializedBlock`.
@@ -328,7 +328,7 @@ Gesamt: Strings mit XRef 538 → 930, XRefs 812 → 1464, Funktionen 927 → 106
   - Gibt die Tabelle fun/len/Aufrufstelle/Folgeaufrufe aus und schreibt das Dekompilat (`out=`).
   - Verifiziert auf R153, R150 und cfs6_222.
 
-Arbeitsdateien lokal (`/tmp/claude-0/ghidra-cfs/`, flüchtig, nicht im Repo):
+Arbeitsdateien lokal (`<arbeitsordner>/ghidra-cfs/`, flüchtig, nicht im Repo):
 - Dispatcher-Dekompilate: `dispatcher_cfs0_153.c`, `dispatcher_cfs0_150.c`, `dispatcher_cfs6_222.c`
 - Gesamt-Dekompilate: `all_cfs0.c` (38k Zeilen), `all_cfs6.c`
 - Abfrage-Helfer: `scripts/Q.java` + `q.sh`

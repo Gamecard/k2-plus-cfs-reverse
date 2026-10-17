@@ -2406,6 +2406,226 @@ def test_1017_steps_guards():
           str(kp._q_read.sent))
 
 
+# =====================================================================
+# 17.10.2026 (3): Treppen-Kriterium contact_criterion 'cumulative'
+# (README-k2_prtouch B.2 Punkt 5 / B.3, ANNAHME)
+# =====================================================================
+
+class FakePresTreppe(FakePres):
+    """Düse mit Treppen-Kraftverlauf: nach jedem Schritt + M400 steht die
+    Kraft still (Fenster großteils NACH dem Schritt). Fenster = 'trans'
+    Samples alter Stufe, dann neue Stufe, Rauschen ±noise. Kraft =
+    k_per_mm × Eindrückung unter z_true, Vorzeichen 'sign' (live negativ),
+    Drift je Lesen, optionale Einzelsprünge {read_nr: counts}. Die Düse
+    löst bei dieser flachen Treppe NICHT selbst aus (mcu_trigger False)."""
+
+    def __init__(self, tool, cfg, k_per_mm=125000.0, sign=-1, drift=0.0,
+                 trans=12, jumps=None, **kw):
+        FakePres.__init__(self, tool, cfg, **kw)
+        self.k_per_mm = float(k_per_mm)
+        self.sign = int(sign)
+        self.drift = float(drift)
+        self.trans = int(trans)
+        self.jumps = dict(jumps or {})
+        self.prev_level = None
+        self.mcu_trigger = False
+
+    def force_level(self):
+        z = float(self.tool.get_z())
+        f = self.k_per_mm * (self.z_true - z) if z < self.z_true else 0.0
+        return (self.baseline + self.sign * f + self.drift * self.reads
+                + self.jumps.get(self.reads, 0))
+
+    def read_pres(self):
+        self.events.append("read_pres")
+        if not self._filled():
+            return self._empty()
+        self.reads += 1
+        lv = self.force_level()
+        prev = lv if self.prev_level is None else self.prev_level
+        out = [int(round(prev if i < self.trans else lv))
+               + det_noise(i + self.reads * 131, self.noise_amp)
+               for i in range(64)]
+        self.prev_level = lv
+        return self._ticks(), struct.pack("<64i", *out)
+
+
+def make_ctl_treppe(z_start=0.2, z_true=0.05, cfg_over=None, **pres_kw):
+    base = {"allow_move": True, "step_mm": 0.02, "probe_speed": 5.0,
+            "max_travel_mm": 5.0, "packing": "struct", "mode": "steps"}
+    base.update(dict(cfg_over or {}))
+    cfg = K.parse_options(base)
+    events = []
+    tool = FakeToolhead(z_start=z_start, events=events)
+    pres = FakePresTreppe(tool, cfg, z_true=z_true, events=events, **pres_kw)
+    step = FakeStep(tool, cfg, pres=pres, events=events)
+    ctl = K.K2PrtouchController(cfg, pres, step, tool,
+                                pause=lambda s: events.append("pause"),
+                                logger=DummyLog())
+    ctl._test_events = events
+    return cfg, tool, pres, step, ctl
+
+
+CUM = {"contact_criterion": "cumulative"}
+
+
+def test_1017_treppe_default_unchanged():
+    """Default 'window' = bisheriges Verhalten: die Treppe (2 500 Counts je
+    0,02-mm-Schritt, B.2 Punkt 5) wird NICHT erkannt -> Notgrenze."""
+    cfg = K.parse_options({})
+    check("(treppe) Default contact_criterion = window, steps 2, min 250",
+          cfg["contact_criterion"] == "window" and cfg["contact_steps"] == 2
+          and cfg["contact_step_min"] == 250.0)
+    cfg, tool, pres, step, ctl = make_ctl_treppe()
+    r = ctl.probe_point(100.0, 100.0)
+    ev = ctl._test_events
+    check("(treppe) window: Treppe 2500/Schritt -> emergency (Treppen-"
+          "Effekt nachgestellt), entschärft, angehoben",
+          r.get("status") == "emergency" and ev.count("stop_pres1") == 1
+          and "lift" in ev, str(r)[:200])
+    # Standard-Fake (Spitze im Fenster): window und cumulative identisch
+    out = {}
+    for name, over in (("window", {}), ("cumulative", CUM)):
+        _c, _t, _p, _s, ctl2, _l = make_ctl(z_start=0.2, z_true=0.0,
+                                            cfg_over=over)
+        rr = ctl2.probe_point(100.0, 100.0)
+        out[name] = rr
+    check("(treppe) Sprung im Fenster: cumulative = window (gleiches z, "
+          "Kriterium 'window' greift zuerst)",
+          out["window"]["status"] == out["cumulative"]["status"] == "ok"
+          and out["window"]["z"] == out["cumulative"]["z"]
+          and out["cumulative"]["criterion"] == "window"
+          and out["window"]["steps"] == out["cumulative"]["steps"],
+          "%s / %s" % (out["window"].get("z"), out["cumulative"].get("z")))
+
+
+def test_1017_treppe_cumulative():
+    for z_true in (0.05, 0.047, 0.0333):
+        cfg, tool, pres, step, ctl = make_ctl_treppe(z_true=z_true,
+                                                     cfg_over=CUM)
+        r = ctl.probe_point(100.0, 100.0)
+        ev = ctl._test_events
+        over = z_true - tool.min_z
+        check("(treppe) cumulative z_true=%.4f: ok, |Fehler| < 0,003 mm, "
+              "Überfahrweg <= 3 Schritte, entschärft vor Lift" % z_true,
+              r.get("status") == "ok" and r.get("criterion") == "cumulative"
+              and abs(r["z"] - z_true) < 0.003 and over <= 3 * 0.02 + 1e-9
+              and ev.index("stop_pres1") < ev.index("lift")
+              and r["zoft"] >= 0 and r["can_brk"] is True,
+              "z=%s over=%.3f %s" % (r.get("z"), over, str(r)[:160]))
+    cfg, tool, pres, step, ctl = make_ctl_treppe(sign=+1, cfg_over=CUM)
+    r = ctl.probe_point(100.0, 100.0)
+    check("(treppe) Vorzeichen egal (Kraft positiv)",
+          r.get("status") == "ok" and abs(r["z"] - 0.05) < 0.003, str(r)[:160])
+    # kleinere Stufen (1000/Schritt): längere Folge, trotzdem vor Notgrenze
+    cfg, tool, pres, step, ctl = make_ctl_treppe(k_per_mm=50000.0,
+                                                 cfg_over=CUM)
+    r = ctl.probe_point(100.0, 100.0)
+    check("(treppe) 1000/Schritt: Kontakt nach 4 Stufen (Summe > 3000), "
+          "z ±0,003", r.get("status") == "ok" and r["cum_run_len"] == 4
+          and abs(r["z"] - 0.05) < 0.003, str(r)[:200])
+    # contact_steps 3: eine Stufe später
+    cfg, tool, pres, step, ctl = make_ctl_treppe(
+        cfg_over=dict(CUM, contact_steps=3))
+    r = ctl.probe_point(100.0, 100.0)
+    check("(treppe) contact_steps 3 -> Folge >= 3",
+          r.get("status") == "ok" and r["cum_run_len"] == 3, str(r)[:160])
+    # Notgrenze bleibt vorrangig: 10 000/Schritt -> 2. Stufe 20 000 > 15 000
+    # (trans=0: Fenster komplett nach dem Schritt -> window sieht nichts)
+    cfg, tool, pres, step, ctl = make_ctl_treppe(
+        k_per_mm=500000.0, z_true=0.06, trans=0, cfg_over=CUM)
+    r = ctl.probe_point(100.0, 100.0)
+    check("(treppe) steile Treppe: Notgrenze 15 000 greift vor cumulative",
+          r.get("status") == "emergency", str(r)[:160])
+    # Düse löst selbst aus, Host nicht -> mcu_contact wie bisher
+    cfg, tool, pres, step, ctl = make_ctl_treppe(k_per_mm=10000.0,
+                                                 cfg_over=CUM)
+    pres.mcu_trigger = True
+    r = ctl.probe_point(100.0, 100.0)
+    check("(treppe) tri_chxs ohne Host-Kontakt -> mcu_contact (unverändert)",
+          r.get("status") == "mcu_contact", str(r)[:160])
+
+
+def test_1017_treppe_robust():
+    # langsame Drift (100 Counts je Lesen ≈ live 2 400 in 24 s), kein Kontakt
+    cfg, tool, pres, step, ctl = make_ctl_treppe(
+        z_true=-5.0, drift=-100.0, cfg_over=dict(CUM, max_travel_mm=1.0))
+    r = ctl.probe_point(100.0, 100.0)
+    check("(treppe) Drift 100/Schritt über 50 Schritte: kein Fehlkontakt "
+          "(max_travel)", r.get("status") == "max_travel", str(r)[:160])
+    # einzelner Sprung +5000 und zurück (Störung) -> kein Kontakt
+    cfg, tool, pres, step, ctl = make_ctl_treppe(
+        z_true=-5.0, jumps={6: -2800}, cfg_over=dict(CUM, max_travel_mm=0.4))
+    r = ctl.probe_point(100.0, 100.0)
+    check("(treppe) Einzelstufe 2800 (eine Stufe, zurück) -> kein Kontakt",
+          r.get("status") == "max_travel", str(r)[:160])
+    # Rauschen der Stufen ±400 (wechselnd) -> keine gleichsinnige Folge
+    jumps = {i: (400 if i % 2 else -400) for i in range(2, 40)}
+    cfg, tool, pres, step, ctl = make_ctl_treppe(
+        z_true=-5.0, jumps=jumps, cfg_over=dict(CUM, max_travel_mm=0.6))
+    r = ctl.probe_point(100.0, 100.0)
+    check("(treppe) Stufenrauschen ±400 -> kein Kontakt",
+          r.get("status") == "max_travel", str(r)[:160])
+    # Fehler im Schritt -> trotzdem entschärft (gemeinsamer finally)
+    cfg, tool, pres, step, ctl = make_ctl_treppe(cfg_over=CUM)
+    tool.fail_down_at = 3
+    r = ctl.probe_point(100.0, 100.0)
+    ev = ctl._test_events
+    check("(treppe) Ausnahme im Schritt (cumulative) -> error, entschärft",
+          r.get("status") == "error" and ev.count("stop_pres1") == 1,
+          str(r)[:160])
+
+
+def test_1017_treppe_pure_config():
+    cfg = K.parse_options(CUM)
+    lv = [0.0, 10.0, -5.0, 1250.0, 3750.0]
+    dp = [0.0, 0.02, 0.04, 0.06, 0.08]
+    d = K.detect_contact_cumulative(lv, dp, cfg)
+    check("(treppe) rein: Nullstelle 0,05 mm, Folge 2, Bezug = Stufe davor",
+          d["contact"] and d["run_start"] == 3 and d["run_len"] == 2
+          and abs(d["contact_depth"] - 0.04996) < 1e-6 and d["baseline"] == -5.0,
+          str(d))
+    d2 = K.detect_contact_cumulative([0.0, 3500.0, 7000.0], [0, 0.02, 0.04],
+                                     cfg)
+    check("(treppe) rein: Nullstelle auf [Stufe s-1, s] begrenzt",
+          d2["contact"] and 0.0 <= d2["contact_depth"] <= 0.02, str(d2))
+    d3 = K.detect_contact_cumulative([0.0, 1000.0, 2000.0], [0, 0.02, 0.04],
+                                     cfg)
+    check("(treppe) rein: Summe <= contact_thresh -> kein Kontakt",
+          not d3["contact"], str(d3))
+    d4 = K.detect_contact_cumulative([0.0, 5000.0], [0, 0.02], cfg)
+    check("(treppe) rein: weniger als contact_steps Stufen -> kein Kontakt",
+          not d4["contact"])
+    check("(treppe) step_level = Median der jüngsten 16",
+          K.step_level([0] * 48 + [7] * 15 + [10 ** 6]) == 7.0)
+    check("(treppe) Config: ungültiges Kriterium / contact_steps 1, 11 / "
+          "contact_step_min >= contact_thresh abgelehnt",
+          _raises({"contact_criterion": "fest"}, "contact_criterion")
+          and _raises({"contact_steps": "1"}, "contact_steps")
+          and _raises({"contact_steps": "11"}, "contact_steps")
+          and _raises({"contact_step_min": "3000"}, "contact_step_min")
+          and _raises({"contact_step_min": "0"}, "contact_step_min"))
+
+    class _Cfg:
+        def __init__(self, d):
+            self.d = d
+
+        def get_options(self):
+            return list(self.d)
+
+        def get(self, k, default=None):
+            return self.d.get(k, default)
+    c2 = K.parse_klipper_config(_Cfg({"contact_criterion": "cumulative",
+                                      "contact_steps": "4",
+                                      "contact_step_min": "300"}))
+    check("(treppe) parse_klipper_config reicht die Optionen durch",
+          c2["contact_criterion"] == "cumulative" and c2["contact_steps"] == 4
+          and c2["contact_step_min"] == 300.0)
+    cfg, tool, pres, step, ctl = make_ctl_treppe(cfg_over=CUM)
+    check("(treppe) describe_plan nennt das Kriterium",
+          "cumulative" in ctl.describe_plan())
+
+
 def main():
     test_live_ring_read()
     test_swap_mechanism()
@@ -2440,6 +2660,10 @@ def main():
     test_1017_steps_register_empty()
     test_1017_steps_errors()
     test_1017_steps_guards()
+    test_1017_treppe_default_unchanged()
+    test_1017_treppe_cumulative()
+    test_1017_treppe_robust()
+    test_1017_treppe_pure_config()
     print("\n%d bestanden, %d fehlgeschlagen" % (len(PASS), len(FAIL)))
     if FAIL:
         print("FEHLER:", FAIL)

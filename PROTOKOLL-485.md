@@ -798,7 +798,7 @@ Stock nur ID 226 (nicht gesendet) und der Extruder-Param-Abgleich (transparent s
 Tippfehler). **Log-Falle:** in `update_flash_param key:… value:N` ist N die **Param-ID**,
 nicht der Wert. Gelesen werden nur IDs 9/10/25 + in `[motor_control]` konfigurierte;
 grants „result is None“ für 9/10/25 ist ein Artefakt des Extruders (0x85-Timeout).
-Volle Tabelle (lokal, nicht im Repo): `/tmp/claude-0/livelog-motor/params.csv`.
+Volle Tabelle (lokal, nicht im Repo): `<arbeitsordner>/livelog-motor/params.csv`.
 
 **Nachbau (parallel umgesetzt 15.10.2026, `nachbau/motor.py` / `motor_mini.py`):**
 `read_sys_param` ([02,id], 4/2/0-Byte-Antwort), `build_sys_param_write_payload`

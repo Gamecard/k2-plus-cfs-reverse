@@ -2,6 +2,8 @@
 
 > **Nachtrag 17.10.2026 (2): Rückfallweg `mode: steps` repariert** – gleiche Reihenfolge und Absicherung wie der Probe-Weg über **gemeinsamen Code** (`K2PrtouchProbeCore.arm/disarm/preflight`): Signalweg → scharf → Totzeit → Ruhetest → kein Kontakt → Schritte → Entschärfen im `finally` → Anheben. Mindestgeschwindigkeit jetzt auch für `probe_speed` (ANNAHME). Host-Kontaktkriterium gegen die MCU-Logik geprüft: Abschnitt **B.2**. Offline-Tests 280/280 + Review-Test.
 
+> **Nachtrag 17.10.2026 (3): Vorabtest am Gerät + Treppen-Kriterium** – neues Geräteskript `prtouch_vorabtest.py` bildet `KTWO_PRTOUCH_READ` (Vorabprüfung) **ohne Klipper** nach, mit dem echten Kern-Code, nur Düsen-MCU, keine Bewegung (Abschnitt **A.9**, Tests `test_prtouch_vorabtest.py` 39/39). Rückfallweg `mode: steps`: optionales Host-Kriterium `contact_criterion: cumulative` gegen den Treppen-Effekt (Default `window` = unverändert, **ANNAHME**, Abschnitt **B.3**). Offline-Tests 303/303 + Review-Test.
+
 > **ENTWURF – Stand 16.10.2026 abends.** Sensor-Lesepfad und Swap-Leitung am Gerät GETESTET (ohne Bewegung, PRTOUCH-LESETEST-BEFUND-2026-10-16.md, Fingerdruck-Test 19/19). **Hauptweg ist jetzt eine normale Upstream-Klipper-Probe** auf `!PC7` (wie Stock). Antasten mit Bewegung ist weiterhin **UNGETESTET**. Offline-Tests: 138/138 + Review-Test (davon 21 gegen die echten Upstream-Dateien `probe.py`/`homing.py`/`manual_probe.py`/`gcode.py`/`pins.py`). Vor der ersten echten Fahrt: Abschnitt A.5 (ANNAHMEN P1–P6) und A.6 (Erstlauf) beachten, erst mit `allow_move: False`.
 
 # [k2_prtouch] – Kraftsensor-Düse des K2 Plus unter Upstream-Klipper
@@ -382,6 +384,96 @@ Pull-Up nicht als Kontakt gelesen – wie bei Stock.
 → Ruhetest immer `rest_error`. Außerdem wurde ohne Totzeit, ohne gefilterten
 Kanal, ohne ack-Prüfung und ohne Entschärfen im `finally` gefahren.
 
+### A.9 Vorabtest am Gerät ohne Klipper (`prtouch_vorabtest.py`, 17.10.2026)
+
+Bildet die Vorabprüfung nach, die `KTWO_PRTOUCH_READ` unter Klipper machen würde –
+mit **demselben Code** (`K2PrtouchProbeCore.preflight` → `arm`/`disarm`,
+`KlippyPresMcu`, `check_rest_ok`); nur die Klipper-Anbindung ist durch Shims
+ersetzt (Query über Klippys `serialhdl.SerialRetryCommand`, wie
+`prtouch_lesetest.py`). Antast-Parameter = unsere Default-Config (= `[k2_prtouch]`
+in `config-pi/printer.cfg`, Test prüft die Gleichheit), änderbar mit `--cfg` bzw.
+`--set key=value`. **Nur Düsen-MCU (ttyS3), keine Bewegung, keine Heizung.**
+
+Gesendet wird (Reihenfolge; Düse 230400 Bd):
+
+1. `get_config` (bei `is_config`/`is_shutdown`: `reset`, neu verbinden, `get_config`),
+   Klippys `ClockSync` (zyklisch `get_clock`/Uhrabgleich wie `prtouch_lesetest.py`).
+2. `allocate_oids count=1` → `config_prtouch_pres oid=0 idx=0 swp_pin=PA15
+   clk_pin=PB13 sdo_pin=PB14` → `finalize_config crc=4711` → `get_config`
+   (exakt wie Stock/Lesetest, kein apax).
+3. Je Durchlauf (`--wiederholungen N`, Default 3, max. 20):
+   `start_prtouch_pres oid=0 cfg_regs=60 acq_tick=93750 ned_tftr=5 ned_hftr=1000
+   ned_lftr=800 min_hold=4000 max_hold=10000 add_hold=500 lmt_dead=128` (ack) →
+   Pause `arm_settle_s` 0,2 s (≥ Totzeit 0,15 s) → `read_prtouch_pres oid=0 is_src=1
+   ch=0 idx=i len=64−i` mit `i += n` (≈ 8 Abfragen, roh) → dasselbe mit `is_src=0`
+   (gefiltert) → `read_prtouch_pres oid=0 is_src=2 ch=0 idx=0 len=0` (Status
+   `tri_chxs`) → **`stop_prtouch_pres oid=0 sta_swap=1`** (immer, `finally`), danach
+   0,5 s Pause.
+4. Zum Schluss immer `reset` (Düse frisch für Klipper), dann Verbindung zu.
+   Notabbruch nach 60 s (SIGALRM, Reserve-Timer 70 s, auch SIGTERM/SIGINT):
+   `stop_prtouch_pres oid=0 sta_swap=1` → `reset` → JSON → Exit 3. SIGHUP
+   (SSH weg) wird ignoriert.
+
+**Ausgelassen (Main-MCU wird nicht angesprochen):** Signalweg-Test PA15 → PC7
+(`swap_check`, braucht PC7-Lesen an der Main-MCU; auch `sta_swap=0` wird nicht
+gesendet), `cont/start/stop_prtouch_step` (der Kern ruft sie auf, der Shim sendet
+nichts – im JSON unter `ausgelassen`), PC7-Prüfung „noch kein Kontakt“ → ersetzt
+durch den Düsen-Status `tri_chxs = 0` (wie `mode: steps`). Diese Teile prüft erst
+`KTWO_PRTOUCH_READ` unter Klipper.
+
+Ausgabe je Durchlauf (Konsole + `ergebnis_vorabtest.json` neben dem Skript):
+`tick_median_ms`, `filt_max_abs` (Grenze 0,5 × min_hold = 2000), Roh-Spannweite
+`dif` (min/max/n), `rest_ok` mit Fehlertexten, `phase` (`armed` = alles bestanden;
+sonst `start`/`rest`/`pc7`), `swap`/`pc7`-Phase, `disarms`, alle Rohwerte und die
+vollständige Befehlsliste. Exit-Code 0 = alle Durchläufe ok, 2 = Vorabprüfung
+fehlgeschlagen, 1 = Verbindungs-/Config-Fehler (bei Config-Fehler wird keine MCU
+angesprochen), 3 = Notabbruch.
+
+**Bedienung am Drucker** (nach Review; Pfad frei wählbar, hier `/tmp/prtouch`):
+
+```sh
+# 1) Vom Rechner kopieren (beide Dateien in DASSELBE Verzeichnis), z. B.:
+ssh root@<drucker> 'mkdir -p /tmp/prtouch'
+ssh root@<drucker> 'cat > /tmp/prtouch/k2_prtouch.py'        < pi-host/k2_prtouch.py
+ssh root@<drucker> 'cat > /tmp/prtouch/prtouch_vorabtest.py' < pi-host/prtouch_vorabtest.py
+
+# 2) Am Drucker: Klipper stoppen, ttyS3 muss frei sein (Ausgabe leer)
+/etc/init.d/klipper stop
+ls -l /proc/*/fd 2>/dev/null | grep ttyS3
+
+# 3) Vorabtest (Düse frei, nichts berührt die Düse; Dauer ~5–10 s)
+cd /tmp/prtouch
+/usr/share/klippy-env/bin/python prtouch_vorabtest.py --wiederholungen 3; echo "rc=$?"
+
+# 4) Klipper starten UND sofort firmware_restart (sonst Extruder stumm)
+/etc/init.d/klipper start
+curl -s -X POST http://127.0.0.1:7125/printer/firmware_restart
+#    (ohne curl am Drucker: vom Rechner aus
+#     curl -X POST http://<drucker-ip>:7125/printer/firmware_restart)
+
+# 5) Ergebnis zurückholen
+ssh root@<drucker> 'cat /tmp/prtouch/ergebnis_vorabtest.json' > ergebnis_vorabtest.json
+```
+
+Läuft die SSH-Sitzung unzuverlässig: Schritt 3 entkoppelt mit
+`start-stop-daemon -S -b -x /usr/share/klippy-env/bin/python --
+/tmp/prtouch/prtouch_vorabtest.py` starten und nach ~15 s nur das JSON lesen
+(Log steht dort unter `log`).
+
+Erwartung nach Live-Lesetest 16.10.: `tick_median_ms` ≈ 0,79, `dif` ≈ 750–1300,
+`filt_max_abs` ≈ ≤ 1000, `tri_chxs = 0`, `phase = armed`. Abweichungen notieren –
+sie sind die Grundlage für die ANNAHMEN in A.8 (Punkt 4) und B.3.
+
+Offline-Tests `python3 test_prtouch_vorabtest.py` (39): Reihenfolge (start →
+Totzeit → roh → gefiltert → Status → stop), Stock-Parameter, Blocklesen `idx += n`,
+nur Düsen-Befehle (kein `sta_swap=0`, Main-Aufrufe nur protokolliert), 3
+Wiederholungen abwechselnd arm/disarm, Entschärfen bei Sensor ab (−1/5 ms),
+unruhiger Ruhe, `tri_chxs = 1`, ack-Fehler, Lese-Timeout, `KeyboardInterrupt`,
+Entschärf-Fehler; Config-Fehler ohne MCU-Befehl; Defaults = printer.cfg;
+Notabbruch direkt und per echtem SIGALRM; Geräteteil mit Fake-`serialhdl`/
+`clocksync`/`reactor` (Konfig-Folge, reset im `finally`, Reset-Pfad bei
+konfigurierter MCU); Python-3.9-Syntax.
+
 ### Tests gegen echte Upstream-Dateien
 
 `KLIPPER_SRC=/pfad/zu/klipper python3 test_k2_prtouch.py` – ohne die Variable werden die 21 Upstream-Prüfungen übersprungen (geprüft gegen Upstream-Commit 9cb9975).
@@ -456,7 +548,7 @@ richtungsunabhängig; danach Puffer eingefroren (Düse und Main, §4.3).
 | 2 | Bezug: Fenster-Median (≈ 25–50 ms alt) vs. Hochpass (37–49 ms alt) | ähnliche Zeitkonstante, grob vergleichbar (F); Host ohne Ausreißer-/Tiefpassfilter |
 | 3 | Schwelle 3000 roh < Düse 4000–5000 gefiltert | Host löst eher aus als die Düse; Ruhe live 756–1 292 dif → Abstand ~4× (**ANNAHME**, keine Fehlauslösung) |
 | 4 | 2 Samples ohne Steigungsbedingung vs. 3 steigende | Host nimmt 2-Sample-Spitzen als Kontakt, die Düse nie (B Modell §3.5) → mögliche Frühauslösung durch Störspitzen (**ANNAHME**: selten; Richtung fail-safe = zu hoch, kein Crash) |
-| 5 | **Treppen-Effekt (F):** Schritt 0,02 mm, dann Stillstand bis M400 + Lesen | Fenster (50 ms) liegt oft großteils NACH dem Schritt; der Fenster-Median ist dann schon belastet → nur ein Kraftsprung **je Schritt** > 3000 im Fenster zählt. Die Düse passt ihren Hochpass in den Pausen ebenso an (≈ 50 ms) und löst nur bei Sprüngen ≥ 5000 aus. Grobe Schätzung aus live 5 mm/s (≥ ~500 Counts/Sample, 0,0039 mm/Sample): **~2 500 Counts je 0,02-mm-Schritt** – also um die Schwelle. Kleinere Sprünge → weder Host noch Düse erkennen den Kontakt; dann stoppt erst die Notgrenze (fester Ruhe-Nullpunkt, 15 000) → `emergency` ohne Messwert (fail-safe, aber unbrauchbar). **ANNAHME – am Gerät messen**, ggf. `step_mm` 0,05 oder `contact_thresh` anpassen. |
+| 5 | **Treppen-Effekt (F)** – optionales Gegenmittel B.3: Schritt 0,02 mm, dann Stillstand bis M400 + Lesen | Fenster (50 ms) liegt oft großteils NACH dem Schritt; der Fenster-Median ist dann schon belastet → nur ein Kraftsprung **je Schritt** > 3000 im Fenster zählt. Die Düse passt ihren Hochpass in den Pausen ebenso an (≈ 50 ms) und löst nur bei Sprüngen ≥ 5000 aus. Grobe Schätzung aus live 5 mm/s (≥ ~500 Counts/Sample, 0,0039 mm/Sample): **~2 500 Counts je 0,02-mm-Schritt** – also um die Schwelle. Kleinere Sprünge → weder Host noch Düse erkennen den Kontakt; dann stoppt erst die Notgrenze (fester Ruhe-Nullpunkt, 15 000) → `emergency` ohne Messwert (fail-safe, aber unbrauchbar). **ANNAHME – am Gerät messen**, ggf. `step_mm` 0,05 oder `contact_thresh` anpassen. |
 | 6 | Eingefrorener Puffer | Löst die Düse aus, endet das Fenster am Auslösesample (B §4.3) → Host-Auswertung auf demselben Puffer wie Stock; `mcu_triggered`/`mcu_contact` machen Abweichungen sichtbar |
 | 7 | `best_indx`/`can_brk` | Stocks `best_indx` (53–60) stammt aus Stocks eigener Auswertung; Host-`best_indx` (erstes > 3000) ist nicht dasselbe → can_brk-Schranken 53/42/0,040 im Rückfallweg **ANNAHME** |
 | 8 | Notgrenze 15 000 | nur Host (MCU hat keine, B §3.3); Drift über lange Fahrten kann sie früher auslösen (fail-safe) |
@@ -467,6 +559,65 @@ Gerätetest Rückfallweg (nach dem Probe-Weg, allow_move erst danach): `KTWO_PRT
 `KTWO_PRTOUCH_PROBE_STEPS DRY_RUN=1`, dann über leerem Bett mit kleinem
 `max_travel_mm` – im Ergebnis `mcu_triggered`, `best_indx`, `zoft` notieren und
 klippy.log auf `emergency`/`mcu_contact` prüfen.
+
+### B.3 Optionales Treppen-Kriterium `contact_criterion: cumulative` (17.10.2026, ANNAHME)
+
+Gegen B.2 Punkt 5. **Default `window` = bisheriges Verhalten, Code-Pfad unverändert**
+(Ergebnis hat nur zusätzlich `criterion: "window"`). Mit `cumulative` gilt
+**window ODER Treppe**: das Fensterkriterium wird zuerst geprüft (dann gleiches
+Ergebnis wie bisher, inkl. `best_indx`/`zoft`/can_brk); nur wenn es nichts findet,
+wertet der Host die Stufen über mehrere Schritte aus. Es kann also nur früher
+erkennen, nie später; Notgrenze (fester Ruhe-Nullpunkt, 15 000) und `mcu_contact`
+bleiben unverändert und werden vorher geprüft.
+
+Ablauf je Schritt: Stufenpegel = Median der jüngsten 16 Rohwerte (≈ 12,5 ms nach
+M400; Median gegen Einzelspitzen, B.2 Punkt 4). Stufe 0 = Median des Ruhetests.
+Kontakt, wenn die letzten **L ≥ `contact_steps`** (Default 2) Stufen **gleichsinnig**
+um je **≥ `contact_step_min`** (Default 250 Counts) gestiegen sind und die Summe seit
+der letzten unbelasteten Stufe **> `contact_thresh`** (3000) ist. Z = Nullstelle der
+Ausgleichsgeraden Kraft über Fahrweg der Stufen der Folge (lineare Federkennlinie),
+begrenzt auf das Intervall zwischen letzter unbelasteter und erster belasteter
+Stufe; `zoft` = z − aktuelle Höhe, `can_brk` entfällt (Schranken beziehen sich auf
+`best_indx`), Ergebnisfelder `cum_run_len`, `cum_total`, `cum_slope_per_mm`, `cum_levels`.
+
+Warum dieser Bezug (aus den Befunden):
+
+- **Nicht der feste Ruhe-Median als Kontaktbezug:** Ruhe driftet live bis 2 397
+  Counts (Fingertest, 24 s + 19 s) und nach Belastung bleibt ein Restversatz ≈ 6 000
+  (LESETEST-BEFUND §6) – bei bis zu 250 Schritten (5 mm / 0,02) über viele Sekunden
+  läge der feste Bezug bald um die Schwelle 3000 daneben → Fehlkontakt (zu hoch).
+  Auch die Düse selbst nutzt bewusst einen **gleitenden** Bezug (Hochpass 37–49 ms,
+  MCU-Befund §3.2). Der feste Ruhe-Nullpunkt bleibt nur für die **Notgrenze**
+  (fail-safe Richtung).
+- **Stattdessen Bezug = Stufe vor dem Anstieg + kumulierte Steigung:** Eine
+  Kontakt-Treppe steigt **je Schritt** gleichsinnig (Schätzung B.2 Punkt 5: ~2 500
+  Counts je 0,02 mm), Drift dagegen ~100 Counts/s ≈ 10–15 Counts je Schritt,
+  Ruherauschen eines 16er-Medians ≈ ±100 (aus dif 756–1 292 roh). Die Bodenschwelle
+  250 je Stufe trennt beides; die Summe > 3000 hält dieselbe Empfindlichkeit wie das
+  Fensterkriterium. Analog zur Düse („3 nicht fallende Samples“, §3.3), nur auf dem
+  Schrittraster.
+- `contact_steps` 2 statt 3: bei ~2 500/Schritt erkennt 2 nach zwei Stufen (Summe
+  5 000) – mit 3 wären es 7 500, und bei steileren Treppen (≥ 7 500/Schritt) käme
+  die Notgrenze 15 000 zuvor. Einzelne Ausreißerstufen (eine Stufe hoch, wieder
+  zurück) erfüllen die Folge nicht (Test).
+
+**ANNAHMEN (am Gerät messen):** Stufenhöhe je Schritt (~2 500), Rauschen des
+16er-Medians, Drift während einer Fahrt, lineare Kennlinie für die Z-Interpolation,
+`contact_step_min` 250 und `contact_steps` 2. Grenzen: Treppen < 250 Counts/Schritt
+erkennt auch `cumulative` nicht (dann Notgrenze → `emergency`); eine Drift ≥ 250
+Counts **je Schritt** über mehrere Schritte wäre von Kontakt nicht zu unterscheiden.
+Gerätetest wie B.2 (leeres Bett, kleines `max_travel_mm`), einmal mit `window`, einmal
+mit `cumulative`; `cum_levels` und `criterion` im Ergebnis vergleichen.
+
+Tests (23, „treppe“): `window` auf einer 2 500er-Treppe → `emergency` (Effekt
+nachgestellt), Sprung im Fenster: `cumulative` = `window` (gleiches z/Schritte);
+`cumulative` bei z_true 0,05/0,047/0,0333: Fehler < 0,003 mm, Überfahrweg ≤ 3
+Schritte, Entschärfen vor dem Anheben; Vorzeichen egal; 1 000/Schritt → Folge 4;
+`contact_steps 3`; steile Treppe → Notgrenze zuerst; `tri_chxs` ohne Host-Kontakt →
+`mcu_contact`; Drift 100/Schritt über 50 Schritte, Einzelstufe, Stufenrauschen ±400 →
+kein Fehlkontakt; Ausnahme im Schritt → entschärft; reine Funktion (Nullstelle,
+Begrenzung, Summe/Mindestlänge), Config-Prüfung, `parse_klipper_config`,
+`describe_plan`.
 
 ---
 

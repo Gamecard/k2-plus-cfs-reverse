@@ -115,7 +115,7 @@ LONG_HINT = {box.FUNC_SET_PRE_LOADING: 60, box.FUNC_EXTRUDE: 15,
 
 SEV_INFO, SEV_WARN, SEV_ERR = 0, 1, 2
 
-# --- Log-Zeilen-Muster (nach /tmp/claude-0/livelog-cfs/parse.py) ---
+# --- Log-Zeilen-Muster (nach <arbeitsordner>/livelog-cfs/parse.py) ---
 R_TS = re.compile(r"^\[(\w+)\] (\d{4}-\d\d-\d\d \d\d:\d\d:\d\d,\d{3}) "
                   r"\[\w+\] \[([^\]]*)\] (.*)$")
 R_TX = re.compile(r"retries = (\d+), cmd = ((?:0x[0-9a-fA-F]+ ?)+)\s*$")

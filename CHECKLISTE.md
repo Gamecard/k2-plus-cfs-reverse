@@ -77,8 +77,11 @@ Audit und Änderungsbegründungen: `<projekt>/AUDIT-UND-AENDERUNGEN.md`.
 - [x] `box.py` (Subagent, verifiziert): ParseData-vollständig (rfid/remain/wheel/
   box-state/version-sn/buffer/hw-status, ~~50/50~~ ~~68/68~~ **101 Checks** Stand 15.10.2026 nach Ghidra-Einarbeitung), BoxState-Tn-Modell,
   BoxAction-Step-Builder; Unbelegtes (Dryer, force-Flag) als TODO markiert
-- [ ] `filament_rack.py` vollständig: FilamentRackWrapper (send_data, blow, beep,
-  check_rfid_valid, Material-Temps/Speeds, Heating-Waits) – braucht Rack-Hardware
+- [x] `filament_rack.py` STATISCH ERLEDIGT 17.10.2026 (Selbsttest 83/83, FILAMENT-RACK-BEFUND-2026-10-17.md):
+  RFID-Leser an 485-Adresse 0x11 (Request F7 11 03 FF 02 64, Auslöser !PA5), Material-Temp/-Speed (Vol/2.4·60 live
+  bestätigt), Heating-Wait, blow/beep/fan; Senden gesperrt. Stock-Bug: max_temp_flush_times minval=300.
+- [ ] Rack-Hardware am Gerät nicht nachweisbar (keine rfid/data_send-Zeilen in klippy.log 05.–16.10.) – Sichtprüfung;
+  offen: Antwort-Status/-Funktion, Retry-Default, material_database.json, flush (Stub, hängt an BoxAction)
 - [x] `motor_mini.py`: ~~read_encoder (0x06)~~, set_mode (0x11), query_version (0xf0/0x00) –
   Selbsttest ok ~~(dabei Doku-Fehler repariert: Big-Endian 38467→51266)~~
   **WIDERLEGT 15.10.2026:** 0x06 ist kein Encoder-Lesen, sondern vermutlich
@@ -129,7 +132,7 @@ Audit und Änderungsbegründungen: `<projekt>/AUDIT-UND-AENDERUNGEN.md`.
 - [x] **Pi vorbereitet (16.10.2026):** CM5, MainsailOS (Debian 13, aarch64, Python 3.13), Klipper per Update-Manager
   auf Upstream 9cb9975 (= geprüfter Stand); auf dem Pi: Batch-Prüfung config-pi EXIT 0, alle 6 Test-Suiten grün
   (Testordner ~/k2-test, NICHT installiert; Klipper-Checkout unverändert)
-- [ ] Pi am Drucker: Lower-Board-Verbindung (UART Main/Düse + USB-RS485), by-id-Namen ermitteln, Module nach
+- [ ] Pi am Drucker (Paket fertig 17.10.2026: pi-host/install/, pack.sh → install.sh, Attrappe Ende-zu-Ende grün): Lower-Board-Verbindung (UART Main/Düse + USB-RS485), by-id-Namen ermitteln, Module nach
   config-pi/README §3 installieren, Inbetriebnahme §4 (erst ohne Bewegung)
 - [~] A10 z_align-Vergleich am Gerät (Dual-Z ohne Lichtschranken stabil?) – OFFLINE VORBEREITET 17.10.2026:
   Analyse + Testprotokoll T0–T8: pi-host/config-pi/NOTIZ-zalign.md. zalign.cfg Variante L aktiv (lesend,
@@ -576,7 +579,8 @@ box 179 · boxmini 17 · cfsseq 28 · motor 134 · motor_mini 43 · auto_addr 33
   pres_idx 0), arm_settle_s ≥ 1,5 × max(lmt_dead,128)/Rate (Stock 0,15 s), Mindestgeschwindigkeit 2,5 mm/s (ANNAHME),
   Ruhetest mit Tickabstand/−1/24 Bit/gefiltertem Kanal, Blocklesen idx += n, Endstop ^!PC7 (Pull-Up wie Stock-Endzustand;
   Batch: config_endstop PC7 pull_up=1). test_k2_prtouch 248/248. KTWO_PRTOUCH_READ macht jetzt die Vorabprüfung (scharf → Ruhe → entschärft).
-- [ ] PrTouch am Gerät: KTWO_PRTOUCH_READ (Vorabprüfung) – tick_median_ms/filt_max_abs notieren; nach erster Antastung
+- [~] PrTouch Vorabprüfung am Stock-Gerät ERLEDIGT 17.10.2026 (prtouch_vorabtest.py, 3/3 OK: tick 0,791 ms, filt_max_abs ≤ 497,
+  Roh-Spannweite ≤ 1 002; PRTOUCH-VORABTEST-BEFUND-2026-10-17.md). Am Pi noch: KTWO_PRTOUCH_READ inkl. PC7-Signalweg; nach erster Antastung
   eingefrorenes Register is_src 0/1 lesen → Rampe Counts/Sample bei 5 mm/s → Mindestgeschwindigkeit/rest_filt_max_frac nachschärfen.
 - [x] k2_prtouch `mode: steps` – BEHOBEN 17.10.2026: nutzt jetzt K2PrtouchProbeCore arm()/disarm()/preflight() wie der
   Probe-Weg (scharf → Totzeit → Ruhetest → Schritte → finally disarm → Anheben), Kontakt im scharfen Zustand per
