@@ -13,6 +13,14 @@
 > Wechsel, Schneidbereich nur in X, PAUSE_STATE-Neusetzung. Offline geprüft:
 > `arbeitsdateien-lokal/upstream-test-resumecut/` (7 Läufe, 83 Prüfungen,
 > 0 Fehler), a45-Batch weiter 0 Fehler, `test_k2_box.py` 28/28.
+>
+> **Ergänzung 17.10.2026 spät (§6a.7–§6a.9):** RESUME nach abgebrochenem
+> CFS-Wechsel ist GESPERRT, solange der Kopf-Filamentsensor leer meldet
+> (sonst druckte RESUME „Luft“); optional (`[k2_box] resume_redo_change`,
+> Default AUS) holt RESUME den abgebrochenen T<n>-Wechsel nach wie Stock
+> `error_resume_process`. Bewusste Abweichungen vom Stock mit Belegen aus
+> `BOOTLOADER-HOST-BEFUND-2026-10-17.md` §5: §6a.8. Offline: resumecut-Batch
+> 11 Läufe / 151 Prüfungen, a45-Batch 0 Fehler, `test_k2_box.py` 34/34.
 
 ## 1. Was wo passiert
 
@@ -24,7 +32,7 @@
 | `macros.cfg` `START_PRINT` | Reinigung vor dem zweiten `G28 Z`; am Ende über dem Schacht auf Drucktemperatur, dann abstreifen |
 | `macros.cfg` `G29` | Reinigung zwischen `Z_TILT_ADJUST` und dem letzten `G28 Z` |
 | `macros.cfg` `PAUSE` | merkt zusätzlich die Pausenposition (`pause_x/y/z`); seit 17.10. `CFS_RETURN_X/Y/Z` (Rückfahrziel aus k2_box, `pause_rebase`), verlässt Schneidbereich (nur X) bzw. Schacht (X160 → Y345) vor dem Parken (§6a) |
-| `macros.cfg` `RESUME` | ruft `_PI_RESUME_PREPARE` (nur wenn pausiert), Lüfter zurück, dann `RESUME_BASE` + `KTWO_BOX_RESUME_FIX` |
+| `macros.cfg` `RESUME` | ruft `_PI_RESUME_PREPARE` (nur wenn pausiert), Lüfter zurück, dann `RESUME_BASE` + `KTWO_BOX_RESUME_FIX`; seit 17.10. spät nach einem CFS-Abbruch (`k2_box.change_aborted`) zuerst `KTWO_BOX_RESUME_CHECK MOVE=0\|1` (§6a.7) |
 | `macros.cfg` `_PI_RESUME_PREPARE/_PRIME/_RETURN` | **neu**: Schacht → `M109` → Vorextrusion → Abkühlen → Abstreifen → Schacht verlassen → Rückfahrt (X/Y in Pausenhöhe, dann Z senkrecht) |
 | `macros.cfg` `_PI_RESUME_REBASE` | **neu 17.10.**: nach CFS-Abbruch PAUSE_STATE an der erreichten Druckposition neu speichern (§6a) |
 | `homing.cfg` `[homing_override]` | `_PI_NOZZLE_CLEAN WHY=G28` vor dem ersten Z-Antasten (nur wenn Z noch nicht referenziert) |
@@ -159,6 +167,9 @@ danach neu gesetzt (§6a); Ziel am Schneidhebel → RESUME verweigert.
 ### 4.3 Ablauf `RESUME` (nur wenn pausiert)
 
 1. `chain_error` offen → `RESUME gesperrt …` (unverändert).
+1a. (17.10. spät) Pause aus einem abgebrochenen CFS-Wechsel
+   (`k2_box.change_aborted`): `KTWO_BOX_RESUME_CHECK MOVE=1|0` VOR jeder
+   Bewegung – Kopfsensor leer → RESUME gesperrt bzw. Nachholen (§6a.7).
 2. `_PI_RESUME_PREPARE` – Voraussetzungen: X/Y/Z referenziert,
    `_PI_FREIGABE allow_move`, `[k2_box]` mit `allow_move`, Pausenposition
    bekannt. Sonst nur `M109 S<Pausentemperatur>` + Meldung, Rückweg über
@@ -271,7 +282,7 @@ aus Hebel/Schacht heraus (`G1 X342,5 Y200`).
 | `…/box.cfg:273-274` (T0-Beispiel 13.) | „Z wiederherstellen (oder zurück zum Modell, **dann** Z)“ |
 | `…/gcode_macro.cfg:759-775` | Stock-PAUSE: `M400`, Rückzug, Z-Hub, dann `BOX_GO_TO_EXTRUDE_POS` / `BOX_NOZZLE_CLEAN` / `BOX_MOVE_TO_SAFE_POS` (nicht schräg zum Parkpunkt) |
 | `…/gcode_macro.cfg:870-881` | Stock-RESUME: `RESUME_EXTERNAL_PROCESS` → `BOX_ERROR_RESUME_PROCESS` → `RESUME_EXTERNAL` → `RESUME_BASE` |
-| `box_wrapper.cpython-39.so` (strings) | `save_resume_tnn`, `clear_resume_tnn`, `resume_flag`, `[error_resume_process] state is not paused` / `resume_tnn is None` / `filament sensor is detected` → Stock merkt sich die TNN des abgebrochenen Wechsels und holt ihn beim RESUME nach (**ANNAHME** nach Strings, Ablauf nicht dekompiliert) |
+| `box_wrapper.cpython-39.so` (strings) | `save_resume_tnn`, `clear_resume_tnn`, `resume_flag`, `[error_resume_process] state is not paused` / `resume_tnn is None` / `filament sensor is detected` → Stock merkt sich die TNN des abgebrochenen Wechsels und holt ihn beim RESUME nach – seit 17.10. spät **belegt** (Disassembly, `BOOTLOADER-HOST-BEFUND-2026-10-17.md` §5.1/§5.2, s. §6a.8) |
 | `klippy.log.2026-10-12:51987-51988`, `klippy.log.2026-10-05:66249`, `klippy.log.2026-10-12:88007` | `error: empty_print, tnn: T1A` → `set resume_flag`; RESUME: `[error_resume_process] resume_tnn is None` bzw. `filament sensor is detected` – **kein** Log eines Fehler-Resume mit Rückfahrt aus dem Schneidbereich → Stock-Rückfahrziel nach Box-Fehler **unbelegt** |
 
 ### 6a.3 Lösung (gewählt: Startposition als Rückfahrziel + Schneidbereich nur in X)
@@ -364,9 +375,150 @@ a45-Prüfungen unverändert grün (Bahn + Render 0 Fehler).
 - **SET_GCODE_OFFSET während einer CFS-Pause:** PAUSE_STATE-Basis gilt wie
   bei Upstream-RESUME; die Korrektur erfolgt mit dem nächsten Druckbefehl
   statt in RESUME_BASE (Rebase ohne Fahrt).
-- **Stock-Gleichwertigkeit:** Stock holt den Wechsel beim RESUME evtl. selbst
-  nach (`resume_tnn`); hier weiter von Hand (`T<n>` in der Pause), dann
-  `KTWO_BOX_ERROR_CLEAR` + `RESUME` (NOTIZ-cfs.md §3).
+- ~~**Stock-Gleichwertigkeit:** Stock holt den Wechsel beim RESUME evtl.
+  selbst nach (`resume_tnn`); hier weiter von Hand …~~ – **geklärt 17.10.
+  spät:** Stock holt nach (BOOTLOADER-HOST-BEFUND §5.2, B); Pi sperrt RESUME
+  bei leerem Kopf und holt optional nach (§6a.7, Abweichungen §6a.8).
+  Reihenfolge von Hand: `KTWO_BOX_ERROR_CLEAR` → `T<n>` → `RESUME` (ein
+  `T<n>` bei offenem Fehler lehnt PRE_OPT ab).
 - **Am Gerät (Hand am Not-Aus):** Abbruch im Schacht provozieren (z. B. Box
   stromlos während `T1`), Parkweg und RESUME-Bahn beobachten; Hebelfall nur
   mit `KTWO_BOX_CUT` außerhalb eines Drucks + manuellem `G1 X10` prüfen.
+
+### 6a.7 RESUME-Sperre bei leerem Kopf + optionales Nachholen (17.10.2026 spät)
+
+> **ENTWURF – am Gerät UNGETESTET. Alles weiter gesperrt ausgeliefert**
+> (`[k2_box] allow_write/allow_move: False`, `resume_redo_change: False`).
+
+**Problem.** Nach einem abgebrochenen Wechsel kann der Kopf leer sein
+(Filament geschnitten/zurückgezogen, das neue noch nicht geladen). Nach
+`KTWO_BOX_ERROR_CLEAR` lief RESUME bisher normal weiter – ohne Filament
+(„Luft“), falls niemand `T<n>` in der Pause wiederholt hatte. Stock holt den
+Wechsel in diesem Fall selbst nach (BOOTLOADER-HOST-BEFUND §5.2).
+
+**Umsetzung (`k2_box.py`, `macros.cfg`):**
+
+1. `_fail` (Pausenpfad im Druck) merkt den Abbruch: Schritt, Ziel-TNN,
+   Herkunft der Kette (`_record_abort`, Stock `recode_err` →
+   `save_resume_tnn`). Status: `change_aborted`, `resume_tnn`,
+   `head_filament` (True/False/None), `resume_redo_change`. Ein
+   Einzelschritt ohne eigene TNN in derselben Pause behält Ziel und
+   Herkunft; die Ablehnung eines `T<n>` bei offenem Fehler (PRE_OPT tut
+   nichts) überschreibt sie nicht. Lebensdauer: bis zum Ende eines
+   erfolgreichen RESUME (`KTWO_BOX_RESUME_FIX` ohne CLEAR) bzw. bis zu einer
+   NEUEN Pause, die nicht aus `_fail` stammt (`RESUME_FIX CLEAR=1` aus dem
+   PAUSE-Makro, Marker `_pause_from_fail`) – kein veralteter Merker nach
+   CANCEL/neuem Druck.
+2. Herkunft: `_KTWO_TOOL_CHANGE` ruft `KTWO_BOX_PRE_OPT … SOURCE=T`. Nur
+   diese Kette (T<n>-Befehl) ist nachholbar – Stock setzt `resume_tnn` nur
+   für Fehler im T<n>-Pfad, nicht für die M8200-Kette (`macro_error_list`,
+   BEFUND §5.1). M8200-Kette/Runout/von Hand: Herkunft leer.
+3. RESUME-Makro: ist `printer.k2_box.change_aborted` gesetzt (und der Druck
+   pausiert), zuerst `KTWO_BOX_RESUME_CHECK MOVE=<1|0>` – VOR
+   `_PI_RESUME_PREPARE` (das rendert erst danach) und vor jeder Bewegung.
+   `MOVE=1` nur mit `_PI_FREIGABE allow_move`, X/Y/Z referenziert und
+   bekannter Pausenposition (= PREPARE darf danach fahren). Ohne Abbruch
+   bzw. nicht pausiert: kein Prüfbefehl, Ablauf unverändert.
+4. `KTWO_BOX_RESUME_CHECK` liest den Kopfsensor wie k2_box überall:
+   Upstream-`[filament_switch_sensor <filament_sensor>]` → `get_status()
+   ["filament_detected"]` (`_sensor_state`). Upstream setzt diesen Zustand
+   auch bei `SET_FILAMENT_SENSOR ENABLE=0` (`filament_switch_sensor.py`
+   `note_filament_present`: `filament_present` wird VOR der
+   `sensor_enabled`-Prüfung gesetzt) – B (Quelltext 9cb9975).
+   - **Filament erkannt** → RESUME frei (Meldung; ob es das Ziel-Filament
+     ist, prüft der Pi nicht – Stock ebenso, §5.2 Schritt 6).
+   - **leer** → `RESUME gesperrt nach abgebrochenem CFS-Wechsel (<Schritt>
+     fehlgeschlagen; Ziel T1B = T1): Kopf-Filamentsensor … meldet KEIN
+     Filament … Druck bleibt PAUSIERT. In der Pause nachholen: T1 (lädt
+     T1B), dann RESUME. Kein automatisches Nachholen: <Grund>.` Bei offener
+     M8200-Kette zusätzlich: `KTWO_BOX_EXTRUDE TNN=…` als Kettenschritt.
+   - **unbekannt** (`filament_sensor` leer bzw. Abschnitt fehlt) →
+     **gesperrt** (sicherer Default: nach einem Abbruch ist offen, ob
+     Schnitt/Rückzug den Kopf geleert haben; ein gesperrtes RESUME ist
+     harmlos, „Luft“ ruiniert den Druck unbemerkt). Freigabe nur von Hand
+     nach Sichtprüfung: `KTWO_BOX_ERROR_CLEAR HEAD_LOADED=1` (wirkt NUR ohne
+     Sensorzustand; meldet der Sensor „leer“, wird die Bestätigung
+     abgelehnt). Nachholen ohne Kopfsensor nie (Stock prüft ihn ebenso).
+5. **Nachholen** (nur `resume_redo_change: True` UND `allow_write` UND
+   `allow_move` UND `MOVE=1` UND Herkunft T UND Ziel-TNN bekannt UND keine
+   offene Kette UND referenziert – sonst Sperre wie 4. mit Grund):
+   `KTWO_BOX_PRE_OPT TNN=<Ziel> Z_HOP=0 SOURCE=T` → Schacht + `M400` +
+   Heizen (TEMP = max(Drucktemperatur vor der Pause, `Tn_extrude_temp` 220),
+   wie Runout) → `KTWO_BOX_RETRUDE` (nur wenn der Hub belegt ist; heiße Düse
+   für die E−10-Schritte) → `KTWO_BOX_EXTRUDE` → `KTWO_BOX_WASTE` →
+   `KTWO_BOX_FLUSH` → `KTWO_BOX_END_OPT RETURN=0`. Kein Schnitt (Kopf ist
+   leer – Stock ebenso). Danach muss der Kopfsensor Filament melden; dann
+   weiter wie jedes RESUME (`_PI_RESUME_PREPARE`: Schacht, M109,
+   Vorextrusion, Abstreifen, Rückfahrt, Rebase = Stock `RESUME_EXTERNAL`).
+   Jeder Fehler → `chain_error` (keine zweite Pause), `RESUME gesperrt:
+   Nachholen des Wechsels … fehlgeschlagen … keine Rückfahrt` (= Stock
+   `resume_err`); Merker bleibt, das nächste RESUME holt nach
+   `KTWO_BOX_ERROR_CLEAR` erneut nach.
+6. Nebenbei korrigiert: Anleitung in der `_fail`-Meldung und in der
+   `chain_error`-Sperre des RESUME-Makros – richtig ist **erst
+   `KTWO_BOX_ERROR_CLEAR`, dann `T<n>`**, dann RESUME (PRE_OPT lehnt ein
+   `T<n>` bei offenem Fehler ab; vorher stand die umgekehrte Reihenfolge).
+
+**Entscheidung zu „Nachholen“:** umgesetzt, Default AUS. Begründung: die
+Bausteine sind dieselben wie beim Runout-Nachladen (PRE_OPT Z_HOP=0 in der
+Pause → EXTRUDE → FLUSH → END_OPT, `test_k2_box`/Batch `upstream-test-runout`
+geprüft); neu sind nur Gate, Heizschritt und Ergebnisprüfung (~150 Zeilen).
+Jeder Fehler lässt den Druck pausiert und sperrt RESUME; Bewegung nur
+Schacht/Abstreifen in Pausenhöhe (wie RESUME_PREPARE ohnehin). Nicht
+nachholbar (bewusst): M8200-Kette (die Datei schickt nach RESUME selbst
+`M8200 L/F/O`), Runout-Kette, Einzelschritte – dort nur die Sperre.
+
+### 6a.8 Bewusste Abweichungen vom Stock (Belege `BOOTLOADER-HOST-BEFUND-2026-10-17.md` §5)
+
+| Punkt | Stock (Beleg) | Pi | Begründung |
+|---|---|---|---|
+| Rückfahrziel | `BoxError.handle_event` @`0x1c3ca4`: `G91 / G0 Z-{move_z} / G90` (Hop zurück) → `BOX_MOVE_TO_SAFE_POS` (@`0x1184e0`: **erst `G0 Y345`, dann `G0 X225`**) → `PAUSE` → PAUSE_STATE = **X225/Y345 auf Druck-Z** (§5.1, B); `RESUME_BASE` fährt gerade dorthin (§5.3, **ANNAHME**: wie Upstream) | **Druckposition vor dem Wechsel** (`PAUSE CFS_RETURN_X/Y/Z`), X/Y in Pausenhöhe, Z senkrecht, PAUSE_STATE dort neu (§6a.3) | Stock senkt die Düse bei X225/Y345 auf Druck-Z und der nächste Slicer-Befehl fährt von dort auf Druck-Z zum Objekt (BEFUND §5.3 V: Kollisionsgefahr). Pi kehrt dorthin zurück, wo `T<n>` begann – konservativer. |
+| Ausstieg Schneidbereich | kein Sonderfall: Z zuerst zurück auf Druck-Z, dann **Y zuerst**, dann X (§5.1/§5.4) | Schneidbereich (X < `pre_cut_pos_x` 10) **nur in X**, vor Rückzug und Z-Hub | Einziger Beleg zum Hebel ist `box.cfg:13` `pre_cut_pos_x` „预撞刀的位置，保证垂直撞刀“ (Hebel senkrecht anfahren) + Schnitt-Rückweg `G0 X10`; eine Y-Fahrt am Hebel ist unbelegt (§5.4: „im Stock-Fehlerpfad kein Beleg“) → vorsichtiger. |
+| Ausstieg Schacht | Z-Hop zurück auf Druck-Z, dann Y345, X225 (§5.1) | erst Z-Hub (Pausenhöhe), dann X160 → Y345 (T0-Beispiel 11), dann Park | Kopf nie auf Druck-Z quer über das Bett. |
+| Nachholen | **automatisch** in `RESUME` → `BOX_ERROR_RESUME_PROCESS` (`error_resume_process` @`0x7cd28`): CFS an, pausiert, `resume_tnn` gesetzt, Kopfsensor **leer** → `go_to_extrude_pos`, `box_retrude_material`, `box_extrude_material`, `extruder_extrude`, `material_change_flush`; Kopfsensor belegt → nichts (live `12:88007`); Fehler → `resume_err` (§5.2, B) | Kopf leer → **RESUME gesperrt** (Default); Nachholen nur mit `resume_redo_change: True` + Freigaben (§6a.7) | Default aus wie jede neue Bewegungsfunktion bis zur Gerätefreigabe; die Sperre allein verhindert schon den Druck ohne Filament (BEFUND §5.4 Empfehlung 4). |
+| Fehler quittieren | `error_resume_process` Schritt 5 `clear_err()` – RESUME quittiert selbst (§5.2) | `KTWO_BOX_ERROR_CLEAR` bleibt Pflicht vor RESUME | bewusste Quittung nach Ursachenbehebung (Box-Fehler 0x04 [00 01]). |
+| Nachholen-Umfang | nur T<n>-Pfad (`resume_tnn` nur, wenn der Fehler nicht in `macro_error_list` steht = M8200-Kette) (§5.1, B) | gleich: nur Herkunft `SOURCE=T`; M8200-Kette/Runout/Einzelschritt nur Sperre | M8200: die Datei schickt nach RESUME die restlichen Kettenbefehle selbst. |
+| Kopfsensor unbekannt | unbelegt (Stock hat ihn immer) | gesperrt bis `KTWO_BOX_ERROR_CLEAR HEAD_LOADED=1` | sicherer Default (§6a.7 Punkt 4). |
+
+### 6a.9 Nachweis (offline) und ANNAHMEN
+
+- `pi-host/test_k2_box.py` 34/34 (6 neue Prüfungen): Kopf leer → gesperrt
+  (keine Bewegung, kein Box-Frame, Meldung „T0 (lädt T1A)“), `HEAD_LOADED`
+  gegen „leer“ abgelehnt, nach `T0` in der Pause frei; Kopf voll → frei;
+  Sensor fehlt/leer konfiguriert → gesperrt, `HEAD_LOADED=1` gibt frei;
+  Merker-Lebensdauer (PAUSE aus `_fail`, abgelehnte PRE_OPT, Einzelschritt,
+  neue Pause, RESUME-Ende, ohne Druck); Nachholen (PRE_OPT Z_HOP=0 → Schacht
+  → M109 235 → Rückzug A mit heißer Düse → Einzug A → Stage 7/m7/PRINT →
+  Spülen → raus, kein Schnitt/Z/Rückfahrt) inkl. Fehlerfall; alle
+  Nachhol-Sperrgründe; RESUME-Makro rendert `KTWO_BOX_RESUME_CHECK MOVE=1/0`
+  nur nach Abbruch. Nebenbei: Test-Helfer `_render_env` las `[k2_box]` aus
+  einem Kommentar (kcfg leer) – korrigiert, Render jetzt mit echten Werten.
+- Batch `arbeitsdateien-lokal/upstream-test-resumecut/` (11 Läufe, 151/151):
+  `lauf-kopfleer` (Kopf leer → RESUME verweigert, nach dem Park keine
+  Bewegung, Extruder nur +1/−3, EXIT 255 gewollt), `lauf-redo` (Nachholen:
+  Park → Schacht in Z50, Box antwortet nicht → verweigert, danach keine
+  Bewegung, keine zweite Pause), `lauf-ohnesensor` (verweigert, „UNBEKANNT“),
+  `lauf-ohnesensor-ok` (`HEAD_LOADED=1` → RESUME normal bis X110/Y120/Z10);
+  schnitt/schacht/wiederholung/sperre mit Kopf voll unverändert grün
+  („RESUME frei“). Kopfsensor im Batch per TEST-Hook `KTWO_TEST_HEAD`.
+  a45-Batch unverändert 0 Fehler; Gesamtlauf-Kopie
+  `upstream-test-resume2-gesamt/` Fehlerbild wie bisher.
+- **ANNAHME:** Der Kopfsensor PA11 meldet „leer“, sobald das Filament nach
+  dem Abbruch aus dem Kopf ist; nach einem Schnitt OHNE Rückzug steckt das
+  obere Stück noch im Sensor → „voll“ → RESUME frei (wie Stock §5.2
+  Schritt 6). Lage des Sensors relativ zu Schneider/Zahnrädern unbelegt.
+- **ANNAHME:** Nachhol-Temperatur max(Drucktemperatur vor der Pause, 220)
+  statt Stock-Materialtemperatur aus RFID; Rückzug nur bei belegtem Hub
+  (Stock ruft `box_retrude_material` immer – bei leerem Hub gleichwertig).
+- **ANNAHME:** Kopf voll ≠ Ziel-Filament geladen (z. B. Schnitt gescheitert):
+  RESUME druckt mit dem alten Filament weiter (Stock ebenso) – vorher von
+  Hand `T<n>`.
+- **Beobachtung (nicht geändert):** `PAUSE` merkt `hotend_temp` =
+  Extruder-Ziel beim Abbruch; hatte die Kette schon geheizt, ist das
+  max(Drucktemperatur, 220) – RESUME heizt dann darauf statt auf die
+  Drucktemperatur (END_OPT nach Fehler stellt das Ziel nicht zurück).
+  Vorschlag: `_fail` übergibt `orig_target` an PAUSE.
+- **Am Gerät (Hand am Not-Aus):** Abbruch im Schacht provozieren (Box
+  stromlos während `T1`), dann Kopf leeren (Filament von Hand ziehen) →
+  RESUME muss verweigern; `T1` in der Pause → RESUME läuft. Nachholen erst
+  nach erfolgreichen Einzelschritten (NOTIZ-cfs.md §2) testen.

@@ -29,6 +29,10 @@ Filamentwechsel (Ergänzung 16.10.2026, Belege README-k2_box.md §8):
 20.-24. Auto-Nachladen bei Runout (A7): Slot-Wahl, Ablauf, Pausenpfade,
     Befehle AUTO_REFILL/SAME_MATERIAL, Config (printer.cfg/k2-module.cfg).
 25. Python-3.9-Syntax.
+RESUME nach abgebrochenem Wechsel (17.10.2026 spät, BOOTLOADER-HOST-BEFUND §5):
+Kopf leer -> gesperrt / voll -> frei, Kopfsensor fehlt -> gesperrt bis
+HEAD_LOADED=1, Abbruch-Merker (Ziel-TNN), Nachholen (resume_redo_change)
+inkl. Fehlerfall + Sperren, RESUME-Makro ruft KTWO_BOX_RESUME_CHECK.
 
 Fakes:
 - FakeBoxBus: simuliert Box-Zustände (IDLE/PRELOAD/PRINT/ERROR), Hub-Maske,
@@ -1127,10 +1131,14 @@ def build_hull(**opt_over):
     return bus, printer, mod
 
 
-def run_chain(mod, tnn, ret=1):
-    """Kette wie macros.cfg _KTWO_TOOL_CHANGE (T-Befehl) -> alle Antworten."""
+def run_chain(mod, tnn, ret=1, source="T"):
+    """Kette wie macros.cfg _KTWO_TOOL_CHANGE (T-Befehl, SOURCE=T) -> alle
+    Antworten. source="" = Kette wie M8200/von Hand (kein Nachholen)."""
     infos = []
-    for fn, params in ((mod.cmd_pre_opt, {"TNN": tnn}), (mod.cmd_cut, {}),
+    pre = {"TNN": tnn}
+    if source:
+        pre["SOURCE"] = source
+    for fn, params in ((mod.cmd_pre_opt, pre), (mod.cmd_cut, {}),
                        (mod.cmd_retrude, {}), (mod.cmd_extrude, {"TNN": tnn}),
                        (mod.cmd_waste, {}), (mod.cmd_flush, {"TNN": tnn}),
                        (mod.cmd_end_opt, {"RETURN": str(ret)})):
@@ -1481,7 +1489,9 @@ def _render_env():
     kcfg = {}
     sec = open(os.path.join(_HERE, "config-pi", "k2-module.cfg"),
                encoding="utf-8").read()
-    a = sec.index("[k2_box]")
+    # Abschnittskopf am Zeilenanfang (Fix 17.10. spät: "[k2_box]" steht
+    # vorher schon in einem Kommentar -> kcfg war leer, Render nur Defaults)
+    a = sec.index("\n[k2_box]\n") + 1
     for ln in sec[a:sec.index("\n[", a + 1)].splitlines()[1:]:
         if ":" in ln and not ln.startswith("#"):
             k, v = ln.split(":", 1)
@@ -1684,6 +1694,308 @@ def test_makros_resume_schneidbereich():
             "RETURN (Ziel Bettkante, vom Hebel, chain_error), REBASE, CLEAN_PATH")
 
 
+# =====================================================================
+# RESUME nach abgebrochenem Wechsel: Kopfsensor-Sperre / Nachholen
+# (17.10.2026 spät, BOOTLOADER-HOST-BEFUND §5, NOTIZ-reinigung-resume.md
+# §6a.7, README-k2_box.md §11, Batch upstream-test-resumecut)
+# =====================================================================
+
+def _hull_abort_leer(source="T", **over):
+    """Druck mit T1B (Hub B, Kopf voll) -> T0 (= T1A): Schnitt + Rückzug B
+    laufen (Kopf danach LEER), Einzug A bricht mit 0x0c ab -> _fail ->
+    PAUSE. "PAUSE" ruft wie das Makro KTWO_BOX_RESUME_FIX CLEAR=1."""
+    bus, printer, mod = build_hull(allow_write="True", **over)
+    bus.hub_mask, bus.head = 0x02, True
+    bus.fail_after_mm = 100.0
+    bus.need_extruder_for_mode7 = True
+    printer.objects["gcode_macro _PI_PARAM"] = _Obj({"hotend_temp": 235.0})
+
+    def fake_pause(g):                       # = macros.cfg PAUSE (Kern)
+        printer.sim("PAUSE")
+        mod.cmd_resume_fix(FakeGcmd({"CLEAR": "1"}))
+    printer.gcode.commands["PAUSE"] = fake_pause
+    printer.set_printing(True)
+    _set_pos(printer, 110, 120, 10)
+    run_chain(mod, "T1A", source=source)
+    return bus, printer, mod
+
+
+def _check_raises(fn, params, texts):
+    try:
+        fn(FakeGcmd(params))
+    except ValueError as exc:
+        assert all(t in str(exc) for t in texts), (texts, str(exc))
+        return str(exc)
+    raise AssertionError("hätte gesperrt sein müssen: %s" % (texts,))
+
+
+def _moves(sc):
+    return [l for l in sc if l.split()[0] in ("G0", "G1", "M109", "M104",
+                                              "PAUSE", "RESUME")]
+
+
+def test_resume_kopf_sperre():
+    # 1) Kopf LEER nach Abbruch: gesperrt (Default resume_redo_change AUS)
+    bus, printer, mod = _hull_abort_leer()
+    sc = printer.gcode.scripts
+    assert "PAUSE CFS_RETURN_X=110 CFS_RETURN_Y=120 CFS_RETURN_Z=10" in sc, sc
+    st = mod.get_status()
+    assert "EXTRUDE fehlgeschlagen" in st["chain_error"] and printer.paused
+    assert st["change_aborted"] and st["resume_tnn"] == "T1A" \
+        and st["head_filament"] is False and not st["resume_redo_change"], st
+    assert any("KTWO_BOX_ERROR_CLEAR, Wechsel (T<n>) bzw. Schritt von Hand "
+               "wiederholen, dann RESUME" in m for m in printer.gcode.raw)
+    # offener Fehler hat Vorrang (wie das RESUME-Makro)
+    _check_raises(mod.cmd_resume_check, {"MOVE": "1"},
+                  ["RESUME gesperrt", "CFS-Wechsel fehlgeschlagen"])
+    g = FakeGcmd({})
+    mod.cmd_error_clear(g)
+    assert any("RESUME prüft den Kopf-Filamentsensor" in m for m in g.infos)
+    n, nb = len(sc), len(bus.calls)
+    msg = _check_raises(mod.cmd_resume_check, {"MOVE": "1"}, [
+        "RESUME gesperrt", "filament_sensor meldet KEIN Filament",
+        "EXTRUDE fehlgeschlagen; Ziel T1A = T0", "PAUSIERT",
+        "T0 (lädt T1A), dann RESUME", "resume_redo_change: False"])
+    assert _moves(sc[n:]) == [] and len(bus.calls) == nb, (sc[n:], msg)
+    assert printer.paused and mod.get_status()["change_aborted"]
+    # HEAD_LOADED=1 gegen einen LEER meldenden Sensor: abgelehnt
+    g = FakeGcmd({"HEAD_LOADED": "1"})
+    mod.cmd_error_clear(g)
+    assert any("HEAD_LOADED abgelehnt" in m for m in g.infos), g.infos
+    _check_raises(mod.cmd_resume_check, {"MOVE": "1"}, ["KEIN Filament"])
+    # 2) Wechsel von Hand in der Pause (T0) -> Kopf voll -> RESUME frei
+    bus.fail_after_mm = None
+    bus.head_at_mm = bus.odo + 100.0
+    run_chain(mod, "T1A")
+    st = mod.get_status()
+    assert st["head_filament"] is True and st["loaded_tnn"] == "T1A" \
+        and st["chain_error"] == "", st
+    g = FakeGcmd({"MOVE": "1"})
+    mod.cmd_resume_check(g)
+    assert any("RESUME frei" in m for m in g.infos), g.infos
+    mod.cmd_resume_fix(FakeGcmd({}))          # Ende RESUME
+    assert not mod.get_status()["change_aborted"]
+    # 3) Kopf VOLL (Abbruch am Schneidhebel): RESUME normal, keine Fahrt
+    bus, printer, mod = _hull_t1b_ok()
+    printer.set_printing(True)
+    _set_pos(printer, 110, 120, 10)
+    printer.fail_on = "G4 P"
+    run_chain(mod, "T1B")
+    mod.cmd_error_clear(FakeGcmd({}))
+    n = len(printer.gcode.scripts)
+    g = FakeGcmd({"MOVE": "1"})
+    mod.cmd_resume_check(g)
+    assert any("meldet Filament" in m and "CUT fehlgeschlagen" in m
+               for m in g.infos), g.infos
+    assert printer.gcode.scripts[n:] == []
+    return ("Kopf leer -> RESUME gesperrt (keine Bewegung/kein Frame, Meldung "
+            "T0 lädt T1A), HEAD_LOADED gegen Sensor abgelehnt, nach T0 in der "
+            "Pause frei; Kopf voll -> frei")
+
+
+def test_resume_kopf_sensor_fehlt():
+    # [filament_switch_sensor] fehlt -> Zustand unbekannt -> gesperrt (auch
+    # mit resume_redo_change), Freigabe nur per HEAD_LOADED=1
+    bus, printer, mod = _hull_abort_leer(resume_redo_change="True")
+    mod.cmd_error_clear(FakeGcmd({}))
+    del printer.objects["filament_switch_sensor filament_sensor"]
+    assert mod.get_status()["head_filament"] is None
+    n = len(printer.gcode.scripts)
+    _check_raises(mod.cmd_resume_check, {"MOVE": "1"}, [
+        "RESUME gesperrt", "liefert keinen Zustand",
+        "[filament_switch_sensor filament_sensor] fehlt", "UNBEKANNT",
+        "KTWO_BOX_ERROR_CLEAR HEAD_LOADED=1", "ohne Kopfsensor nie"])
+    assert printer.gcode.scripts[n:] == []
+    g = FakeGcmd({"HEAD_LOADED": "1"})
+    mod.cmd_error_clear(g)
+    assert any("Kopf als geladen bestätigt" in m and "unbekannt" in m
+               for m in g.infos), g.infos
+    g = FakeGcmd({"MOVE": "1"})
+    mod.cmd_resume_check(g)
+    assert any("kein abgebrochener Wechsel" in m for m in g.infos)
+    # Option filament_sensor leer (nicht konfiguriert): ebenso gesperrt
+    bus, printer, mod = _hull_abort_leer(filament_sensor="")
+    mod.cmd_error_clear(FakeGcmd({}))
+    _check_raises(mod.cmd_resume_check, {"MOVE": "1"},
+                  ["(nicht konfiguriert, [k2_box] filament_sensor leer)",
+                   "liefert keinen Zustand"])
+    return "Sensor fehlt/leer konfiguriert -> gesperrt, HEAD_LOADED=1 gibt frei"
+
+
+def test_resume_abbruch_merker():
+    bus, printer, mod = _hull_abort_leer()
+    # PAUSE aus _fail ruft RESUME_FIX CLEAR=1 -> Merker bleibt
+    assert mod.aborted == {"step": "EXTRUDE", "tnn": "T1A", "source": "T"}, \
+        mod.aborted
+    # PRE_OPT bei offenem Fehler (nichts passiert) überschreibt ihn nicht
+    mod.cmd_pre_opt(FakeGcmd({"TNN": "T1C", "SOURCE": "T"}))
+    mod.cmd_end_opt(FakeGcmd({}))
+    assert mod.aborted["tnn"] == "T1A", mod.aborted
+    # Einzelschritt ohne TNN (CUT von Hand in der Pause) behält Ziel/Herkunft
+    mod.cmd_error_clear(FakeGcmd({}))
+    printer.fail_on = "G4 P"
+    mod.cmd_cut(FakeGcmd({}))
+    assert mod.aborted == {"step": "CUT", "tnn": "T1A", "source": "T"}, \
+        mod.aborted
+    assert "PAUSE" not in [l.split()[0] for l in printer.gcode.scripts[-3:]]
+    # neue Pause, die NICHT aus _fail stammt (Hand-PAUSE, Runout, neuer
+    # Druck nach CANCEL) -> veralteter Merker weg
+    mod.cmd_resume_fix(FakeGcmd({"CLEAR": "1"}))
+    assert mod.aborted is None and not mod.get_status()["change_aborted"]
+    # M8200-Kette (ohne SOURCE): Herkunft leer, Ziel aus EXTRUDE TNN
+    bus, printer, mod = _hull_abort_leer(source="")
+    assert mod.aborted == {"step": "EXTRUDE", "tnn": "T1A", "source": ""}
+    # Ende eines RESUME (RESUME_FIX ohne CLEAR) -> Merker weg
+    mod.cmd_resume_fix(FakeGcmd({}))
+    assert mod.aborted is None
+    # Fehler ohne Druck: kein Merker
+    bus, printer, mod = build_hull(allow_write="True")
+    bus.fail_after_mm = 50.0
+    mod.cmd_pre_opt(FakeGcmd({"TNN": "T1A", "SOURCE": "T"}))
+    try:
+        mod.cmd_extrude(FakeGcmd({"TNN": "T1A"}))
+    except ValueError:
+        pass
+    assert mod.aborted is None
+    return ("Merker überlebt PAUSE aus _fail, nicht die abgelehnte PRE_OPT; "
+            "Einzelschritt behält Ziel; neue Pause/RESUME-Ende löschen; "
+            "M8200 ohne Herkunft; ohne Druck kein Merker")
+
+
+def test_resume_nachholen():
+    # resume_redo_change True + beide Freigaben + MOVE=1: Stock-analog
+    bus, printer, mod = _hull_abort_leer(resume_redo_change="True")
+    mod.cmd_error_clear(FakeGcmd({}))        # Box 0x04 [00 01] -> IDLE
+    assert bus.hub_mask == 0x01, bus.hub_mask  # A steckt im Hub (Abbruch)
+    bus.fail_after_mm = None
+    bus.head_at_mm = bus.odo + 100.0
+    pos0 = list(printer.pos[:3])
+    bus.trace = []
+    n = len(printer.gcode.scripts)
+    g = FakeGcmd({"MOVE": "1"})
+    mod.cmd_resume_check(g)
+    t = bus.trace
+    sc = printer.gcode.scripts[n:]
+    assert sc[0] == "KTWO_BOX_PRE_OPT TNN=T1A Z_HOP=0 SOURCE=T", sc[:3]
+    i0 = _idx(t, _g("M109 S235"))                          # Schacht + Heizen
+    i1 = _idx(t, _b(0x11, (0x01, 0x00)), i0)               # Rückzug A (Hub)
+    _idx(t, _g("G1 E-10 F600"), i1)                        # mit heißer Düse
+    i2 = _idx(t, _b(0x11, (0x01, 0x01)), i1)               # p1
+    i3 = _idx(t, _b(0x10, (0x01, 0x00, 0x00)), i2)         # Einzug A
+    i4 = _idx(t, _g("G1 E30 F360"), i3)                    # Stage 7
+    i5 = _idx(t, _b(0x10, (0x01, 0x07, 0x03)), i4)
+    i6 = _idx(t, _b(0x04, (0x01, 0x00)), i5)               # PRINT
+    i7 = _idx(t, _g("G1 E18 F360"), i6)                    # Spülen
+    i8 = _idx(t, _g("G1 E56 F360"), i7)
+    _idx(t, _g("G0 Y345 F12000"), i8)                      # Schacht raus
+    assert "G0 X-7.8 Y200 F30000" not in sc, "kein Schnitt (Kopf leer)"
+    assert not [l for l in sc if l.startswith(("G1 Z", "G0 Z", "PAUSE",
+                                               "RESUME"))], sc
+    assert not [l for l in sc if l.startswith("G0 X110 Y120")], \
+        "keine Rückfahrt (END_OPT RETURN=0, die macht RESUME)"
+    assert i0 < i1 and printer.pos[:2] == [160.0, 345.0] \
+        and printer.pos[2] == pos0[2], printer.pos
+    st = mod.get_status()
+    assert st["chain_error"] == "" and st["head_filament"] is True \
+        and st["loaded_tnn"] == "T1A" and not st["chain_active"] \
+        and printer.paused and printer.sensor.enabled, st
+    assert any("NACHGEHOLT" in m for m in g.infos) \
+        and any("nachgeholt (Kopfsensor meldet Filament)" in m
+                for m in g.infos), g.infos
+    mod.cmd_resume_fix(FakeGcmd({}))
+    assert not mod.get_status()["change_aborted"]
+    # Nachholen scheitert (Slot A wieder 0x0c): gesperrt, pausiert, keine
+    # Rückfahrt, Merker bleibt (nächstes RESUME holt erneut nach)
+    bus, printer, mod = _hull_abort_leer(resume_redo_change="True")
+    mod.cmd_error_clear(FakeGcmd({}))
+    n = len(printer.gcode.scripts)
+    _check_raises(mod.cmd_resume_check, {"MOVE": "1"}, [
+        "Nachholen des Wechsels T1A fehlgeschlagen", "EXTRUDE fehlgeschlagen",
+        "keine Rückfahrt", "KTWO_BOX_ERROR_CLEAR"])
+    sc = printer.gcode.scripts[n:]
+    assert printer.paused and not [l for l in sc if l.split()[0] in (
+        "PAUSE", "RESUME") or l.startswith("G0 X110 Y120")], sc
+    st = mod.get_status()
+    assert "EXTRUDE fehlgeschlagen" in st["chain_error"] \
+        and mod.aborted["source"] == "T" and mod.aborted["tnn"] == "T1A", st
+    return ("Nachholen: PRE_OPT Z_HOP=0 -> Schacht/M109 235 -> Rückzug A "
+            "(E-10 heiß) -> Einzug A -> E30/mode7/PRINT -> Spülen -> raus, "
+            "kein Schnitt/Z/Rückfahrt; Fehler -> gesperrt + pausiert")
+
+
+def test_resume_nachholen_sperren():
+    def blocked(over, prep, params, text, source="T"):
+        bus, printer, mod = _hull_abort_leer(source=source, **over)
+        mod.cmd_error_clear(FakeGcmd({}))
+        prep(bus, printer, mod)
+        bus.calls[:] = []
+        n = len(printer.gcode.scripts)
+        _check_raises(mod.cmd_resume_check, params,
+                      ["RESUME gesperrt", "KEIN Filament", text])
+        assert printer.gcode.scripts[n:] == [] and _mech(bus) == [], \
+            (text, printer.gcode.scripts[n:])
+    nop = lambda b, p, m: None  # noqa: E731
+    on = {"resume_redo_change": "True"}
+    blocked(on, nop, {"MOVE": "0"}, "RESUME darf nicht fahren")
+    blocked(on, nop, {}, "RESUME darf nicht fahren")
+    blocked(on, lambda b, p, m: m.cfg.update(allow_write=False),
+            {"MOVE": "1"}, "nicht freigegeben")
+    blocked(on, nop, {"MOVE": "1"}, "nicht aus einem T<n>-Wechsel",
+            source="")
+    blocked(on, lambda b, p, m: m.aborted.update(tnn=""), {"MOVE": "1"},
+            "Ziel-TNN des abgebrochenen Wechsels unbekannt")
+    blocked(on, lambda b, p, m: m.cmd_pre_opt(FakeGcmd({"TNN": "T1C"})),
+            {"MOVE": "1"}, "Wechselkette noch offen")
+    blocked({}, nop, {"MOVE": "1"}, "resume_redo_change: False")
+    # nicht pausiert: nichts zu prüfen (RESUME-Makro ruft dann gar nicht)
+    bus, printer, mod = _hull_abort_leer()
+    mod.cmd_error_clear(FakeGcmd({}))
+    printer.paused, printer.print_state = False, "printing"
+    printer._refresh()
+    g = FakeGcmd({"MOVE": "1"})
+    mod.cmd_resume_check(g)
+    assert any("nicht pausiert" in m for m in g.infos), g.infos
+    return ("Nachholen nur mit Option + allow_write/allow_move + MOVE=1 + "
+            "T<n>-Herkunft + bekanntem Ziel + geschlossener Kette – sonst "
+            "gesperrt ohne Bewegung/Frame")
+
+
+def test_makros_resume_kopfpruefung():
+    try:
+        env, macros, kcfg, param = _render_env()
+    except ImportError:
+        return "SKIP (jinja2 fehlt)"
+    R = lambda pr: _render(env, macros, "RESUME", pr)  # noqa: E731
+    pr = _rprinter(param, kcfg, k2_box={"change_aborted": True})
+    lines, _m = R(pr)
+    i = lines.index("_PI_RESUME_PREPARE")
+    assert lines[:i] == ["KTWO_BOX_RESUME_CHECK MOVE=1"], lines
+    for upd in ({"gcode_macro _PI_FREIGABE": {"allow_move": False}},
+                {"toolhead": {"homed_axes": "xy"}},
+                {"gcode_macro _PI_PARAM": {"pause_pos_valid": False}}):
+        pr = _rprinter(param, kcfg, k2_box={"change_aborted": True}, **upd)
+        lines, _m = R(pr)
+        assert lines[0] == "KTWO_BOX_RESUME_CHECK MOVE=0", (upd, lines)
+    # ohne Abbruch bzw. nicht pausiert: kein Prüfbefehl (Ablauf unverändert)
+    for upd in ({"k2_box": {"change_aborted": False}},
+                {"k2_box": {"change_aborted": True},
+                 "pause_resume": {"is_paused": False}}):
+        lines, _m = R(_rprinter(param, kcfg, **upd))
+        assert not [l for l in lines if "RESUME_CHECK" in l], (upd, lines)
+    # offener Fehler: Reihenfolge der Anleitung (erst quittieren)
+    pr = _rprinter(param, kcfg, k2_box={"chain_error": "EXTRUDE x"})
+    try:
+        R(pr)
+    except _RenderRaise as exc:
+        assert "KTWO_BOX_ERROR_CLEAR, Wechsel (T<n>)" in str(exc), exc
+    else:
+        raise AssertionError("RESUME hätte gesperrt sein müssen")
+    kb = dict(kcfg)
+    assert kb.get("resume_redo_change") == "False", kb
+    return ("RESUME: KTWO_BOX_RESUME_CHECK MOVE=1/0 vor _PI_RESUME_PREPARE nur "
+            "nach Abbruch, Auslieferung resume_redo_change False")
+
+
 def test_reactor_bus_proxy():
     bus = FakeBoxBus()
     seen = []
@@ -1799,7 +2111,7 @@ def test_makros_cfg():
     exp = {0: "T1A", 1: "T1B", 3: "T1D", 4: "T2A", 5: "T2B", 15: "T4D"}
     for i, tnn in exp.items():
         lines, _m = render("_KTWO_TOOL_CHANGE", {"T": str(i)})
-        assert lines == ["_KTWO_FAN_SAVE", "KTWO_BOX_PRE_OPT TNN=%s" % tnn,
+        assert lines == ["_KTWO_FAN_SAVE", "KTWO_BOX_PRE_OPT TNN=%s SOURCE=T" % tnn,
                          "KTWO_BOX_CUT", "KTWO_BOX_RETRUDE",
                          "KTWO_BOX_EXTRUDE TNN=%s" % tnn, "KTWO_BOX_WASTE",
                          "KTWO_BOX_FLUSH TNN=%s" % tnn,
@@ -2190,6 +2502,17 @@ TESTS = [
      test_schacht_aus_schneidbereich_und_resume_fix),
     ("Makros PAUSE/RESUME nach CFS-Abbruch (Schneidbereich/Schacht)",
      test_makros_resume_schneidbereich),
+    ("RESUME nach Abbruch: Kopf leer gesperrt / voll frei",
+     test_resume_kopf_sperre),
+    ("RESUME nach Abbruch: Kopfsensor fehlt -> gesperrt, HEAD_LOADED",
+     test_resume_kopf_sensor_fehlt),
+    ("RESUME nach Abbruch: Merker (Ziel-TNN) Lebensdauer",
+     test_resume_abbruch_merker),
+    ("RESUME nach Abbruch: Wechsel nachholen (resume_redo_change)",
+     test_resume_nachholen),
+    ("RESUME nach Abbruch: Nachholen nur mit allen Freigaben",
+     test_resume_nachholen_sperren),
+    ("Makros RESUME: Kopfprüfung vor PREPARE", test_makros_resume_kopfpruefung),
     ("ReactorBusProxy (kein Reactor-Blockieren)", test_reactor_bus_proxy),
     ("Makros T0-T15/M8200/RESUME (macros.cfg)", test_makros_cfg),
     ("Runout: Slot-Wahl-Regel + Optionen", test_runout_slotwahl),

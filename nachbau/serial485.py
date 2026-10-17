@@ -68,7 +68,8 @@ MAX_RETRIES = 4          # Beleg: klippy.log "retries = 4"
 
 # Obergrenze, wie lange EINE Transaktion den Bus-Lock halten darf
 # (timeout * (retries + 1)), Review M6 16.10.2026. Längster belegter Fall:
-# 0x0d op 2/3 Maske 0x0F = 980 s (box.preload_force_timeout, retries=0).
+# 0x0d op 2/3 Maske 0x0F/0x00 = 1200 s (box.preload_force_timeout =
+# max(180+200·n, 300·n) seit 17.10.2026, retries=0) – genau an der Grenze.
 # Darüber -> ValueError statt stundenlanger Bus-Blockade (z.B. 300 s x 5).
 MAX_BUS_HOLD_S = 1200.0
 # Ab dieser Haltedauer wird der lange Lock im Log vermerkt (INFO).
@@ -91,10 +92,58 @@ RESP_QUEUE_MAX = 32
 
 # Plausibilitätsgrenzen für das Längenfeld (len = status+fun+daten... inkl. crc,
 # vgl. build_frame: len = len(data)+3). Minimum 3 = Frame ohne Daten.
-# Ein kleineres Maximum als das Byte-Maximum 255 ist nicht belegt (weder
-# Wrapper-Quellen noch Mitschnitte) -> 255.
+# EMPFANG: bleibt beim Byte-Maximum 255 (Parser soll jeden Frame erkennen;
+# live längstes RX-len = 46, RFID-Antwort). SENDEN: s. TX_* unten.
 FRAME_LEN_MIN = 3
 FRAME_LEN_MAX = 255
+
+# --- Sendeschutz (17.10.2026) -------------------------------------------
+# Längengrenze für AUSGEHENDE Frames (check_tx_frame/build_tx_frame; der
+# Empfang bleibt bei FRAME_LEN_MAX = 255):
+# - CFS-App (CFS-RESTE-BEFUND §5, B): Empfangs-Statemachine FUN_0800f880
+#   prüft nur len >= 3, der Frame-Kontext ist 0x70 = 112 B, Daten ab
+#   Offset 6, CRC fest bei 0x6A -> sauber nur <= 100 Datenbytes (len <= 103);
+#   längere Frames überschreiben CRC-/Timeout-Felder, ab len ~110 Überlauf.
+# - CFS-Bootloader (BOOTLOADER-HOST-BEFUND §2, B): vec_54 @0x080011ec
+#   verwirft len > 0xFC STUMM (keine Antwort, Host sieht nur Timeouts).
+# - Längste tatsächlich gesendete Frames: live 0xA0 (Auto-Addr SET) mit
+#   13 Datenbytes (len 0x10; Auszählung aller `retries = N, cmd = …` in
+#   live-logs-2026-10-15/-16), dann 0x06-Schreiben (6 Datenbytes); im
+#   Nachbau ebenso. Einzige längere Klasse: Update-Datenblöcke (fun 0xF0)
+#   mit GENAU 0x80 Datenbytes (len 0x83) – der Bootloader kopiert je Frame
+#   fest 0x80 B (FUN_08001480), größere Blöcke zerstören das Image.
+# Gewählt (konservativ): alle fun 100 Datenbytes (= CFS-App-Grenze, das
+# 7-Fache des längsten Live-Requests); fun 0xF0 (Update-Pfad, Ziel ist
+# dann der Bootloader) 0x80 Datenbytes (len 0x83 < 0xFC). ANNAHME: Die
+# Motor-App puffert mindestens so viel wie die CFS-App (Motor-RX-Puffer
+# nicht ausgewertet; live nie > 6 Datenbytes an Motoren).
+TX_DATA_MAX = 100              # Datenbytes je Sende-Frame (len <= 103)
+TX_FUNC_UPDATE = 0xF0          # Update-Pfad (mcu_util_485), Datenblöcke
+TX_DATA_MAX_UPDATE = 0x80      # Datenbytes bei fun 0xF0 (len <= 0x83)
+BOOTLOADER_LEN_MAX = 0xFC      # harte Bootloader-Grenze für das len-Byte
+# Broadcast-Schutz (MOTOR-RESTE-BEFUND §2/§7, B): Die Motor-App nimmt per
+# 0xFF genau reboot (0x01), boot (0x0B) und rs485_addr (0x0E) an
+# (Broadcast-Flag @0xd758-0xd762). boot 0x0B [00] (FUN_104e6) setzt
+# boot_key 0x8567 und löst einen Watchdog-Reset aus -> Bootloader;
+# reboot 0x01 [00] (FUN_f724) startet neu. Per 0xFF träfe das ALLE Motoren
+# gleichzeitig (Haltemoment weg, Z sackt ab). Beide Handler wirken im
+# Binärmodus NUR bei Payload-Byte 0 == 0 (0x104f6-0x104fc bzw.
+# 0xf734-0xf73a: `lbu a5,0(payload); beqz` -> ausführen, sonst Rücksprung).
+# Daher:
+# - 0xFF/0xFD + fun 0x01: immer gesperrt (kein legitimer Nutzer).
+# - 0xFF/0xFD + fun 0x0B: gesperrt, AUSSER exakt Payload [01] an 0xFF =
+#   CFS-Loader->App (auto_addr.logic_loader_check, Stock live
+#   `0xff 0x4 0x0 0xb 0x1`, BOOTLOADER-HOST-BEFUND §0/§1: der CFS-Bootloader
+#   nimmt an 0xFF nur 0x0B [01] an; die Motor-App ignoriert [01], s. oben).
+# 0xFD (BROADCAST_CLM) ist die Motor-Gruppenadresse der Auto-Adressierung
+# (Motor-Bootloader, Verhalten nicht im Image) – vorsorglich mit gesperrt.
+# 0xFE/0xFC (CFS-/Belt-Gruppe) erreichen die Motor-App nicht (Dispatcher
+# FUN_d5c2: nur eigene Adresse oder 0xFF) und bleiben frei. Unicast
+# 0x0B/0x01 an 0x81-0x84 sperrt motor.py (boot()/reboot() = Stubs).
+TX_FUNC_REBOOT = 0x01
+TX_FUNC_BOOT = CMD_LOADER_TO_APP           # 0x0B (Motor: boot)
+TX_BOOT_GUARD_ADDRS = frozenset((BROADCAST_ALL, BROADCAST_CLM))
+TX_LOADER_TO_APP_PAYLOAD = (0x01,)         # einzig erlaubt: 0xFF 0x0B [01]
 
 import logging
 import threading
@@ -125,11 +174,74 @@ def build_frame(addr, fun, data=(), status=STATUS_OK):
 
     len = len(data) + 3 (Beleg: auto_addr_wrapper.py::data_pack).
     CRC über [len, status, fun] + data (Beleg: cal_pack_crc).
+
+    Neutraler Bau OHNE Sendeschutz (auch für Antwort-/Testframes bis
+    len 255); Sendepfade nutzen build_tx_frame. len > 255 -> ValueError.
     """
     data = list(data)
     length = len(data) + 3
+    if length > FRAME_LEN_MAX:
+        raise ValueError("Frame zu lang: len %d > %d (%d Datenbytes)"
+                         % (length, FRAME_LEN_MAX, len(data)))
     body = [length, status, fun] + data
     return bytes([PACK_HEAD, addr] + body + [crc8_cal(body)])
+
+
+class TxGuardError(ValueError):
+    """Sendeschutz verletzt (Längengrenze oder gesperrter Broadcast).
+    Unterklasse von ValueError; es wurde NICHTS gesendet."""
+
+
+def tx_data_max(fun):
+    """Erlaubte Datenbytes eines Sende-Frames mit diesem fun (s. TX_*)."""
+    return TX_DATA_MAX_UPDATE if fun == TX_FUNC_UPDATE else TX_DATA_MAX
+
+
+def check_tx_frame(addr, fun, data=()):
+    """Sendeschutz für EINEN ausgehenden Frame (17.10.2026), ohne Bus-Zugriff.
+
+    1. Länge: <= tx_data_max(fun) Datenbytes (100, bei fun 0xF0 0x80),
+       Begründung s. TX_DATA_MAX; das len-Byte bleibt damit <= 0xFC.
+    2. Broadcast: an 0xFF/0xFD nie fun 0x01 (reboot) und nie fun 0x0B
+       (boot) – einzige Ausnahme 0xFF 0x0B [01] (CFS-Loader->App, live
+       belegt; Motor-App ignoriert [01]). Belege s. TX_BOOT_GUARD_ADDRS.
+    Verstoß -> TxGuardError (ValueError). Rückgabe: Daten als Liste.
+    """
+    data = list(data)
+    limit = tx_data_max(fun)
+    if len(data) > limit:
+        raise TxGuardError(
+            "Sendeschutz: addr 0x%02x fun 0x%02x mit %d Datenbytes (len %d) "
+            "> Grenze %d – CFS-App puffert sauber nur 100 Datenbytes "
+            "(Frame-Kontext 112 B), Bootloader verwirft len > 0xFC stumm, "
+            "Update-Datenblöcke sind genau 0x80 B; nichts gesendet"
+            % (addr, fun, len(data), len(data) + 3, limit))
+    if len(data) + 3 > BOOTLOADER_LEN_MAX:  # Absicherung, falls TX_* geändert
+        raise TxGuardError("Sendeschutz: len %d > 0xFC" % (len(data) + 3))
+    if addr in TX_BOOT_GUARD_ADDRS:
+        if fun == TX_FUNC_REBOOT:
+            raise TxGuardError(
+                "Sendeschutz: Broadcast 0x%02x fun 0x01 (reboot) gesperrt – "
+                "startet ALLE Motoren neu (Motor-FW reboot FUN_f724, per 0xFF "
+                "erreichbar); nichts gesendet" % addr)
+        if fun == TX_FUNC_BOOT and not (
+                addr == BROADCAST_ALL
+                and tuple(data) == TX_LOADER_TO_APP_PAYLOAD):
+            raise TxGuardError(
+                "Sendeschutz: Broadcast 0x%02x fun 0x0B [%s] gesperrt – "
+                "schickt ALLE Motoren in den Bootloader (Motor-FW boot "
+                "FUN_104e6: Payload [00] -> boot_key 0x8567 + Watchdog-Reset; "
+                "Haltemoment weg). Erlaubt ist nur 0xFF 0x0B [01] "
+                "(CFS-Loader->App); nichts gesendet"
+                % (addr, " ".join("%02x" % b for b in data)))
+    return data
+
+
+def build_tx_frame(addr, fun, data=(), status=STATUS_OK):
+    """Sende-Frame = check_tx_frame (Länge + Broadcast-Schutz) + build_frame.
+    Von allen Sendepfaden (transact*/raw_send*/Wrapper) genutzt."""
+    return build_frame(addr, fun, check_tx_frame(addr, fun, data),
+                       status=status)
 
 
 def parse_frame(raw):
@@ -383,7 +495,7 @@ class Serial485:
         expect_fun = fun if expect_fun is None else expect_fun
         if expect_addr is _AUTO:
             expect_addr = reply_addr_for(addr)
-        frame = build_frame(addr, fun, data, status=status)
+        frame = build_tx_frame(addr, fun, data, status=status)  # Sendeschutz
         last_err = None
         # TODO: am klippy.log nachzählen, ob 4 Versuche oder 1+4
         # (aktuell: retries=4 -> 1 Erstsendung + 4 Wiederholungen = 5 Sendungen).
@@ -553,8 +665,10 @@ class Serial485:
         (dann Verhalten wie bisher). expect_fun/expect_addr schränken die
         Erwartung ein (Default: gleicher fun, Absender wie Ziel bzw.
         beliebig bei Broadcast-Zielen).
+        Sendeschutz (check_tx_frame): zu lange Frames und gesperrte
+        Broadcasts -> TxGuardError, nichts gesendet.
         """
-        frame = build_frame(addr, fun, data, status=status)
+        frame = build_tx_frame(addr, fun, data, status=status)
         with self._lock:
             self.ser.write(frame)
             self._inc("sent")
@@ -623,7 +737,7 @@ class Serial485:
 
         BUS-LOCK (Review M6, Entscheidung 16.10.2026): _lock bleibt für die
         GANZE Transaktion gehalten (Senden bis Antwort/Timeout), auch bei
-        langen Kommandos (0x0d op 2/3 bis 980 s, 0x11 bis 150 s). Andere
+        langen Kommandos (0x0d op 2/3 bis 1200 s, 0x11 bis 150 s). Andere
         Threads (Motoren, 0x0a-Poll, _bg_thread) warten solange. Gründe:
         (1) RS485 halbduplex: der Slave antwortet asynchron am Ende seines
             Vorgangs; sendet der Host in dieser Zeit, kollidieren die Frames
@@ -635,7 +749,9 @@ class Serial485:
         (3) Box-FW bearbeitet 0x0d op 2/3 synchron und ist solange stumm
             (live 0x04 5x unbeantwortet, 13:130637-130652).
         Absicherung: Haltedauer timeout*(retries+1) <= MAX_BUS_HOLD_S, sonst
-        ValueError; ab LONG_HOLD_LOG_S INFO-Logzeile.
+        ValueError; ab LONG_HOLD_LOG_S INFO-Logzeile. Sendeschutz
+        (check_tx_frame, 17.10.2026) VOR dem Lock: TxGuardError, nichts
+        gesendet.
         TODO (M6): Pending-Registry (Senden unter Lock, Warten ohne Lock)
           wäre nur für Geräte sinnvoll, die während einer laufenden Box-
           Operation sicher senden dürfen – dafür fehlt ein Kollisions-Beleg;
@@ -644,6 +760,7 @@ class Serial485:
           ob fremde Slaves dazwischen senden dürfen.
         """
         timeout = self.default_timeout if timeout is None else timeout
+        data = check_tx_frame(addr, fun, data)  # Sendeschutz vor dem Lock
         hold = self._check_hold(timeout, retries)
         if hold >= LONG_HOLD_LOG_S:
             _log.info("Bus-Lock bis %.0f s für addr 0x%02x fun 0x%02x",
@@ -827,7 +944,15 @@ class Serial_485_Wrapper:
     # --- Queue (Belegnamen) ---
     def add_send_data(self, data, timeout=TIMEOUT_LONG, retransmit=True):
         """Reiht Wire-Bytes ein, gibt Eintrags-ID zurück
-        (Beleg: Serial_485_Wrapper.add_send_data)."""
+        (Beleg: Serial_485_Wrapper.add_send_data).
+
+        Sendeschutz (check_tx_frame, 17.10.2026) schon beim Einreihen:
+        gesperrte Broadcasts / zu lange Frames -> TxGuardError, der Eintrag
+        kommt nie in die Queue (sonst bräche send_queue_process mittendrin
+        ab). Erlaubt bleibt u. a. auto_addr 0xFF 0x0B [01]."""
+        wire = bytes(data)
+        if len(wire) >= 4:
+            check_tx_frame(wire[0], wire[3], wire[4:])
         with self._qlock:
             self._seq += 1
             entry = {"id": self._seq, "data": bytes(data),
@@ -1606,6 +1731,108 @@ def selftest():
         ok13b = True
     check2("B.2 ohne Erwartung: bg dispatcht wie bisher", ok13b and hits13b == [bytes([0x05])])
     bus13b.disconnect()
+
+    # 14. Sendeschutz 17.10.2026: Längengrenze (TX) + Broadcast-Schutz
+    def _raises_tx(fn, *a, **kw):
+        try:
+            fn(*a, **kw)
+        except TxGuardError:
+            return True
+        except Exception:
+            return False
+        return False
+
+    check2("TX-Grenzen: 100 Datenbytes, fun 0xF0 0x80, len <= 0xFC",
+           TX_DATA_MAX == 100 and TX_DATA_MAX_UPDATE == 0x80
+           and tx_data_max(0x10) == 100 and tx_data_max(0xF0) == 0x80
+           and TX_DATA_MAX_UPDATE + 3 <= BOOTLOADER_LEN_MAX
+           and issubclass(TxGuardError, ValueError))
+    check2("TX-Länge: 100 B ok (len 103), 101 B gesperrt",
+           build_tx_frame(0x01, 0x10, bytes(100))[2] == 103
+           and _raises_tx(build_tx_frame, 0x01, 0x10, bytes(101)))
+    check2("TX-Länge fun 0xF0: Datenblock 0x80 ok (len 0x83), 0x81 gesperrt",
+           build_tx_frame(0x01, 0xF0, bytes(0x80))[2] == 0x83
+           and _raises_tx(build_tx_frame, 0x01, 0xF0, bytes(0x81)))
+    big = build_frame(0x01, 0x02, bytes(252))
+    check2("RX unverändert bis len 255 (build/parse neutral)",
+           big[2] == 255 and parse_frame(big) == (0x02, bytes(252))
+           and _scan_frame(bytearray(big))[0] == "ok")
+    try:
+        build_frame(0x01, 0x02, bytes(253))
+        ok14 = False
+    except ValueError as e:
+        ok14 = "zu lang" in str(e)
+    check2("build_frame len > 255 -> klare ValueError", ok14)
+    # Längste Live-Requests bleiben erlaubt: 0xA0 (13 B), 0x06-Schreiben
+    check2("TX: längste Live-Requests erlaubt (0xA0 13 B, 0x06 6 B)",
+           len(check_tx_frame(0xFE, 0xA0, bytes(13))) == 13
+           and len(check_tx_frame(0x81, 0x06, [1, 70, 0, 0, 0x96, 0x43])) == 6)
+    # Broadcast-Schutz: gesperrte Kombinationen, NICHTS geschrieben
+    blocked = [(0xFF, 0x0B, [0x00]), (0xFF, 0x0B, []), (0xFF, 0x0B, [0x01, 0x00]),
+               (0xFF, 0x0B, [0x02]), (0xFF, 0x01, [0x00]), (0xFF, 0x01, []),
+               (0xFF, 0x01, [0x01]), (0xFD, 0x0B, [0x00]), (0xFD, 0x0B, [0x01]),
+               (0xFD, 0x01, [0x00])]
+    bus14 = Serial485("/dev/ttyFAKE1", ser=FakeSerial([]))
+    ok14 = True
+    for a, f, d in blocked:
+        ok14 &= _raises_tx(check_tx_frame, a, f, d)
+        ok14 &= _raises_tx(bus14.transact, a, f, d, timeout=0.01, retries=0)
+        ok14 &= _raises_tx(bus14.transact_full, a, f, d, timeout=0.01, retries=0)
+        ok14 &= _raises_tx(bus14.raw_send, a, f, d, expect_response=False)
+    check2("Broadcast 0xFF/0xFD + 0x01/0x0B gesperrt (transact/_full/raw_send)",
+           ok14 and bus14.ser.written == [] and bus14.stats()["sent"] == 0)
+    try:
+        check_tx_frame(0xFF, 0x0B, [0x00])
+        msg14 = ""
+    except TxGuardError as e:
+        msg14 = str(e)
+    check2("Fehlermeldung nennt Bootloader + Ausnahme [01]",
+           "Bootloader" in msg14 and "0xFF 0x0B [01]" in msg14)
+    wrap14 = Serial_485_Wrapper(bus=bus14)
+    check2("Wrapper: gesperrter Broadcast kommt nie in die Queue",
+           _raises_tx(wrap14.add_send_data, bytes([0xFF, 4, 0, 0x0B, 0x00]))
+           and _raises_tx(wrap14.cmd_send_data_with_response,
+                          bytes([0xFF, 4, 0, 0x01, 0x00]), 0.01, False)
+           and _raises_tx(wrap14.cmd_485_send_data, bytes([0xFF, 4, 0, 0x0B, 0x00]))
+           and _raises_tx(wrap14.add_send_data, bytes([0x01, 0x6A, 0, 0x10])
+                          + bytes(101))
+           and wrap14.stats()["queue_len"] == 0 and bus14.ser.written == [])
+    # Erlaubt: 0xFF 0x0B [01] (CFS-Loader->App, live `0xff 0x4 0x0 0xb 0x1`),
+    # 0xFF 0x0E [01] (Motor-Adress-Broadcast, live), Unicast 0x0B an 0x01
+    live_l2a = bytes.fromhex("f7 ff 04 00 0b 01") + bytes(
+        [crc8_cal([0x04, 0x00, 0x0B, 0x01])])
+    bus14b = Serial485("/dev/ttyFAKE1", ser=FakeSerial([None, None, None]))
+    try:
+        bus14b.transact(0xFF, 0x0B, [0x01], timeout=0.01, retries=0)
+        ok14b = False
+    except TimeoutError:
+        ok14b = True  # keine Antwort = live-Verhalten
+    try:
+        bus14b.transact(0xFF, 0x0E, [0x01], timeout=0.01, retries=0)
+    except TimeoutError:
+        pass
+    bus14b.raw_send(0x01, 0x0B, [0x0F, 0x02], expect_response=False)
+    check2("Erlaubt: 0xFF 0x0B [01] / 0xFF 0x0E [01] / Unicast 0x0B",
+           ok14b and bus14b.ser.written[0] == live_l2a
+           and bus14b.ser.written[1] == bytes.fromhex("f7 ff 04 00 0e 01 89")
+           and len(bus14b.ser.written) == 3)
+    # auto_addr-Pfad (Port von auto_addr_wrapper) über den echten Wrapper:
+    # Loader-Gerät -> 0x0B [01] an 0xFF geht unverändert raus, kein Fehler.
+    try:
+        import os
+        _here = os.path.dirname(os.path.abspath(__file__))
+        if _here not in sys.path:
+            sys.path.append(_here)  # auto_addr.py liegt neben serial485.py
+        import auto_addr as _aa
+        bus14c = Serial485("/dev/ttyFAKE1", ser=FakeSerial([None]))
+        aa14 = _aa.AutoAddr(Serial_485_Wrapper(bus=bus14c))
+        aa14.tables[_aa.DEV_TYPE_MB][0].mode = _aa.MODE_LOADER
+        sent14 = aa14.logic_loader_check(_aa.DEV_TYPE_MB)
+        ok14c = sent14 is True and bus14c.ser.written == [live_l2a]
+    except Exception as e:  # noqa: BLE001 – im Selbsttest als FAIL melden
+        print("auto_addr-Pfad: %r" % (e,))
+        ok14c = False
+    check2("auto_addr Loader->App (0xFF 0x0B [01]) über Wrapper unverändert", ok14c)
 
     print("SELBSTTEST: %d/%d ok" % (total - fails, total))
     return fails

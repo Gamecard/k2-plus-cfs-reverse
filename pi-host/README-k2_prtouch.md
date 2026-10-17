@@ -1,3 +1,5 @@
+> **Nachtrag 17.10.2026 (PRTOUCH-MCU-BEFUND-2026-10-17 §7): Absicherung umgesetzt** – Config-Prüfung der Antast-Parameter, `arm_settle_s` an die Totzeit gekoppelt, Mindest-Antastgeschwindigkeit (ANNAHME), erweiterter Ruhetest (Tickabstand, −1/24 Bit, gefilterter Kanal), Blocklesen `idx += n`, Endstop-Pin jetzt **`^!PC7`** (Pull-Up wie Stock). Details Abschnitt **A.8**. Weiterhin gesperrt (`allow_move: False`). Offline-Tests 248/248 + Review-Test; Batch gegen Upstream lauf-F EXIT 0.
+
 > **ENTWURF – Stand 16.10.2026 abends.** Sensor-Lesepfad und Swap-Leitung am Gerät GETESTET (ohne Bewegung, PRTOUCH-LESETEST-BEFUND-2026-10-16.md, Fingerdruck-Test 19/19). **Hauptweg ist jetzt eine normale Upstream-Klipper-Probe** auf `!PC7` (wie Stock). Antasten mit Bewegung ist weiterhin **UNGETESTET**. Offline-Tests: 138/138 + Review-Test (davon 21 gegen die echten Upstream-Dateien `probe.py`/`homing.py`/`manual_probe.py`/`gcode.py`/`pins.py`). Vor der ersten echten Fahrt: Abschnitt A.5 (ANNAHMEN P1–P6) und A.6 (Erstlauf) beachten, erst mit `allow_move: False`.
 
 # [k2_prtouch] – Kraftsensor-Düse des K2 Plus unter Upstream-Klipper
@@ -15,7 +17,8 @@ Düse scharf (start_prtouch_pres, Antast-Parameter)
 ```
 
 Genau so macht es Stock (`PRTouchEndstopWrapper`, `config_endstop pin=PC7 pull_up=0`,
-`step_swap_pin: !PC7`, `probe:z_virtual_endstop`). `[k2_prtouch]` registriert sich
+`step_swap_pin: !PC7`, `probe:z_virtual_endstop`). Bei uns `^!PC7` (gleicher
+Endzustand Pull-Up, s. A.8 Punkt 6). `[k2_prtouch]` registriert sich
 deshalb als Objekt `probe` (wie `[bltouch]`/`[load_cell_probe]`), und damit
 funktionieren die Standardbefehle: `PROBE`, `QUERY_PROBE`, `PROBE_ACCURACY`,
 `PROBE_CALIBRATE`, `Z_OFFSET_APPLY_PROBE`, `G28 Z` (über
@@ -27,16 +30,20 @@ Emulation von `probe_prepare`/`probe_finish`, ergänzt um eigene Prüfungen (*):
 
 1. *Freigabe: `allow_move: True`, sonst Fehler ohne jede Bewegung (schon in
    `start_probe_session`, also auch vor den XY-Fahrten von `BED_MESH_CALIBRATE`).
-2. *Geschwindigkeit ≤ 5 mm/s (auch `PROBE_SPEED=` und bei `G28` die
-   `homing_speed`/`second_homing_speed` aus `[stepper_z]`), sonst Fehler.
-3. `toolhead.wait_moves()` – scharf geschaltet wird im Stillstand (Schwelle
-   relativ zum Ruhewert beim Scharfschalten, Fingerdruck-Test §6).
+2. *Geschwindigkeit ≤ 5 mm/s **und ≥ Mindestgeschwindigkeit** (Stock-Schwellen:
+   2,5 mm/s, ANNAHME, A.8 Punkt 3) – auch `PROBE_SPEED=` und bei `G28` die
+   `homing_speed`/`second_homing_speed` aus `[stepper_z]`, sonst Fehler.
+3. `toolhead.wait_moves()` – scharf geschaltet wird im Stillstand (Bezugswert
+   der Düse = gleitendes Mittel von vor 37–49 ms, MCU-Befund §3.2).
 4. *Signalweg-Test über den Stopp-Endstop: `sta_swap=0` → Endstop muss
    „ausgelöst“ melden, `sta_swap=1` → „frei“ (`swap_check`, Default an).
 5. `cont_prtouch_step` → `start_prtouch_pres` (ack `err != 0` → Abbruch) →
    `start_prtouch_step` (ack geprüft).
-6. *Wartezeit `arm_settle_s` (Default 0,2 s, ANNAHME P2), Ruhetest
-   (`rest_check`, `dif ≤ rest_max_dif`).
+6. *Wartezeit `arm_settle_s` (Default 0,2 s; Pflicht ≥ 1,5 × max(`lmt_dead`, 128)
+   Samples = 0,15 s bei Stock, A.8 Punkt 2), Ruhetest (`rest_check`): Rohwerte
+   (`is_src=1`: `dif ≤ rest_max_dif`, kein −1, 24 Bit, nicht konstant,
+   Tickabstand 0,78 ms ± 10 %) **und** gefilterter Kanal (`is_src=0`:
+   max |gefiltert| ≤ `rest_filt_max_frac` × `min_hold`), A.8 Punkt 4.
 7. *Endstop darf jetzt NICHT ausgelöst sein, sonst Abbruch („Düse meldet bereits
    Kontakt VOR der Fahrt“).
 8. Fahrt: Upstream `homing.probing_move()` (HomingMove/trsync). Ziel außerhalb
@@ -45,7 +52,8 @@ Emulation von `probe_prepare`/`probe_finish`, ergänzt um eigene Prüfungen (*):
 9. Immer (try/finally, auch bei jeder Ausnahme): `stop_prtouch_step` →
    `stop_prtouch_pres sta_swap=1`. Optional (`diag_readout: True`) danach der
    eingefrorene Ring in Stock-Reihenfolge (Status `[oid,2,0,0,0]`, FTR/SRC
-   idx 0…56 mit len 64−idx, step analog) – nur Diagnose, in `KTWO_PRTOUCH_STATUS`.
+   mit len 64−idx, nächster idx = idx + n statt fester 8er-Schritte, A.8
+   Punkt 5; step analog) – nur Diagnose, in `KTWO_PRTOUCH_STATUS`.
 
 Fehler werden als `printer.command_error` gemeldet (kein Klipper-Shutdown).
 
@@ -63,7 +71,7 @@ serial: /dev/serial/by-id/<Düsen-MCU>       # Platzhalter (bzw. Stock-Anbindung
 [k2_prtouch]
 mode: probe                 # Hauptweg (Rückfall: steps)
 allow_move: False           # ERST nach TEST_SWAP/READ/QUERY_PROBE auf True
-speed: 5.0                  # Antastgeschwindigkeit, hart <= 5 mm/s (Stock 5)
+speed: 5.0                  # Antastgeschwindigkeit, 2.5 (ANNAHME) .. 5 mm/s (Stock 5)
 lift_speed: 5.0
 z_offset: 0.0               # Stock 0 (Düse = Taster); PROBE_CALIBRATE schreibt hierher
 #position_endstop: 0.0      # Default = z_offset
@@ -73,16 +81,17 @@ sample_retract_dist: 2.0
 #samples_tolerance: 0.100
 #samples_tolerance_retries: 0
 probe_max_travel_mm: 8.0    # Weg je Antastung außerhalb G28 (max 10)
-arm_settle_s: 0.2           # ANNAHME P2
+arm_settle_s: 0.2           # >= 1.5 x max(lmt_dead,128)/1280 Hz = 0.15 (A.8)
 swap_check: True            # Signalweg-Test PA15->PC7 vor jeder Fahrt
-rest_check: True            # Ruhetest nach dem Scharfschalten
+rest_check: True            # Ruhetest nach dem Scharfschalten (roh + gefiltert)
 rest_max_dif: 3000
+#rest_filt_max_frac: 0.5    # max |gefiltert| <= 0.5 x min_hold (ANNAHME)
 #diag_readout: False
 
 # Pins/MCUs (Stock):
 main_mcu: mcu
 nozzle_mcu: nozzle_mcu
-step_swap_pin: !PC7         # Endstop-Pin, ausgelöst = PC7 low
+step_swap_pin: ^!PC7        # Endstop-Pin, ausgelöst = PC7 low, Pull-Up (A.8)
 pres_swap_pin: nozzle_mcu:PA15
 pres_cs0_pin: nozzle_mcu:PB13, nozzle_mcu:PB14   # clk=PB13, sdo=PB14 (BELEGT)
 
@@ -99,8 +108,8 @@ step_acq_tkms: 0.390625
 endstop_pin: probe:z_virtual_endstop
 position_min: -10
 position_max: 360
-homing_speed: 5             # MUSS <= 5 sein (sonst lehnt k2_prtouch G28 ab)
-second_homing_speed: 5      # dito
+homing_speed: 5             # MUSS 2.5..5 sein (sonst lehnt k2_prtouch G28 ab)
+second_homing_speed: 5      # dito (Upstream-Default = homing_speed/2!)
 homing_retract_dist: 5      # 0 = nur eine Antastung beim G28
 
 [stepper_z1]
@@ -214,25 +223,36 @@ landete auf `extras/statistics.py`, weil andere Module `klippy/extras/` vorn in
 `sys.path` einfügten) ist in k2_motor/k2_box/k2_belt behoben – k2_prtouch
 selbst war nicht betroffen.
 
-### A.5 ANNAHMEN des Hauptwegs (offline nicht prüfbar, im Code markiert)
+### A.5 ANNAHMEN des Hauptwegs (Stand nach PRTOUCH-MCU-BEFUND-2026-10-17 §5)
 
-- **P1** Stopp unter Bewegung: PA15 → PC7 → `endstop_home`/trsync reagiert schnell
-  genug (Upstream-Abtastung 4 × 15 µs). Belegt ist nur der Stand (Fingerdruck).
-- **P2** `arm_settle_s` 0,2 s genügt zur Ruhewertübernahme der Düsen-MCU.
-- **P3** Ruhetest per `read_prtouch_pres` auch mit zusätzlich gestartetem
-  `start_prtouch_step` (live belegt nur pres-seitig, Test D).
-- **P4** Signalweg-Test vor jeder Fahrt (sta_swap 0/1 ohne laufende Messung) stört
-  nicht (entspricht Stock-TEST_SWAP).
-- **P5** `start_prtouch_step`/`stop_prtouch_step` antworten mit `ack_prtouch`.
-- **P6** Endstop und `config_prtouch_step` teilen PC7 (wie Stock) – auf Upstream ohne
-  Pin-Konflikt, da `config_prtouch_step` den Pin nur als Namen trägt.
+- **P1** Stopp unter Bewegung schnell genug – **teilweise**: Düse löst ≥ 2 Samples
+  nach dem ersten Überschreiten aus (≈ 1,6 ms), PA15 im selben Durchlauf
+  (0x08008192), Main = Standard-Endstop/trsync. **Neu:** Anstiegsdetektor – zu
+  langsamer Kraftaufbau (< ~80 Counts/Sample) löst NIE aus → Mindestgeschwindigkeit
+  (A.8 Punkt 3, Grenze ANNAHME). Überfahrweg/Physik nur am Gerät.
+- **P2** `arm_settle_s` – **bestätigt mit Korrektur**: keine „Ruhewertübernahme“
+  (Bezug gleitet), aber Totzeit `lmt_dead` Samples (Stock 128 ≈ 100 ms) → jetzt
+  gekoppelt (A.8 Punkt 2, Reservefaktor 1,5 = ANNAHME).
+- **P3** Ruhetest mit gestartetem `start_prtouch_step` – **bestätigt** (getrennte
+  Zustände auf getrennten MCUs).
+- **P4** Signalweg-Test vor jeder Fahrt – **bestätigt**, aber nur **vor** `start`
+  (danach würde er entschärfen) – so umgesetzt.
+- **P5** `start_prtouch_step`/`stop_prtouch_step` antworten mit `ack_prtouch` –
+  **bestätigt** (stop: expar0 = PC7-Pegel, expar1 = 71).
+- **P6** PC7 geteilt – **bestätigt mit Hinweis**: Pull hängt in der Creality-FW von
+  der Reihenfolge ab → `^!PC7` (A.8 Punkt 6).
 - Ladepfad: Datei liegt als `klippy/extras/k2_prtouch.py` (Upstream-Module per
   `from . import probe`); offline über ein `extras`-Paket getestet.
 
 ### A.6 Erstlauf (Pflicht-Reihenfolge)
 
 1. `allow_move: False`: `KTWO_PRTOUCH_TEST_SWAP`, `KTWO_PRTOUCH_READ`, `QUERY_PROBE`
-   (muss `open` melden), `KTWO_PRTOUCH_STATUS`.
+   (muss `open` melden), `KTWO_PRTOUCH_STATUS`. `KTWO_PRTOUCH_READ` ist im
+   Probe-Modus seit 17.10.2026 die vollständige Vorabprüfung **ohne Bewegung**
+   (Signalweg-Test, scharf schalten, Totzeit, Ruhetest roh + gefiltert + Ticks,
+   PC7 frei, entschärfen; vorher `wait_moves`) – Ausgabe `READ ok (Vorabprüfung ohne Bewegung)` mit
+   `tick_median_ms`, `filt_max_abs`. Werte notieren (Grundlage für die
+   ANNAHMEN in A.8).
 2. `PROBE` mit `allow_move: False` → muss mit „allow_move“-Fehler abbrechen, ohne
    Bewegung.
 3. `allow_move: True`, Z per `SET_KINEMATIC_POSITION Z=10` (nur für den Test!),
@@ -254,6 +274,94 @@ Stock-Abfragefolge). Integration gegen die **echten Upstream-Dateien** (wenn
 `Homing`-Klasse, Abbruch bei `allow_move: False`/`homing_speed 10`/hängender
 Leitung, `mode: steps`. Gesamt 138/138 + Review-Test; `test_k2_box.py` und
 `test_k2_motor.py` je 9/9.
+
+Stand 17.10.2026: **248/248** + Review-Test (davon 109 neue Prüfungen „1017“ zu
+A.8, inkl. Negativfällen und 6 gegen die echten Upstream-Dateien). Dafür gibt
+es im Test einen Nachbau von Düsen-Encoder (0x08006524, 41-Byte-Grenze) und
+64er-Schieberegister (`_McuRegister`).
+
+### A.8 Absicherung nach PRTOUCH-MCU-BEFUND-2026-10-17 (Code 17.10.2026)
+
+Kennzeichnung wie im Befund: **B** = im MCU-Image belegt (Adresse Düse noz0_130,
+Basis 0x08003000), **F** = Folgerung, **ANNAHME** = nicht belegt (am Gerät klären).
+
+**1. Config-Prüfung beim Laden** (`validate_mcu_params`, Fehler → `config.error`,
+Klipper startet nicht):
+
+| Prüfung | Grund | Einstufung |
+|---|---|---|
+| `min_hold != max_hold` | sonst Stream-Modus: kein Puffer, kein Filter, **nie Auslösung → Crash ins Bett** (0x08007E26) | B |
+| `ned_hftr > 0` (`pres_tri_fter[1]`) | Hochpass nur bei ≠ 0 (0x08007E6C); ohne ihn Fehlauslösung in Ruhe nach 133 Samples (Modell) | B + F |
+| `ned_lftr` = 0 oder 1…1000 | a = ned_lftr/1000 (0x080042F4), a > 1 → schwingender IIR | B |
+| `lmt_dead ≥ 64` | Firmware hebt < 64 an (0x0800431E), Wert ist Sample-Anzahl | B |
+| `cfg_regs` ∈ {60, 56, 44} | einzig belegte CS1237-Werte (Stock-printer.cfg:343), bestimmen Rate/PGA | B |
+| `min_hold ≥ 1000` | Modell: max \|gefiltert\| in Ruhe 1 002 | F |
+| `add_hold ≥ 0` | Auslösetreppe muss steigen | ANNAHME |
+| `pres_idx = 0` | Kanalzahl = idx+1 (0x08004A78); Modul konfiguriert nur einen Kanal | B + K2 live |
+| `acq_tick`, `aqc_tick` > 0 | 0 = keine Abtastung (0x08007BAA) | B |
+
+**2. `arm_settle_s` an die Totzeit gekoppelt** (`min_arm_settle_s`):
+Minimum = 1,5 × max(`lmt_dead`, 128) × Abtastperiode. Periode = 1/Rate aus
+`cfg_regs` (60/56 → 1280 Hz = 0,78125 ms, live 0,7907 ms; 44 → 640 Hz), **nicht**
+aus `acq_tick` (im Bitbang-Modus nur Ein-Schalter, B 0x08007BB6). 128: alle 64
+gefilterten Einträge erst nach 128 Samples gültig (Memset bei `start`, Hochpass
+aus `roh[20]` über 16 Werte, F) – sonst sind Richtungserkennung und Ruhetest am
+gefilterten Kanal verfälscht. Faktor 1,5 = **ANNAHME** (Oszillator, Handshake,
+Scheduling). Stock: **0,15 s** (Default 0,2 s ok). Zu kurz → Config-Fehler; im
+Kern zusätzlich Laufzeitprüfung (fail-safe). Grenze `lmt_dead ≤ 1706` folgt aus
+`arm_settle_s ≤ 2 s`.
+
+**3. Mindest-Antastgeschwindigkeit** (`min_probe_speed`, nur `mode: probe`) –
+**ANNAHME**: 2,5 mm/s × max(1, (`min_hold`+2·`add_hold`)/5000 × Rate/1280 × 128/PGA).
+Herleitung: Modell §3.5 – Rampe < ~70–80 Counts/Sample löst nie aus; live (5 mm/s)
+zoft 0,010–0,040 mm = 2,6–10 Samples bis Auslösung → laut Modell ≥ ~500 Counts/
+Sample bei 5 mm/s; Rampe ∝ Geschwindigkeit → theoretisch ≈ 0,8 mm/s, mit Faktor ~3
+Reserve 2,5 mm/s (= Upstream-Default `second_homing_speed` bei `homing_speed` 5).
+Gilt für `speed`, `PROBE_SPEED=`, `homing_speed`/`second_homing_speed`.
+Schwellen, deren Minimum über 5 mm/s läge (z. B. `pres_tri_hold` 9000, …, 1000),
+werden abgelehnt; bei `cfg_regs` 56 (PGA 64) ist nur noch 5 mm/s zulässig. `mode: steps` ausgenommen (dort stoppt der Host, nicht die MCU).
+
+**4. Ruhetest erweitert** (`check_rest_ok`): Rohwerte `is_src=1`: mind. 32 gültige
+Samples (ANNAHME), `dif ≤ rest_max_dif`, **kein −1** (F: Sensor ab → MCU liest nach
+5 ms trotzdem, 0x08005224 → −1), alle im 24-Bit-Bereich (B), **nicht konstant**
+(ANNAHME: ein laufender ADC rauscht; ein abgezogener Sensor bestand den alten Test
+mit dif 0), **Tickabstand**: Median = 1/Rate ± 10 % und kein Einzelabstand
+< 0,5 × Periode (ANNAHMEN; erkennt 5 ms „hängt“, ~55 µs „DOUT low“, falsche
+Rate ×2; Einzel-Jitter durch verspätetes Lesen bleibt erlaubt). Gefilterter Kanal `is_src=0`
+(= was die Düse gegen `min_hold` vergleicht): max |gefiltert| ≤
+`rest_filt_max_frac` (Default 0,5, ANNAHME) × `min_hold`.
+
+**5. Blocklesen `idx += n`** (`read_ring_blocks`): idx = Index im
+64er-Schieberegister (kein Ring), Antwort endet bei > 41 Byte (Überlauf-Sample
+enthalten) → 7–9 Samples; angefragt `len = 64 − idx` wie Stock, nächster idx =
+idx + n (n aus dem Paket); das Antwortfeld `len` (bei vollständigem Bereich
+n + 1) wird nicht benutzt; Einträge Tick 0 + Wert 0 (Register nicht voll) werden
+verworfen; n = 0 beendet das Lesen; ungleiches n von ticks/datas → Fehler.
+Gilt für `read_pres`, `read_pres_filtered`, `read_step`, `read_frozen`. Der Test
+zeigt, dass feste 8er-Schritte bei einem 7er-Block ein Sample verlieren.
+
+**6. PC7-Pull: Entscheidung Pull-Up wie Stock → `step_swap_pin: ^!PC7`.**
+In der Creality-Firmware heißt `pull_up=0` **Pull-Down** (B 0x08004734), `1`
+Pull-Up, `-1` (Upstream `~`) schwebend; `config_prtouch_step` setzt immer Pull-Up
+(B 0x08004910); wer zuletzt konfiguriert, gewinnt. Stock: `config_endstop
+pull_up=0` → danach `config_prtouch_step` → **Pull-Up**. k2_prtouch sendet
+`config_prtouch_step` **vor** `config_endstop` (Callback-Reihenfolge) – mit
+`!PC7` blieb PC7 deshalb auf Pull-Down (Batch vorher: `config_endstop … pull_up=0`
+nach `config_prtouch_step`). Mit `^` fordern beide Befehle Pull-Up → Endzustand
+**unabhängig von der Reihenfolge** = Stock (Batch jetzt: `config_endstop oid=0
+pin=PC7 pull_up=1`). `!PC7`/`~!PC7`/`^PC7`/`!^PC7` und PC7 auf einer anderen MCU
+werden im Probe-Modus mit Erklärung abgelehnt. Abgewogen: Pull-Down wäre bei
+ungetriebener Leitung fehlersicher („ausgelöst“), ist aber nicht Stock; bei
+aktiv getriebenem PA15 (Push-Pull, B) ist der Pull wirkungslos, und eine
+abgerissene Leitung erkennt der Signalweg-Test vor **jeder** Fahrt. Restrisiko
+(ANNAHME): Leitungsbruch bzw. Düsen-MCU-Reset **während** einer Fahrt würde mit
+Pull-Up nicht als Kontakt gelesen – wie bei Stock.
+
+**Hinweis Rückfallweg (`mode: steps`):** Der Ruhetest läuft dort VOR
+`start_prtouch_pres`. Ein nie gestartetes Register ist leer und fällt jetzt
+richtig durch (vorher „ok“ mit Nullpunkt 0 → Notgrenzen-Abbruch nach dem ersten
+Schritt). Der Rückfallweg bleibt damit ohne vorheriges Scharfschalten
+unbenutzbar – nicht Teil dieser Änderung.
 
 ### Tests gegen echte Upstream-Dateien
 
@@ -425,7 +533,7 @@ Erstlauf-Reihenfolge: `KTWO_PRTOUCH_TEST_SWAP` → `KTWO_PRTOUCH_READ` →
 
 - **1 Datenformat: WIDERLEGT → gepackt** (`packing: packed`, `decode_packed`), live 315+3/318 Pakete exakt.
 - **2 clk/sdo: BELEGT** PB13 = clk, PB14 = sdo (Emulation des Stock-Moduls, wörtlicher `config_prtouch_pres`).
-- **7 read-Args: BELEGT** `is_src=1` = Rohwerte, je Abfrage ≤ 8 Samples aus 64er-Ring (`idx` = Ringposition) → 8 Blöcke + `merge_ring`.
+- **7 read-Args: BELEGT** `is_src=1` = Rohwerte, je Abfrage ≤ 8 Samples aus 64er-Ring (`idx` = Ringposition) → 8 Blöcke + `merge_ring`. *Korrigiert 17.10.2026 (MCU-Befund §2): Schieberegister, 7–9 Samples je Antwort, nächster idx = idx + n – A.8 Punkt 5.*
 - **10 Ruhetest:** echte Ruhe-DIF 756–1 292 (64–2 500 Samples) → Schranke 3000 passt.
 - **13 Swap: BELEGT** Ablauf `sta_swap` 0/1 + Rücklesen `expar0` (0, 1) an der Main-MCU; Versionen in `expar1`.
 - **14 Stepper-OIDs:** Stock nimmt den letzten Z-Stepper (`stepper_z1`).

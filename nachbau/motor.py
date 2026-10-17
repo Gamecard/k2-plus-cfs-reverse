@@ -31,7 +31,8 @@ CH32V30x-Klasse, Basis 0x3000 hinter 12-KB-Bootloader, Befehlsregistrierung
 @0x6100-0x63d8) + Live 16.10. (Fahrt X F600/F1200, DIR-Gegenprobe):
 - 0x08-Tabelle der FW idx 0..18 komplett (VARIABLE_TABLE: Name, Einheit,
   Belegstatus); idx 1-4 = pos/spd/id/iq_ref, 5/6 = LESO-Beobachter (Host-
-  Namen pos_fdb/spd_fdb), 9/10 = Ia/-Ib [A], 11 = Schrittpuls-Zähler,
+  Namen pos_fdb/spd_fdb), 9/10 = Ia/Ib [A] (idx 10 Vorzeichen s. NACHTRAG
+  17.10.), 11 = Schrittpuls-Zähler,
   12 = DIR-Eingang (live bestätigt), 17/18 = °C/V; spd_fdb = rad/s belegt.
   idx > 18: FW sendet einen veralteten Wert (kein Crash).
 - 0x0C [0b]: Byte 0-3 Fehler u32 LE, Byte 4-7 Warnung u32 LE -> decode_
@@ -51,6 +52,23 @@ Antworten STATUS 00: 0x13/0x14 len 0x4d -> 74 B, 0x15/0x16 len 0xa4 ->
 reihenfolge ERR_DETAIL_FORMAT bestätigt; 0x14-Zusatzfloat heißt im Host
 param_peak_overcurrent_A).
 - 0x11 heißt in der FW emergency_pin_mode (Host: stall_mode).
+NACHTRAG 17.10.2026 (MOTOR-RESTE-BEFUND-2026-10-17.md §2/§3/§4/§5/§7,
+BOOTLOADER-HOST-BEFUND-2026-10-17.md §2, statisch):
+- KORREKTUR idx 10: FW-Wert = Ib x s, s = -1,0 NUR bei phase_order_invert
+  != 0 (@0xbb30 `lh a5,0x5a(s0)`, `beqz` -> +1,0 @0x19c98, sonst -1,0
+  @0x19d14; obj+0x5a = Param-ID 10). Live phase_order_invert = 0 -> idx 10
+  = +Ib (bis 17.10. fälschlich als -Ib geführt). read_phase_currents()
+  nimmt phase_order_invert als Parameter (Default 0), Name idx 10 = "ib"
+  (Alt-Konstante IDX_MINUS_IB bleibt als Alias).
+- idx 15/16 benannt: encoder_single_turn / encoder_fdb (Counts, 32768/U).
+- Fehlerbits 1/4/6 und Warnbit 0 haben in mot2_002_081 keinen Setzer; Bit 11
+  = Motorcheck PhaseNotConnected (@0xe082-0xe08e); Bits 9-13 nur aus dem
+  Motorcheck beim Hochlauf.
+- Erase (F0 [06]) für Motorziele GESPERRT (build_erase_payload/
+  update_sequence -> ValueError): Motor-App kennt 0xF0 nicht, Stock sendet
+  [06] nur an CFS-Typ 1/10 (mcu_util_485 @0x15378).
+- Broadcast-Schutz zentral in serial485.check_tx_frame: nie 0xFF/0xFD mit
+  0x01 (reboot) oder 0x0B (boot), außer 0xFF 0x0B [01] (CFS-Loader->App).
 
 Umfang:
 - LESEND (live belegt, senden erlaubt):
@@ -76,7 +94,8 @@ Umfang:
 - read_encoder: GESPERRT (0x06-Altfalle) – "Encoder" = 0x08 idx 5/11
   (Single-Turn) -> read_position_feedback(with_counts=True)
 - 0x08-Helfer (FW-Tabelle 16.10.): read_reference_values (idx 1-4),
-  read_phase_currents (idx 9/10 -> Ia, Ib), read_dir_input (idx 12);
+  read_phase_currents (idx 9/10 -> Ia, Ib; phase_order_invert, Default 0),
+  read_dir_input (idx 12);
   read_variable_raw_fw (idx 0..18, NUR confirm=True, eigener Bus-Zugriff,
   live für 0/13..18 NICHT geprüft)
 - check_protection (0x0C [0b]) -> dekodiert (decode_protection),
@@ -102,6 +121,9 @@ Umfang:
   live NIE beobachtet): query_version/query_sector_size frei (Abfragen),
   request_update/send_fw_len/update_end NUR mit confirm=True (Bootloader-
   Risiko, Haltemoment weg); Builder + update_sequence senden nichts.
+  HINWEIS 17.10.: Die laufende Motor-App ignoriert 0xF0 komplett (keine
+  Antwort, MOTOR-RESTE §2) – F0 wirkt nur im Motor-Bootloader (nicht im
+  Image). Erase (Sub 0x06) für Motorziele -> ValueError.
 - write_sys_param: IDs außerhalb SYS_PARAM_CONFIGURABLE zusätzlich nur mit
   allow_locked=True; Werte mit float32-Plausibilitätsprüfung.
 
@@ -142,6 +164,7 @@ crc8_cal, CRC über len..data; live gegen 36 626 RX-Frames geprüft).
 
 from serial485 import Serial485  # noqa: F401 (für echten Betrieb)
 from serial485 import build_frame, parse_frame, crc8_cal  # noqa: F401 (Selbsttest)
+from serial485 import check_tx_frame, TxGuardError  # noqa: F401 (Sendeschutz, Selbsttest)
 
 import math
 import struct
@@ -162,6 +185,17 @@ import struct
 # (0x08 "get feedback" -> live 16.10. Variablen-Lesepfad; 0x0F "version"
 # -> live 16.10. bestätigt.)
 FUNC_CONTROL = 0x05        # [01]/[02] live nie beantwortet -> NICHT gebaut
+# 0x05 control, Sub = Payload-Byte 0 (MOTOR-RESTE-BEFUND §1, B, Handler
+# 0xf880): 01 Regelung AUS, 02 Regelung EIN (leert 0x15/0x16-Ringe),
+# 03 Umschalten (nie senden), 04 Status lesen -> 3 B [EN-Pin, Regler, PWM].
+# NUR Sub 04 antwortet; 00/01/02/03/>=05 bleiben by design OHNE Antwort
+# (live 0x05 [01]/[02] -> Timeout nach ~52-58 ms). Nur Konstanten (cfswatch).
+CONTROL_OFF = 0x01
+CONTROL_ON = 0x02
+CONTROL_TOGGLE = 0x03
+CONTROL_STATUS = 0x04
+CONTROL_STATUS_LEN = 3
+CONTROL_STATUS_FIELDS = ("en_pin", "controller_on", "pwm_on")
 FUNC_SYS_PARAM = 0x06
 FUNC_READ_ENCODER = FUNC_SYS_PARAM  # Alt-Name, NUR Kompatibilität – nicht senden!
 FUNC_PROTECTION = 0x0C     # Schutzstatus: Request 1 B ([0b]), Antwort 8 B
@@ -282,6 +316,15 @@ TIMEOUT_DETAIL = 1.0       # 0x13..0x16: Host-Timeout unbelegt; live Antwort
 # Überstrom) Setzer nicht lokalisiert, Bit 11 im Befund ohne Beleg;
 # Warnung Bit 1 Unterspannung (0x480 < min), Bit 2 MCU-Übertemperatur
 # (0x484 > max), Bit 0 Setzer nicht lokalisiert. Live nur 8x 00.
+# PRÄZISIERT 17.10.2026 (MOTOR-RESTE-BEFUND §4, B; alle Schreibstellen auf
+# obj+0x428/0x438 aufgezählt): Fehlerprüfung FUN_ddf2 wird nur mit n = 0, 2,
+# 3, 5, 7, 8, 9 aufgerufen -> Bit 1 (EncoderReadErr), Bit 4 (HW-Überstrom,
+# Tabelleneintrag nur Latch-Neuberechnung @0xdfe8) und Bit 6 (PosFdbOverLimit)
+# werden in mot2_002_081 NIE gesetzt; Warnbit 0 (CommunicationErr) ebenfalls
+# nie. Bit 11 = Motorcheck „PhaseNotConnected“ (@0xe082-0xe08e). Bits 9-13
+# stammen nur aus dem Motorcheck beim Hochlauf (FUN_e51c; FW-Namen als
+# Zweitbeschriftung in MOTOR_ERROR_BITS_MOTORCHECK). Zyklisch setzbar sind
+# nur Bits 0, 2, 3, 5, 7, 8 und Warnbits 1, 2.
 MOTOR_ERROR_BITS = {
     0: ("key781", "Encoder-Sprung"), 1: ("key782", "Encoder-Lesefehler"),
     2: ("key783", "SW-Spitzenüberstrom"), 3: ("key784", "SW-Dauerüberstrom"),
@@ -294,6 +337,14 @@ MOTOR_ERROR_BITS = {
 MOTOR_WARNING_BITS = {
     0: ("key795", "Kommunikation"), 1: ("key796", "Unterspannung"),
     2: ("key797", "MCU-Übertemperatur"),
+}
+# 17.10.2026 (MOTOR-RESTE §4, B): in mot2_002_081 ohne Setzer
+MOTOR_ERROR_BITS_NEVER_SET = (1, 4, 6)
+MOTOR_WARNING_BITS_NEVER_SET = (0,)
+# Motorcheck-Ergebnis obj+0x1d6 -> Fehlerbit, FW-Namen (Zweitbeschriftung)
+MOTOR_ERROR_BITS_MOTORCHECK = {
+    9: "ValueAbnormal", 10: "UnStable", 11: "PhaseNotConnected",
+    12: "ResistanceDifferent", 13: "OtherErr",
 }
 ERROR_CODE_BITS = 32       # u32, genutzt Bit 0..13
 WARNING_CODE_BITS = 32     # u32, genutzt Bit 0..2
@@ -374,8 +425,11 @@ VARIABLE_TABLE = {
     8: ("iq_fdb", "A", "belegt", "q-Strom-Istwert (ctrl+0x610), Host-Name"),
     9: ("ia", "A", "belegt",
         "Phasenstrom Ia (ADC-Kanal 0 - Offset); Stillstand 0,00161 = 2 LSB"),
-    10: ("minus_ib", "A", "belegt",
-         "Phasenstrom -Ib (ADC-Kanal 1, x -1.0); Stillstand 0,00081 = 1 LSB"),
+    10: ("ib", "A", "belegt",
+         "Phasenstrom Ib (ADC-Kanal 1 - Offset) x s, s = +1,0 bei "
+         "phase_order_invert 0 (live), -1,0 sonst (@0xbb30 lh 0x5a(obj); "
+         "beqz -> +1,0 @0x19c98, sonst -1,0 @0x19d14); Stillstand 0,00081 "
+         "= 1 LSB. KORREKTUR 17.10.: nicht pauschal -Ib"),
     11: ("pos_counts", "counts", "belegt",
          "Schrittpuls-Zählerstand (obj+0x7bc u32, STEP-Eingang), 0..3199 = "
          "3200/Umdrehung; x2pi/3200 = Soll-Winkel"),
@@ -386,8 +440,13 @@ VARIABLE_TABLE = {
          "Pegel EN-Eingang (pins+0x118): 1 -> Regelung aus"),
     14: ("stall_flag", "0/1", "fw",
          "Stall-Flag (obj+0x40) = STATUS bit0 (|iq_ref| bzw. |pos-PID-Fehler| > Schwelle)"),
-    15: (None, None, "offen", "obj->[0xc]+0x24 (u32), Bedeutung offen"),
-    16: (None, None, "offen", "obj->[0xc]+0x2c (u32), Bedeutung offen"),
+    15: ("encoder_single_turn", "counts", "fw",
+         "Encoder Single-Turn 0..32767 (enc+0x24, richtungskorrigiert), "
+         "32768 Counts/U; rad = x*2pi/32768 (MOTOR-RESTE §3); live nie gelesen"),
+    16: ("encoder_fdb", "counts", "fw",
+         "encoder_fdb (enc+0x2c -> obj+0x84, Feld encoder_fdb in 0x13/0x14): "
+         "bei singleturn_control_mode 1 (FW-Default) == idx 15, sonst "
+         "Umdrehungen*32768 + idx 15; live nie gelesen"),
     17: ("board_detect_temperature_C", "°C", "fw",
          "MCU-Temperatursensor (Kalibrierung 0x1FFFF720)"),
     18: ("board_detect_power_supply_V", "V", "fw",
@@ -397,14 +456,21 @@ VARIABLE_FW_INDEX_MIN = 0
 VARIABLE_FW_INDEX_MAX = 18   # > 18: FW sendet veralteten Scratch-Wert (gp-0x7b4)
 VARIABLE_NAMES_HOST = {5: "pos_fdb", 6: "spd_fdb", 7: "id_fdb", 8: "iq_fdb"}
 VARIABLE_NAMES_DERIVED = {11: "pos_counts"}   # live 16.10. abgeleitet (Alt-Name)
-# idx -> Name für alle Indizes mit Namen (0..14, 17, 18; 15/16 offen)
+# idx -> Name für alle Indizes 0..18 (15/16 seit 17.10. benannt)
 VARIABLE_NAMES = dict((i, v[0]) for i, v in VARIABLE_TABLE.items() if v[0])
 VARIABLE_UNITS = dict((i, v[1]) for i, v in VARIABLE_TABLE.items())
 VARIABLE_STATUS = dict((i, v[2]) for i, v in VARIABLE_TABLE.items())
 IDX_POS_FDB, IDX_SPD_FDB, IDX_ID_FDB, IDX_IQ_FDB = 5, 6, 7, 8
 IDX_POS_COUNTS = 11
 IDX_POS_REF, IDX_SPD_REF, IDX_ID_REF, IDX_IQ_REF = 1, 2, 3, 4
-IDX_IA, IDX_MINUS_IB, IDX_DIR_INPUT = 9, 10, 12
+IDX_IA, IDX_IB, IDX_DIR_INPUT = 9, 10, 12
+IDX_MINUS_IB = IDX_IB   # Alt-Name (bis 17.10. fälschlich "-Ib"), nur Kompatibilität
+IDX_ENCODER_SINGLE_TURN, IDX_ENCODER_FDB = 15, 16
+ENCODER_COUNTS_PER_REV = 32768   # enc+0x14 = 0x8000 (MOTOR-RESTE §3)
+# Vorzeichen idx 10 (MOTOR-RESTE §5): obj+0x5a = Sys-Param ID 10
+# param_phase_order_invert (live 2 B `00 00`, klippy.log:2526; 0x13 live 0).
+SYS_PARAM_PHASE_ORDER_INVERT = 10
+PHASE_ORDER_INVERT_LIVE = 0
 # Skalierung (BELEGT live 16.10.): idx 5 pos_fdb [rad] = idx11 * 2*pi/3200.
 # 3200 = 200 Vollschritte x 16 Microsteps ([stepper_x] microsteps 16);
 # rotation_distance 40 -> 80 Counts/mm. Live-Rest pos_fdb - idx11*2pi/3200
@@ -499,7 +565,8 @@ TIMEOUT_VARIABLE = 1.0     # unbelegt
 SUB_GET_VERSION = 0x00     # get version
 SUB_REQUEST_UPDATE = 0x01  # request update
 SUB_GET_SECTOR = 0x03      # get sector size
-SUB_ERASE_SECTOR = 0x06    # erase private flash sector (nur CFS-Typ 1/10 belegt!)
+SUB_ERASE_SECTOR = 0x06    # erase private flash sector – NUR CFS-Typ 1/10,
+                           # für Motoren gesperrt (s. build_erase_payload)
 SUB_UPDATE_END = 0x02      # update_end (Beleg: mcu_util_485 @0x15a50..0x15a8c:
                            # Zustand 10, Func 0xF0, 1 Byte = 0x02, Timeout 500 ms;
                            # String "update_end" + "update end, wait to startup app")
@@ -514,6 +581,15 @@ UPDATE_RETRIES = 2
 SECTOR_SIZE_MIN = 1        # Beleg: Sector-Size im Binary signed Byte (ldrsb
 SECTOR_SIZE_MAX = 127      # [r4,#40] @0x15560, <=0 -> Fehlerpfad) -> 1..127;
                            # Längenbyte erlaubt ohnehin max. 252 Datenbytes.
+
+# Gerätetypen der Auto-Adressierung/mcu_util_485 (auto_addr DEV_TYPE_*):
+# 1 = CFS-Box (MB), 2 = Closed-loop-Motor (CLM), 10 = CFS-Pro. Erase F0 [06]
+# sendet der Stock-Updater NUR an Typ 1/10 (mcu_util_485 Erase-Zustand 5
+# @0x15378-0x153d4: `ldr r5,[node,#0x10]; cmp r5,#1; cmpne r5,#10`).
+DEV_TYPE_CFS = 1
+DEV_TYPE_MOTOR = 2
+DEV_TYPE_CFS_PRO = 10
+ERASE_DEV_TYPES = (DEV_TYPE_CFS, DEV_TYPE_CFS_PRO)
 
 PARAM_LEN_0C = PROTECTION_LEN  # Alt-Name
 FW_LEN_BYTES = 4           # Beleg: 1.7 "4 Bytes = send fw len (32-bit LE)"
@@ -862,6 +938,35 @@ def counts_delta(new, old, counts_per_rev=POS_COUNTS_PER_REV):
     return d - counts_per_rev if d > counts_per_rev / 2 else d
 
 
+def encoder_counts_to_rad(counts):
+    """Encoder-Counts (idx 15/16, encoder_fdb in 0x13/0x14) -> rad,
+    32768 Counts/U (MOTOR-RESTE §3; live 0x14: 4421 -> 0,8477 rad =
+    pos_fdb_encoder). NICHT für idx 11 (STEP-Pulse, 3200/U). Ohne Bus."""
+    return counts_to_rad(counts, ENCODER_COUNTS_PER_REV)
+
+
+def _check_phase_order_invert(phase_order_invert):
+    if isinstance(phase_order_invert, bool) or not isinstance(phase_order_invert, int):
+        raise ValueError("phase_order_invert muss int sein (Sys-Param ID 10, "
+                         "live 0): %r" % (phase_order_invert,))
+    return phase_order_invert
+
+
+def ib_from_idx10(value, phase_order_invert=PHASE_ORDER_INVERT_LIVE):
+    """0x08-idx-10-Wert -> Phasenstrom Ib [A], ohne Bus.
+
+    FW (MOTOR-RESTE §5, B): idx 10 = Ib x s mit s = +1,0 bei
+    phase_order_invert == 0 und -1,0 bei != 0 (@0xbb30 `lh a5,0x5a(s0)`,
+    `beqz` -> +1,0 @0x19c98, sonst -1,0 @0x19d14; obj+0x5a = int16 =
+    Sys-Param ID 10). Da s*s = 1: Ib = idx10 x s. Live ist
+    phase_order_invert = 0 -> Ib = idx 10 (unverändert).
+    phase_order_invert: int (0 = live/Default); bool/sonstiges -> ValueError.
+    """
+    if _check_phase_order_invert(phase_order_invert) != 0:
+        return -value
+    return value
+
+
 def build_variable_payload(idx):
     """0x08-Payload [idx], idx 1..12 (live 16.10.: `81 04 00 08 09`). Builder."""
     _check_variable_index(idx)
@@ -1057,12 +1162,35 @@ def build_sector_payload():
     return [SUB_GET_SECTOR]
 
 
-def build_erase_payload():
-    """Sub 0x06 (1B) = erase private flash sector.
+def _check_erase_target(dev_type):
+    """Erase nur für CFS-Gerätetyp 1/10; Motor (2) und alles andere ->
+    ValueError (ohne Bus-Zugriff). bool wird abgelehnt (True == 1!)."""
+    if isinstance(dev_type, bool) or dev_type not in ERASE_DEV_TYPES:
+        raise ValueError(
+            "Erase (F0 [06]) für Gerätetyp %r gesperrt – nur CFS-Typ 1/10. "
+            "Motorziele: die Motor-App kennt 0xF0 nicht (Kommandotabelle "
+            "FUN_60fc nur 0x00-0x16, Frame ignoriert, MOTOR-RESTE §2), der "
+            "Stock-Updater mcu_util_485 sendet [06] nur an Typ 1/10 "
+            "(@0x15378-0x153d4 `cmp r5,#1; cmpne r5,#10`); Wirkung im "
+            "Motor-Bootloader unbelegt" % (dev_type,))
+    return dev_type
 
-    WARNUNG: Nur für CFS-Typ 1/10 belegt (1.7) – ob Motor-Boards diesen
-    Sub-Code unterstützen, ist UNBELEGT. Nicht blind an 0x81-0x84 senden.
+
+def build_erase_payload(dev_type=DEV_TYPE_MOTOR):
+    """Sub 0x06 (1B) = erase private flash sector – NUR CFS-Typ 1/10.
+
+    17.10.2026 (MOTOR-RESTE-BEFUND §2/§7, B): Für Motorziele GESPERRT ->
+    ValueError. Belege: (1) Die Motor-App registriert nur Cmd 0x00-0x16
+    (FUN_60fc, 19 Einträge), 0xF0 fehlt -> jeder F0-Frame wird ignoriert
+    (keine Antwort, keine Wirkung). (2) Der Stock-Updater mcu_util_485
+    sendet F0 [06] (Timeout 500 ms, 3 Versuche) nur für Gerätetyp 1 oder
+    10 (Erase-Zustand 5 @0x15378-0x153d4), Motoren sind Typ 2 -> Stock
+    sendet Motoren nie 0x06. Ein Motor-Update ginge nur über den
+    Bootloader (0x0B), dessen F0-[06]-Verhalten nicht im Image liegt.
+    dev_type: Gerätetyp (Default DEV_TYPE_MOTOR = 2, dieses Modul ist der
+    Motor-Nachbau); nur DEV_TYPE_CFS (1) / DEV_TYPE_CFS_PRO (10) erlaubt.
     """
+    _check_erase_target(dev_type)
     return [SUB_ERASE_SECTOR]
 
 
@@ -1107,14 +1235,21 @@ def chunk_firmware(fw_bytes, sector_size):
     return [fw[i:i + sector_size] for i in range(0, len(fw), sector_size)]
 
 
-def update_sequence(fw_bytes, sector_size, erase=False):
+def update_sequence(fw_bytes, sector_size, erase=False, dev_type=DEV_TYPE_MOTOR):
     """Dokumentierte Update-Sequenz als (Schritt, Func, Payload)-Liste.
 
-    Reihenfolge nach 1.7: version -> sector -> [erase, NUR mit erase=True;
-    belegt nur für CFS-Typ 1/10, für Motor-Boards UNBELEGT] -> request ->
-    len(LE) -> Daten-Chunks -> update-end (Sub 0x02, Beleg: mcu_util_485
-    @0x15a64, Timeout UPDATE_END_TIMEOUT).
+    Reihenfolge nach 1.7: version -> sector -> [erase, NUR mit erase=True
+    UND dev_type CFS 1/10] -> request -> len(LE) -> Daten-Chunks ->
+    update-end (Sub 0x02, Beleg: mcu_util_485 @0x15a64, Timeout
+    UPDATE_END_TIMEOUT).
+
+    erase=True für Motorziele (Default dev_type = DEV_TYPE_MOTOR) ->
+    ValueError (Beleg s. build_erase_payload: Motor-App kennt 0xF0 nicht,
+    Stock sendet [06] nur an CFS-Typ 1/10, mcu_util_485 @0x15378). Ohne
+    erase ist dev_type ohne Wirkung. Sendet nichts.
     """
+    if erase:
+        _check_erase_target(dev_type)  # vor allem anderen, ohne Bus
     fw = bytes(fw_bytes)
     chunks = chunk_firmware(fw, sector_size)  # prüft leer + sector_size
     seq = [
@@ -1122,8 +1257,8 @@ def update_sequence(fw_bytes, sector_size, erase=False):
         ("get-sector-size", FUNC_FW_UPDATE, build_sector_payload()),
     ]
     if erase:
-        seq.append(("erase-sector (NUR CFS-Typ 1/10 belegt!)", FUNC_FW_UPDATE,
-                    build_erase_payload()))
+        seq.append(("erase-sector (CFS-Typ %d)" % dev_type, FUNC_FW_UPDATE,
+                    build_erase_payload(dev_type)))
     seq += [
         ("request-update", FUNC_FW_UPDATE, build_update_request_payload()),
         ("send-fw-len", FUNC_FW_UPDATE, build_fw_len_payload(len(fw))),
@@ -1449,13 +1584,28 @@ class Motor:
         return dict((VARIABLE_NAMES[i], self.read_variable(i)["value"])
                     for i in (IDX_POS_REF, IDX_SPD_REF, IDX_ID_REF, IDX_IQ_REF))
 
-    def read_phase_currents(self):
-        """Phasenströme (0x08 idx 9, 10; 2 Frames) -> {'ia', 'ib', 'minus_ib'}
-        in A. LESEND. idx 10 liefert die FW als -Ib (x -1.0) -> 'ib' =
-        -Wert. Skala raw*Vref/4096/(Gain*R); Gain*R = 1 Ohm VERMUTET."""
+    def read_phase_currents(self, phase_order_invert=PHASE_ORDER_INVERT_LIVE):
+        """Phasenströme (0x08 idx 9, 10; 2 Frames) in A. LESEND.
+
+        KORREKTUR 17.10.2026 (MOTOR-RESTE §5, B): idx 10 = Ib x (-1 NUR
+        falls phase_order_invert != 0), s. ib_from_idx10. Bei
+        phase_order_invert = 0 (live, Default) ist 'ib' = idx 10.
+
+        phase_order_invert: Wert von Sys-Param ID 10 (param_phase_order_
+        invert, obj+0x5a), int, Default 0 = Live-Stand aller Motoren. Kein
+        Bus-Zugriff dafür (bei Bedarf vorher read_sys_param_raw(10) lesen;
+        live 2 B `00 00`). bool/sonstiges -> ValueError OHNE Senden.
+
+        Rückgabe {'ia', 'ib', 'ib_fw' (idx-10-Rohwert), 'minus_ib' (= -ib,
+        Alt-Schlüssel; bis 17.10. fälschlich der Rohwert idx 10),
+        'phase_order_invert'}. Skala raw*Vref/4096/(Gain*R); Gain*R = 1 Ohm
+        VERMUTET (MOTOR-RESTE §5: V, stark)."""
+        _check_phase_order_invert(phase_order_invert)
         ia = self.read_variable(IDX_IA)["value"]
-        mib = self.read_variable(IDX_MINUS_IB)["value"]
-        return {"ia": ia, "ib": -mib, "minus_ib": mib}
+        ib_fw = self.read_variable(IDX_IB)["value"]
+        ib = ib_from_idx10(ib_fw, phase_order_invert)
+        return {"ia": ia, "ib": ib, "ib_fw": ib_fw, "minus_ib": -ib,
+                "phase_order_invert": phase_order_invert}
 
     def read_dir_input(self):
         """Pegel des DIR-Eingangs (0x08 idx 12) -> int 0/1. LESEND.
@@ -1586,12 +1736,18 @@ class Motor:
     # gesehen) – senden NICHTS ---
 
     def reboot(self, *args):
-        """TODO 0x01 reboot (Host-Tabelle) – live nie gesehen, nicht senden."""
+        """TODO 0x01 reboot (Host-Tabelle) – live nie gesehen, nicht senden.
+        FW (MOTOR-RESTE §2, B): FUN_f724, nur Payload [00] wirkt (Watchdog-
+        Reset ohne Boot-Key); per 0xFF erreichbar -> Broadcast sperrt
+        serial485.check_tx_frame."""
         raise NotImplementedError("TODO 0x01 reboot: nicht nachgebaut")
 
     def boot(self, *args):
         """GESPERRT 0x0B boot (MOTOR_BOOT „使系统进入boot模式“) – Bootloader,
-        Haltemoment weg. Nie senden."""
+        Haltemoment weg. Nie senden. FW (MOTOR-RESTE §2, B): FUN_104e6, nur
+        Payload [00] wirkt (boot_key 0x8567 + Watchdog-Reset), [01] ist in
+        der Motor-App wirkungslos (@0x104f6-0x104fc). Broadcast 0xFF 0x0B
+        (außer [01] = CFS-Loader->App) sperrt serial485.check_tx_frame."""
         raise NotImplementedError("0x0B boot gesperrt (Bootloader)")
 
     def systemid(self, *args):
@@ -1606,6 +1762,9 @@ class Motor:
     # GESCHÜTZT (confirm=True, sonst PermissionError ohne Bus-Zugriff):
     # request_update, send_fw_len, update_end. Es gibt bewusst KEINE Methode
     # für Daten-Chunks/Erase (nur Builder + update_sequence, senden nichts).
+    # Erase ist für Motoren zusätzlich in den Buildern gesperrt (17.10.2026,
+    # ValueError). Die laufende Motor-App ignoriert 0xF0 komplett (keine
+    # Antwort) – query_* laufen an einem App-Motor also in den Timeout.
 
     @staticmethod
     def _check_update_confirm(name, confirm):
@@ -2132,15 +2291,35 @@ def selftest():
           and set(VARIABLE_STATUS.values()) <= {"belegt", "fw", "vermutet", "offen"}
           and set(u for u in VARIABLE_UNITS.values() if u)
           <= {"rad", "rad/s", "A", "counts", "°C", "V", "0/1"}
-          and sorted(i for i in VARIABLE_TABLE if VARIABLE_NAMES.get(i) is None) == [15, 16])
+          and sorted(i for i in VARIABLE_TABLE if VARIABLE_NAMES.get(i) is None) == [])
     check("VARIABLE_TABLE Kernnamen/Einheiten",
           [VARIABLE_NAMES[i] for i in (1, 2, 3, 4, 9, 10, 12)]
-          == ["pos_ref", "spd_ref", "id_ref", "iq_ref", "ia", "minus_ib", "dir_input"]
+          == ["pos_ref", "spd_ref", "id_ref", "iq_ref", "ia", "ib", "dir_input"]
           and VARIABLE_UNITS[6] == "rad/s" and VARIABLE_UNITS[5] == "rad"
           and VARIABLE_UNITS[9] == "A" and VARIABLE_UNITS[11] == "counts"
           and VARIABLE_UNITS[17] == "°C" and VARIABLE_UNITS[18] == "V"
           and VARIABLE_STATUS[12] == "belegt" and VARIABLE_STATUS[13] == "vermutet"
-          and VARIABLE_STATUS[15] == "offen")
+          and VARIABLE_STATUS[15] == "fw" and VARIABLE_STATUS[16] == "fw")
+    # 17.10.2026 (MOTOR-RESTE §3): idx 15/16 benannt, Encoder 32768/U
+    check("idx 15/16 = encoder_single_turn / encoder_fdb (counts, '<I')",
+          VARIABLE_NAMES[15] == "encoder_single_turn"
+          and VARIABLE_NAMES[16] == "encoder_fdb"
+          and VARIABLE_UNITS[15] == VARIABLE_UNITS[16] == "counts"
+          and VARIABLE_FW_FORMATS[15] == VARIABLE_FW_FORMATS[16] == "<I"
+          and (IDX_ENCODER_SINGLE_TURN, IDX_ENCODER_FDB) == (15, 16)
+          and decode_variable_fw(16, struct.pack("<I", 4421))["value"] == 4421)
+    check("encoder_counts_to_rad 32768/U (live 0x14: 4421 -> 0,8477 rad)",
+          ENCODER_COUNTS_PER_REV == 32768
+          and abs(encoder_counts_to_rad(4421) - 0.84772) < 1e-5
+          and abs(encoder_counts_to_rad(16384) - math.pi) < 1e-12)
+    # 17.10.2026 (MOTOR-RESTE §4): Bits ohne Setzer + Motorcheck-Namen
+    check("Fehlerbits ohne Setzer 1/4/6, Warnbit 0; Motorcheck 9..13",
+          MOTOR_ERROR_BITS_NEVER_SET == (1, 4, 6)
+          and MOTOR_WARNING_BITS_NEVER_SET == (0,)
+          and all(b in MOTOR_ERROR_BITS for b in MOTOR_ERROR_BITS_NEVER_SET)
+          and sorted(MOTOR_ERROR_BITS_MOTORCHECK) == [9, 10, 11, 12, 13]
+          and MOTOR_ERROR_BITS_MOTORCHECK[11] == "PhaseNotConnected"
+          and MOTOR_ERROR_BITS[11][0] == "key792")
     check("decode_variable liefert unit/status",
           decode_variable(6, struct.pack("<f", 1.572))["unit"] == "rad/s"
           and decode_variable(12, bytes(4))["status"] == "belegt")
@@ -2156,10 +2335,35 @@ def selftest():
           and ref["id_ref"] == 0.0 and abs(ref["iq_ref"] - 0.0794) < 1e-6
           and [c[2] for c in bus.calls] == [[1], [2], [3], [4]])
     ph = mr.read_phase_currents()
-    check("read_phase_currents idx 9/10 -> Ia, Ib = -idx10 (live F600)",
-          abs(ph["ia"] + 0.0725) < 1e-6 and abs(ph["minus_ib"] + 0.0363) < 1e-6
-          and abs(ph["ib"] - 0.0363) < 1e-6
+    # KORREKTUR 17.10.2026 (MOTOR-RESTE §5): phase_order_invert 0 (live)
+    # -> Ib = idx 10 unverändert (vorher fälschlich -idx10)
+    check("read_phase_currents idx 9/10 -> Ia, Ib = +idx10 (live F600, invert 0)",
+          abs(ph["ia"] + 0.0725) < 1e-6 and abs(ph["ib"] + 0.0363) < 1e-6
+          and abs(ph["ib_fw"] + 0.0363) < 1e-6
+          and abs(ph["minus_ib"] - 0.0363) < 1e-6
+          and ph["phase_order_invert"] == 0
           and [c[2] for c in bus.calls[4:6]] == [[9], [10]])
+    check("IDX_IB = 10, Alt-Alias IDX_MINUS_IB, Live-Default 0",
+          IDX_IB == IDX_MINUS_IB == 10 and PHASE_ORDER_INVERT_LIVE == 0
+          and SYS_PARAM_PHASE_ORDER_INVERT == 10
+          and SYS_PARAM_NAMES[10] == "param_phase_order_invert")
+    check("ib_from_idx10: invert 0 -> +, != 0 -> - (@0xbb30 beqz)",
+          ib_from_idx10(-0.0363) == -0.0363
+          and ib_from_idx10(-0.0363, 0) == -0.0363
+          and ib_from_idx10(-0.0363, 1) == 0.0363
+          and ib_from_idx10(0.5, -1) == -0.5
+          and all(raises(ValueError, ib_from_idx10, 1.0, bad)
+                  for bad in (True, False, None, 1.0, "0")))
+    bus_inv = _FakeBus([_vrxb(i, struct.pack("<f", f600[i])) for i in (9, 10)])
+    ph1 = Motor(bus_inv, 0x81).read_phase_currents(phase_order_invert=1)
+    check("read_phase_currents(phase_order_invert=1) -> Ib = -idx10",
+          abs(ph1["ib"] - 0.0363) < 1e-6 and abs(ph1["ib_fw"] + 0.0363) < 1e-6
+          and abs(ph1["minus_ib"] + 0.0363) < 1e-6 and not bus_inv.script)
+    nobus_ph = _FakeBus([])
+    check("read_phase_currents ungültiges invert -> ValueError ohne Senden",
+          raises(ValueError, Motor(nobus_ph, 0x81).read_phase_currents, True)
+          and raises(ValueError, Motor(nobus_ph, 0x81).read_phase_currents, "1")
+          and nobus_ph.calls == [])
     # DIR-Gegenprobe 16.10.: Fahrt -X = 0, Fahrt +X = 1, Stillstand danach = 1
     check("read_dir_input idx 12: -X 0 / +X 1 / Stillstand hält 1",
           [mr.read_dir_input() for _ in range(3)] == [0, 1, 1] and not bus.script)
@@ -2423,7 +2627,29 @@ def selftest():
           and bus.calls[2][3].get("timeout") == UPDATE_END_TIMEOUT)
     check("payload version", build_version_payload() == [0x00])
     check("payload sector", build_sector_payload() == [0x03])
-    check("payload erase", build_erase_payload() == [0x06])
+    # 17.10.2026: Erase nur CFS-Typ 1/10, Motorziele -> ValueError
+    check("payload erase CFS-Typ 1/10", build_erase_payload(DEV_TYPE_CFS) == [0x06]
+          and build_erase_payload(dev_type=DEV_TYPE_CFS_PRO) == [0x06])
+    check("erase für Motoren gesperrt (Default + Typ 2, bool, None)",
+          all(raises(ValueError, build_erase_payload, *a)
+              for a in ((), (DEV_TYPE_MOTOR,), (2,), (True,), (None,), (3,))))
+    try:
+        build_erase_payload()
+        msg_e = ""
+    except ValueError as e:
+        msg_e = str(e)
+    check("erase-Fehlermeldung mit Beleg", "0x15378" in msg_e and "0xF0" in msg_e)
+    # 17.10.2026: Broadcast-Schutz zentral in serial485 (Motor-FW boot/reboot
+    # per 0xFF erreichbar); 0xFF 0x0B [01] (CFS-Loader->App) bleibt erlaubt
+    check("serial485-Sendeschutz: FF 0B [00]/FF 01 gesperrt, FF 0B [01] frei",
+          raises(TxGuardError, check_tx_frame, 0xFF, FUNC_BOOT, [0x00])
+          and raises(TxGuardError, check_tx_frame, 0xFF, FUNC_REBOOT, [0x00])
+          and check_tx_frame(0xFF, FUNC_BOOT, [0x01]) == [0x01]
+          and check_tx_frame(0xFF, FUNC_ADDR, [0x01]) == [0x01])
+    check("Motor.boot/reboot bleiben Stubs (senden nichts)",
+          raises(NotImplementedError, Motor(nobus, 0x81).boot)
+          and raises(NotImplementedError, Motor(nobus, 0x81).reboot)
+          and nobus.calls == [])
     check("payload request", build_update_request_payload() == [0x01])
     check("payload update-end", build_update_end_payload() == [0x02])
     check("fw_len LE", build_fw_len_payload(0x1E240) == [0x40, 0xE2, 0x01, 0x00])
@@ -2446,9 +2672,17 @@ def selftest():
     check("seq len-payload", seq[3][2] == [0x06, 0x00, 0x00, 0x00])
     check("seq ende sub 0x02", seq[-1][2] == [SUB_UPDATE_END])
     check("seq fun-codes", all(s[1] == FUNC_FW_UPDATE for s in seq))
-    seq_e = update_sequence(b"ABCDEF", 4, erase=True)
-    check("seq erase nur auf Wunsch",
-          seq_e[2] == ("erase-sector (NUR CFS-Typ 1/10 belegt!)",
+    check("seq erase=True für Motor -> ValueError (Default, Typ 2)",
+          raises(ValueError, update_sequence, b"ABCDEF", 4, erase=True)
+          and raises(ValueError, update_sequence, b"ABCDEF", 4, True,
+                     DEV_TYPE_MOTOR)
+          and raises(ValueError, update_sequence, b"ABCDEF", 4, erase=True,
+                     dev_type=True))
+    check("seq ohne erase: dev_type ohne Wirkung",
+          update_sequence(b"ABCDEF", 4, dev_type=DEV_TYPE_MOTOR) == seq)
+    seq_e = update_sequence(b"ABCDEF", 4, erase=True, dev_type=DEV_TYPE_CFS)
+    check("seq erase nur auf Wunsch und nur CFS-Typ 1/10",
+          seq_e[2] == ("erase-sector (CFS-Typ 1)",
                        FUNC_FW_UPDATE, [SUB_ERASE_SECTOR])
           and len(seq_e) == len(seq) + 1
           and all(s[2] != [SUB_ERASE_SECTOR] for s in seq))

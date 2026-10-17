@@ -21,6 +21,12 @@ GLEICHER Schnittstelle::
   (``timeout_ms``), parst ``transparent_response`` mit ``parse_frame``
   (CRC prüfen, Absenderadresse prüfen). ``retries=0`` wie Stock (genau eine
   Sendung, nie ein Retry – live ~2200 Motor-Sendungen alle „retries = 0“).
+- SENDESCHUTZ (17.10.2026) in BEIDEN Transporten vor jeder Sendung
+  (``check_tx_frame``/``build_tx_frame``, aus nachbau/serial485 bzw. lokal
+  gleichwertig): max. 100 Datenbytes je Frame (fun 0xF0: 0x80), Empfang
+  weiter bis len 255; Broadcast 0xFF/0xFD nie mit fun 0x01 (reboot) oder
+  0x0B (boot), außer 0xFF 0x0B [01] (CFS-Loader->App). Verstoß ->
+  ``TxGuardError`` (ValueError), nichts gesendet.
 
 Grundlagen (nur gelesen, nichts gesendet):
 - MOTOR-INIT-BEFUND-2026-10-16.md (§2 Ablauf, §4 Param-Abgleich, §5
@@ -138,6 +144,7 @@ try:
     _nb_crc8 = _nb_s485.crc8_cal
     _HAVE_NACHBAU = True
 except Exception:  # pragma: no cover – Fallback für Klipper ohne nachbau/
+    _nb_s485 = None
     _HAVE_NACHBAU = False
 
 # --- Lokale Frame-Helfer (byte-identisch zu nachbau/serial485.py) ------------
@@ -162,11 +169,77 @@ def _crc8_cal(data):
     return crc
 
 
+FRAME_LEN_MAX = 255            # Empfang/neutraler Bau (wie serial485)
+
+# --- Sendeschutz (17.10.2026, byte-gleich zu nachbau/serial485.py) -----------
+# Längengrenze für AUSGEHENDE Frames (Empfang bleibt bei len 255):
+# - CFS-App: Frame-Kontext 0x70 = 112 B, Daten ab Offset 6, CRC fest bei 0x6A
+#   -> sauber nur <= 100 Datenbytes (CFS-RESTE-BEFUND-2026-10-17.md §5, B).
+# - CFS-Bootloader verwirft len > 0xFC stumm (BOOTLOADER-HOST-BEFUND §2, B).
+# - Längste live gesendete Requests: 0xA0 mit 13 Datenbytes, 0x06-Schreiben
+#   mit 6; an Motoren (RS485 und transparent) nie mehr als 6 Datenbytes.
+#   Update-Datenblöcke (fun 0xF0) haben genau 0x80 Datenbytes.
+# -> 100 Datenbytes je Frame, bei fun 0xF0 0x80 (len 0x83 < 0xFC).
+# Broadcast-Schutz (MOTOR-RESTE-BEFUND §2/§7, B): an 0xFF/0xFD nie fun 0x01
+# (reboot) und nie fun 0x0B (boot -> ALLE Motoren in den Bootloader, Motor-FW
+# FUN_104e6 bei Payload [00]); einzige Ausnahme 0xFF 0x0B [01] = CFS-Loader->App
+# (live `0xff 0x4 0x0 0xb 0x1`; Motor-App ignoriert [01], @0x104f6-0x104fc).
+TX_DATA_MAX = 100
+TX_FUNC_UPDATE = 0xF0
+TX_DATA_MAX_UPDATE = 0x80
+BOOTLOADER_LEN_MAX = 0xFC
+TX_FUNC_REBOOT = 0x01
+TX_FUNC_BOOT = 0x0B
+TX_BOOT_GUARD_ADDRS = frozenset((0xFF, 0xFD))
+TX_LOADER_TO_APP_PAYLOAD = (0x01,)
+
+
+class _LocalTxGuardError(ValueError):
+    """Sendeschutz verletzt (Fallback ohne nachbau/); nichts gesendet."""
+
+
 def _build_frame_local(addr, fun, data=(), status=STATUS_OK):
+    """Neutraler Frame-Bau (auch Antwort-/Testframes bis len 255), byte-
+    identisch zu serial485.build_frame. Sendepfade: _build_tx_frame_local."""
     data = list(data)
     length = len(data) + 3
+    if length > FRAME_LEN_MAX:
+        raise ValueError("Frame zu lang: len %d > %d (%d Datenbytes)"
+                         % (length, FRAME_LEN_MAX, len(data)))
     body = [length, status, fun] + data
     return bytes([PACK_HEAD, addr] + body + [_crc8_cal(body)])
+
+
+def _check_tx_frame_local(addr, fun, data=()):
+    """Sendeschutz wie serial485.check_tx_frame (Fallback ohne nachbau/).
+    Verstoß -> _LocalTxGuardError (ValueError); Rückgabe Daten als Liste."""
+    data = list(data)
+    limit = TX_DATA_MAX_UPDATE if fun == TX_FUNC_UPDATE else TX_DATA_MAX
+    if len(data) > limit or len(data) + 3 > BOOTLOADER_LEN_MAX:
+        raise _LocalTxGuardError(
+            "Sendeschutz: addr 0x%02x fun 0x%02x mit %d Datenbytes (len %d) "
+            "> Grenze %d (CFS-App 100, Update-Block 0x80, Bootloader len "
+            "<= 0xFC); nichts gesendet" % (addr, fun, len(data), len(data) + 3,
+                                           limit))
+    if addr in TX_BOOT_GUARD_ADDRS:
+        if fun == TX_FUNC_REBOOT:
+            raise _LocalTxGuardError(
+                "Sendeschutz: Broadcast 0x%02x fun 0x01 (reboot) gesperrt – "
+                "startet ALLE Motoren neu; nichts gesendet" % addr)
+        if fun == TX_FUNC_BOOT and not (
+                addr == BROADCAST_ADDR and tuple(data) == TX_LOADER_TO_APP_PAYLOAD):
+            raise _LocalTxGuardError(
+                "Sendeschutz: Broadcast 0x%02x fun 0x0B [%s] gesperrt – "
+                "schickt ALLE Motoren in den Bootloader. Erlaubt ist nur "
+                "0xFF 0x0B [01] (CFS-Loader->App); nichts gesendet"
+                % (addr, " ".join("%02x" % b for b in data)))
+    return data
+
+
+def _build_tx_frame_local(addr, fun, data=(), status=STATUS_OK):
+    """Sende-Frame (Fallback): Sendeschutz + neutraler Bau."""
+    return _build_frame_local(addr, fun, _check_tx_frame_local(addr, fun, data),
+                              status=status)
 
 
 def _parse_frame_local(raw):
@@ -195,6 +268,20 @@ else:  # pragma: no cover
     build_frame = _build_frame_local
     parse_frame = _parse_frame_local
     crc8_cal = _crc8_cal
+
+# Sendeschutz: nachbau/serial485 bevorzugt (eine Quelle der Wahrheit); ein
+# älteres serial485 ohne check_tx_frame (Pi-Installation nicht aktualisiert)
+# fällt auf die lokale, gleichwertige Prüfung zurück – nie ohne Schutz.
+if (_nb_s485 is not None and hasattr(_nb_s485, "check_tx_frame")
+        and hasattr(_nb_s485, "build_tx_frame")
+        and hasattr(_nb_s485, "TxGuardError")):
+    check_tx_frame = _nb_s485.check_tx_frame
+    build_tx_frame = _nb_s485.build_tx_frame
+    TxGuardError = _nb_s485.TxGuardError
+else:
+    check_tx_frame = _check_tx_frame_local
+    build_tx_frame = _build_tx_frame_local
+    TxGuardError = _LocalTxGuardError
 
 
 def _check_addr_fun(addr, fun):
@@ -304,6 +391,9 @@ class Rs485Transport:
         """
         _check_addr_fun(addr, fun)
         payload = list(bytes(data) if isinstance(data, (bytes, bytearray)) else data)
+        # Sendeschutz (Länge, Broadcast 0x01/0x0B) VOR dem Bus – unabhängig
+        # davon, ob ``bus`` selbst prüft (z. B. Fremd-/Test-Bus).
+        payload = check_tx_frame(addr, fun, payload)
         self.sent.append((addr, fun, tuple(payload)))
         full = getattr(self.bus, "transact_full", None)
         if full is not None:
@@ -358,12 +448,13 @@ class TransparentTransport:
     def transact(self, addr, fun, data, timeout=2.0, retries=0):
         _check_addr_fun(addr, fun)
         payload = list(bytes(data) if isinstance(data, (bytes, bytearray)) else data)
+        # Sendeschutz (Länge, Broadcast 0x01/0x0B) vor jeder MCU-Sendung.
+        frame = bytes(build_tx_frame(addr, fun, payload, status=STATUS_OK))
         self.sent.append((addr, fun, tuple(payload)))
         if timeout is None or timeout < 0:
             raise ValueError("timeout muss >= 0 sein: %r" % (timeout,))
         if retries is None or retries < 0:
             raise ValueError("retries muss >= 0 sein: %r" % (retries,))
-        frame = bytes(build_frame(addr, fun, payload, status=STATUS_OK))
         timeout_ms = int(round(float(timeout) * 1000))
         last_err = None
         for _ in range(int(retries) + 1):

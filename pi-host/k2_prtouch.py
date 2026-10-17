@@ -40,7 +40,7 @@ Stil wie pi-host/k2_motor_init.py und k2_box.py:
 HAUPTWEG (mode: probe, Default, Stand 16.10.2026 abends):
   [k2_prtouch] registriert sich als Upstream-Probe (Objekt 'probe',
   Pseudo-Pin probe:z_virtual_endstop). Stopp über einen normalen
-  MCU_endstop auf step_swap_pin (Default !PC7, Main-MCU) mit trsync – wie
+  MCU_endstop auf step_swap_pin (Default ^!PC7, Main-MCU) mit trsync – wie
   Stock (BELEGT: Emulation + Fingerdruck-Test 19/19). Vor jeder Fahrt:
   Signalweg-Test (sta_swap 0/1 über den Endstop), Stock-probe_prepare
   (cont_prtouch_step -> start_prtouch_pres mit ack-Prüfung ->
@@ -61,6 +61,12 @@ Sicherheit (verbindlich, im Code durchgesetzt + getestet):
      <= probe_max_travel_mm (Default 8, max 10), Entschärfen bei jeder
      Ausnahme, Abbruch VOR der Fahrt bei ack err != 0, Signalweg-/Ruhetest-
      Fehler oder schon ausgelöstem Endstop.
+     Seit 17.10.2026 (PRTOUCH-MCU-BEFUND §7): Config-Prüfung der Antast-
+     Parameter (min_hold != max_hold, ned_hftr != 0, ned_lftr, lmt_dead >=
+     64, cfg_regs 60/56/44, …), arm_settle_s >= 1,5 × Totzeit, Mindest-
+     Antastgeschwindigkeit (ANNAHME 2,5 mm/s bei Stock-Schwellen), Ruhetest
+     mit Tickabstand/-1/24 Bit/gefiltertem Kanal, Blocklesen idx += n,
+     Endstop-Pin '^!PC7' (Pull-Up wie Stock).
   S1 MCU stoppt nicht selbst → Abwärtsfahrt NUR in kurzen Schritten
      (step_mm Default 0.02, Maximum 0.05) mit niedriger Geschwindigkeit
      (Default 5mm/s, Maximum 5mm/s), nach JEDEM Schritt wait_moves
@@ -212,15 +218,91 @@ MAX_TRAVEL_DEFAULT = 5.0  # Stock-Hub
 # von G28 (PROBE, BED_MESH_CALIBRATE, Z_TILT_ADJUST …). Default 8 mm deckt
 # horizontal_move_z 5 + Bettwelligkeit ab; harte Grenze wie MAX_TRAVEL_MAX.
 PROBE_MAX_TRAVEL_DEFAULT = 8.0
-ARM_SETTLE_DEFAULT_S = 0.2  # ANNAHME: Wartezeit nach dem Scharfschalten
+# Wartezeit nach dem Scharfschalten. Untergrenze seit 17.10.2026 an die
+# Totzeit gekoppelt (min_arm_settle_s, PRTOUCH-MCU-BEFUND §3.2/5 + §7.2):
+# Stock (lmt_dead 128, 1280 Hz) -> Minimum 0,15 s; Default 0,2 s.
+ARM_SETTLE_DEFAULT_S = 0.2
 ARM_SETTLE_MAX_S = 2.0
 MODES = ("probe", "steps")
 Z_LIFT_DEFAULT = 2.0  # wie sample_retract_dist 2.0
 TIMEOUT_DEFAULT_S = 30.0  # wie z_align timeout 30s
 
-READ_CHUNK = 8  # BELEGT 16.10.2026 live: read_prtouch_* liefert <= 8 Samples
-# je Abfrage aus einem 64er-Ringpuffer (idx = Ringposition, laufend
-# überschrieben) -> 8 Blöcke lesen, nach Tick sortieren (merge_ring).
+# Blocklesen read_prtouch_pres/_step (BELEGT PRTOUCH-MCU-BEFUND-2026-10-17
+# §2, Düse 0x08003F60 ff.): idx = Index im 64er-SCHIEBEREGISTER (0 = ältestes,
+# 63 = neuestes, kein Ring), eine Antwort endet, sobald ticks+datas > 41 Byte
+# (0x0800400E, Überlauf-Sample ist mit drin) -> 7-9 Samples je Antwort; das
+# Antwortfeld 'len' ist bei vollständig passendem Bereich um 1 zu groß
+# (0x08004014). Deshalb: angefragt wird wie Stock len = 64 - idx, der nächste
+# idx ist idx + n (n = Anzahl im gepackten Puffer) – NICHT feste 8er-Schritte
+# und NICHT das len-Feld (read_ring_blocks).
+RING_N = 64
+
+# =====================================================================
+# Absicherung nach PRTOUCH-MCU-BEFUND-2026-10-17 (§3, §4.5, §7)
+# =====================================================================
+# Kennzeichnung wie im Befund: B = Beobachtung im Image (Adresse),
+# F = Folgerung, ANNAHME = nicht belegt.
+
+# CS1237-Konfigregister cfg_regs -> (Datenrate Hz, PGA). BELEGT nur diese
+# drei Werte: Stock-printer.cfg:343 „60（1280/128）44（640/128）56（1280/64）“,
+# Bit 5:4 Rate, 3:2 PGA, 1:0 Kanal A; live 0,7907 ms bei 60 (≈ 1/1280 Hz).
+# Im Bitbang-Modus bestimmt NUR cfg_regs die Abtastrate – acq_tick ist dort
+# bloß ein Ein-Schalter (B 0x08007BB6 -> 0x08007DC4).
+CS1237_CFG = {60: (1280.0, 128), 56: (1280.0, 64), 44: (640.0, 128)}
+# Totzeit lmt_dead: Sample-Anzahl, die Firmware hebt < 64 auf 64 an
+# (B 0x08004310-0x0800431E) -> kleinere Werte lehnen wir ab.
+LMT_DEAD_MIN = 64
+# F (Memset aller Puffer bei start 0x080043xx + Hochpass-Fenster M[0..15]
+# aus roh[20]): gefiltert[63] ist erst ab Sample 64 gültig, alle 64 Einträge
+# des gefilterten Schieberegisters erst ab Sample 128 (= Stock-lmt_dead).
+# Davor stehen Rohwert-nahe Einträge (≈ -1,43e6) im Register: Richtungs-
+# erkennung „gefiltert[0] > gefiltert[63]“ (0x0800800E) und der Ruhetest am
+# gefilterten Kanal wären verfälscht.
+PRES_FILTER_WARMUP = 128
+# ANNAHME Reservefaktor 1,5 auf die Totzeit (Vorschlag MCU-Befund §7.2):
+# deckt Oszillator-Abweichung (live +1,2 %), Konfig-Handshake nach start
+# (Schreiben/Rücklesen, B 0x08007DF4) und Schedulingschwankungen ab.
+ARM_SETTLE_RESERVE = 1.5
+# Mindest-Antastgeschwindigkeit (nur mode: probe, MCU-Trigger stoppt Z).
+# Herleitung (alles ANNAHME bis zur Messung am Gerät):
+#  - B/F Modell §3.5: Rampe < ~70-80 Counts/Sample löst NIE aus (Hochpass
+#    gegen Mittel von vor 48-63 Samples -> Ausgang ≈ 55 × Steigung; nötig
+#    L[4] >= min_hold + 2*add_hold = 5000).
+#  - Live (Stock 5 mm/s): zoft 0,010-0,040 mm = 2,6-10 Samples vom
+#    Kontaktbeginn bis zur Auslösung -> laut Modell (300 -> 17, 1000 -> 6
+#    Samples) Rampe >= ~500 Counts/Sample bei 5 mm/s.
+#  - Rampe ∝ Geschwindigkeit -> Grenze ≈ 5 × 80/500 ≈ 0,8 mm/s; Faktor ~3
+#    Reserve (Steifigkeit Bett/Düse/Temperatur unbekannt) -> 2,5 mm/s.
+#  - Skaliert mit (min_hold + 2*add_hold)/5000 × Rate/1280 × 128/PGA
+#    (Schwelle in Counts, Hochpassfenster in Samples, Counts ∝ PGA);
+#    nie kleiner als 2,5 mm/s. 2,5 = Upstream-Default second_homing_speed
+#    (homing_speed/2) bei homing_speed 5.
+SPEED_MIN_BASE = 2.5
+STOCK_TRIGGER_TOP = 5000  # min_hold + 2*add_hold (Stock 4000 + 2*500)
+STOCK_RATE_HZ = 1280.0
+STOCK_PGA = 128
+# min_hold: F Modell §3.5 – max |gefiltert| in reiner Ruhe 1 002 Counts ->
+# eine Schwelle darunter löst schon durch Rauschen aus.
+MIN_HOLD_MIN = 1000
+# Ruhetest (S4) – Erweiterungen 17.10.2026 (MCU-Befund §1/§7.4):
+REST_MIN_SAMPLES = 32  # ANNAHME: mind. halbes Fenster gültiger Samples
+REST_TICK_TOL = 0.10  # ANNAHME: Median ±10 % um 1/Rate (live +1,2 %);
+# Fehlerbilder „Sensor hängt“ (alle 5 ms, B 0x08005224) und „DOUT dauernd
+# low“ (~55 µs) liegen um Faktor >= 6 daneben, falsche Rate (×2) auch.
+REST_TICK_MIN_FRAC = 0.5  # ANNAHME: kein Einzelabstand < 0,5 × Periode.
+# Bewusst weit: ein verspätet gelesenes Sample (Leerlauf-Polling mit
+# freigegebenen IRQs, B 0x08007BA8) ergibt einen langen und einen kurzen
+# Abstand – das ist Jitter, kein Fehler.
+REST_FILT_MAX_FRAC_DEFAULT = 0.5  # ANNAHME: max |gefiltert| in Ruhe
+# <= 0,5 × min_hold (live/Modell ≈ 1 000 bei min_hold 4 000 -> Faktor 2
+# Reserve für Lüfter/Heizung); 1,0 = absolute Grenze (Auslöseniveau).
+ADC24_MIN, ADC24_MAX = -(1 << 23), (1 << 23) - 1  # B 0x080051F6 (s32 aus 24 Bit)
+ADC_STUCK_VALUE = -1  # F: DOUT dauernd high -> nach 5 ms 27 × '1' >> 3 = -1
+# PC7 (step_swap_pin): Pull-Semantik der CREALITY-Firmware (B GPIO-Kern
+# 0x08004734-0x08004766): pull_up 1 -> Pull-Up, 0 -> Pull-DOWN, sonst
+# (-1 = Upstream '~') -> schwebend. Upstream: 0 = schwebend.
+CREALITY_PULL = {1: "Pull-Up", 0: "Pull-Down", -1: "schwebend"}
+STEP_SWAP_PIN_DEFAULT = "^!PC7"  # Pull-Up wie Stock-Endzustand (s. README)
 
 HOST_PY_VER = 1  # eigene Host-Version (nicht Stock-78; ANNAHME: nur
 # geloggt, kein exakter Match nötig – FW-Updates ändern PRES/STEP_VER).
@@ -267,6 +349,214 @@ def split_cs0_pin(spec):
     """'nozzle_mcu:PB13, nozzle_mcu:PB14' -> [pin1, pin2]."""
     parts = [p.strip() for p in str(spec).split(",") if p.strip()]
     return parts
+
+
+def parse_pin_desc(desc):
+    """Pin-Beschreibung wie Upstream PrinterPins.parse_pin (pins.py:66-95):
+    Reihenfolge [^|~] [!] [chip:]pin. -> dict(pullup, invert, chip, pin).
+
+    pullup: 1 ('^'), -1 ('~'), 0 (ohne). '!^PC7' ist wie bei Upstream
+    UNGÜLTIG (Upstream würde mit „Invalid pin description“ abbrechen).
+    """
+    s = str(desc).strip()
+    pull = inv = 0
+    if s[:1] in ("^", "~"):
+        pull = 1 if s[0] == "^" else -1
+        s = s[1:].strip()
+    if s[:1] == "!":
+        inv = 1
+        s = s[1:].strip()
+    if ":" in s:
+        chip, pin = [p.strip() for p in s.split(":", 1)]
+    else:
+        chip, pin = "mcu", s
+    if (not pin or any(ch in pin for ch in "^~!:")
+            or "".join(pin.split()) != pin):
+        raise ValueError("ungültige Pin-Beschreibung %r (Format wie Upstream: "
+                         "[^~] [!] [chip:]pin, z. B. ^!PC7)" % (desc,))
+    return {"pullup": pull, "invert": inv, "chip": chip, "pin": pin}
+
+
+# =====================================================================
+# Absicherung nach PRTOUCH-MCU-BEFUND-2026-10-17 – reine Funktionen
+# =====================================================================
+
+def cs1237_rate_pga(cfg_regs):
+    """cfg_regs -> (Rate Hz, PGA); nur die drei belegten Werte (s. CS1237_CFG)."""
+    try:
+        return CS1237_CFG[int(cfg_regs)]
+    except (KeyError, ValueError, TypeError):
+        raise ValueError(
+            "cfg_regs/pres_cfg_regs=%r unbekannt – zulässig nur %s "
+            "(60 = 1280 Hz/PGA128 Stock, 56 = 1280 Hz/PGA64, 44 = 640 Hz/"
+            "PGA128; Stock-printer.cfg:343, PRTOUCH-MCU-BEFUND §1/§7.1)"
+            % (cfg_regs, sorted(CS1237_CFG)))
+
+
+def pres_sample_period_s(cfg):
+    """Abtastperiode der Düse in s = 1/Rate aus cfg_regs (NICHT acq_tick:
+    im Bitbang-Modus nur Ein-Schalter, B 0x08007BB6)."""
+    rate, _pga = cs1237_rate_pga(cfg["cfg_regs"])
+    return 1.0 / rate
+
+
+def pres_dead_time_s(cfg):
+    """Totzeit nach start_prtouch_pres: max(lmt_dead, 64) Samples
+    (B 0x08004318, 0x08007F34) – Kontakt darin wird NICHT erkannt."""
+    return max(int(cfg["lmt_dead"]), LMT_DEAD_MIN) * pres_sample_period_s(cfg)
+
+
+def min_arm_settle_s(cfg):
+    """Mindestwartezeit nach dem Scharfschalten (vor Ruhetest und Fahrt).
+
+    = ARM_SETTLE_RESERVE × max(lmt_dead, 128) × Abtastperiode.
+    lmt_dead: B Totzeit; 128: F gefiltertes Register erst dann voll gültig
+    (PRES_FILTER_WARMUP). Stock (128, 1280 Hz): 1,5 × 0,1 s = 0,15 s.
+    """
+    n = max(int(cfg["lmt_dead"]), LMT_DEAD_MIN, PRES_FILTER_WARMUP)
+    return ARM_SETTLE_RESERVE * n * pres_sample_period_s(cfg)
+
+
+def min_probe_speed(cfg):
+    """Mindest-Antastgeschwindigkeit in mm/s (ANNAHME, Herleitung bei
+    SPEED_MIN_BASE): 2,5 mm/s × max(1, Schwellenfaktor × Ratenfaktor ×
+    PGA-Faktor)."""
+    rate, pga = cs1237_rate_pga(cfg["cfg_regs"])
+    top = float(cfg["min_hold"]) + 2.0 * float(cfg["add_hold"])
+    scale = ((top / STOCK_TRIGGER_TOP) * (rate / STOCK_RATE_HZ)
+             * (float(STOCK_PGA) / float(pga)))
+    return SPEED_MIN_BASE * max(1.0, scale)
+
+
+def check_probe_speed(speed, cfg):
+    """None wenn zulässig, sonst Fehlertext (zu schnell / zu langsam)."""
+    sp = float(speed)
+    if not 0.0 < sp <= SPEED_MAX + 1e-12:
+        return ("Antastgeschwindigkeit %.2f mm/s unzulässig (hart <= %.1f "
+                "mm/s)" % (sp, SPEED_MAX))
+    vmin = min_probe_speed(cfg)
+    if sp < vmin - 1e-9:
+        return ("Antastgeschwindigkeit %.2f mm/s zu langsam (Minimum %.2f "
+                "mm/s, ANNAHME): die Düsen-MCU erkennt nur einen schnellen "
+                "Kraftanstieg – eine zu flache Kraftrampe (< ~80 Counts/"
+                "Sample) löst NIE aus, Z würde ins Bett fahren "
+                "(PRTOUCH-MCU-BEFUND §3.5/§7.3)" % (sp, vmin))
+    return None
+
+
+def validate_mcu_params(cfg):
+    """Antast-Parameter gegen den MCU-Befund prüfen (wirft ValueError).
+
+    Reihenfolge = Gefährlichkeit. Belege: PRTOUCH-MCU-BEFUND-2026-10-17
+    §3.1-3.5 (Adressen Düse noz0_130, Basis 0x08003000).
+    """
+    mn, mx, add = (int(cfg["min_hold"]), int(cfg["max_hold"]),
+                   int(cfg["add_hold"]))
+    if mn == mx:
+        # B 0x08007E26-0x08007E30: min_hold == max_hold -> Stream-Modus,
+        # kein Puffer, kein Filter, KEINE Auslösung -> Crash ins Bett.
+        raise ValueError(
+            "min_hold == max_hold (%d): die Düsen-MCU läuft dann im Stream-"
+            "Modus und löst NIE aus – Z würde ins Bett fahren. max_hold "
+            "(pres_tri_hold[1]) muss != min_hold sein (Stock 10000 bei 4000)"
+            % mn)
+    if int(cfg["ned_hftr"]) <= 0:
+        # B 0x08007E6C: Hochpass nur bei ned_hftr != 0; F Modell §3.5:
+        # ohne Hochpass Fehlauslösung nach 133 Samples in reiner Ruhe.
+        raise ValueError(
+            "ned_hftr=%d: Hochpass aus – die Schwellen wirken dann auf "
+            "Absolutwerte (≈ -1,43e6) -> Fehlauslösung schon in Ruhe "
+            "(Modell: nach 133 Samples). ned_hftr muss > 0 sein "
+            "(pres_tri_fter[1] > 0, Stock 1 -> 1000)" % int(cfg["ned_hftr"]))
+    lf = int(cfg["ned_lftr"])
+    if not (lf == 0 or 0 < lf <= 1000):
+        # B 0x080042EE/0x08007ED6: a = ned_lftr/1000, y = (1-a)·y + a·x;
+        # a > 1 -> (1-a) < 0 -> schwingender Tiefpass.
+        raise ValueError(
+            "ned_lftr=%d unzulässig: Tiefpass a = ned_lftr/1000 muss in "
+            "(0, 1] liegen (0 = aus); > 1000 macht den IIR-Filter "
+            "schwingend (pres_tri_fter[2] in [0, 1], Stock 0.8)" % lf)
+    if int(cfg["ned_tftr"]) < 0:
+        raise ValueError("ned_tftr=%d muss >= 0 sein (nur Schalter, Stock 5)"
+                         % int(cfg["ned_tftr"]))
+    if int(cfg["lmt_dead"]) < LMT_DEAD_MIN:
+        # B 0x08004310-0x0800431E: Firmware hebt auf 64 an – der Host würde
+        # mit einer falschen Totzeit rechnen.
+        raise ValueError(
+            "lmt_dead=%d < %d: die Firmware hebt auf %d Samples an; Wert "
+            "ist eine SAMPLE-Anzahl (nicht ms), Stock 128 = 100 ms bei "
+            "1280 Hz" % (int(cfg["lmt_dead"]), LMT_DEAD_MIN, LMT_DEAD_MIN))
+    cs1237_rate_pga(cfg["cfg_regs"])  # wirft bei unbekanntem cfg_regs
+    if mn < MIN_HOLD_MIN:
+        raise ValueError(
+            "min_hold=%d < %d: liegt im Ruherauschen des gefilterten Kanals "
+            "(Modell max |gefiltert| in Ruhe 1 002) -> Fehlauslösungen "
+            "(Stock 4000)" % (mn, MIN_HOLD_MIN))
+    if add < 0:
+        raise ValueError(
+            "add_hold=%d < 0: die Auslösetreppe min/min+add/min+2·add muss "
+            "steigen (ANNAHME, Stock 500)" % add)
+    if int(cfg["pres_idx"]) != 0:
+        # B 0x08004A78: Kanalzahl = idx+1; k2_prtouch konfiguriert nur EINEN
+        # Kanal und liest ch=0 (K2 live: idx 0) – andere Kanäle blieben
+        # ohne Pins, würden aber mit ausgewertet.
+        raise ValueError(
+            "pres_idx=%d: nur 0 unterstützt (K2 hat einen Kraftsensor-Kanal, "
+            "Stock idx=0; Kanalzahl = idx+1 in der MCU)" % int(cfg["pres_idx"]))
+    if int(cfg["acq_tick"]) <= 0 or int(cfg["aqc_tick"]) <= 0:
+        raise ValueError("acq_tick/aqc_tick müssen > 0 sein (acq_tick == 0 "
+                         "= keine Abtastung, B 0x08007BAA)")
+
+
+def validate_arm_settle(cfg):
+    """arm_settle_s >= min_arm_settle_s (wirft ValueError)."""
+    need = min_arm_settle_s(cfg)
+    have = float(cfg["arm_settle_s"])
+    if need > ARM_SETTLE_MAX_S + 1e-12:
+        raise ValueError(
+            "lmt_dead=%d bei %d Hz braucht arm_settle_s >= %.3f s – mehr als "
+            "das Maximum %.1f s; lmt_dead verkleinern (Stock 128)"
+            % (int(cfg["lmt_dead"]), int(1.0 / pres_sample_period_s(cfg)),
+               need, ARM_SETTLE_MAX_S))
+    if have < need - 1e-9:
+        raise ValueError(
+            "arm_settle_s=%.3f zu kurz: Minimum %.3f s = %.1f × max(lmt_dead "
+            "%d, %d) Samples × %.4f ms. In der Totzeit nach start_prtouch_pres "
+            "erkennt die Düse KEINEN Kontakt (PRTOUCH-MCU-BEFUND §3.2/5, §5 P2)"
+            % (have, need, ARM_SETTLE_RESERVE, int(cfg["lmt_dead"]),
+               PRES_FILTER_WARMUP, pres_sample_period_s(cfg) * 1000.0))
+
+
+def validate_step_swap_pin(cfg):
+    """step_swap_pin für den Endstop (mode probe): '^' + '!' Pflicht.
+
+    PC7-Pull (Entscheidung 17.10.2026, README A.8): Pull-UP wie der
+    Stock-Endzustand. Stock sendet config_endstop pull_up=0 (in der Creality-
+    FW = Pull-DOWN, B 0x08004734) und DANACH config_prtouch_step (setzt immer
+    Pull-Up, B 0x08004910) -> Pull-Up. k2_prtouch sendet config_prtouch_step
+    VOR config_endstop (Callback-Reihenfolge) -> mit '!PC7' bliebe Pull-Down.
+    Mit '^' fordern BEIDE Befehle Pull-Up -> Endzustand reihenfolge-
+    unabhängig = Stock. '!' (ausgelöst = PC7 low) ist B (Ruhe HIGH, Kontakt
+    LOW, §4).
+    """
+    p = parse_pin_desc(cfg["step_swap_pin"])
+    if p["chip"] != str(cfg.get("main_mcu", "mcu")):
+        raise ValueError(
+            "step_swap_pin %r liegt nicht auf main_mcu %r (Swap-Eingang PC7 "
+            "ist an der Main-MCU)" % (cfg["step_swap_pin"], cfg.get("main_mcu")))
+    if p["pullup"] != 1:
+        raise ValueError(
+            "step_swap_pin %r: Pull-Up '^' fehlt (ergäbe in der Creality-"
+            "Firmware %s statt Stock-Pull-Up – dort heißt pull_up=0 Pull-DOWN, "
+            "'~' schwebend). Bitte '^!%s' schreiben (PRTOUCH-MCU-BEFUND §4.5)"
+            % (cfg["step_swap_pin"], CREALITY_PULL.get(p["pullup"], "?"),
+               p["pin"]))
+    if p["invert"] != 1:
+        raise ValueError(
+            "step_swap_pin %r: Invertierung '!' fehlt – PC7 ist in Ruhe HIGH "
+            "und bei Kontakt LOW (PRTOUCH-MCU-BEFUND §4), also '^!%s'"
+            % (cfg["step_swap_pin"], p["pin"]))
+    return p
 
 
 # =====================================================================
@@ -432,6 +722,14 @@ def parse_options(opts):
     cfg["swap_check"] = _bool("swap_check", True)
     cfg["rest_check"] = _bool("rest_check", True)
     cfg["diag_readout"] = _bool("diag_readout", False)
+    # Ruhetest am gefilterten Kanal (is_src=0): max |gefiltert| <=
+    # rest_filt_max_frac × min_hold (ANNAHME, s. REST_FILT_MAX_FRAC_DEFAULT).
+    cfg["rest_filt_max_frac"] = _float("rest_filt_max_frac",
+                                       REST_FILT_MAX_FRAC_DEFAULT)
+    if not 0.0 < cfg["rest_filt_max_frac"] <= 1.0 + 1e-12:
+        raise ValueError("rest_filt_max_frac muss in (0, 1] sein (1 = "
+                         "Auslöseniveau min_hold): %r"
+                         % (o.get("rest_filt_max_frac"),))
 
     # --- MCUs / Pins (Stock-Defaults aus printer-live.cfg) ---
     cfg["main_mcu"] = _str("main_mcu", "mcu") or "mcu"
@@ -439,7 +737,9 @@ def parse_options(opts):
     cfg["pres_idx"] = _int("pres_idx", 0)
     cfg["pres_swap_pin"] = _str("pres_swap_pin",
                                 "nozzle_mcu:PA15") or "nozzle_mcu:PA15"
-    cfg["step_swap_pin"] = _str("step_swap_pin", "!PC7") or "!PC7"
+    # Default '^!PC7' = Pull-Up wie Stock-Endzustand (validate_step_swap_pin).
+    cfg["step_swap_pin"] = (_str("step_swap_pin", STEP_SWAP_PIN_DEFAULT)
+                            or STEP_SWAP_PIN_DEFAULT)
     cfg["pres_cs0_pin"] = _str("pres_cs0_pin",
                                "nozzle_mcu:PB13, nozzle_mcu:PB14")
     # ANNAHME clk/sdo: stehen NICHT in printer-live.cfg (Negativbeleg
@@ -488,8 +788,10 @@ def parse_options(opts):
         cfg["clock_freq"], cfg["clock_freq"])
     for key, val in mcu_p.items():
         cfg[key] = _int(key, val) if key in o else int(val)
-    if cfg["acq_tick"] <= 0 or cfg["aqc_tick"] <= 0:
-        raise ValueError("acq_tick/aqc_tick müssen > 0 sein")
+    # MCU-Befund 17.10.2026: Antast-Parameter prüfen (klare Meldung, kein
+    # Start) – min_hold != max_hold, ned_hftr != 0, ned_lftr, lmt_dead,
+    # cfg_regs, min_hold-Untergrenze, add_hold, pres_idx, acq/aqc_tick.
+    validate_mcu_params(cfg)
 
     # --- Datenformat (ANNAHME, zentral konfigurierbar) ---
     # BELEGT: ticks/datas sind Byte-Arrays (%.*s), 64 Samples, little/
@@ -547,6 +849,29 @@ def parse_options(opts):
             cfg[k] = None
 
     cfg["shutdown_on_failure"] = _bool("shutdown_on_failure", False)
+
+    # --- Kopplungen nach MCU-Befund 17.10.2026 (brauchen alle Werte) ---
+    # arm_settle_s >= Totzeit × Reserve (beide Modi, Stock-Werte: 0,15 s).
+    validate_arm_settle(cfg)
+    if cfg["mode"] == "probe":
+        # Nur im Probe-Hauptweg stoppt der MCU-Trigger Z: Mindest-
+        # geschwindigkeit + Endstop-Pin '^!PC7' (Pull-Up wie Stock).
+        err = check_probe_speed(cfg["speed"], cfg)
+        if err:
+            raise ValueError("speed: %s" % err)
+        sw = validate_step_swap_pin(cfg)
+        cfg["step_swap_pull"] = CREALITY_PULL.get(sw["pullup"], "?")
+    else:
+        # mode steps: kein Endstop auf PC7, nur config_prtouch_step (setzt
+        # immer Pull-Up, B 0x08004910).
+        cfg["step_swap_pull"] = "Pull-Up (nur config_prtouch_step)"
+    rate, pga = cs1237_rate_pga(cfg["cfg_regs"])
+    cfg["pres_rate_hz"] = rate
+    cfg["pres_pga"] = pga
+    cfg["pres_period_s"] = pres_sample_period_s(cfg)
+    cfg["pres_dead_time_s"] = pres_dead_time_s(cfg)
+    cfg["arm_settle_min_s"] = min_arm_settle_s(cfg)
+    cfg["speed_min"] = min_probe_speed(cfg)
     return cfg
 
 
@@ -602,7 +927,9 @@ def parse_klipper_config(config):
               "pres_acq_tkms", "step_acq_tkms", "pres_tri_fter",
               "pres_tri_hold", "pres_ded_tkms", "rest_min_consec",
               "stepper_x_oid", "stepper_y_oid", "stepper_z_oid",
-              "can_brk_min_best", "can_brk_min_step", "can_brk_max_zoft"):
+              "can_brk_min_best", "can_brk_min_step", "can_brk_max_zoft",
+              # Absicherung MCU-Befund 17.10.2026:
+              "rest_filt_max_frac"):
         if k not in opts:
             v = _g(k, None)
             if v is not None and str(v) != "":
@@ -734,6 +1061,72 @@ def merge_ring(ticks, datas, n=PRES_N):
     return [k for k, _ in keyed], [v for _, v in keyed]
 
 
+def drop_empty(ticks, datas):
+    """Einträge mit Tick 0 UND Wert 0 verwerfen: Schieberegister nach start
+    noch nicht voll (B Memset bei start, MCU-Befund §2 Empfehlung)."""
+    keep = [(int(t), int(d)) for t, d in zip(ticks, datas)
+            if not (int(t) == 0 and int(d) == 0)]
+    return [t for t, _ in keep], [d for _, d in keep]
+
+
+def read_ring_blocks(send, make_args, cfg, decode_data, n_total=RING_N):
+    """64er-Schieberegister blockweise lesen (MCU-Befund §2/§7.6).
+
+    send(args) -> Antwort-Dict mit 'ticks'/'datas' (gepackt);
+    make_args(idx, ln) -> Befehlsargumente. Angefragt wird wie Stock
+    ln = n_total - idx; der nächste idx ist idx + n mit n = Anzahl Samples
+    im Paket (7-9, 41-Byte-Grenze) – das Antwortfeld 'len' wird bewusst
+    NICHT benutzt (B: bei vollständig passendem Bereich um 1 zu groß).
+    Abbruch bei n = 0 oder idx >= n_total. Gibt (ticks, datas, idxs)
+    zurück (idxs = angefragte Startindizes, für Tests/Diagnose).
+    """
+    ts, ds, idxs = [], [], []
+    idx = 0
+    while idx < int(n_total):
+        res = send(make_args(idx, int(n_total) - idx))
+        idxs.append(idx)
+        t = decode_ticks(bytes(res["ticks"]), cfg)
+        d = decode_data(bytes(res["datas"]), cfg)
+        if len(t) != len(d):
+            raise ValueError("Ringblock idx=%d: %d Ticks, aber %d Werte"
+                             % (idx, len(t), len(d)))
+        if not t:
+            break
+        ts += t
+        ds += d
+        idx += len(t)
+    return ts, ds, idxs
+
+
+def check_tick_spacing(ticks, cfg):
+    """Tickabstand plausibel? -> (ok, median_s, min_s, Fehlertext|None).
+
+    Erwartet 1/Rate aus cfg_regs (Stock 0,78125 ms, live 0,7907 ms).
+    Sortierte, zusammengeführte Ticks (merge_ring): zwischen den Blöcken
+    eines LAUFENDEN Registers liegen Lücken (Vielfache der Periode), daher
+    Median (Periode ± REST_TICK_TOL) + Minimum (>= REST_TICK_MIN_FRAC ×
+    Periode) statt Maximum.
+    """
+    f = float(cfg.get("clock_freq", CLOCK_FREQ))
+    per = pres_sample_period_s(cfg)
+    tk = [int(t) & 0xFFFFFFFF for t in ticks]
+    diffs = [((b - a) & 0xFFFFFFFF) / f for a, b in zip(tk, tk[1:])]
+    if not diffs:
+        return False, None, None, "zu wenige Ticks für die Abstandsprüfung"
+    med = float(statistics.median(diffs))
+    mn = min(diffs)
+    tol = REST_TICK_TOL
+    if abs(med - per) > tol * per or mn < REST_TICK_MIN_FRAC * per:
+        return (False, med, mn,
+                "Tickabstand Median %.3f ms (Soll %.3f ms ±%d %%) / Minimum "
+                "%.3f ms (Soll >= %.3f ms) – Sensor läuft nicht im Takt "
+                "(~5 ms = DOUT hängt high/Sensor ab, ≪ 0,78 ms = DOUT hängt "
+                "low, Faktor 2 = falsche Rate)"
+                % (med * 1e3, per * 1e3, round(tol * 100), mn * 1e3,
+                   REST_TICK_MIN_FRAC * per * 1e3))
+    return True, med, mn, None
+
+
 def ticks_to_times(ticks, freq=None):
     """MCU-ticks -> Sekunden relativ zum Fensterende (letzter = 0.0).
 
@@ -811,16 +1204,74 @@ def rest_info(datas):
             "len": len(vals)}
 
 
-def check_rest_ok(datas, cfg):
-    """Sensor-Ruhetest (analog PRES_CHECK). True/False + Info.
+def check_rest_ok(datas, cfg, ticks=None, filt=None):
+    """Sensor-Ruhetest (analog PRES_CHECK). -> (ok, info); info['errors']
+    listet jede verletzte Bedingung (leer = ok).
 
-    ANNAHME Schranke: dif <= rest_max_dif (Default 3000). BELEGT: FTR
-    ±600 Ruhe, PRES_CHECK SUCCESS bei dif=55285 über 7668 Samples
-    (langes Fenster) – unser Kurzfenster (64) muss deutlich ruhiger sein.
+    Rohwerte (is_src=1) – immer:
+      - mind. REST_MIN_SAMPLES gültige Samples (ANNAHME),
+      - dif <= rest_max_dif (ANNAHME Schranke, Default 3000; BELEGT live
+        Ruhe-DIF 756-1 292),
+      - kein Wert -1 (F: Sensor ab/DOUT hängt high -> MCU liest nach 5 ms
+        trotzdem und erhält -1, B 0x08005224/0x080051F6) und alle Werte im
+        24-Bit-Bereich (B: s32 aus 24-Bit-Zweierkomplement),
+      - Werte nicht konstant (dif > 0; ANNAHME: ein laufender 24-Bit-ADC mit
+        PGA 128 rauscht immer – ein abgezogener Sensor besteht sonst den
+        dif-Test mit dif = 0, MCU-Befund §1).
+    ticks (optional): Tickabstand ≈ 1/Rate (check_tick_spacing).
+    filt (optional, is_src=0): max |gefiltert| <= rest_filt_max_frac ×
+      min_hold (MCU-Befund §7.4; gefiltert = das, was die MCU gegen
+      min_hold vergleicht).
     """
-    info = rest_info(datas)
-    ok = info["dif"] <= float(cfg["rest_max_dif"])
-    return ok, info
+    errors = []
+    vals = [int(v) for v in datas]
+    if vals:
+        info = rest_info(vals)
+    else:
+        info = {"min": 0, "max": 0, "avg": 0.0, "dif": 0, "len": 0}
+    if len(vals) < REST_MIN_SAMPLES:
+        errors.append("nur %d gültige Rohwerte (< %d) – Sampling nicht "
+                      "gestartet/Puffer leer?" % (len(vals), REST_MIN_SAMPLES))
+    if vals:
+        if info["dif"] > float(cfg["rest_max_dif"]):
+            errors.append("dif=%d > %d (min=%d max=%d avg=%.0f len=%d)"
+                          % (info["dif"], cfg["rest_max_dif"], info["min"],
+                             info["max"], info["avg"], info["len"]))
+        n_stuck = sum(1 for v in vals if v == ADC_STUCK_VALUE)
+        if n_stuck:
+            errors.append("%d× Rohwert -1 (Sensor abgezogen/DOUT hängt high)"
+                          % n_stuck)
+        n_out = sum(1 for v in vals if not ADC24_MIN <= v <= ADC24_MAX)
+        if n_out:
+            errors.append("%d Rohwerte außerhalb 24 Bit" % n_out)
+        if info["dif"] == 0 and len(vals) > 1:
+            errors.append("Rohwerte konstant (dif=0) – kein Sensorrauschen, "
+                          "Sensor/Leitung prüfen")
+    if ticks is not None:
+        tok, med, mn, terr = check_tick_spacing(ticks, cfg)
+        info["tick_median_ms"] = None if med is None else med * 1e3
+        info["tick_min_ms"] = None if mn is None else mn * 1e3
+        if not tok:
+            errors.append(terr)
+    if filt is not None:
+        fv = [int(v) for v in filt]
+        lim = float(cfg.get("rest_filt_max_frac", REST_FILT_MAX_FRAC_DEFAULT)
+                    ) * float(cfg["min_hold"])
+        info["filt_len"] = len(fv)
+        info["filt_max_abs"] = max(abs(v) for v in fv) if fv else None
+        info["filt_limit"] = lim
+        if len(fv) < REST_MIN_SAMPLES:
+            errors.append("nur %d gültige gefilterte Werte (< %d)"
+                          % (len(fv), REST_MIN_SAMPLES))
+        elif info["filt_max_abs"] > lim:
+            errors.append("gefilterter Kanal max |%d| > %.0f (= %.2f × "
+                          "min_hold %d) – Ruherauschen zu nah an der "
+                          "Auslöseschwelle" % (info["filt_max_abs"], lim,
+                                               cfg.get("rest_filt_max_frac",
+                                                       REST_FILT_MAX_FRAC_DEFAULT),
+                                               int(cfg["min_hold"])))
+    info["errors"] = errors
+    return (not errors), info
 
 
 def detect_contact(pres_datas, pres_times, step_mms, step_times, cfg):
@@ -1021,33 +1472,39 @@ class KlippyPresMcu(PrtouchMcuOps):
     def read_frozen(self):
         """Diagnose nach dem Entschärfen, Stock-Reihenfolge (BELEGT per
         Emulation 16.10.): read_prtouch_pres [oid, 2, 0, 0, 0] (Status,
-        len 0), dann is_src=0 (FTR) und is_src=1 (SRC) je idx 0,8,…,56 mit
-        len = 64 - idx (Antwort je Abfrage <= 8 Samples, gepackt)."""
+        len 0), dann is_src=0 (FTR) und is_src=1 (SRC) mit len = 64 - idx.
+        Abweichend von Stock (idx fest 0,8,…,56) ist der nächste idx = idx + n
+        (n aus dem Paket, 7-9 Samples, MCU-Befund §2) -> keine Lücken."""
         status = self._q_read.send([self.oid, 2, 0, 0, 0])
         out = {"status": {k: status.get(k) for k in
                           ("tri_chxs", "buf_len", "idx", "len")
                           if hasattr(status, "get")}}
         for name, is_src in (("ftr", 0), ("src", 1)):
-            ts, ds = [], []
-            for idx in range(0, PRES_N, READ_CHUNK):
-                res = self._q_read.send([self.oid, is_src, 0, idx,
-                                         PRES_N - idx])
-                ts += decode_ticks(bytes(res["ticks"]), self.cfg)
-                ds += decode_pres_datas(bytes(res["datas"]), self.cfg)
-            out[name] = merge_ring(ts, ds, PRES_N)
+            out[name] = self._read_ring(is_src)
         return out
+
+    def _read_ring(self, is_src):
+        """Ein Register (is_src 1 = roh, 0 = gefiltert) blockweise lesen,
+        leere Einträge (Tick 0 + Wert 0) verwerfen, nach Tick sortieren."""
+        oid = self.oid
+        ts, ds, _ = read_ring_blocks(
+            self._q_read.send,
+            lambda idx, ln: [oid, int(is_src), 0, idx, ln],
+            self.cfg, decode_pres_datas, PRES_N)
+        ts, ds = drop_empty(ts, ds)
+        return merge_ring(ts, ds, PRES_N)
 
     def read_pres(self):
         # BELEGT live 16.10.2026: is_src=1 = Rohwerte (Skala wie Stock-
-        # READ_PRES, ~-1,428e6), is_src=0 = anderer (kleiner, gefilterter)
-        # Kanal; ch=0; je Abfrage <= 8 Samples aus dem 64er-Ring (idx =
-        # Ringposition) -> 8 Blöcke lesen, merge_ring. Rückgabe: Listen.
-        ts, ds = [], []
-        for idx in range(0, PRES_N, READ_CHUNK):
-            res = self._q_read.send([self.oid, 1, 0, idx, READ_CHUNK])
-            ts += decode_ticks(bytes(res["ticks"]), self.cfg)
-            ds += decode_pres_datas(bytes(res["datas"]), self.cfg)
-        return merge_ring(ts, ds, PRES_N)
+        # READ_PRES, ~-1,428e6); ch=0. BELEGT MCU-Befund §2: idx = Index im
+        # Schieberegister, 7-9 Samples je Antwort -> read_ring_blocks
+        # (idx += n), merge_ring. Rückgabe: Listen (ticks, datas).
+        return self._read_ring(1)
+
+    def read_pres_filtered(self):
+        """is_src=0: gefilterte Werte – genau das, was die Düse gegen
+        min_hold vergleicht (MCU-Befund §3.2, 0x08003F92)."""
+        return self._read_ring(0)
 
     def stop_sampling(self, ok=True):
         # BELEGT 16.10.2026: sta_swap=1 = Leitung high (Ruhe, PC7=1);
@@ -1122,27 +1579,25 @@ class KlippyStepMcu(PrtouchMcuOps):
 
     def read_frozen(self):
         """Diagnose (Stock-Reihenfolge, BELEGT per Emulation): read_prtouch_
-        step [oid, 0, 0], dann idx 0,8,…,56 mit len = 64 - idx."""
+        step [oid, 0, 0], dann len = 64 - idx mit idx += n (MCU-Befund §2)."""
         self._q_read.send([self.oid, 0, 0])
-        ts, ds = [], []
-        for idx in range(0, STEP_N, READ_CHUNK):
-            res = self._q_read.send([self.oid, idx, STEP_N - idx])
-            ts += decode_ticks(bytes(res["ticks"]), self.cfg)
-            ds += decode_step_counts(bytes(res["datas"]), self.cfg)
-        return {"step": merge_ring(ts, ds, STEP_N)}
+        return {"step": self._read_ring()}
+
+    def _read_ring(self):
+        oid = self.oid
+        ts, ds, _ = read_ring_blocks(
+            self._q_read.send, lambda idx, ln: [oid, idx, ln],
+            self.cfg, decode_step_counts, STEP_N)
+        ts, ds = drop_empty(ts, ds)
+        return merge_ring(ts, ds, STEP_N)
 
     def read_pres(self):
         raise NotImplementedError("step-MCU hat kein pres")
 
     def read_step(self):
-        # ANNAHME (Main-MCU live noch nicht gelesen): wie pres – <= 8
-        # Samples je Abfrage aus 64er-Ring, gleiche Packung.
-        ts, ds = [], []
-        for idx in range(0, STEP_N, READ_CHUNK):
-            res = self._q_read.send([self.oid, idx, READ_CHUNK])
-            ts += decode_ticks(bytes(res["ticks"]), self.cfg)
-            ds += decode_step_counts(bytes(res["datas"]), self.cfg)
-        return merge_ring(ts, ds, STEP_N)
+        # BELEGT MCU-Befund §2: derselbe Encoder wie pres (0x08003E88),
+        # Schieberegister 64, 7-9 Samples je Antwort -> idx += n.
+        return self._read_ring()
 
     def stop_sampling(self, ok=True):
         try:
@@ -1285,8 +1740,16 @@ class K2PrtouchController:
                          c["max_hold"], c["add_hold"], c["lmt_dead"]))
         lines.append("step: aqc_tick=%d (Stock 46875 = 0,390625 ms)"
                      % c["aqc_tick"])
+        lines.append("Düse: %.0f Hz/PGA %d (%.4f ms), Totzeit %.0f ms, "
+                     "arm_settle_s %.3f (min %.3f), speed min %.2f mm/s "
+                     "(ANNAHME), PC7 %s" % (
+                         c["pres_rate_hz"], c["pres_pga"],
+                         c["pres_period_s"] * 1e3,
+                         c["pres_dead_time_s"] * 1e3, c["arm_settle_s"],
+                         c["arm_settle_min_s"], c["speed_min"],
+                         c.get("step_swap_pull", "?")))
         lines.append("Pins: pres_swap=%s step_swap=%s clk=%s sdo=%s "
-                     "(ANNAHME clk/sdo aus pres_cs0_pin)" % (
+                     "(clk/sdo PB13/PB14 BELEGT)" % (
                          c["pres_swap_pin"], c["step_swap_pin"],
                          c["pres_clk_pin"], c["pres_sdo_pin"]))
         lines.append("Schwellen: contact=%.0f emergency=%.0f rest_dif=%.0f "
@@ -1355,17 +1818,21 @@ class K2PrtouchController:
         return {"pres": p, "step": s}
 
     def check_sensor_rest(self):
-        """Ruhetest vor Bewegung (S4). Gibt (ok, info) oder wirft."""
+        """Ruhetest vor Bewegung (S4). Gibt (info, datas) oder wirft.
+
+        Seit 17.10.2026 inkl. Tickabstand, -1/24-Bit, nicht konstant
+        (check_rest_ok). Hinweis Rückfallweg: hier wird VOR start_prtouch_pres
+        gelesen – ein nie gestartetes Register ist leer und fällt jetzt
+        (richtig) durch, statt mit Nullpunkt 0 „ok“ zu melden."""
         t_b, d_b = self.pres.read_rest_pres()
+        ticks = decode_ticks(t_b, self.cfg)
         datas = decode_pres_datas(d_b, self.cfg)
-        ok, info = check_rest_ok(datas, self.cfg)
+        ticks, datas = drop_empty(ticks, datas)
+        ok, info = check_rest_ok(datas, self.cfg, ticks=ticks)
         if not ok:
             raise K2PrtouchError(
-                "Sensor-Ruhetest fehlgeschlagen (analog PRES_CHECK): "
-                "dif=%d > max %d (min=%d max=%d avg=%.0f len=%d) – "
-                "keine Bewegung." % (info["dif"], self.cfg["rest_max_dif"],
-                                     info["min"], info["max"], info["avg"],
-                                     info["len"]))
+                "Sensor-Ruhetest fehlgeschlagen (analog PRES_CHECK): %s – "
+                "keine Bewegung." % "; ".join(info["errors"]))
         return info, datas
 
     def check_temps(self):
@@ -1650,7 +2117,7 @@ class K2PrtouchController:
 # Emulation Stock-probe_prepare/probe_finish):
 #   Düse scharf (start_prtouch_pres, Antast-Parameter) -> Kontakt zieht
 #   PA15 (Düse) und damit PC7 (Main) auf 0 -> normaler Upstream-
-#   MCU_endstop auf !PC7 mit trsync stoppt Z IN DER MCU -> danach
+#   MCU_endstop auf ^!PC7 mit trsync stoppt Z IN DER MCU -> danach
 #   stop_prtouch_pres sta_swap=1 (PC7 wieder 1).
 # Stock-Reihenfolge, hier übernommen:
 #   prepare: cont_prtouch_step -> start_prtouch_pres -> start_prtouch_step
@@ -1662,21 +2129,24 @@ class K2PrtouchController:
 # allow_move-Sperre, Geschwindigkeitsgrenze 5 mm/s, Wegbegrenzung außerhalb
 # von G28, Entschärfen bei JEDER Ausnahme (try/finally).
 #
-# ANNAHMEN (offline bzw. gegen Upstream NICHT prüfbar, vor erster echter
-# Fahrt am Gerät klären):
-#   P1 Stopp unter Bewegung: PA15->PC7->endstop_home/trsync reagiert schnell
-#      genug (Upstream-Abtastung 4x15 µs, homing.py:9-10); nur im Stand per
-#      Fingerdruck belegt, nicht während einer Fahrt.
-#   P2 arm_settle_s 0,2 s reicht, damit die Düsen-MCU ihren Ruhewert
-#      übernimmt (Stock-Wartezeit nicht bekannt).
-#   P3 Ruhetest (read_prtouch_pres) ist auch bei zusätzlich gestartetem
-#      start_prtouch_step zulässig (live belegt nur ohne step-Seite, Test D).
-#   P4 Signalweg-Test vor jeder Fahrt (sta_swap 0/1 ohne laufende Messung)
-#      stört nichts – entspricht Stock-TEST_SWAP, dort aber ohne Endstop.
-#   P5 start/stop_prtouch_step antworten mit ack_prtouch (err 0 = ok).
-#   P6 Main-MCU-Endstop auf PC7 parallel zu config_prtouch_step swp_pin=PC7
-#      (wie Stock, BELEGT per Emulation) – auf Upstream ohne Pin-Konflikt,
-#      da config_prtouch_step den Pin nur als Namen im Config-Text trägt.
+# ANNAHMEN P1-P6 – Stand nach PRTOUCH-MCU-BEFUND-2026-10-17 §5 (statisch):
+#   P1 Stopp unter Bewegung schnell genug – TEILWEISE: MCU löst >= 2 Samples
+#      nach erstem Überschreiten aus (PA15 im selben Durchlauf, 0x08008192),
+#      Main = Standard-Endstop. NEU: Anstiegsdetektor – zu langsamer
+#      Kraftaufbau löst NIE aus -> Mindestgeschwindigkeit (min_probe_speed,
+#      Grenze ANNAHME). Physik/Überfahrweg am Gerät offen.
+#   P2 arm_settle_s – BESTÄTIGT MIT KORREKTUR: keine „Ruhewertübernahme“
+#      (Bezug gleitet, Mittel von vor 37-49 ms), aber Totzeit lmt_dead
+#      Samples -> arm_settle_s jetzt an die Totzeit gekoppelt
+#      (min_arm_settle_s, Reservefaktor 1,5 = ANNAHME).
+#   P3 Ruhetest bei gestartetem start_prtouch_step – BESTÄTIGT (getrennte
+#      Zustände auf getrennten MCUs).
+#   P4 Signalweg-Test vor start stört nicht – BESTÄTIGT (nur VOR start
+#      erlaubt; danach würde er entschärfen).
+#   P5 start/stop_prtouch_step antworten mit ack_prtouch – BESTÄTIGT.
+#   P6 PC7 geteilt – BESTÄTIGT mit Hinweis: Pull hängt in der Creality-FW von
+#      der Reihenfolge ab (pull_up=0 = Pull-DOWN) -> '^!PC7' (beide Befehle
+#      Pull-Up, Endzustand = Stock), validate_step_swap_pin.
 
 def compute_probe_target_z(cur_z, z_min, max_travel, is_homing):
     """Zielhöhe der Abwärtsfahrt.
@@ -1762,6 +2232,15 @@ class K2PrtouchProbeCore:
                 "(hart <= %.1f mm/s). Bei G28: homing_speed und "
                 "second_homing_speed in [stepper_z] <= %.1f setzen. "
                 "Keine Bewegung." % (sp, SPEED_MAX, SPEED_MAX))
+        # MCU-Befund §3.5/§7.3: zu langsam -> Kraftrampe zu flach -> die Düse
+        # löst nie aus (ANNAHME-Grenze, s. min_probe_speed).
+        err = check_probe_speed(sp, self.cfg)
+        if err:
+            raise self.error(
+                "[k2_prtouch] %s. Bei G28: homing_speed UND "
+                "second_homing_speed in [stepper_z] >= %.2f setzen (Upstream-"
+                "Default second_homing_speed = homing_speed/2). Keine "
+                "Bewegung." % (err, min_probe_speed(self.cfg)))
         return params
 
     # --- Scharf schalten / entschärfen ----------------------------------
@@ -1794,7 +2273,7 @@ class K2PrtouchProbeCore:
                     "[k2_prtouch] Signalweg-Test fehlgeschlagen: Endstop "
                     "%s meldete ausgelöst=%s bei sta_swap=0 und %s bei "
                     "sta_swap=1 (erwartet True/False). Verkabelung, "
-                    "step_swap_pin-Invertierung (!PC7) oder pres_swap_pin "
+                    "step_swap_pin-Invertierung (^!PC7) oder pres_swap_pin "
                     "prüfen – keine Bewegung."
                     % (c.get("step_swap_pin"), t0, t1))
         # Stock-probe_prepare: cont_step -> start_pres -> start_step.
@@ -1815,20 +2294,36 @@ class K2PrtouchProbeCore:
                 "Bewegung." % int(ack2.get("err", 0)))
         self.armed = True
         self.arm_count += 1
+        # Totzeit abwarten (MCU-Befund §3.2/5): Kontakt innerhalb von
+        # lmt_dead Samples nach start erkennt die Düse NICHT. parse_options
+        # erzwingt arm_settle_s >= min_arm_settle_s; hier doppelt (fail-safe).
         settle = float(c.get("arm_settle_s", ARM_SETTLE_DEFAULT_S))
-        if settle > 0:
-            self.pause(settle)
+        need = min_arm_settle_s(c)
+        if settle < need - 1e-9:
+            raise self.error(
+                "[k2_prtouch] arm_settle_s %.3f < Totzeit-Minimum %.3f s – "
+                "keine Bewegung." % (settle, need))
+        self.pause(settle)
         if c.get("rest_check", True):
-            _t, d = self._wrap("read_prtouch_pres (Ruhetest)",
-                               self.pres.read_pres)
-            datas = decode_pres_datas(d, c)
-            ok, ri = check_rest_ok(datas, c)
+            # Ruhetest erweitert (MCU-Befund §1/§7.4): Rohwerte (is_src=1)
+            # mit Tickabstand/-1/24 Bit/nicht konstant + gefilterter Kanal
+            # (is_src=0) gegen min_hold.
+            t, d = self._wrap("read_prtouch_pres is_src=1 (Ruhetest roh)",
+                              self.pres.read_pres)
+            ft, fd = self._wrap(
+                "read_prtouch_pres is_src=0 (Ruhetest gefiltert)",
+                self.pres.read_pres_filtered)
+            ticks, datas = drop_empty(decode_ticks(t, c),
+                                      decode_pres_datas(d, c))
+            _ft, filt = drop_empty(decode_ticks(ft, c),
+                                   decode_pres_datas(fd, c))
+            ok, ri = check_rest_ok(datas, c, ticks=ticks, filt=filt)
             info["rest"] = ri
             if not ok:
                 raise self.error(
                     "[k2_prtouch] Sensor-Ruhetest nach dem Scharfschalten "
-                    "fehlgeschlagen: dif=%d > %d (len=%d) – keine Bewegung."
-                    % (ri["dif"], c["rest_max_dif"], ri["len"]))
+                    "fehlgeschlagen: %s – keine Bewegung."
+                    % "; ".join(ri["errors"]))
         if bool(self._wrap("Endstop-Abfrage", self.query_triggered)):
             raise self.error(
                 "[k2_prtouch] Düse meldet bereits Kontakt (Endstop %s "
@@ -1851,6 +2346,26 @@ class K2PrtouchProbeCore:
         self.armed = False
         self.disarm_count += 1
         return errs
+
+    def preflight(self):
+        """Vorabprüfung OHNE Bewegung (KTWO_PRTOUCH_READ im Probe-Modus):
+        arm() inkl. Signalweg-Test, Totzeit, erweitertem Ruhetest und
+        PC7-Prüfung, danach IMMER disarm(). Gibt das arm()-Info-Dict zurück
+        oder wirft self.error. Braucht kein allow_move (keine Fahrt)."""
+        pending = None
+        info = None
+        self.wait_moves()  # Stillstand wie run_probe (Ruhetest aussagekräftig)
+        try:
+            info = self.arm()
+        except BaseException as exc:
+            pending = exc
+            raise
+        finally:
+            errs = self.disarm()
+            if errs and pending is None:
+                raise self.error("[k2_prtouch] Entschärfen fehlgeschlagen: "
+                                 "%s" % "; ".join(errs))
+        return info
 
     def _diag(self):
         out = {}
@@ -2010,10 +2525,9 @@ class K2DescendHelper:
         toolhead = self.printer.lookup_object("toolhead")
         pos = toolhead.get_position()
         speed = float(params["probe_speed"])
-        if not 0.0 < speed <= SPEED_MAX + 1e-12:
-            raise self.printer.command_error(
-                "[k2_prtouch] probe_speed %.2f > %.1f mm/s" % (speed,
-                                                               SPEED_MAX))
+        err = check_probe_speed(speed, self.cfg)  # zu schnell UND zu langsam
+        if err:
+            raise self.printer.command_error("[k2_prtouch] %s" % err)
         is_homing = gcmd.get_command() == "G28"
         pos[2] = compute_probe_target_z(
             pos[2], self.z_min_position, self.cfg["probe_max_travel_mm"],
@@ -2158,7 +2672,7 @@ class PrinterK2Prtouch:
         self.mcu_step.register_config_callback(self._build_step_config)
         self.printer.register_event_handler("klippy:connect",
                                             self.handle_connect)
-        # Hauptweg: Upstream-Probe auf step_swap_pin (Default !PC7).
+        # Hauptweg: Upstream-Probe auf step_swap_pin (Default ^!PC7).
         if self.cfg["mode"] == "probe":
             try:
                 self.probe = K2PrtouchPrinterProbe(config, self.cfg)
@@ -2442,6 +2956,18 @@ class PrinterK2Prtouch:
             ctl = self._ctl()
         except Exception as exc:
             gcmd.respond_info("[k2_prtouch] %s" % exc)
+            return
+        # mode probe (17.10.2026): vollständige Vorabprüfung OHNE Bewegung
+        # (Signalweg, scharf schalten, Totzeit, Ruhetest roh+gefiltert+Ticks,
+        # PC7 frei, entschärfen). Grund: ein nie gestartetes Register ist
+        # leer – ein Lesen ohne start_prtouch_pres prüft nichts.
+        if self.probe is not None and self.probe.core.pres is not None:
+            try:
+                info = self.probe.core.preflight()
+                gcmd.respond_info("[k2_prtouch] READ ok (Vorabprüfung ohne "
+                                  "Bewegung): rest=%s" % (info.get("rest"),))
+            except Exception as exc:
+                gcmd.respond_info("[k2_prtouch] READ: %s" % exc)
             return
         try:
             info, _ = ctl.check_sensor_rest()

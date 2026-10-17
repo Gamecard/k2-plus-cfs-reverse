@@ -676,6 +676,94 @@ def test_transparent_format():
     return "3 Live-Requests + 2 Antworten byte-identisch (CRC ok), Roundtrip ok"
 
 
+def test_transport_sendeschutz():
+    """Sendeschutz 17.10.2026 in k2_transport: Länge (100 / fun 0xF0 0x80),
+    Broadcast 0xFF/0xFD + 0x01/0x0B gesperrt (außer 0xFF 0x0B [01]); lokale
+    Fallback-Prüfung == nachbau/serial485; nichts gesendet bei Verstoß."""
+    cases = [
+        (0x81, 0x06, [1, 70, 0, 0, 0x96, 0x43], True),   # längster Motor-Request
+        (0xFE, 0xA0, list(range(13)), True),             # längster Live-Request
+        (0x01, 0x10, [0] * 100, True), (0x01, 0x10, [0] * 101, False),
+        (0x01, 0xF0, [0] * 0x80, True), (0x01, 0xF0, [0] * 0x81, False),
+        (0xFF, 0x0E, [0x01], True), (0xFF, 0x0B, [0x01], True),
+        (0x81, 0x0B, [0x00], True),  # Unicast: Sperre liegt in motor.py (Stub)
+        (0xFF, 0x0B, [0x00], False), (0xFF, 0x0B, [], False),
+        (0xFF, 0x0B, [0x01, 0x00], False), (0xFF, 0x01, [0x00], False),
+        (0xFF, 0x01, [0x01], False), (0xFD, 0x0B, [0x01], False),
+        (0xFD, 0x01, [], False), (0xFE, 0x0B, [0x00], True),
+    ]
+    impls = [("lokal", T._check_tx_frame_local)]
+    if _HAVE_SERIAL:
+        import serial485 as _S
+        impls.append(("serial485", _S.check_tx_frame))
+        assert T.check_tx_frame is _S.check_tx_frame, "nachbau-Prüfung nicht genutzt"
+    for name, fn in impls:
+        for addr, fun, data, ok in cases:
+            try:
+                fn(addr, fun, data)
+                got = True
+            except ValueError:
+                got = False
+            assert got == ok, "%s: 0x%02X fun 0x%02X %d B -> %s" % (
+                name, addr, fun, len(data), got)
+    # _build_frame_local byte-identisch, > len 255 klarer Fehler, RX bis 255
+    for addr, fun, data in ((0xFF, 0x0E, [0x01]), (0x81, 0x0C, [0x0B]),
+                            (0x81, 0x15, list(range(161)))):
+        assert T._build_frame_local(addr, fun, data) == bytes(T.build_frame(addr, fun, data))
+    long_rx = T._build_frame_local(0x81, 0x16, [0] * 252)
+    assert long_rx[2] == 255 and T._parse_frame_local(long_rx)[0] == 0x16
+    try:
+        T._build_frame_local(0x81, 0x16, [0] * 253)
+        raise AssertionError("len 256 nicht abgelehnt")
+    except ValueError as exc:
+        assert "zu lang" in str(exc)
+    assert T._build_tx_frame_local(0xFF, 0x0B, [0x01]) == bytes(
+        T.build_frame(0xFF, 0x0B, [0x01]))
+
+    # Rs485Transport: gesperrt -> kein Bus-Aufruf, nichts in sent
+    class _RecBus:
+        def __init__(self):
+            self.calls = []
+
+        def transact_full(self, addr, fun, data, timeout=None, retries=0):
+            self.calls.append((addr, fun, list(data)))
+            raise TimeoutError("still")
+    rb = _RecBus()
+    rs = T.Rs485Transport(rb)
+    for addr, fun, data in ((0xFF, 0x0B, [0x00]), (0xFF, 0x01, [0x00]),
+                            (0x81, 0x06, [0] * 101)):
+        try:
+            rs.transact(addr, fun, data, timeout=0.05, retries=0)
+            raise AssertionError("Rs485 nicht gesperrt: 0x%02X/0x%02X" % (addr, fun))
+        except T.TxGuardError:
+            pass
+    assert rb.calls == [] and rs.sent == [], (rb.calls, rs.sent)
+    try:
+        rs.transact(0xFF, 0x0B, [0x01], timeout=0.05, retries=0)
+    except TimeoutError:
+        pass
+    assert rb.calls == [(0xFF, 0x0B, [0x01])], rb.calls
+
+    # TransparentTransport: gesperrt -> keine MCU-Sendung; erlaubt -> Live-Bytes
+    mcu = FakeMcu()
+    tr = T.TransparentTransport(mcu)
+    for addr, fun, data in ((0xFF, 0x0B, [0x00]), (0xFF, 0x01, []),
+                            (0x81, 0x11, [0] * 101)):
+        try:
+            tr.transact(addr, fun, data, timeout=2.0, retries=0)
+            raise AssertionError("transparent nicht gesperrt: 0x%02X/0x%02X" % (addr, fun))
+        except T.TxGuardError:
+            pass
+    assert mcu.writes == [] and tr.sent == [], (mcu.writes, tr.sent)
+    try:
+        tr.transact(0xFF, 0x0E, [0x01], timeout=2.0, retries=0)
+    except TimeoutError:
+        pass
+    assert bytes(mcu.writes[0]) == bytes.fromhex("f7 ff 04 00 0e 01 89")
+    return "%d Fälle x %d Implementierungen, Rs485 + transparent ohne Sendung" % (
+        len(cases), len(impls))
+
+
 def test_init_lauf():
     """Kompletter Init-Lauf (alle antworten) – Status ready, Event k2_motor:ready."""
     # Fake-Werte: alles in Toleranz AUSSER X ID 70 (300 statt 100 → Write) und
@@ -1830,6 +1918,7 @@ def test_cutcal_klippy_adapter():
 
 TESTS = [
     ("transparent-Format vs. Live (CRC)", test_transparent_format),
+    ("Sendeschutz Transport (Länge/Broadcast 0x01/0x0B)", test_transport_sendeschutz),
     ("kompletter Init-Lauf", test_init_lauf),
     ("Plan-Vergleich motor_init", test_plan_vergleich),
     ("Extruder via transparent 0x81 (nie 0x85)", test_extruder_transparent),

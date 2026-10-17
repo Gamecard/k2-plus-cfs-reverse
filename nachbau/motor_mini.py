@@ -30,7 +30,9 @@ LIVE-STAND 15.10.2026 (live-logs-2026-10-15/klippy.log*, lokal, nicht im Repo; s
 - NACHTRAG 16.10.2026 (MOTOR-FW-BEFUND-2026-10-16.md, Motor-FW WCH RISC-V,
   statisch + Live-Gegenproben): Namen/Einheiten idx 1..12 (VARIABLE_NAMES,
   VARIABLE_UNITS; Details/Belegstatus idx 0..18 in motor.VARIABLE_TABLE),
-  read_reference_values (idx 1-4), read_phase_currents (idx 9/10 -> Ia, Ib),
+  read_reference_values (idx 1-4), read_phase_currents (idx 9/10 -> Ia, Ib;
+  KORREKTUR 17.10.2026: idx 10 = +Ib bei phase_order_invert 0 (live),
+  -Ib nur bei != 0 – MOTOR-RESTE-BEFUND §5, Details motor.ib_from_idx10),
   read_dir_input (idx 12, DIR-Eingang live bestätigt); spd_fdb = rad/s;
   check_protection -> decode_protection (Byte 0-3 Fehler, 4-7 Warnung,
   u32 LE), check_protection_raw -> 8 B; decode_motor_status (STATUS-
@@ -82,7 +84,14 @@ VARIABLE_TYPES = dict([(i, "float") for i in range(1, 11)]
 # 11 = Schrittpuls-Zähler 0..3199/Umdrehung, 12 = DIR-Eingangspegel.
 VARIABLE_NAMES = {1: "pos_ref", 2: "spd_ref", 3: "id_ref", 4: "iq_ref",
                   5: "pos_fdb", 6: "spd_fdb", 7: "id_fdb", 8: "iq_fdb",
-                  9: "ia", 10: "minus_ib", 11: "pos_counts", 12: "dir_input"}
+                  9: "ia", 10: "ib", 11: "pos_counts", 12: "dir_input"}
+# idx 10 (MOTOR-RESTE §5, B): FW = Ib x (-1 NUR falls phase_order_invert
+# != 0; @0xbb30 `lh a5,0x5a(s0)`, beqz -> +1,0 @0x19c98, sonst -1,0
+# @0x19d14). obj+0x5a = Sys-Param ID 10, live 0 -> idx 10 = +Ib.
+# Bis 17.10. hieß idx 10 "minus_ib" (fälschlich pauschal -Ib).
+IDX_IB = 10
+IDX_MINUS_IB = IDX_IB          # Alt-Name, nur Kompatibilität
+PHASE_ORDER_INVERT_LIVE = 0
 # Einheiten (A: Gain*R = 1 Ohm vermutet, s. motor.py)
 VARIABLE_UNITS = {1: "rad", 2: "rad/s", 3: "A", 4: "A", 5: "rad", 6: "rad/s",
                   7: "A", 8: "A", 9: "A", 10: "A", 11: "counts", 12: "0/1"}
@@ -387,10 +396,20 @@ class MotorMini:
         return dict((VARIABLE_NAMES[i], self.read_variable(i)["value"])
                     for i in (1, 2, 3, 4))
 
-    def read_phase_currents(self):
-        """idx 9/10 -> {'ia', 'ib', 'minus_ib'} [A]; idx 10 = -Ib (FW)."""
-        ia, mib = self.read_variable(9)["value"], self.read_variable(10)["value"]
-        return {"ia": ia, "ib": -mib, "minus_ib": mib}
+    def read_phase_currents(self, phase_order_invert=PHASE_ORDER_INVERT_LIVE):
+        """idx 9/10 -> {'ia', 'ib', 'ib_fw', 'minus_ib', 'phase_order_invert'}
+        [A]. KORREKTUR 17.10.2026: idx 10 = Ib x (-1 NUR falls
+        phase_order_invert != 0) -> bei 0 (live, Default) ist 'ib' = idx 10.
+        phase_order_invert = Sys-Param ID 10 (int; bool/sonst -> ValueError
+        ohne Senden). 'ib_fw' = Rohwert idx 10, 'minus_ib' = -ib (Alt-
+        Schlüssel; bis 17.10. fälschlich = Rohwert). Wie motor.py."""
+        if isinstance(phase_order_invert, bool) or not isinstance(phase_order_invert, int):
+            raise ValueError("phase_order_invert muss int sein (live 0): %r"
+                             % (phase_order_invert,))
+        ia, ib_fw = self.read_variable(9)["value"], self.read_variable(IDX_IB)["value"]
+        ib = -ib_fw if phase_order_invert != 0 else ib_fw
+        return {"ia": ia, "ib": ib, "ib_fw": ib_fw, "minus_ib": -ib,
+                "phase_order_invert": phase_order_invert}
 
     def read_dir_input(self):
         """idx 12 -> Pegel DIR-Eingang 0/1 (live 16.10.: -X 0, +X 1)."""
@@ -579,10 +598,23 @@ def selftest():
                    _crc8(bytes([7, 0, 8]) + struct.pack("<I", v)))) for v in (0, 1)])
     mh = MotorMini(bus, 0x81)
     ref, ph = mh.read_reference_values(), mh.read_phase_currents()
+    # KORREKTUR 17.10.2026: phase_order_invert 0 (live) -> Ib = +idx10
     check("read_reference_values / read_phase_currents / read_dir_input",
           abs(ref["spd_ref"] - 1.633) < 1e-5 and ref["id_ref"] == 0.0
-          and abs(ph["ib"] - 0.0363) < 1e-6 and abs(ph["ia"] + 0.0725) < 1e-6
+          and abs(ph["ib"] + 0.0363) < 1e-6 and abs(ph["ib_fw"] + 0.0363) < 1e-6
+          and abs(ph["minus_ib"] - 0.0363) < 1e-6 and abs(ph["ia"] + 0.0725) < 1e-6
+          and ph["phase_order_invert"] == 0 and VARIABLE_NAMES[10] == "ib"
+          and IDX_IB == IDX_MINUS_IB == 10
           and [mh.read_dir_input(), mh.read_dir_input()] == [0, 1] and not bus.script)
+    bus = _Bus([("81 04 00 08 %02x" % i, _vrx(vals[i])) for i in (9, 10)])
+    ph1 = MotorMini(bus, 0x81).read_phase_currents(phase_order_invert=1)
+    check("read_phase_currents(phase_order_invert=1) -> Ib = -idx10",
+          abs(ph1["ib"] - 0.0363) < 1e-6 and abs(ph1["minus_ib"] + 0.0363) < 1e-6
+          and not bus.script)
+    check("read_phase_currents ungültiges invert -> ValueError ohne Senden",
+          raises(ValueError, MotorMini(nobus, 0x81).read_phase_currents, True)
+          and raises(ValueError, MotorMini(nobus, 0x81).read_phase_currents, 1.0)
+          and nobus.calls == [])
     dp = decode_protection(bytes.fromhex("05 01 00 00 06 00 00 00"))
     check("decode_protection u32 LE / decode_motor_status",
           dp["errors"] == [0, 2, 8] and dp["warnings"] == [1, 2] and not dp["ok"]

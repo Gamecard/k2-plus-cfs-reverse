@@ -146,7 +146,8 @@ FUNC_RETRIES.update({0x10: 0, 0x11: 0})  # bewusste Abweichung (s. oben)
 # ob sie der Poll-Timeout ist, ist unbelegt (Poll-Antworten 3-390 ms).
 # GENUTZT (Review M3, 16.10.2026) von BoxAction.communication_extrude (0x10,
 # 15 s > live 7,25 s) und communication_retrude (0x11, 150 s > live 23 s).
-# 0x0d nutzt bewusst preload_force_timeout (>= 380 s) statt 300 s.
+# 0x0d nutzt bewusst preload_force_timeout (>= 380 s, max(180+200·n, 300·n))
+# statt 300 s.
 FUNC_TIMEOUTS_SO = {
     FUNC_SET_PRE_LOADING: 300.0, 0x10: 15.0, 0x11: 150.0,
 }
@@ -335,14 +336,31 @@ PRELOAD_FORCE_ACTIONS = (PRELOAD_FORCE_READ, PRELOAD_FORCE_TENSION_ONLY)
 # Die 0x0d-Antwort kommt erst danach. -> Timeout = Vorlauf + je Slot.
 PRELOAD_FORCE_TIMEOUT_BASE = 180.0      # s, Vorlauf (Warten/Pull-back)
 PRELOAD_FORCE_TIMEOUT_PER_SLOT = 200.0  # s, 5 s + 180 s + Reserve je Slot
+# Stock-Host (BOOTLOADER-HOST-BEFUND-2026-10-17.md §3/§4, B): Timeout je
+# Versuch = Slotanzahl x cmd_timeout['SET_PRE_LOADING'] (TIMEOUT_LONGER_TIME
+# = 300 s, PyNumber_Multiply @0x158b3c), bis 5 Versuche, keine Gesamtfrist.
+PRELOAD_FORCE_TIMEOUT_STOCK_PER_SLOT = 300.0
 
 
 def preload_force_timeout(mask):
-    """Host-Timeout (s) für 0x0d op 2/3: Vorlauf + 200 s je Slot der Maske.
-    Beispiel Maske 0x01 -> 380 s, 0x0F -> 980 s.
+    """Host-Timeout (s) für 0x0d op 2/3:
+    max(180 + 200·n, 300·n), n = Slots der Maske (Maske 0 -> n = 4).
+    Ergebnis 380 / 600 / 900 / 1200 s für 1 / 2 / 3 / 4 Slots.
+
+    ÄNDERUNG 17.10.2026 (BOOTLOADER-HOST-BEFUND §4): bisher 180 + 200·n
+    (380/580/780/980 s). Box-Worst-Case (V, aus App-Befund): je Slot 5 s +
+    <= 180 s, vorher <= 179 s Warten (Zustand PRELOAD) bzw. Pull-back
+    hub-belegter Slots -> 1 Slot bis 364 s (deckte 380 s), 4 Slots bis
+    ~966 s (980 s nur ~14 s Reserve). Neu mindestens der Stock-Wert je
+    Versuch (n x 300 s), damit nie kürzer gewartet wird als Stock:
+    4 Slots 1200 s (>= ~230 s Reserve). Gleichzeitig = serial485
+    MAX_BUS_HOLD_S (1200 s x 1 Versuch, erlaubt). retries bleibt 0 (der
+    Aufrufer übergibt retries=0; ein Retransmit würde den Force-Preload
+    erneut auslösen, die Box hat keine Duplikaterkennung). Stock dagegen:
+    bis 5 Versuche, Maske 0 -> 0 s -> 5 Sendungen in ~20 ms (§3).
 
     Maske 0 (Review G2, Entscheidung 16.10.2026): wird wie 4 Slots gerechnet
-    (980 s), NICHT abgelehnt. Gründe: der Host sendet live [00 02]
+    (jetzt 1200 s), NICHT abgelehnt. Gründe: der Host sendet live [00 02]
     („Force alle“, G-Code-Pfad, PROTOKOLL-485.md 6.4) – Ablehnen würde
     diesen belegten Request unmöglich machen. Die Laufzeit ist für Maske 0
     unbelegt: Ghidra-Schleife über die Maskenbits ergäbe 0 Slots, der
@@ -354,7 +372,8 @@ def preload_force_timeout(mask):
     n = bin(check_mask(mask)).count("1")
     if n == 0:
         n = len(SLOT_MASKS)
-    return PRELOAD_FORCE_TIMEOUT_BASE + PRELOAD_FORCE_TIMEOUT_PER_SLOT * n
+    return max(PRELOAD_FORCE_TIMEOUT_BASE + PRELOAD_FORCE_TIMEOUT_PER_SLOT * n,
+               PRELOAD_FORCE_TIMEOUT_STOCK_PER_SLOT * n)
 
 
 def check_mask(mask):
@@ -1284,8 +1303,9 @@ class BoxAction:
         nach Ghidra-Laufzeit (>=380 s), weil ein Retransmit nach 300 s den
         Force-Preload erneut auslösen würde (Mehrslot-Masken > 300 s
         möglich). Die Host-Bursts [00 02] (5 Sendungen in ~20 ms, nie
-        beantwortet) werden NICHT nachgebildet. Maske 0 bei op 2/3: 980 s
-        (wie 4 Slots, s. preload_force_timeout). Der Bus-Lock wird so lange
+        beantwortet) werden NICHT nachgebildet. Maske 0 bei op 2/3: 1200 s
+        (wie 4 Slots, s. preload_force_timeout; bis 16.10.: 980 s). Timeout
+        seit 17.10.2026 max(180+200·n, 300·n). Der Bus-Lock wird so lange
         gehalten (serial485 MAX_BUS_HOLD_S, Review M6).
         timeout = expliziter Override (s).
         """
@@ -1731,10 +1751,21 @@ def selftest():
           and build_preload_inhibit(False) == build_release())
     check("FUNC_MOTOR_ACTION alias 0x0f",
           FUNC_MOTOR_ACTION == FUNC_PRELOAD_INHIBIT == 0x0F)
+    # 17.10.2026 (BOOTLOADER-HOST-BEFUND §4): max(180+200·n, 300·n)
     check("force-timeout 1 slot 380 s", preload_force_timeout(0x01) == 380.0)
-    check("force-timeout 4 slots 980 s", preload_force_timeout(0x0F) == 980.0)
-    check("force-timeout maske 0 -> wie 4 slots (G2)",
-          preload_force_timeout(0x00) == 980.0)
+    check("force-timeout 2 slots 600 s", preload_force_timeout(0x05) == 600.0)
+    check("force-timeout 3 slots 900 s", preload_force_timeout(0x0E) == 900.0)
+    check("force-timeout 4 slots 1200 s", preload_force_timeout(0x0F) == 1200.0)
+    check("force-timeout maske 0 -> wie 4 slots (G2), 1200 s",
+          preload_force_timeout(0x00) == 1200.0)
+    check("force-timeout nie unter Stock n x 300 s, deckt 1-Slot-Worst-Case 364 s",
+          all(preload_force_timeout(m) >= 300.0 * bin(m).count("1")
+              for m in range(1, 16))
+          and preload_force_timeout(0x01) > 364.0)
+    import serial485 as _s485
+    check("force-timeout 4 slots <= serial485 MAX_BUS_HOLD_S (retries 0)",
+          max(preload_force_timeout(m) for m in range(16)) <= _s485.MAX_BUS_HOLD_S
+          and _s485.Serial485._check_hold(preload_force_timeout(0x0F), 0) == 1200.0)
     check("extrude-modi re-export",
           EXTRUDE_MODE_EXTRUDER_CHECK == 7 and EXTRUDE_MODE_QUERY == 5
           and EXTRUDER_CHECK_MM == 3 and RETRUDE_P_PULL_HUB == 1)
@@ -1900,9 +1931,9 @@ def selftest():
           and bus3.calls[6][3]["retries"] == 0
           and bus3.calls[6][3]["timeout"] == 150.0)
     act3.communication_set_pre_loading(0x00, PRELOAD_FORCE_READ)
-    check("G2 0x0d op 2 Maske 0 -> 980 s, retries 0",
+    check("G2 0x0d op 2 Maske 0 -> 1200 s, retries 0",
           bus3.calls[7][2] == [0x00, 0x02]
-          and bus3.calls[7][3]["timeout"] == 980.0
+          and bus3.calls[7][3]["timeout"] == 1200.0
           and bus3.calls[7][3]["retries"] == 0)
     r = act3.communication_measuring_wheel(WHEEL_OP_RESET, reset=True)
     check("G1 wheel op 0 mit reset=True sendet [00]",

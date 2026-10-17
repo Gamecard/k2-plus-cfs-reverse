@@ -98,6 +98,13 @@ MOTOR_FUN_NAMES = {
     motor.FUNC_ERR_DETAIL_DATA: "Fehlerdetail", motor.FUNC_CUT_DETAIL_DATA: "Stalldetail",
     motor.FUNC_POS_DATA_SAMPLE: "Pos-Proben", motor.FUNC_SPD_DATA_SAMPLE: "Spd-Proben",
 }
+# 0x05 control (MOTOR-RESTE-BEFUND-2026-10-17.md §1, B; Handler 0xf880):
+# nur Sub 04 (Status) antwortet, 01/02/03 bleiben by design stumm.
+CONTROL_SUB_TEXT = {
+    motor.CONTROL_OFF: "Regelung AUS", motor.CONTROL_ON: "Regelung EIN",
+    motor.CONTROL_TOGGLE: "Regelung umschalten",
+    motor.CONTROL_STATUS: "Status lesen (EN/Regler/PWM)",
+}
 AUTO_ADDR_FUNS = (0xA0, 0xA1, 0xA2, 0xA3)
 DEDUP_FUNS = (box.FUNC_GET_BOX_STATE, box.FUNC_MEASURING_WHEEL,
               box.FUNC_GET_REMAIN_LEN, box.FUNC_GET_FILAMENT_SENSOR_STATE,
@@ -299,6 +306,9 @@ class Decoder:
                 txt += " (außerhalb 1..12 – Host-Crash bei MOTOR_GET DATA=0/13!)"
         elif fun == motor.FUNC_VERSION and list(d) == [motor.SUB_VERSION_GET]:
             txt += " abfragen"
+        elif fun == motor.FUNC_CONTROL and d and d[0] in CONTROL_SUB_TEXT:
+            # MOTOR-RESTE-BEFUND §1 (B): nur Sub 04 antwortet
+            txt += " %s [%s]" % (CONTROL_SUB_TEXT[d[0]], hexs(d))
         elif d:
             txt += " [%s]" % hexs(d)
         return txt
@@ -503,6 +513,12 @@ class Decoder:
                 SEV_WARN, None, None)
 
     def _other_resp(self, addr, fun, data, req_data=b""):
+        if addr in motor.MOTOR_ADDRS and fun == motor.FUNC_CONTROL \
+                and len(data) == motor.CONTROL_STATUS_LEN \
+                and req_data[:1] == bytes([motor.CONTROL_STATUS]):
+            # MOTOR-RESTE §1: [obj+0x7a6 EN-Pin (1 = gesperrt), ctrl+4, drv+4]
+            return "Control-Status: EN-Pin %d, Regler %s, PWM %s" % (
+                data[0], "ein" if data[1] else "aus", "ein" if data[2] else "aus")
         if addr in motor.MOTOR_ADDRS and fun == motor.FUNC_VERSION \
                 and len(data) == motor.VERSION_LEN:
             v = motor.decode_motor_version(data)
@@ -782,8 +798,12 @@ class Monitor:
             return True
         if x.addr == 0x85 or x.addr == 0xFF:
             return True
+        # 0x05 (MOTOR-RESTE §1, B): Sub 01/02 (und 00/03/>=05) antworten
+        # NIE – „erwartet“. Sub 04 (Status lesen) antwortet mit 3 B, dort
+        # ist ein Ausbleiben ein echter Fehler (nicht stumm schalten).
         if x.addr in motor.MOTOR_ADDRS and (
-                x.fun == motor.FUNC_CONTROL or
+                (x.fun == motor.FUNC_CONTROL and x.data[:1] not in
+                 (b"", bytes([motor.CONTROL_STATUS]))) or
                 (x.fun == motor.FUNC_PROTECTION and x.data[:1] ==
                  bytes([motor.SUB_PROT_UNKNOWN_05]))):
             return True
@@ -1007,6 +1027,40 @@ def selftest():
     check(m4.flush() == [], "Motor ohne Antwort-Ende: nichts ausgegeben")
     m4.emit(datetime.datetime(2026, 10, 13, 3, 34, 8, 434000), SEV_INFO, "x")
     check(m4.flush()[0].startswith("12.10. 21:34:08.434"), "--local UTC+8->MESZ")
+    # 0x05 control (MOTOR-RESTE §1, 17.10.2026): [02]/[01] ohne Antwort =
+    # erwartet (Live klippy.log.2026-10-12:28621-28622, BELT_TENSION);
+    # [04] ohne Antwort = echter Fehler (synthetisch, live nie gesendet)
+    ctl_log = [
+        "[INFO] 2026-10-12 00:39:23,766 [root] [reactor:_check_timers:168] "
+        "retries = 0, cmd = 0x81 0x4 0x0 0x5 0x2",
+        "[INFO] 2026-10-12 00:39:23,818 [root] [reactor:_check_timers:168] "
+        "cmd[0x81 0x4 0x0 0x5 0x2] get response or timeout",
+        "[INFO] 2026-10-12 00:39:30,000 [root] [reactor:_check_timers:168] "
+        "retries = 0, cmd = 0x82 0x4 0x0 0x5 0x1",
+        "[INFO] 2026-10-12 00:39:30,052 [root] [reactor:_check_timers:168] "
+        "cmd[0x82 0x4 0x0 0x5 0x1] get response or timeout",
+        "[INFO] 2026-10-12 00:39:31,000 [root] [reactor:_check_timers:168] "
+        "retries = 0, cmd = 0x81 0x4 0x0 0x5 0x4",
+        "[INFO] 2026-10-12 00:39:31,052 [root] [reactor:_check_timers:168] "
+        "cmd[0x81 0x4 0x0 0x5 0x4] get response or timeout",
+    ]
+    mc = Monitor(show_all=True)
+    for ln in ctl_log:
+        mc.feed(ln, "selftest-ctl")
+    tc = mc.flush()
+    tcj = "\n".join(tc)
+    check(len(tc) == 3
+          and "Motor X(0x81) Control Regelung EIN [02] -> keine Antwort (erwartet/by design)"
+          in tcj
+          and "Motor Y(0x82) Control Regelung AUS [01] -> keine Antwort (erwartet/by design)"
+          in tcj, "0x05 [01]/[02] ohne Antwort = erwartet: " + tcj)
+    check("Control Status lesen (EN/Regler/PWM) [04] -> KEINE ANTWORT" in tcj
+          and "erwartet" not in tc[-1], "0x05 [04] ohne Antwort = Fehler: " + tcj)
+    tcs = Decoder().response(0x81, motor.FUNC_CONTROL, b"\x04", hx(
+        "f7 81 06 00 05 00 01 01 %02x" % crc8_cal([6, 0, 5, 0, 1, 1])))
+    check(tcs[0] == "Control-Status: EN-Pin 0, Regler ein, PWM ein"
+          and tcs[1] == SEV_INFO, "0x05 [04] Antwort dekodiert: %r" % (tcs,))
+
     m5 = Monitor(unmask=True)
     for ln in SELFTEST_LOG:
         m5.feed(ln)

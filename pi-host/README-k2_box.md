@@ -312,7 +312,7 @@ Lüfter, Rückfahrt.
 
 | G-Code | Stock | Inhalt |
 |---|---|---|
-| `KTWO_BOX_PRE_OPT [TNN=] [Z_HOP=]` | M8200 P | Kette starten; schon geladen (Hub-Sensor + Kopfsensor) → Rest überspringen; Kopfsensor sperren (`SET_FILAMENT_SENSOR … ENABLE=0`, sonst pausiert Upstream beim Rückzug); `SAVE_GCODE_STATE`; Z-Hop 0,4 |
+| `KTWO_BOX_PRE_OPT [TNN=] [Z_HOP=] [SOURCE=T]` | M8200 P | Kette starten (`SOURCE=T` aus `_KTWO_TOOL_CHANGE` = nachholbarer T<n>-Wechsel, §11); schon geladen (Hub-Sensor + Kopfsensor) → Rest überspringen; Kopfsensor sperren (`SET_FILAMENT_SENSOR … ENABLE=0`, sonst pausiert Upstream beim Rückzug); `SAVE_GCODE_STATE`; Z-Hop 0,4 |
 | `KTWO_BOX_CUT` | M8200 C | `G0 X10 Y200 F12000`, `ACCEL=5000`, `G0 X-7.8 Y200 F30000`, `G4 P100`, `G0 X10`, Accel zurück, `M400`; optional Schneidhebel-Sensor (`cut_sensor`) |
 | `KTWO_BOX_GO_EXTRUDE_POS` / `KTWO_BOX_SAFE_POS` | BOX_GO_TO_EXTRUDE_POS / BOX_MOVE_TO_SAFE_POS | T0-Beispiel Schritt 6 / 11 |
 | `KTWO_BOX_RETRUDE [SLOT=] [LENGTH=]` | M8200 R [E] | Schacht, M109 (nur mit Filament am Kopf), Box bereit abwarten, Slot aus Hub-Sensor, `do_retrude(after_p0=…)`: p0 → E-10 F600 → … → p1 |
@@ -321,7 +321,8 @@ Lüfter, Rückfahrt.
 | `KTWO_BOX_WIPE`, `KTWO_BOX_WASTE` | T0-Bsp. 10.1–10.3, M8200 W | Abstreifen; WASTE = nur Hinweis (Stock-Kamera fehlt) |
 | `KTWO_BOX_END_OPT [RETURN=0\|1]` | M8200 O | Schacht verlassen, ggf. Rückfahrt XY + Z, Zieltemperatur zurück, Zustand/Kopfsensor zurück |
 | `KTWO_BOX_WAIT [TIMEOUT=]` | BOX_MODE_WAIT | 0x0a bis IDLE/PRINT, ERROR → Fehler |
-| `KTWO_BOX_ERROR_CLEAR` / `KTWO_BOX_RESUME_FIX` | BOX_ERROR_CLEAR | Fehler quittieren (+ 0x04 [00 01]) / Z-Hop nach Pause zurücknehmen (aus RESUME) |
+| `KTWO_BOX_ERROR_CLEAR [HEAD_LOADED=1]` / `KTWO_BOX_RESUME_FIX` | BOX_ERROR_CLEAR | Fehler quittieren (+ 0x04 [00 01]); `HEAD_LOADED=1` = Kopf von Hand als geladen bestätigt (nur ohne Kopfsensor-Zustand, §11) / Z-Hop nach Pause zurücknehmen (aus RESUME) |
+| `KTWO_BOX_RESUME_CHECK [MOVE=0\|1] [TEMP=]` | BOX_ERROR_RESUME_PROCESS | aus RESUME nach einem abgebrochenen Wechsel: Kopfsensor leer → RESUME gesperrt bzw. Nachholen (`resume_redo_change`, §11) |
 
 Controller-Erweiterungen (wiederverwendet, Frame-Folgen unverändert):
 `do_extrude(sensor_fn, sensor_timeout, poll_interval, stage7_fn, stage7_delay)`,
@@ -347,6 +348,10 @@ Neue Optionen (Stock-Namen, Defaults = box.cfg): s. `CHANGE_DEFAULTS` und
 - Seit 17.10.2026 (§10): Abbruch im laufenden Druck → `PAUSE
   CFS_RETURN_X/Y/Z=<Druckposition vor dem Wechsel>`; RESUME fährt dorthin
   statt zur Fehlerposition (Schneidhebel/Schacht).
+- Seit 17.10.2026 spät (§11): RESUME nach einem Abbruch ist GESPERRT,
+  solange der Kopf-Filamentsensor leer (oder unbekannt) meldet; optional
+  Nachholen des T<n>-Wechsels (`resume_redo_change`, Default AUS).
+  Reihenfolge von Hand: `KTWO_BOX_ERROR_CLEAR` → `T<n>` → `RESUME`.
 - Box 2–4 (T4–T15) abgelehnt, solange nicht konfiguriert; Hub durch anderen
   Slot belegt → Ablehnung vor jedem Frame; Kopfsensor zeigt Filament vor
   dem Einzug → Ablehnung.
@@ -440,3 +445,77 @@ nicht nachgebaut, Z nach RESUME mitten im Wechsel. Details:
   vom Hebel nur in X, und `_PI_RESUME_REBASE` setzt `PAUSE_STATE` an der
   Druckposition neu (`RESTORE_GCODE_STATE` + `SAVE_GCODE_STATE`, ohne Fahrt)
   → `RESUME_BASE` = Nullfahrt, G-Code-E wie vor dem Wechsel.
+
+### 10.1 Bewusste Abweichung vom Stock (Ergänzung 17.10.2026 spät)
+
+`BOOTLOADER-HOST-BEFUND-2026-10-17.md` §5 belegt den Stock-Fehlerpfad
+(B, Disassembly `box_wrapper.so`): `BoxError.handle_event` @`0x1c3ca4`
+nimmt den Z-Hop an der Fehlerposition zurück (`G0 Z-{move_z}`), fährt
+`BOX_MOVE_TO_SAFE_POS` (@`0x1184e0`: **erst `G0 Y345`, dann `G0 X225`**) und
+ruft dann `PAUSE` → PAUSE_STATE = **X225/Y345 auf Druck-Z**; `RESUME_BASE`
+fährt dorthin zurück (§5.3, ANNAHME: wie Upstream). Der Pi weicht bewusst ab:
+
+| Punkt | Stock | Pi | Grund |
+|---|---|---|---|
+| Rückfahrziel | X225/Y345, Druck-Z (gerade Fahrt) | Druckposition vor dem Wechsel, X/Y in Pausenhöhe, Z senkrecht | Stock senkt bei X225/Y345 auf Druck-Z, danach fährt der Slicer auf Druck-Z zum Objekt (BEFUND §5.3 V) |
+| Schneidbereich | kein Sonderfall, Y zuerst | X < `pre_cut_pos_x` nur in X | einziger Beleg `box.cfg:13` „垂直撞刀“; Y am Hebel unbelegt (BEFUND §5.4) |
+| Schacht | Z zurück auf Druck-Z, dann Y345/X225 | Z-Hub, X160 → Y345 (T0-Beispiel 11), Park | nie auf Druck-Z quer über das Bett |
+| Nachholen | automatisch (§11) | gesperrt; optional `resume_redo_change` | §11 |
+
+Ausführlich: `config-pi/NOTIZ-reinigung-resume.md` §6a.8.
+
+## 11. RESUME nach abgebrochenem Wechsel: Kopfsensor-Sperre und Nachholen (Ergänzung 17.10.2026 spät)
+
+> **ENTWURF – am Gerät UNGETESTET.** Offline: `test_k2_box.py` 34/34 (6 neue
+> Prüfungen), Batch `arbeitsdateien-lokal/upstream-test-resumecut/` (11
+> Läufe, 151/151), a45-Batch 0 Fehler, Gesamtlauf-Kopie
+> `upstream-test-resume2-gesamt/` unverändert. Belege, Ablauf, ANNAHMEN:
+> `config-pi/NOTIZ-reinigung-resume.md` §6a.7–§6a.9. Alles gesperrt
+> ausgeliefert (`allow_write`/`allow_move`/`resume_redo_change` False).
+
+**Stock (BOOTLOADER-HOST-BEFUND §5.1/§5.2, B):** `BoxSave.recode_err`
+@`0x19fb90` speichert `resume_tnn` = Ziel-TNN nur für Fehler im T<n>-Pfad
+(nicht `macro_error_list` = M8200-Kette). `RESUME` → `BOX_ERROR_RESUME_PROCESS`
+→ `error_resume_process` @`0x7cd28`: CFS an, pausiert, `resume_tnn` gesetzt;
+`clear_err()`; Kopfsensor belegt → Ende ohne Wechsel (live `12:88007`);
+sonst `go_to_extrude_pos` → `box_retrude_material` → `box_extrude_material`
+→ `extruder_extrude` → `material_change_flush`; Fehler → `resume_err`,
+`move_to_safe_pos`. Danach `RESUME_EXTERNAL` (Prime, Reinigung) → `RESUME_BASE`.
+
+**Pi:**
+
+- `_fail` merkt den Abbruch (`_record_abort`: Schritt, Ziel-TNN, Herkunft;
+  Status `change_aborted`, `resume_tnn`, `head_filament`,
+  `resume_redo_change`). Herkunft `SOURCE=T` setzt nur `_KTWO_TOOL_CHANGE`
+  (T<n>-Befehl) – nur dieser Wechsel ist nachholbar (wie Stock). Merker lebt
+  bis zum Ende eines RESUME (`KTWO_BOX_RESUME_FIX`) oder bis zu einer neuen
+  Pause, die nicht aus `_fail` stammt (`RESUME_FIX CLEAR=1`,
+  `_pause_from_fail`).
+- RESUME-Makro: bei `change_aborted` zuerst `KTWO_BOX_RESUME_CHECK MOVE=<1|0>`
+  (vor `_PI_RESUME_PREPARE`, vor jeder Bewegung). Kopfsensor über
+  Upstream-`filament_switch_sensor` (`filament_detected`, auch bei
+  ENABLE=0 aktuell):
+  - **Filament** → RESUME frei (wie Stock: kein Wechsel, alter Faden).
+  - **leer** → `RESUME gesperrt nach abgebrochenem CFS-Wechsel (…): …
+    meldet KEIN Filament … Druck bleibt PAUSIERT. In der Pause nachholen:
+    T1 (lädt T1B), dann RESUME.` (gcode-Fehler, RESUME_BASE läuft nicht).
+  - **unbekannt** (`filament_sensor` leer/Abschnitt fehlt) → gesperrt
+    (sicherer Default), Freigabe nur `KTWO_BOX_ERROR_CLEAR HEAD_LOADED=1`
+    (abgelehnt, wenn der Sensor „leer“ meldet).
+- **Nachholen** (`resume_redo_change: True` + `allow_write` + `allow_move`
+  + `MOVE=1` + Herkunft T + Ziel bekannt + Kette geschlossen +
+  referenziert): `PRE_OPT TNN=<Ziel> Z_HOP=0 SOURCE=T` → Schacht + `M400` +
+  Heizen (max(Drucktemperatur vor der Pause, 220)) → `RETRUDE` (nur bei
+  belegtem Hub) → `EXTRUDE` → `WASTE` → `FLUSH` → `END_OPT RETURN=0`; kein
+  Schnitt; danach muss der Kopfsensor Filament melden; weiter mit dem
+  normalen RESUME (Schacht/Vorextrusion/Rückfahrt). Fehler → `chain_error`,
+  RESUME gesperrt, keine Rückfahrt, keine zweite Pause (= Stock
+  `resume_err`).
+- Abweichungen: Fehler quittiert der Pi nicht im RESUME (Stock
+  `clear_err()`), sondern weiter per `KTWO_BOX_ERROR_CLEAR`; Nachholen
+  Default AUS (Stock immer); Kopfsensor unbekannt → gesperrt.
+- Korrigiert: Anleitung in `_fail`/RESUME-Sperre jetzt `KTWO_BOX_ERROR_CLEAR`
+  → `T<n>` → `RESUME` (ein `T<n>` bei offenem Fehler lehnt PRE_OPT ab).
+- Neue Option `resume_redo_change` (Default False, `k2-module.cfg`), neuer
+  Befehl `KTWO_BOX_RESUME_CHECK`, `KTWO_BOX_ERROR_CLEAR HEAD_LOADED=1`,
+  `KTWO_BOX_PRE_OPT … SOURCE=`.

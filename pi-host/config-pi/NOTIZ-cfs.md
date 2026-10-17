@@ -11,9 +11,9 @@
 
 | Datei | Inhalt |
 |---|---|
-| `macros.cfg` | `T0`–`T15` → `_KTWO_TOOL_CHANGE T=n`; `M8200` (P/C/R/L/W/F/O wie Stock-box.cfg); `_KTWO_FAN_SAVE/_RESTORE` (fan2); `RESUME` gesperrt bei offenem Wechsel-Fehler + `KTWO_BOX_RESUME_FIX` |
+| `macros.cfg` | `T0`–`T15` → `_KTWO_TOOL_CHANGE T=n` (PRE_OPT mit `SOURCE=T`); `M8200` (P/C/R/L/W/F/O wie Stock-box.cfg); `_KTWO_FAN_SAVE/_RESTORE` (fan2); `RESUME` gesperrt bei offenem Wechsel-Fehler und – nach einem Abbruch – bei leerem Kopf-Filamentsensor (`KTWO_BOX_RESUME_CHECK`, §3) + `KTWO_BOX_RESUME_FIX` |
 | `k2-module.cfg` `[k2_box]` | Freigaben `allow_write` / `allow_move` (beide False), `pause_on_failure: True`, alle Stock-`[box]`-Werte (Positionen, Längen, Temperaturen, Geschwindigkeiten), `cut_pos_x: -7.80` (SAVE_CONFIG-Wert der Stock-Kalibrierung) |
-| `pi-host/k2_box.py` | Schritte `KTWO_BOX_PRE_OPT/CUT/GO_EXTRUDE_POS/RETRUDE/EXTRUDE/WASTE/FLUSH/WIPE/SAFE_POS/END_OPT/WAIT/ERROR_CLEAR/RESUME_FIX` |
+| `pi-host/k2_box.py` | Schritte `KTWO_BOX_PRE_OPT/CUT/GO_EXTRUDE_POS/RETRUDE/EXTRUDE/WASTE/FLUSH/WIPE/SAFE_POS/END_OPT/WAIT/ERROR_CLEAR/RESUME_FIX/RESUME_CHECK` |
 
 Zuordnung (Stock box.cfg `M8200 L`): Werkzeug `n` → Box `n/4+1`, Slot
 `"ABCD"[n%4]` – `T0..T3 = T1A..T1D`. **Nur Box 1 ist unterstützt**
@@ -65,9 +65,28 @@ mit echtem Port, `KTWO_BOX_STATUS` liefert Zustand/Hub/Temp.
   (kein Abbruch/Shutdown), restliche Schritte werden übersprungen,
   Kopfsensor und G-Code-Zustand werden zurückgesetzt, der Kopf bleibt stehen.
   Weiter: Ursache beheben (z. B. Filament im Hub, Box-Fehler 0x0c =
-  Odometer-Stillstand), Schritt bzw. ganzen Wechsel `T<n>` von Hand
-  wiederholen, `KTWO_BOX_ERROR_CLEAR` (setzt auch die Box per 0x04 [00 01]
-  auf IDLE), dann `RESUME`.
+  Odometer-Stillstand), `KTWO_BOX_ERROR_CLEAR` (setzt auch die Box per
+  0x04 [00 01] auf IDLE), DANN Schritt bzw. ganzen Wechsel `T<n>` von Hand
+  wiederholen, dann `RESUME`. (Korrigiert 17.10. spät: vorher stand
+  „wiederholen, dann ERROR_CLEAR“ – ein `T<n>` bei offenem Fehler lehnt
+  PRE_OPT aber ab, nichts passiert.)
+  Seit 17.10.2026 spät (ENTWURF, offline geprüft, NOTIZ-reinigung-resume.md
+  §6a.7/§6a.8): RESUME nach einem Abbruch prüft den Kopf-Filamentsensor
+  (`KTWO_BOX_RESUME_CHECK`, aus dem RESUME-Makro, vor jeder Bewegung):
+  - Filament erkannt → RESUME wie bisher (auch wenn der Wechsel nicht
+    stattfand – alter Faden, wie Stock).
+  - LEER → `RESUME gesperrt …`, Druck bleibt pausiert. In der Pause `T<n>`
+    (die Meldung nennt `T<n>` und Ziel-TNN), dann `RESUME`. Bei offener
+    M8200-Kette alternativ `KTWO_BOX_EXTRUDE TNN=…` als Kettenschritt.
+  - unbekannt (kein Kopfsensor) → gesperrt; nach Sichtprüfung
+    `KTWO_BOX_ERROR_CLEAR HEAD_LOADED=1`, dann `RESUME`.
+  - Optional `[k2_box] resume_redo_change: True` (Default AUS, nur mit
+    `allow_write` + `allow_move`): RESUME holt einen abgebrochenen
+    T<n>-Wechsel selbst nach wie Stock `error_resume_process`
+    (BOOTLOADER-HOST-BEFUND §5.2): Schacht, Heizen, Rückzug nur bei
+    belegtem Hub, Einzug, Spülen, dann normales RESUME. Fehler → RESUME
+    gesperrt, keine Rückfahrt. M8200-Kette/Runout/Einzelschritt: nie
+    nachholen (Stock ebenso: `resume_tnn` nur im T<n>-Pfad).
   Seit 17.10.2026 (ENTWURF, offline geprüft, NOTIZ-reinigung-resume.md §6a):
   - PAUSE bekommt von k2_box das Rückfahrziel = **Druckposition vor dem
     Wechsel** (`PAUSE CFS_RETURN_X/Y/Z`, Z ohne Hop) statt der
@@ -116,6 +135,15 @@ mit echtem Port, `KTWO_BOX_STATUS` liefert Zustand/Hub/Temp.
   bzw. auf dem Weg zum Schacht Kollisionsgefahr wie im Stock.
 - **Abbruch im Schneidbereich:** Hebelzone (X ≤ −5,5) und Y-Ausdehnung des
   Hebels nur aus Stock-Werten abgeleitet (NOTIZ-reinigung-resume.md §6a.6).
+- **Bewusste Abweichungen vom Stock-Fehlerpfad** (BOOTLOADER-HOST-BEFUND
+  §5, Tabelle NOTIZ-reinigung-resume.md §6a.8): Rückfahrziel =
+  Druckposition vor dem Wechsel (Stock: X225/Y345 auf Druck-Z),
+  Schneidbereich nur in X (Stock: Y zuerst, kein Sonderfall), Nachholen nur
+  optional (Stock: immer) und nur nach `KTWO_BOX_ERROR_CLEAR` (Stock
+  quittiert im RESUME selbst).
+- **Kopfsensor nach Abbruch:** dass PA11 „leer“ meldet, sobald der Faden aus
+  dem Kopf ist, ist ANNAHME (Lage relativ zu Schneider/Zahnrädern unbelegt);
+  Nachhol-Temperatur max(Drucktemperatur vor der Pause, 220) statt RFID.
 - **Reactor:** lange Box-Antworten laufen über `ReactorBusProxy` in einem
   Hilfs-Thread; am Gerät prüfen, dass Heizung/MCU dabei stabil bleiben.
 - **Mehrere Boxen**, WASTE-Prüfung, RFID-basierte Spülmengen: nicht umgesetzt.

@@ -453,20 +453,130 @@ class _RingQuery:
                 "len": len(d)}
 
 
+def _wrap32(x):
+    return ((int(x) + (1 << 31)) & 0xFFFFFFFF) - (1 << 31)
+
+
+def _delta_size(x):
+    """Bytebreite je Delta wie Düsen-Encoder 0x08006524 (±2^7/2^15/2^23)."""
+    if -0x80 <= x <= 0x7F:
+        return 1
+    if -0x8000 <= x <= 0x7FFF:
+        return 2
+    if -0x800000 <= x <= 0x7FFFFF:
+        return 3
+    return 4
+
+
+class _McuEncoder:
+    """Nachbau Encoder 0x08006524 + Abschluss 0x080064D8 (MCU-Befund §2):
+    Delta zum Vorgänger (32 Bit), 0x80000000 übersprungen, Rückgabe =
+    Datenbytes + (n_alt >> 2) + 2 (= Paketgröße)."""
+
+    def __init__(self):
+        self.prev = 0
+        self.n = 0
+        self.mask = 0
+        self.body = b""
+
+    def add(self, v):
+        if int(v) & 0xFFFFFFFF == 0x80000000:
+            return len(self.body) + (self.n >> 2) + 2
+        n_old = self.n
+        x = _wrap32(int(v) - self.prev)
+        self.prev = int(v)
+        sz = _delta_size(x)
+        self.mask |= (sz - 1) << (2 * self.n)
+        self.body += x.to_bytes(sz, "little", signed=True)
+        self.n += 1
+        return len(self.body) + (n_old >> 2) + 2
+
+    def finish(self):
+        if self.n == 0:
+            return b""
+        return (bytes([self.n]) + self.mask.to_bytes((self.n + 3) // 4, "big")
+                + self.body)
+
+
+class _McuRegister:
+    """Nachbau read_prtouch_pres (Düse 0x08003F60) bzw. read_prtouch_step:
+    64er-SCHIEBEREGISTER (Index 0 = ältestes), Antwort endet sobald
+    ticks+datas > 41 Byte (Überlauf-Sample enthalten), len-Feld =
+    Endindex - idx + 1 (bei vollständigem Bereich also n + 1, MCU-Befund
+    §2). advance = Samples, die nach jeder Abfrage nachgeschoben werden
+    (laufendes Register)."""
+
+    def __init__(self, ticks, raw, filt=None, step=False, advance=0):
+        self.ticks = [int(t) for t in ticks]
+        self.raw = [int(v) for v in raw]
+        self.filt = [int(v) for v in (filt if filt is not None else raw)]
+        assert len(self.ticks) == len(self.raw) == len(self.filt) == 64
+        self.step = step
+        self.advance = int(advance)
+        self.sent = []
+        self.ns = []
+        self.lens = []
+        self._k = 0
+
+    def _shift(self):
+        self._k += 1
+        t = (self.ticks[-1] + 94900) & 0xFFFFFFFF
+        v = self.raw[-1] + (37 if self._k % 2 else -41)
+        self.ticks = self.ticks[1:] + [t]
+        self.raw = self.raw[1:] + [v]
+        self.filt = self.filt[1:] + [(self._k * 13) % 200 - 100]
+
+    def send(self, params):
+        self.sent.append(list(params))
+        if self.step:
+            oid, idx, ln = params
+            src = self.raw
+        else:
+            oid, is_src, ch, idx, ln = params
+            if is_src >= 2:
+                return {"tri_chxs": 0, "buf_len": 64, "idx": 0, "len": 0,
+                        "ticks": b"", "datas": b""}
+            src = self.raw if is_src == 1 else self.filt
+        end = min(64, idx + ln)
+        et, ed = _McuEncoder(), _McuEncoder()
+        k = idx
+        while k < end:
+            if et.add(self.ticks[k]) + ed.add(src[k]) > 41:
+                break
+            k += 1
+        res = {"ticks": et.finish(), "datas": ed.finish(), "idx": idx,
+               "len": (k - idx) + 1, "buf_len": 64}
+        self.ns.append(et.n)
+        self.lens.append(res["len"])
+        for _ in range(self.advance):
+            self._shift()
+        return res
+
+
 def test_live_ring_read():
+    """Live-Werte (Test D1) im Schieberegister-Nachbau: Index 0 leer (Tick 0,
+    Wert 0 = Register noch nicht voll), danach 63 echte Samples."""
     cfg = K.parse_options({})
-    q = _RingQuery(LIVE_D1)
+    t_live = [t for _, ts, _ in LIVE_D1 for t in ts]
+    d_live = [v for _, _, ds in LIVE_D1 for v in ds]
+    reg = _McuRegister([0] + t_live, [0] + d_live)
     pres = K.KlippyPresMcu(None, None, cfg, 0, {})
-    pres._q_read = q
+    pres._q_read = reg
     t, d = pres.read_pres()
-    check("(ring) 8 Abfragen idx 0..56, len 8, is_src 1",
-          [p[3] for p in q.sent] == list(range(0, 64, 8))
-          and all(p[1] == 1 and p[4] == 8 for p in q.sent))
-    check("(ring) %d Samples zusammengeführt (<= 64)" % len(d), 56 <= len(d) <= 64)
+    idxs = [p[3] for p in reg.sent]
+    exp_idx = [sum(reg.ns[:i]) for i in range(len(reg.ns))]
+    check("(ring) idx += n (n aus dem Paket), len = 64 - idx, is_src 1",
+          idxs == exp_idx and all(p[1] == 1 and p[4] == 64 - p[3]
+                                  for p in reg.sent), str(reg.sent))
+    check("(ring) Blockgrößen 7-9 (41-Byte-Grenze) ns=%s" % reg.ns,
+          all(7 <= n <= 9 for n in reg.ns[:-1]) and sum(reg.ns) == 64)
+    check("(ring) leerer Eintrag (Tick 0/Wert 0) verworfen, 63 Samples",
+          len(d) == 63 and 0 not in t and t == t_live and d == d_live)
     check("(ring) Ticks streng steigend", all(b > a for a, b in zip(t, t[1:])))
     check("(ring) Rohwerte im Ruhebereich", all(-1430000 < v < -1426000 for v in d))
-    ok, info = K.check_rest_ok(d, cfg)
-    check("(ring) Ruhetest ok (dif=%d)" % info["dif"], ok)
+    ok, info = K.check_rest_ok(d, cfg, ticks=t)
+    check("(ring) Ruhetest inkl. Tickabstand ok (dif=%d, Median %.4f ms)"
+          % (info["dif"], info.get("tick_median_ms") or 0), ok, str(info))
     t2, d2 = K.merge_ring([5, 3, 5, 4], [50, 30, 51, 40], 64)
     check("(ring) merge_ring sortiert + entfernt Duplikate", t2 == [3, 4, 5] and d2 == [30, 40, 51])
     t3, _ = K.merge_ring([0xFFFFFFF0, 0x10, 0xFFFFFFF8], [1, 3, 2], 64)
@@ -538,9 +648,10 @@ def test_stock_mapping():
                                 0.39)["lmt_dead"] == 96)
     check("(map) stock_to_mcu_params rein", p["acq_tick"] == 93750
           and p["aqc_tick"] == 46875 and p["ned_hftr"] == 1000)
-    cfg3 = K.parse_options({"lmt_dead": "77", "pres_cfg_regs": "61"})
+    cfg3 = K.parse_options({"lmt_dead": "77", "pres_cfg_regs": "44",
+                            "arm_settle_s": "0.3"})
     check("(map) direkte MCU-Option übersteuert",
-          cfg3["lmt_dead"] == 77 and cfg3["cfg_regs"] == 61
+          cfg3["lmt_dead"] == 77 and cfg3["cfg_regs"] == 44
           and cfg3["ned_lftr"] == 800)
     try:
         K.parse_options({"ned_lftr_scale": "10"})
@@ -563,6 +674,8 @@ class ProbeLine:
         self.trigger_on_arm = False  # Düse löst sofort beim Scharfschalten aus
         self.ack_err = 0
         self.rest_noisy = False
+        self.sensor_stuck = False   # Sensor ab: alle 5 ms Rohwert -1
+        self.filt_noisy = False     # gefilterter Kanal zu nah an min_hold
         self.log = []
 
     def triggered(self):
@@ -587,12 +700,25 @@ class FakeProbePres:
         self.line.level = 0 if self.line.trigger_on_arm else 1
         return {"err": 0, "expar0": 0, "expar1": 71}
 
+    @staticmethod
+    def _ticks():
+        # 0,78125 ms = 93 750 Takte (1280 Hz, cfg_regs 60)
+        return [10000000 + i * 93750 for i in range(64)]
+
     def read_pres(self):
         self.line.log.append("read_pres")
+        if self.line.sensor_stuck:
+            # MCU-Befund §1: DOUT hängt high -> alle 5 ms gelesen, Wert -1
+            return [10000000 + i * 600000 for i in range(64)], [-1] * 64
         base = -1428000
         d = [base + ((5000 if i % 2 else -5000) if self.line.rest_noisy
                      else det_noise(i, 300)) for i in range(64)]
-        return list(range(64)), d
+        return self._ticks(), d
+
+    def read_pres_filtered(self):
+        self.line.log.append("read_ftr")
+        amp = 2500 if self.line.filt_noisy else 300
+        return self._ticks(), [det_noise(3 * i + 1, amp) for i in range(64)]
 
     def disarm(self):
         self.line.log.append("stop_pres1")
@@ -656,7 +782,9 @@ class FakeGcmd:
 
 
 def make_core(cfg_over=None, line=None, raise_exc=None, fail_disarm=False):
-    base = {"allow_move": True, "arm_settle_s": 0.0}
+    # arm_settle_s 0.2 (Default; seit 17.10. >= 0,15 s Pflicht, die Fakes
+    # pausieren nicht wirklich)
+    base = {"allow_move": True, "arm_settle_s": 0.2}
     base.update(cfg_over or {})
     cfg = K.parse_options(base)
     line = line or ProbeLine()
@@ -672,12 +800,13 @@ def make_core(cfg_over=None, line=None, raise_exc=None, fail_disarm=False):
     core = K.K2PrtouchProbeCore(cfg, get_params, desc, line.triggered,
                                 lambda: waits.append(1), pauses.append)
     core.attach(FakeProbePres(line), FakeProbeStep(line, fail_disarm))
+    core._test_pauses = pauses
     return core, line, desc, waits
 
 
 EXPECT_ORDER = ["swap0", "query", "swap1", "query", "cont", "start_pres",
-                "start_step", "read_pres", "query", "DESCEND", "stop_step",
-                "stop_pres1", "query"]
+                "start_step", "read_pres", "read_ftr", "query", "DESCEND",
+                "stop_step", "stop_pres1", "query"]
 
 
 def _run(core, gcmd=None):
@@ -1044,6 +1173,7 @@ def _integration_env(cfg_over=None, z_true=0.0, homing_speed=5.0):
             name = msgformat.split()[0]
             pres = FakeProbePres(line)
             step = FakeProbeStep(line)
+            regs = {}
 
             def fn(d):
                 if name == "start_prtouch_pres":
@@ -1055,11 +1185,14 @@ def _integration_env(cfg_over=None, z_true=0.0, homing_speed=5.0):
                         return pres.disarm()
                     return pres.set_swap(d[1])
                 if name == "read_prtouch_pres":
-                    t, v = pres.read_pres()
-                    if d[3] != 0:  # 8 Blockabfragen = 1 Ruhetest im Log
-                        line.log.pop()
-                    return {"ticks": _RingQuery._pack(t[:8]),
-                            "datas": _RingQuery._pack(v[d[3]:d[3] + 8])}
+                    if d[1] >= 2:  # Status-Abfrage (is_src >= 2)
+                        return {"tri_chxs": 0, "buf_len": 64, "idx": 0,
+                                "len": 0, "ticks": b"", "datas": b""}
+                    if d[3] == 0:  # neuer Ringlesevorgang = 1 Logeintrag
+                        t, v = (pres.read_pres() if d[1] == 1
+                                else pres.read_pres_filtered())
+                        regs[d[1]] = _McuRegister(t, v)
+                    return regs[d[1]].send(d)
                 if name == "cont_prtouch_step":
                     return step.cont_step()
                 if name == "start_prtouch_step":
@@ -1203,7 +1336,7 @@ def _integration_env(cfg_over=None, z_true=0.0, homing_speed=5.0):
                  ("mcu", mcu), ("mcu nozzle_mcu", noz),
                  ("homing", Homing())):
         printer.add_object(n, o)
-    opts = {"allow_move": "True", "arm_settle_s": "0"}
+    opts = {"allow_move": "True", "arm_settle_s": "0.2"}
     opts.update(cfg_over or {})
     zsec = Config("stepper_z", {"position_min": "-5"})
     config = Config("k2_prtouch", opts, {"stepper_z": zsec})
@@ -1236,9 +1369,10 @@ def test_upstream_integration():
     printer = env["printer"]
     check("(upstream) Objekt 'probe' registriert",
           printer.lookup_object("probe", None) is env["obj"].probe)
-    check("(upstream) Endstop auf !PC7 (mcu, invert=1, pullup=0)",
+    check("(upstream) Endstop auf ^!PC7 (mcu, invert=1, pullup=1)",
           rec["endstop_pin"]["pin"] == "PC7"
           and rec["endstop_pin"]["invert"] == 1
+          and rec["endstop_pin"]["pullup"] == 1
           and rec["endstop_pin"]["chip_name"] == "mcu")
     check("(upstream) Upstream-Befehle registriert",
           all(c in gc.cmds for c in ("PROBE", "QUERY_PROBE",
@@ -1395,6 +1529,532 @@ def test_upstream_integration_guards():
               "KTWO_PRTOUCH_PROBE_STEPS"))
           and "PROBE" not in env4["gcode"].cmds)
 
+# =====================================================================
+# Absicherung nach PRTOUCH-MCU-BEFUND-2026-10-17 (§7) – Punkte 1-6
+# =====================================================================
+
+def _raises(opts, needle=None):
+    """parse_options muss ValueError werfen (optional mit Textteil)."""
+    try:
+        K.parse_options(opts)
+    except ValueError as exc:
+        return needle is None or needle in str(exc)
+    return False
+
+
+def test_1017_config_validation():
+    """Punkt 1: Antast-Parameter beim Laden prüfen (kein Start)."""
+    cfg = K.parse_options({})
+    check("(1017-1) Stock-Defaults gültig, unverändert",
+          list(K.build_start_pres_tuple(cfg, 1))
+          == [1, 60, 93750, 5, 1000, 800, 4000, 10000, 500, 128])
+    check("(1017-1) min_hold == max_hold (pres_tri_hold) -> Stream-Modus abgelehnt",
+          _raises({"pres_tri_hold": "4000, 4000, 500"}, "Stream"))
+    check("(1017-1) min_hold == max_hold (direkte MCU-Option) abgelehnt",
+          _raises({"max_hold": "4000"}, "NIE"))
+    check("(1017-1) max_hold != min_hold (auch < min_hold) erlaubt",
+          not _raises({"max_hold": "3999"}))
+    check("(1017-1) ned_hftr = 0 (pres_tri_fter[1] = 0) -> abgelehnt",
+          _raises({"pres_tri_fter": "5, 0, 0.8"}, "Hochpass"))
+    check("(1017-1) ned_hftr = 0 (direkt) abgelehnt",
+          _raises({"ned_hftr": "0"}, "ned_hftr"))
+    check("(1017-1) ned_hftr negativ abgelehnt", _raises({"ned_hftr": "-1"}))
+    for v, ok in (("0", True), ("1", True), ("800", True), ("1000", True),
+                  ("1001", False), ("5000", False)):
+        check("(1017-1) ned_lftr=%s %s" % (v, "erlaubt" if ok else "abgelehnt"),
+              _raises({"ned_lftr": v}, "ned_lftr") is (not ok))
+    check("(1017-1) pres_tri_fter[2] = 1.2 (-> 1200) abgelehnt",
+          _raises({"pres_tri_fter": "5, 1, 1.2"}, "schwingend"))
+    check("(1017-1) lmt_dead 63 abgelehnt", _raises({"lmt_dead": "63"}, "SAMPLE"))
+    check("(1017-1) pres_ded_tkms 50 (-> 50) abgelehnt",
+          _raises({"pres_ded_tkms": "50"}, "lmt_dead"))
+    check("(1017-1) lmt_dead 64 erlaubt", not _raises({"lmt_dead": "64"}))
+    check("(1017-1) cfg_regs 61 unbekannt -> abgelehnt",
+          _raises({"pres_cfg_regs": "61"}, "unbekannt"))
+    check("(1017-1) cfg_regs 56 (1280 Hz/PGA64) erlaubt",
+          not _raises({"pres_cfg_regs": "56"}))
+    check("(1017-1) cfg_regs 44 (640 Hz) mit arm_settle_s 0.3 erlaubt",
+          not _raises({"pres_cfg_regs": "44", "arm_settle_s": "0.3"}))
+    check("(1017-1) min_hold 999 (< Ruherauschen) abgelehnt",
+          _raises({"pres_tri_hold": "999, 10000, 500"}, "Ruherauschen"))
+    check("(1017-1) min_hold 1000 erlaubt",
+          not _raises({"pres_tri_hold": "1000, 10000, 500"}))
+    check("(1017-1) add_hold < 0 abgelehnt",
+          _raises({"pres_tri_hold": "4000, 10000, -1"}, "add_hold"))
+    check("(1017-1) pres_idx 1 abgelehnt", _raises({"pres_idx": "1"}, "pres_idx"))
+    check("(1017-1) acq_tick 0 abgelehnt", _raises({"acq_tick": "0"}))
+    check("(1017-1) ned_tftr 0 (nur Schalter) erlaubt",
+          not _raises({"ned_tftr": "0"}))
+    # Klipper-Hülle: Config-Fehler -> config.error, kein Start
+    class _Cfg(dict):
+        class error(Exception):
+            pass
+
+        def get_printer(self):
+            raise AssertionError("darf nicht erreicht werden")
+
+        def get_options(self):
+            return list(self.keys())
+
+    class _P:
+        def get_reactor(self):
+            return None
+
+        def lookup_object(self, name):
+            return None
+
+    class _C(_Cfg):
+        def get_printer(self):
+            return _P()
+
+    try:
+        K.PrinterK2Prtouch(_C({"pres_tri_hold": "4000, 4000, 500"}))
+        ok = False
+    except _Cfg.error as exc:
+        ok = "Config-Fehler" in str(exc) and "Stream" in str(exc)
+    check("(1017-1) Hülle: Fehler als config.error, kein Start", ok)
+
+
+def test_1017_arm_settle():
+    """Punkt 2: arm_settle_s an die Totzeit koppeln."""
+    cfg = K.parse_options({})
+    check("(1017-2) Abtastperiode aus cfg_regs 60 = 0,78125 ms",
+          abs(K.pres_sample_period_s(cfg) - 0.00078125) < 1e-12)
+    check("(1017-2) Totzeit Stock 128 Samples = 100 ms",
+          abs(K.pres_dead_time_s(cfg) - 0.1) < 1e-9)
+    check("(1017-2) Minimum Stock = 1,5 × 128 × 0,78125 ms = 0,15 s",
+          abs(K.min_arm_settle_s(cfg) - 0.15) < 1e-9
+          and abs(cfg["arm_settle_min_s"] - 0.15) < 1e-9)
+    check("(1017-2) Default 0,2 s gültig", cfg["arm_settle_s"] == 0.2)
+    check("(1017-2) arm_settle_s 0.149 abgelehnt",
+          _raises({"arm_settle_s": "0.149"}, "Totzeit"))
+    check("(1017-2) arm_settle_s 0 abgelehnt", _raises({"arm_settle_s": "0"}))
+    check("(1017-2) arm_settle_s 0.15 erlaubt", not _raises({"arm_settle_s": "0.15"}))
+    c64 = K.parse_options({"lmt_dead": "64"})
+    check("(1017-2) lmt_dead 64: Minimum über Filter-Einschwingen 128 (0,15 s)",
+          abs(c64["arm_settle_min_s"] - 0.15) < 1e-9
+          and abs(c64["pres_dead_time_s"] - 0.05) < 1e-9)
+    check("(1017-2) lmt_dead 256 braucht 0,3 s (0,2 abgelehnt)",
+          _raises({"lmt_dead": "256"}, "arm_settle_s")
+          and not _raises({"lmt_dead": "256", "arm_settle_s": "0.3"}))
+    check("(1017-2) cfg_regs 44 (640 Hz) braucht 0,3 s (0,2 abgelehnt)",
+          _raises({"pres_cfg_regs": "44"}, "arm_settle_s"))
+    check("(1017-2) lmt_dead 2000 > Maximum 2 s -> abgelehnt",
+          _raises({"lmt_dead": "2000", "arm_settle_s": "2.0"}, "Maximum"))
+    check("(1017-2) acq_tick ändert die Periode NICHT (Bitbang)",
+          abs(K.parse_options({"pres_acq_tkms": "2.0"})["arm_settle_min_s"]
+              - 0.15) < 1e-9)
+    # Laufzeit: Kern pausiert genau arm_settle_s, fail-safe bei zu kurz
+    core, line, desc, _ = make_core({"arm_settle_s": "0.25"})
+    res, err = _run(core)
+    check("(1017-2) Kern pausiert arm_settle_s nach dem Scharfschalten",
+          err is None and core._test_pauses == [0.25], str(core._test_pauses))
+    core2, line2, desc2, _ = make_core()
+    core2.cfg["arm_settle_s"] = 0.05  # an parse_options vorbei
+    res2, err2 = _run(core2)
+    check("(1017-2) Kern: zu kurze Wartezeit -> Abbruch vor Fahrt, entschärft",
+          err2 is not None and "Totzeit" in str(err2)
+          and "DESCEND" not in line2.log and "stop_pres1" in line2.log,
+          str(err2))
+
+
+def test_1017_min_speed():
+    """Punkt 3: Mindestgeschwindigkeit (ANNAHME 2,5 mm/s bei Stock)."""
+    cfg = K.parse_options({})
+    check("(1017-3) Mindestgeschwindigkeit Stock 2,5 mm/s",
+          abs(K.min_probe_speed(cfg) - 2.5) < 1e-12 and cfg["speed_min"] == 2.5)
+    check("(1017-3) speed 2.4 abgelehnt", _raises({"speed": "2.4"}, "zu langsam"))
+    check("(1017-3) speed 2.5 erlaubt", not _raises({"speed": "2.5"}))
+    check("(1017-3) probe_speed 2 (speed fällt zurück) abgelehnt",
+          _raises({"probe_speed": "2"}, "zu langsam"))
+    check("(1017-3) mode steps: probe_speed 2 erlaubt (Host stoppt, nicht MCU)",
+          not _raises({"mode": "steps", "probe_speed": "2"}))
+    c = K.parse_options({"pres_tri_hold": "8000, 10000, 1000"})
+    check("(1017-3) Schwellen 8000/1000 -> Minimum 5,0 mm/s",
+          abs(c["speed_min"] - 5.0) < 1e-9
+          and _raises({"pres_tri_hold": "8000, 10000, 1000", "speed": "4.9"},
+                      "zu langsam"))
+    check("(1017-3) Schwellen 9000/1000 -> Minimum > 5 -> unzulässig",
+          _raises({"pres_tri_hold": "9000, 10000, 1000"}, "zu langsam"))
+    check("(1017-3) cfg_regs 56 (PGA 64) -> Minimum 5,0 mm/s",
+          abs(K.parse_options({"pres_cfg_regs": "56"})["speed_min"] - 5.0) < 1e-9)
+    check("(1017-3) cfg_regs 44 (640 Hz) -> nie unter 2,5 mm/s",
+          K.parse_options({"pres_cfg_regs": "44",
+                           "arm_settle_s": "0.3"})["speed_min"] == 2.5)
+    core, line, desc, _ = make_core()
+    res, err = _run(core, FakeGcmd({"PROBE_SPEED": "2"}))
+    check("(1017-3) PROBE_SPEED=2 -> Fehler 'zu langsam', kein MCU-Befehl",
+          err is not None and "zu langsam" in str(err)
+          and "second_homing_speed" in str(err) and line.log == []
+          and not desc.calls, str(err))
+    core2, line2, desc2, _ = make_core()
+    res2, err2 = _run(core2, FakeGcmd({"PROBE_SPEED": "2.5"}))
+    check("(1017-3) PROBE_SPEED=2.5 erlaubt", err2 is None
+          and desc2.calls[0]["probe_speed"] == 2.5, str(err2))
+    check("(1017-3) check_probe_speed: 0 / 5.1 / 2.49 abgelehnt, 3 ok",
+          K.check_probe_speed(0, cfg) and K.check_probe_speed(5.1, cfg)
+          and K.check_probe_speed(2.49, cfg)
+          and K.check_probe_speed(3.0, cfg) is None)
+
+
+def test_1017_rest_extended():
+    """Punkt 4: Ruhetest um Tickabstand, -1/24 Bit, gefilterten Kanal."""
+    cfg = K.parse_options({})
+    per = 93750  # 0,78125 ms in Takten
+    tk = [5000000 + i * per for i in range(64)]
+    ok_d = [-1428000 + det_noise(i, 300) for i in range(64)]
+    ok_f = [det_noise(i, 300) for i in range(64)]
+    ok, info = K.check_rest_ok(ok_d, cfg, ticks=tk, filt=ok_f)
+    check("(1017-4) gesunder Sensor: ok", ok and not info["errors"], str(info))
+    stuck = [-1] * 64
+    ok_old = K.rest_info(stuck)["dif"] <= cfg["rest_max_dif"]
+    ok, info = K.check_rest_ok(stuck, cfg)
+    check("(1017-4) Sensor ab (-1, dif 0): alter dif-Test bestünde, neuer nicht",
+          ok_old and not ok and any("-1" in e for e in info["errors"])
+          and any("konstant" in e for e in info["errors"]), str(info["errors"]))
+    ok, info = K.check_rest_ok([-1428000] * 64, cfg)
+    check("(1017-4) konstante Rohwerte (dif 0) abgelehnt",
+          not ok and any("konstant" in e for e in info["errors"]))
+    big = list(ok_d)
+    big[5] = 1 << 23
+    ok, info = K.check_rest_ok(big, cfg)
+    check("(1017-4) Wert außerhalb 24 Bit abgelehnt",
+          not ok and any("24 Bit" in e for e in info["errors"]))
+    ok, info = K.check_rest_ok(ok_d[:10], cfg)
+    check("(1017-4) zu wenige Samples (10) abgelehnt",
+          not ok and any("gültige Rohwerte" in e for e in info["errors"]))
+    ok, info = K.check_rest_ok([], cfg)
+    check("(1017-4) leeres Register abgelehnt (kein Fehlerwurf)", not ok)
+    for name, step, good in (("5 ms (Sensor hängt)", 600000, False),
+                             ("55 µs (DOUT low)", 6600, False),
+                             ("1,5625 ms (falsche Rate)", 187500, False),
+                             ("0,7907 ms (live)", 94884, True),
+                             ("0,85 ms (+8,8 %)", 102000, True),
+                             ("0,87 ms (+11 %)", 104400, False)):
+        t2 = [5000000 + i * step for i in range(64)]
+        ok, info = K.check_rest_ok(ok_d, cfg, ticks=t2)
+        check("(1017-4) Tickabstand %s -> %s" % (name, "ok" if good else "Abbruch"),
+              ok is good, str(info["errors"]))
+    # Jitter: ein Sample 60 µs zu spät gelesen (langer + kurzer Abstand) -> ok
+    jit = list(tk)
+    jit[20] += 7200
+    ok, info = K.check_rest_ok(ok_d, cfg, ticks=jit)
+    check("(1017-4) Jitter ±60 µs an einem Sample -> ok", ok, str(info["errors"]))
+    # Einzelner viel zu kurzer Abstand (0,3 × Periode) -> Abbruch über Minimum
+    short = list(tk)
+    short[20] = short[19] + 28000
+    short[21:] = [t + 28000 - per for t in short[21:]]
+    ok, info = K.check_rest_ok(ok_d, cfg, ticks=sorted(short))
+    check("(1017-4) Einzelabstand 0,23 ms (< 0,5 × Periode) -> Abbruch",
+          not ok and any("Minimum" in e for e in info["errors"]),
+          str(info["errors"]))
+    # Laufendes Register (Lücken zwischen Blöcken): Median trotzdem ≈ Periode
+    gap = [5000000 + (i + 11 * (i // 8)) * per for i in range(64)]
+    ok, info = K.check_rest_ok(ok_d, cfg, ticks=gap)
+    check("(1017-4) Blocklücken (laufendes Register) -> ok über Median", ok,
+          str(info["errors"]))
+    noisy_f = [2100 if i == 30 else v for i, v in enumerate(ok_f)]
+    ok, info = K.check_rest_ok(ok_d, cfg, ticks=tk, filt=noisy_f)
+    check("(1017-4) gefiltert max 2100 > 0,5 × min_hold 4000 -> Abbruch",
+          not ok and any("gefilterter Kanal" in e for e in info["errors"])
+          and info["filt_max_abs"] == 2100 and info["filt_limit"] == 2000.0)
+    neg_f = [-2100 if i == 30 else v for i, v in enumerate(ok_f)]
+    ok, info = K.check_rest_ok(ok_d, cfg, filt=neg_f)
+    check("(1017-4) gefiltert -2100 (Betrag) -> Abbruch", not ok)
+    cfg1 = K.parse_options({"rest_filt_max_frac": "1.0"})
+    ok, info = K.check_rest_ok(ok_d, cfg1, filt=noisy_f)
+    check("(1017-4) rest_filt_max_frac 1.0 -> 2100 < 4000 ok", ok)
+    check("(1017-4) rest_filt_max_frac 0 / 1.5 abgelehnt",
+          _raises({"rest_filt_max_frac": "0"}) and
+          _raises({"rest_filt_max_frac": "1.5"}))
+    ok, info = K.check_rest_ok(ok_d, cfg, filt=ok_f[:5])
+    check("(1017-4) zu wenige gefilterte Werte abgelehnt", not ok)
+    # Kern (mode probe): Abbruch vor Fahrt, entschärft
+    for flag, needle in (("sensor_stuck", "-1"), ("filt_noisy", "gefilterter"),
+                         ("rest_noisy", "dif=")):
+        line = ProbeLine()
+        setattr(line, flag, True)
+        core, line, desc, _ = make_core(line=line)
+        res, err = _run(core)
+        check("(1017-4) Kern %s -> Ruhetest-Abbruch vor Fahrt" % flag,
+              err is not None and "Ruhetest" in str(err) and needle in str(err)
+              and "DESCEND" not in line.log and "stop_pres1" in line.log
+              and not core.armed, str(err))
+    core, line, desc, _ = make_core()
+    res, err = _run(core)
+    ri = core.last["arm"]["rest"]
+    check("(1017-4) Kern liest roh + gefiltert, Info mit Tick/Filter",
+          err is None and "read_ftr" in line.log
+          and abs(ri["tick_median_ms"] - 0.78125) < 1e-6
+          and ri["filt_max_abs"] <= 300, str(ri))
+    # Rückfallweg: Tickprüfung greift auch dort
+    cfg_s, tool, pres, step, ctl, log = make_ctl(z_start=0.2, z_true=0.0)
+    pres._ticks = lambda: struct.pack("<64I", *[10000000 + i * 600000
+                                               for i in range(64)])
+    r = ctl.probe_point()
+    check("(1017-4) Rückfallweg: Tickabstand 5 ms -> rest_error, keine Fahrt",
+          r.get("status") == "rest_error" and "Tickabstand" in r.get("error", "")
+          and not tool.moves, str(r)[:200])
+
+
+def _varied_register():
+    """64 Samples, deren Datendeltas Blöcke mit n = 9, 7, 8 … erzwingen."""
+    ticks = [146176342 + i * 94900 for i in range(64)]
+    vals, v = [], -1428000
+    for i in range(64):
+        if i == 0:
+            d = 0
+        elif i <= 8:
+            d = 50 if i % 2 else -50      # 1-Byte-Deltas -> Block n = 9
+        elif i <= 15:
+            d = 300 if i % 2 else -300    # 2-Byte-Deltas -> Block n = 7
+        elif i <= 23:
+            d = 150 if i % 2 else -110    # gemischt 1/2 Byte -> n = 8
+        else:
+            d = 60 if i % 2 else -60      # 1 Byte -> 4 × 9, Rest 4 (vollständig)
+        v += d
+        vals.append(v)
+    return ticks, vals
+
+
+def test_1017_ring_blocks():
+    """Punkt 5: Blocklesen idx += n (n aus dem Paket), len-Feld ignoriert."""
+    cfg = K.parse_options({})
+    ticks, vals = _varied_register()
+    filt = [det_noise(i, 200) for i in range(64)]
+    reg = _McuRegister(ticks, vals, filt=filt)
+    pres = K.KlippyPresMcu(None, None, cfg, 3, {})
+    pres._q_read = reg
+    t, d = pres.read_pres()
+    check("(1017-5) Blockgrößen 9/7/8 kommen vor (ns=%s)" % reg.ns,
+          reg.ns[:3] == [9, 7, 8] and set(reg.ns[:-1]) <= {7, 8, 9}
+          and reg.ns[-1] == 4)
+    check("(1017-5) alle 64 Samples genau einmal, lückenlos",
+          t == ticks and d == vals)
+    idxs = [p[3] for p in reg.sent]
+    check("(1017-5) nächster idx = idx + n, angefragt len = 64 - idx",
+          idxs == [sum(reg.ns[:i]) for i in range(len(reg.ns))]
+          and all(p[4] == 64 - p[3] for p in reg.sent), str(idxs))
+    check("(1017-5) len-Feld der Antwort beim vollständigen Restblock n+1 "
+          "(%d bei %d Samples) – nicht benutzt" % (reg.lens[-1], reg.ns[-1]),
+          reg.lens[-1] == reg.ns[-1] + 1 and len(d) == 64)
+    # Alte Methode (feste 8er-Schritte, len 8) hätte Samples verloren:
+    reg_old = _McuRegister(ticks, vals)
+    got = set()
+    for idx in range(0, 64, 8):
+        r = reg_old.send([3, 1, 0, idx, 8])
+        got.update(K.decode_ticks(r["ticks"], cfg))
+    check("(1017-5) Gegenprobe: feste 8er-Schritte verlieren %d Sample(s)"
+          % (64 - len(got)), len(got) < 64)
+    # Gefilterter Kanal (is_src=0) über denselben Weg:
+    n_sent = len(reg.sent)
+    tf, df = pres.read_pres_filtered()
+    check("(1017-5) is_src=0 liefert den gefilterten Kanal vollständig",
+          df == filt and tf == ticks
+          and all(p[1] == 0 for p in reg.sent[n_sent:]))
+    # Register noch nicht voll: leere Einträge werden verworfen
+    reg2 = _McuRegister([0] * 20 + ticks[20:], [0] * 20 + vals[20:])
+    pres._q_read = reg2
+    t2, d2 = pres.read_pres()
+    check("(1017-5) Tick-0/Wert-0-Einträge verworfen (44 von 64)",
+          len(d2) == 44 and t2 == ticks[20:])
+    # n = 0 vor Ende -> Abbruch, keine Endlosschleife
+    class _Zero:
+        def __init__(self):
+            self.sent = []
+
+        def send(self, p):
+            self.sent.append(list(p))
+            return {"ticks": b"", "datas": b"", "len": 1}
+    z = _Zero()
+    ts, ds, ix = K.read_ring_blocks(z.send, lambda i, ln: [0, 1, 0, i, ln],
+                                    cfg, K.decode_pres_datas)
+    check("(1017-5) n = 0 -> Abbruch nach 1 Abfrage", ts == [] and len(z.sent) == 1)
+    # ticks/datas ungleich lang -> Fehler (fail-safe)
+    blk8 = _RingQuery._pack(list(range(100, 108)))
+    blk7 = _RingQuery._pack(list(range(100, 107)))
+    try:
+        K.read_ring_blocks(lambda p: {"ticks": blk8, "datas": blk7},
+                           lambda i, ln: [0, 1, 0, i, ln], cfg,
+                           K.decode_pres_datas)
+        ok = False
+    except ValueError:
+        ok = True
+    check("(1017-5) ticks/datas mit verschiedenem n -> ValueError", ok)
+    # Laufendes Register (3 neue Samples je Abfrage): Ruhetest trotzdem ok
+    calm = [-1428000 + det_noise(i, 300) for i in range(64)]
+    reg3 = _McuRegister(ticks, calm, advance=3)
+    pres._q_read = reg3
+    t3, d3 = pres.read_pres()
+    ok, info = K.check_rest_ok(d3, cfg, ticks=t3)
+    check("(1017-5) laufendes Register: sortiert, Ruhetest ok (Median %.3f ms)"
+          % (info.get("tick_median_ms") or 0),
+          all(b > a for a, b in zip(t3, t3[1:])) and ok, str(info["errors"]))
+    # Eingefrorener Ring (Diagnose): Status, dann is_src 0 und 1 mit idx += n
+    reg4 = _McuRegister(ticks, vals, filt=filt)
+    pres._q_read = reg4
+    fr = pres.read_frozen()
+    s0 = reg4.sent
+    nf = len(reg4.ns) // 2
+    check("(1017-5) read_frozen: Status [oid,2,0,0,0], dann FTR/SRC idx += n",
+          s0[0] == [3, 2, 0, 0, 0] and fr["ftr"][1] == filt
+          and fr["src"][1] == vals
+          and [p[3] for p in s0[1:1 + nf]]
+          == [sum(reg4.ns[:i]) for i in range(nf)], str(s0[:4]))
+    # step-Seite (Main): gleiches Verfahren
+    regs = _McuRegister(ticks, vals, step=True)
+    stp = K.KlippyStepMcu(None, None, cfg, 9)
+    stp._q_read = regs
+    ts5, ds5 = stp.read_step()
+    check("(1017-5) read_step: idx += n, alle 64",
+          ts5 == ticks and ds5 == vals
+          and [p[1] for p in regs.sent]
+          == [sum(regs.ns[:i]) for i in range(len(regs.ns))])
+    regs2 = _McuRegister(ticks, vals, step=True)
+    stp._q_read = regs2
+    st = stp.read_frozen()
+    check("(1017-5) step read_frozen: [oid,0,0] zuerst, dann idx += n",
+          regs2.sent[0] == [9, 0, 0] and st["step"][1] == vals)
+
+
+def _creality_pc7_pull(cmds):
+    """Endzustand des PC7-Pulls in der CREALITY-Firmware aus der Folge der
+    MCU-Config-Befehle (MCU-Befund §4.5): wer zuletzt konfiguriert, gewinnt;
+    config_endstop pull_up 0 = Pull-Down, 1 = Pull-Up, sonst schwebend;
+    config_prtouch_step = immer Pull-Up."""
+    pull = None
+    for c in cmds:
+        if c.startswith("config_endstop") and "pin=PC7" in c:
+            v = int(c.split("pull_up=")[1].split()[0])
+            pull = K.CREALITY_PULL.get(v, "schwebend")
+        elif c.startswith("config_prtouch_step") and "swp_pin=PC7" in c:
+            pull = "Pull-Up"
+    return pull
+
+
+def test_1017_pc7_pull():
+    """Punkt 6: PC7-Pull bewusst Pull-Up (Stock-Endzustand) via '^!PC7'."""
+    p = K.parse_pin_desc("^!PC7")
+    check("(1017-6) parse_pin_desc ^!PC7 -> pullup 1, invert 1, mcu",
+          p == {"pullup": 1, "invert": 1, "chip": "mcu", "pin": "PC7"})
+    check("(1017-6) parse_pin_desc ~!PC7 -> pullup -1",
+          K.parse_pin_desc("~!PC7")["pullup"] == -1)
+    try:
+        K.parse_pin_desc("!^PC7")
+        ok = False
+    except ValueError:
+        ok = True
+    check("(1017-6) '!^PC7' (falsche Reihenfolge, Upstream ungültig) abgelehnt", ok)
+    cfg = K.parse_options({})
+    check("(1017-6) Default step_swap_pin '^!PC7' = Pull-Up",
+          cfg["step_swap_pin"] == "^!PC7" and cfg["step_swap_pull"] == "Pull-Up")
+    check("(1017-6) '!PC7' (Creality: Pull-DOWN) im Probe-Modus abgelehnt",
+          _raises({"step_swap_pin": "!PC7"}, "Pull-DOWN"))
+    check("(1017-6) '~!PC7' (Creality: schwebend) abgelehnt",
+          _raises({"step_swap_pin": "~!PC7"}, "schwebend"))
+    check("(1017-6) '^PC7' ohne Invertierung abgelehnt",
+          _raises({"step_swap_pin": "^PC7"}, "Invertierung"))
+    check("(1017-6) '^!nozzle_mcu:PC7' (falsche MCU) abgelehnt",
+          _raises({"step_swap_pin": "^!nozzle_mcu:PC7"}, "main_mcu"))
+    check("(1017-6) mode steps: '!PC7' erlaubt (kein Endstop)",
+          not _raises({"mode": "steps", "step_swap_pin": "!PC7"}))
+    stock = ["config_endstop oid=1 pin=PC7 pull_up=0",
+             "config_trsync oid=2",
+             "config_prtouch_step oid=3 oid_xstp=4 oid_ystp=7 oid_zstp=9 "
+             "swp_pin=PC7"]
+    alt = [stock[2], "config_endstop oid=0 pin=PC7 pull_up=0"]
+    neu = [stock[2], "config_endstop oid=0 pin=PC7 pull_up=1"]
+    check("(1017-6) Creality-Modell: Stock-Folge -> Pull-Up",
+          _creality_pc7_pull(stock) == "Pull-Up")
+    check("(1017-6) Creality-Modell: alte k2-Folge mit !PC7 -> Pull-Down",
+          _creality_pc7_pull(alt) == "Pull-Down")
+    check("(1017-6) Creality-Modell: neue k2-Folge mit ^!PC7 -> Pull-Up "
+          "(reihenfolgeunabhängig)",
+          _creality_pc7_pull(neu) == "Pull-Up"
+          and _creality_pc7_pull(neu[::-1]) == "Pull-Up")
+
+
+def test_1017_upstream():
+    """Integration gegen die echten Upstream-Dateien (sonst SKIP)."""
+    if not os.path.isdir(os.path.join(UPSTREAM_KLIPPY, "extras")):
+        print("SKIP (1017-upstream) lokale Upstream-Kopie fehlt")
+        return
+    # Config-Fehler beim Laden -> kein Start
+    try:
+        _integration_env({"pres_tri_hold": "4000, 4000, 500"})
+        ok = False
+    except ValueError as exc:
+        ok = "Config-Fehler" in str(exc) and "Stream" in str(exc)
+    check("(1017-upstream) min_hold == max_hold -> Config-Fehler beim Laden", ok)
+    try:
+        _integration_env({"step_swap_pin": "!PC7"})
+        ok = False
+    except ValueError as exc:
+        ok = "Pull-DOWN" in str(exc)
+    check("(1017-upstream) step_swap_pin '!PC7' -> Config-Fehler beim Laden", ok)
+    # G28 Z: second_homing_speed 2 (< 2,5) -> 2. Antastung abgelehnt
+    import collections
+    env = _integration_env()
+    hv = env["pins"].setup_pin("endstop", "probe:z_virtual_endstop")
+    HI = collections.namedtuple(
+        "homing_info", ["speed", "position_endstop", "retract_speed",
+                        "retract_dist", "positive_dir", "second_homing_speed"])
+    hinfo = HI(5.0, 0.0, 5.0, 5.0, False, 2.0)
+
+    class Rail:
+        def get_endstops(self):
+            return [(hv, "probe")]
+
+        def get_homing_info(self):
+            return hinfo
+
+    env["th"].pos = [175.0, 175.0, 120.0, 0.0]
+    try:
+        env["uhoming"].Homing(env["printer"]).home_rails(
+            [Rail()], [None, None, 180.0, None], [None, None, 0.0, None])
+        ok = False
+    except env["ugcode"].CommandError as exc:
+        ok = "zu langsam" in str(exc) and "second_homing_speed" in str(exc)
+    core = env["obj"].probe.core
+    check("(1017-upstream) G28 Z: second_homing_speed 2 -> 2. Fahrt abgelehnt",
+          ok and len(env["rec"]["probing"]) == 1 and not core.armed,
+          str(env["rec"]["probing"]))
+    # KTWO_PRTOUCH_READ im Probe-Modus: Vorabprüfung ohne Bewegung
+    env2 = _integration_env({"allow_move": "False"})
+    env2["line"].log.clear()
+    gc2 = env2["gcode"]
+    gc2.cmds["KTWO_PRTOUCH_READ"](gc2.create_gcode_command(
+        "KTWO_PRTOUCH_READ", "KTWO_PRTOUCH_READ", {}))
+    core2 = env2["obj"].probe.core
+    check("(1017-upstream) KTWO_PRTOUCH_READ: scharf -> Ruhetest -> entschärft, "
+          "keine Fahrt (auch allow_move False)",
+          any("READ ok" in m for m in gc2.out) and env2["rec"]["probing"] == []
+          and "read_ftr" in env2["line"].log
+          and env2["line"].log[0] == "wait"
+          and env2["line"].log[-2:] == ["stop_step", "stop_pres1"]
+          and not core2.armed and core2.arm_count == 1, str(gc2.out[-1:]))
+    env3 = _integration_env()
+    env3["line"].sensor_stuck = True
+    gc3 = env3["gcode"]
+    gc3.cmds["KTWO_PRTOUCH_READ"](gc3.create_gcode_command(
+        "KTWO_PRTOUCH_READ", "KTWO_PRTOUCH_READ", {}))
+    check("(1017-upstream) KTWO_PRTOUCH_READ bei abgezogenem Sensor -> Meldung, "
+          "entschärft",
+          any("Ruhetest" in m and "-1" in m for m in gc3.out)
+          and not env3["obj"].probe.core.armed, str(gc3.out[-1:]))
+    # PROBE bei abgezogenem Sensor: keine Fahrt
+    env4 = _integration_env()
+    env4["line"].sensor_stuck = True
+    try:
+        env4["gcode"].cmds["PROBE"](env4["gcode"].create_gcode_command(
+            "PROBE", "PROBE", {}))
+        ok = False
+    except env4["ugcode"].CommandError as exc:
+        ok = "Ruhetest" in str(exc)
+    check("(1017-upstream) PROBE bei abgezogenem Sensor -> keine Fahrt",
+          ok and env4["rec"]["probing"] == [])
+
+
 def main():
     test_live_ring_read()
     test_swap_mechanism()
@@ -1418,6 +2078,13 @@ def main():
     test_klippy_adapters_disarm_and_frozen()
     test_upstream_integration()
     test_upstream_integration_guards()
+    test_1017_config_validation()
+    test_1017_arm_settle()
+    test_1017_min_speed()
+    test_1017_rest_extended()
+    test_1017_ring_blocks()
+    test_1017_pc7_pull()
+    test_1017_upstream()
     print("\n%d bestanden, %d fehlgeschlagen" % (len(PASS), len(FAIL)))
     if FAIL:
         print("FEHLER:", FAIL)

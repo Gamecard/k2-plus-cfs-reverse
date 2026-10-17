@@ -569,7 +569,7 @@ App 108/113; keine Lizenz für Texte/Dumps → nur Fakten übernommen) + eigene 
 - **Bootloader-Protokoll (stark, Disassembly des Bootloader-Dumps durch unseren Agent):**
   - spricht selbst F7-Frames mit CRC-8 (poly 0x07, init 0, über [len..data]) – wie die App
   - akzeptiert Zieladressen `0xFF`, `0xFE`, eigene Adresse und `0xF0` (Bedeutung von
-    0xF0 unklar); Längengrenze **len ≤ 0xFC** (serial485 prüft bis 255 – nur notiert)
+    0xF0 unklar); Längengrenze **len ≤ 0xFC** (Nachbau seit 17.10.2026: Senden ≤ 100 Datenbytes, fun 0xF0 ≤ 0x80; Empfang bis 255)
   - **UNTERSCHIED Bootloader ↔ App (BELEGT 15.10.2026, Ghidra):** die App-Empfangs-
     Statemachine `FUN_0800f880` akzeptiert NUR `eigene`, `0xEA`, `0xEB` (kein 0xFF/0xFE/0xF0);
     0xFF/0xFE kommen in der App nur im Modul `RS485_AUTO_ADDR` vor (`FUN_0800a92c`:
@@ -885,7 +885,7 @@ Binary `rootfs-live/usr/share/klipper/klippy/extras/motor_control_wrapper.cpytho
 | 0x01 | reboot | nie | Stub `reboot()` |
 | 0x03 | encoder_calibrate_official | nie | Stub `encoder_calibrate()` |
 | 0x04 | elec_offset_calibrate | nie | Stub `elec_offset_calibrate()` |
-| 0x05 | control | unbeantwortet | nicht gebaut |
+| 0x05 | control | nur Sub 04 antwortet (3 B EN/Regler/PWM), 01/02/03 by design stumm (MOTOR-RESTE-BEFUND §1) | nur Konstanten CONTROL_*; cfswatch wertet [04] ohne Antwort als Fehler |
 | 0x06 | sys_param | belegt | `read/write_sys_param` |
 | 0x07 | flash_param | nie | Stubs `get/set_flash_param` |
 | 0x08 | get | belegt | `read_variable` + Feedback-Helfer |
@@ -1448,7 +1448,7 @@ ausgeführt; die Antworten fehlen im Host-Log → Ursache **Host-seitig vermutet
 | serial485 | `MAX_BUS_HOLD_S = 1200` s: timeout × (retries+1) darüber → ValueError. Der Bus-Lock bleibt **bewusst** über die ganze Transaktion (Halbduplex, Original identisch) (M6) |
 | box | `CfsStatusError` / `StatusBytes` / `raise_on_status`: Status ≠ 0 wird gemeldet statt verschluckt (M2) |
 | box | `FUNC_RETRIES` 0x10/0x11 = 0 (**bewusste Abweichung**, `FUNC_RETRIES_ORIGINAL` = 4): Retransmit würde Mechanik doppelt auslösen – passt zu BEFUND2 §5 (Box hat keine Duplikaterkennung); `communication_extrude`/`communication_retrude` mit langen Timeouts (M3) |
-| box | Messrad 0x0e op 0 (Nullen) nur mit `reset=True` (G1); Maske 0 bei 0x0d op 2/3 = 4 Slots (980 s) (G2); `_box_fw_num` versteht Host-Form „1.5.3“ (G3); `_is_full_frame` robust gegen Anhang (G4); DeprecationWarning bei `get_hardware_status(channel)` (sendet 0x08) (G6) |
+| box | Messrad 0x0e op 0 (Nullen) nur mit `reset=True` (G1); Maske 0 bei 0x0d op 2/3 = 4 Slots (1200 s, seit 17.10.2026 max(180+200·n, 300·n)) (G2); `_box_fw_num` versteht Host-Form „1.5.3“ (G3); `_is_full_frame` robust gegen Anhang (G4); DeprecationWarning bei `get_hardware_status(channel)` (sendet 0x08) (G6) |
 | cfsseq | `EXTRUDE_ACK`/`RETRUDE_ACK`, `check_one_hot`, einziges `slot_to_mask` (G5/G6) |
 | motor | F0-Update-Sender nur mit `confirm=True`; `write_sys_param` für die 166 gesperrten IDs nur mit `allow_locked=True`; float32-Plausibilität |
 | motor_mini | `MINI_WRITABLE_IDS` (13 Stock-IDs), `update_sys_params` nur mit `confirm=True` |

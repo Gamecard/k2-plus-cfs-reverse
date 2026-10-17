@@ -143,9 +143,19 @@ Audit und Änderungsbegründungen: `<projekt>/AUDIT-UND-AENDERUNGEN.md`.
   Schacht über X160→Y345, RESUME setzt PAUSE_STATE neu (_PI_RESUME_REBASE), Ziel am Hebel/ohne Freigabe → RESUME gesperrt.
   Nebenbei behoben: pending_resume_z bei Kette in Pause, Z-Korrektur nach CANCEL, _keep_start_pos nach CANCEL/RESUME,
   END_OPT senkte Z in der Pause. Abgebrochener Wechsel wird NICHT automatisch nachgeholt (Stock resume_tnn):
-  in der Pause T<n>, dann KTWO_BOX_ERROR_CLEAR + RESUME.
+  KTWO_BOX_ERROR_CLEAR, dann T<n> in der Pause, dann RESUME (T<n> bei offenem Fehler wird abgelehnt; korrigiert 17.10. spät).
 - [ ] Am Gerät: CFS-Abbruch im Schacht provozieren (Box stromlos während T1), Park- und RESUME-Bahn beobachten;
   Hebelfall nur außerhalb eines Drucks mit KTWO_BOX_CUT
+  **Stock-Vergleich 17.10.2026 (BOOTLOADER-HOST-BEFUND-2026-10-17.md §5):** Stock holt den Wechsel beim RESUME automatisch nach (nur T<n>-Fehler, Kopfsensor leer: go_to_extrude_pos → retrude → extrude → flush) und parkt vor PAUSE auf X225/Y345 bei Druck-Z. Pi weicht bewusst ab (Druckposition vor dem Wechsel, Schneidbereich nur X, kein Auto-Nachholen).
+- [x] RESUME nach abgebrochenem CFS-Wechsel bei leerem Kopf – OFFLINE UMGESETZT 17.10.2026 spät (NOTIZ-reinigung-resume
+  §6a.7–§6a.9, README-k2_box §11): KTWO_BOX_RESUME_CHECK vor jeder Bewegung; Kopfsensor leer → RESUME gesperrt (Druck
+  pausiert, Meldung T<n>/Ziel-TNN), Sensor unbekannt → gesperrt bis KTWO_BOX_ERROR_CLEAR HEAD_LOADED=1; optional
+  [k2_box] resume_redo_change (Default AUS) = Stock error_resume_process (nur T<n>-Wechsel). Abweichungen mit Belegen
+  in §6a.8. test_k2_box 34/34, resumecut 11 Läufe 151/151, a45 0 Fehler.
+- [ ] Am Gerät: Abbruch im Schacht (Box stromlos während T1), Faden von Hand aus dem Kopf → RESUME muss verweigern;
+  T1 in der Pause → RESUME läuft; erst danach resume_redo_change testen.
+- [ ] Offen: PAUSE merkt nach Kettenabbruch hotend_temp = Wechsel-Temperatur (≥ 220 °C) → RESUME heizt darauf
+  (Vorschlag: _fail übergibt die ursprüngliche Zieltemperatur an PAUSE).
 - [ ] Am Pi zu prüfen: Positionen Reinigung/Schacht wegen FORCE_MOVE-Versatz einzeln langsam abfahren; Vorextrusion
   460 mm/min/180 °C; Stall-Pin PB11 in Mode 3; RESUME direkt aus runout_gcode
   Zurückgestellt: Motor-Kalibrierfunktionen aus dessen motor_control.py (0x03 Encoder, 0x04 Elektrik-Offset,
@@ -196,16 +206,17 @@ motor 98 · motor_mini 30 · auto_addr 31 – alle grün.
 - [x] **Timeout 0x0d op 2/3** (Bezug Retry-TODO oben): FW antwortet erst nach bis zu ~3 min
   pro Slot – Nachbau-Default 2 s + 4 Retries hätte den Force-Preload bis zu 5× gesendet.
   ERLEDIGT 15.10.2026: `box.communication_set_pre_loading` nutzt bei op 2/3 langen Timeout
-  (`preload_force_timeout(mask)`, 180 s + 200 s je Slot) und `retries=0`
-- [ ] `serial485.Wrapper._done` wächst unbegrenzt (nie abgeholte Antworten) – Aufräumen/Limit
-- [ ] Hintergrund-Thread kann `get_response` Antworten wegschnappen, wenn zwischen
+  (`preload_force_timeout(mask)`, seit 17.10.2026 max(180+200·n, 300·n) s = 380/600/900/1200 s) und `retries=0`
+- [x] `serial485.Wrapper._done` wächst unbegrenzt (nie abgeholte Antworten) – Aufräumen/Limit **(erledigt 16.10.2026, Fix B.1, s. Review 2: MAX 128 + cleanup; abgehakt 17.10.)**
+- [x] Hintergrund-Thread kann `get_response` Antworten wegschnappen, wenn zwischen **(erledigt 16.10.2026, Fix B.2: Erwartungs-Registry + _resp_queue, serial485.py:83 ff.; abgehakt 17.10.)**
   `raw_send` und `get_response` eine Lücke ist – Registry/Zuordnung klären
 - [x] Motor 0x06: Position der ID 70 im Frame klären – getrennter TX/RX-Mitschnitt
   (Live-Frame `f7 81 07 00 06 00 00 96 43 09` trägt nur den Float) – **ERLEDIGT 15.10.2026:**
   ID im Request (`[02,id]` lesen, `[01,id]+<f>` schreiben, `[03]` übernehmen); der Frame
   war die Antwort; Werte flüchtig (PROTOKOLL-485.md §3.1, umgesetzt in motor.py)
-- [ ] Erase (0xF0/0x06) belegen: nur CFS-Typ 1/10 dekompiliert, für Motoren unbelegt
+- [~] Erase (0xF0/0x06) belegen: nur CFS-Typ 1/10 dekompiliert, für Motoren unbelegt
   (im Nachbau nur mit `erase=True`)
+  **TEILWEISE 17.10.2026 (MOTOR-RESTE-BEFUND-2026-10-17.md §2):** Motor-App kennt 0xF0 nicht (ignoriert, keine Antwort); Stock-Updater mcu_util_485 sendet 0x06 nur an Typ 1/10 (CFS, @0x15378), nie an Motoren. Offen: Motor-Bootloader (kein Dump). Nachbau seit 17.10.2026: Erase für Motorziele → ValueError (nur Typ 1/10); Sendeschutz gegen FF 0B [00] / FF 01.
 - [x] Motor 0x08 (laut grant0013 „get feedback“) live prüfen – Kandidat fürs echte
   Encoder-Lesen; `read_encoder` bleibt bis dahin gesperrt – **TEILWEISE ERLEDIGT 16.10.2026
   (live, Motor X, Standby):** 0x08 = Variablen-Lesepfad `[idx]` → 4 B LE, idx 1..12 gescannt
@@ -261,17 +272,19 @@ motor 98 · motor_mini 30 · auto_addr 31 – alle grün.
   Selbsttest 7e mit Live-Frames (UUID-Platzhalter, CRC neu). `motor_param_modifi_data` (vermutl.
   schreibend) NICHT angefasst. Rest offen: Union-Inhalte bei err_code ≠ 0, Bedeutung
   `param_peak_overcurrent_A` (live 0,012), Host-Timeout.
-- [ ] **Offen aus dem Motor-FW-Befund:** idx 15/16 (obj->[0xc]+0x24/+0x2c); ~~0x13–0x16 live
+- [~] **Offen aus dem Motor-FW-Befund:** idx 15/16 (obj->[0xc]+0x24/+0x2c); ~~0x13–0x16 live
   gegenprüfen (Längen 74/161 B, Feldreihenfolge der Proben vermutet)~~ (erledigt 16.10., s. oben); Setzer von Fehlerbit 4
   (HW-Überstrom) und Warnbit 0 (Kommunikation) nicht lokalisiert (Fehlerbit 11 ohne Beleg);
   Gain·R der Strommessung (1 Ω vermutet → Flash-Parameter `driver_board_amp_gain` /
   `driver_board_R_of_current_sample_ohm` lesen); idx 13 (EN) live gegenprüfen
+  **17.10.2026 weitgehend erledigt (MOTOR-RESTE-BEFUND-2026-10-17.md):** idx 15 = Encoder Single-Turn (32768/U), idx 16 = encoder_fdb (= idx 15 bei singleturn_control_mode 1); Bit 11 = Motorcheck PhaseNotConnected (@0xe082); Bit 4, Warnbit 0 (und Bit 1/6) ohne Setzer; Gain·R FW-Default 0,4 Ω, Laufzeit aus Flash, Live-Rohbytes → 1 Ω (V). **KORREKTUR:** idx 10 = +Ib bei phase_order_invert 0 (live), −Ib nur bei ≠ 0 – selbst nachgeprüft (Verzweigung @0xbb30/0xbc5c, +1.0 @0x19c98 / −1.0 @0x19d14) → korrigiert 17.10.2026 (`read_phase_currents(phase_order_invert=0)`, `IDX_IB`; Schlüssel `minus_ib` jetzt = −ib). Rest offen: Gain/R live lesen (06 [02,0x1c]/[02,0x1e]), idx 13 live über 0x05 [04].
 - [ ] **NEU 16.10.2026:** Offen, ob der Motor selbst 0x08 mit idx ≥ 13 verträgt – ~~(Crash bei
   DATA=13 liegt im Host; nicht geprüft, ob ein Frame rausging)~~ Host kennt 13–18 (Typkette),
   Crash ist belegt host-seitig ohne Frame (s. unten); am Motor weiter ungeprüft – nur mit
   eigenem Sender, nicht über Stock-G-Code. **16.10. statisch geklärt (Motor-FW):** FW behandelt
   idx 0..18 lesend, > 18 → veralteter Wert, kein Crash; Nachbau `read_variable_raw_fw(idx,
   confirm=True)`. Live-Gegenprobe bleibt offen
+  **17.10.2026 nochmals bestätigt (MOTOR-RESTE-BEFUND-2026-10-17.md §6):** Grenze @0x1039a, > 18 → Scratch-Wert ohne Seiteneffekt; idx 13 = EN-Pin flankengesteuert (0→1 Regelung aus, 1→0 ein ohne gespeicherten Fehler); auch über 0x05 [04] lesbar. Live-Gegenprobe weiter offen.
 - [x] Motor 0x0C: Protection-Semantik (grant0013/k2-vanilla) gegen Plus-Frame `00*8` prüfen
   – **ERLEDIGT 15.10.2026:** Request `[0b]` → 8 B Status (00 = ok), `[05]` ohne Antwort;
   „8-Byte-Parameter“ WIDERLEGT (`motor.check_protection`)
@@ -298,16 +311,19 @@ Details: PROTOKOLL-485.md §2 („CFS-Firmware“, „CFS-Hardware“, „CFS-Bu
 PROTOKOLL-GESAMT.md 1.9.
 - [x] Ghidra-Neuanalyse cfs0 @0x08003000 / cfs6 @0x08004000 (Basis korrigiert) –
   ERLEDIGT 15.10.2026: `GHIDRA-CFS-BEFUND-2026-10-15.md` (cfs0 1063, cfs6 936 Funktionen)
-- [ ] MT6826S-Encoder (SPI PB12-15): misst er das Messrad oder den BLDC? → Verlauf
+- [x] MT6826S-Encoder (SPI PB12-15): misst er das Messrad oder den BLDC? → Verlauf
   0x0e MEASURING_WHEEL gegen Förderweg/BLDC-Laufzeit korrelieren
-- [ ] Bootloader-Parser: Bedeutung der akzeptierten Adresse 0xF0 klären (App akzeptiert
+  **ERLEDIGT 17.10.2026 (CFS-RESTE-BEFUND-2026-10-17.md §7):** speist 0x0e MEASURING_WHEEL + das gemeinsame Odometer (mm = count × 7,886e-4), NICHT die BLDC-Regelung (BLDC Open-Loop-PWM + separater FG-Tacho PE11); live: Motor läuft/Odometer steht bei Block ⇒ Messrad. Physischer Anbau bleibt ANNAHME.
+- [x] Bootloader-Parser: Bedeutung der akzeptierten Adresse 0xF0 klären (App akzeptiert
   dagegen nur eigene/0xEA/0xEB – Unterschied belegt, s. PROTOKOLL-485.md)
+  **GEKLÄRT 17.10.2026 (BOOTLOADER-HOST-BEFUND-2026-10-17.md §1, Bootloader aus fake-name-Dump):** 0xF0 = adressunabhängige Service-Adresse, nur fun 0xF2 = EEPROM-Dienst (24C16, PE5/PE6; op 0 Schreiben mit 8-Byte-Schlüssel, op 1 Lesen; Antwort mit Absender 0xF0). Host nutzt ihn nie. Nie an 0xF0 senden.
 - [x] **0xEA/0xEB-Semantik der App** – ERLEDIGT 16.10.2026 (BEFUND2 §6): „halbe Broadcasts“ –
   0xEA wird bei normalen Kommandos mit eigener Adresse beantwortet (nur CRC-Fehler/
   unbekannte fun/0x50 still), 0xEB nur 0x50/0x51; 0xFE/0xFF nur ohne eigene Adresse
   (PROTOKOLL-485.md §6.8)
-- [ ] Längengrenze Bootloader len ≤ 0xFC vs. `serial485`-Prüfung bis 255 – nur notiert,
+- [x] Längengrenze Bootloader len ≤ 0xFC vs. `serial485`-Prüfung bis 255 – nur notiert,
   Code NICHT geändert (App-Grenze unbekannt)
+  **BELEGT 17.10.2026 (BOOTLOADER-HOST-BEFUND-2026-10-17.md §2, @0x080011ec: `(len−3)&0xFF > 0xF9` → stumm verworfen; selbst nachgeprüft):** RX-Puffer 0xFF/Slot, 4 Byte Kopf. App (CFS-RESTE-BEFUND-2026-10-17.md §5): RX-Ring 1024 B, prüft nur len ≥ 3, Frame-Kontext 112 B → sauber ≤ 100 Datenbytes. Umgesetzt 17.10.2026: `serial485.check_tx_frame`/`build_tx_frame` + `k2_transport` (TX ≤ 100 Datenbytes, fun 0xF0 ≤ 0x80, len ≤ 0xFC; Empfang 255).
 - [x] Hypothese 0x10 `[mask 07 03]` – **BESTÄTIGT 15.10.2026 (Ghidra):** mode 7 mit
   p = 3 mm = Extruder-Check (Odometer muss in 300 ms > p mm laufen, sonst 0x0e)
 - [x] 0x0a-Zustandsbyte (ERLEDIGT 15.10.2026, Ghidra): Byte 3 = IDLE 0, PRELOAD 1,
@@ -325,7 +341,8 @@ Details: `GHIDRA-CFS-BEFUND-2026-10-15.md` §9/§10.
   Motorblock > 10 s (Bit 4 Hauptmotor, Bit 0–3 Feeder), R[5] = Blockmaske sofort (`block_*`)
 - [x] 0x0a Byte 5 – **ERLEDIGT 16.10.2026 (BEFUND2 §2):** Typ-7-Tag-Sperrbit, nicht „RFID gültig“
   (`inlet_tag_mask`; live immer 0 erklärt)
-- [ ] Bedeutung Config #6 (0x0c lesen / 0x50 schreiben + Reset) – NICHT senden (0x50 resettet)
+- [x] Bedeutung Config #6 (0x0c lesen / 0x50 schreiben + Reset) – NICHT senden (0x50 resettet)
+  **ERLEDIGT 17.10.2026 (CFS-RESTE-BEFUND-2026-10-17.md §1):** persistenter Arbeitsmodus (0 = STANDARD/Normal, ≠ 0 = Werks-/Alterungs-/Testmodus), beim Boot gelesen (FUN_080032e8 → FUN_080096ca); 0x50 schreibt Flash-DB (Page 0x0807F800) + Reset (AIRCR = 0x05FA0004, selbst nachgeprüft). 0x50 NIE senden; 0x0c-Byte ≠ 0 = Box im Testmodus.
 - [x] Inhalt 0x15 (6 Einträge `((i+1)<<4)|X[i]`) – live `10 20 30 40 50 60 00…` (alle X = 0),
   Host-Name GET_HARDWARE_STATUS; ~~Bedeutung von X weiter offen~~ **ERLEDIGT 16.10.2026
   (BEFUND2 §3):** Init-Flags EEPROM/AHT30/Odometer/Buffer/RFID0/RFID1, 0 = OK
@@ -336,12 +353,15 @@ Details: `GHIDRA-CFS-BEFUND-2026-10-15.md` §9/§10.
 - [x] Physische Zuordnung Sensor A/B (Pin-Tabelle @0x20000218; Deutung A = Einlauf, B = Hub) –
   **ERLEDIGT 16.10.2026 (BEFUND2 §8):** Einlauf PD7–PD4, Hub PE10–PE7, Buffer PD8/PD9; ein
   gemeinsames Odometer MT6826
-- [ ] cfs6-Handler 0x16–0x19/0x57 (Trockner?) im Detail
-- [~] Weitere Fehlercodes nur im LED-Mapping (~~0x1a~~, 0x20, 0x22, ~~0x51~~, ~~0x52~~, ~~0x53~~) – Quellen
+- [x] cfs6-Handler 0x16–0x19/0x57 (Trockner?) im Detail
+  **ERLEDIGT 17.10.2026 (CFS-RESTE-BEFUND-2026-10-17.md §2):** 0x16 = LCD/Backlight, 0x17 = Odometer-Richtung, 0x18 = Trockner/Heizung START [Maske, Modus 0–3, Temp 30–85 °C, Param 20–60, Zeit u16 BE ≤ 5759 min], 0x19 = Trockner-Status (6 B), 0x57 = Werks-Aging. Nur 0x18/0x19 sind Trockner. Live offen (kein cfs6-Gerät).
+- [x] Weitere Fehlercodes nur im LED-Mapping (~~0x1a~~, 0x20, 0x22, ~~0x51~~, ~~0x52~~, ~~0x53~~) – Quellen
   (0x51 LIVE 15.10.2026 als SPEED_ERR belegt, key846) – **16.10.2026 (BEFUND2 §4/§8):** 0x50 Runout
   im Druck-Slot, 0x51/0x52 aus print_check, 0x1a Pull-back 40 s, 0x53 nie erzeugt; offen 0x20/0x22
-- [ ] 0x0d op 2 mit Mehrfachmaske: Laufzeit summiert sich je Slot (bis > 12 min bei 4 Slots)
+  **0x20/0x22 ERLEDIGT 17.10.2026 (CFS-RESTE-BEFUND-2026-10-17.md §3):** kein erreichbarer Erzeuger – 0x22 nur in totem FUN_08015898 (RFID-Tag-Life, 0 Aufrufer), 0x20 nie als Box-Status. Reine LED-Tabellen-Reste.
+- [x] 0x0d op 2 mit Mehrfachmaske: Laufzeit summiert sich je Slot (bis > 12 min bei 4 Slots)
   – live prüfen, ob der Host (box_wrapper) dafür eigene Timeouts hat (.so: SET_PRE_LOADING=300 s)
+  **Host-Seite GEKLÄRT 17.10.2026 (BOOTLOADER-HOST-BEFUND-2026-10-17.md §4):** Timeout je Versuch = Slotanzahl × 300 s (4 Slots 1200 s), bis 5 Versuche, keine Gesamtfrist → reicht für 4 Slots (≤ ~966 s). 1 Slot bei laufendem Preload bis 364 s > 300 s möglich. Nachbau-Vorschlag max(180+200·n, 300·n), retries=0. Box-Laufzeit live offen.
 - [ ] 0x06 Feeder-Kommando: FW-Bug (Maske aus r7) → am Bus praktisch immer Status 1; nicht
   im Nachbau verwenden, bei neuer CFS-FW-Version erneut prüfen
 - [x] RFID-vender-Feldlayout (40 Zeichen) → `box.split_rfid_vendor()` (Selbsttest)
@@ -444,7 +464,8 @@ Quelle: `live-logs-2026-10-15/` (lokal, nicht fürs Repo), Auswertung PROTOKOLL-
      „Motorblock > 10 s“ beobachten).
 
 ### Offen nach den Live-Logs
-- [ ] 0x0d op 3 ~~und Status 0x50~~ – live nie gesehen (0x50-Semantik per BEFUND2 §4 geklärt: Runout)
+- [x] 0x0d op 3 ~~und Status 0x50~~ – live nie gesehen (0x50-Semantik per BEFUND2 §4 geklärt: Runout)
+  **ERLEDIGT 17.10.2026 (CFS-RESTE-BEFUND-2026-10-17.md §6, selbst nachgeprüft):** op 3 = Forced-Preload OHNE RFID (FUN_08004ec4(mask, 0) statt (mask, 1) bei op 2; nur pretension), sonst wie op 2. Live nie.
 - [x] 0x0d [00 02]-Bursts (5 Sendungen in ~20 ms) – warum keine Antwort? – **16.10.2026
   (BEFUND2 §5):** Box verweigert nicht (RX synchron, keine Busy-Antwort, keine Duplikat-
   erkennung, mind. ein Burst-Frame live ausgeführt); **Ursache Host-seitig vermutet**
@@ -452,7 +473,8 @@ Quelle: `live-logs-2026-10-15/` (lokal, nicht fürs Repo), Auswertung PROTOKOLL-
   Folge für den Nachbau: keine Bursts, retries=0 bei Mechanik-Kommandos (so umgesetzt)
 - [x] 0x0a Byte 0/1 = Temp/Feuchte gegenprüfen (Hygrometer) – **16.10.2026 per Disassembly
   belegt** (AHT30); Hygrometer-Vergleich nur noch optional (Genauigkeit)
-- [ ] Motor 0x05 (`[01]/[02]` bei BELT_TENSION, nie Antwort) – Semantik
+- [x] Motor 0x05 (`[01]/[02]` bei BELT_TENSION, nie Antwort) – Semantik
+  **ERLEDIGT 17.10.2026 (MOTOR-RESTE-BEFUND-2026-10-17.md §1):** Sub 01 = Regelung AUS, 02 = EIN (an Ist-Position, leert 0x15/0x16-Ringe), 03 = Toggle, 04 = Status (3 B: EN-Pin, Regler, PWM). Antwort nur bei 04 → [01]/[02] nie beantwortet. BELT_TENSION: [02] vor FORCE_MOVE, [01] + M84 danach (belt_mdl-live.py:238–249). Live-Gegenprobe 0x05 [04] offen.
 
 ## Review 2 (16.10.2026) – Fixes (abgehakt) + BEFUND2
 
@@ -467,7 +489,7 @@ box 179 · boxmini 17 · cfsseq 28 · motor 134 · motor_mini 43 · auto_addr 33
 - [x] box: `CfsStatusError`/`StatusBytes`/`raise_on_status` (M2)
 - [x] box: `FUNC_RETRIES` 0x10/0x11 = 0 (bewusste Abweichung, `FUNC_RETRIES_ORIGINAL` = 4),
   `communication_extrude`/`communication_retrude` (M3)
-- [x] box: Messrad op 0 nur mit `reset=True` (G1); Maske 0 bei 0x0d op 2/3 = 4 Slots, 980 s (G2);
+- [x] box: Messrad op 0 nur mit `reset=True` (G1); Maske 0 bei 0x0d op 2/3 = 4 Slots, 1200 s seit 17.10.2026 (G2);
   `_box_fw_num` Host-Formate „1.5.3“ (G3); `_is_full_frame` robust (G4);
   DeprecationWarning bei `get_hardware_status(channel)` (G6)
 - [x] cfsseq: `EXTRUDE_ACK`/`RETRUDE_ACK`, `check_one_hot`, einziges `slot_to_mask` (G5/G6)
@@ -480,19 +502,20 @@ box 179 · boxmini 17 · cfsseq 28 · motor 134 · motor_mini 43 · auto_addr 33
   (`temp_c`/`rh`, `inlet_tag_mask`, `block_*`), `parse_get_hardware_status` (`components`),
   `STATUS_NAMES` (0x05/0x0a/0x0c/0x14/0x17/0x19/0x1a/0x50/0x51/0x52), cfswatch-Texte,
   auto_addr-Selbsttest 13 (A0 3×, adressierte Box ignoriert A0)
-- [ ] Offen aus BEFUND2: Config #6, Fehlercodes 0x20/0x22, Zweck Typ-7-Tag-Sperrbit (0x5c-Auth?),
+- [x] Offen aus BEFUND2: Config #6, Fehlercodes 0x20/0x22, Zweck Typ-7-Tag-Sperrbit (0x5c-Auth?),
   Host-Burst-Timing im `.so`, Treiber-RX-Puffergröße der Box
+  **ERLEDIGT 17.10.2026:** Config #6, 0x20/0x22, Typ-7-Sperrbit, RX-Puffer → CFS-RESTE-BEFUND-2026-10-17.md §1/§3/§4/§5 (Typ-7-Bit: FM15L013-Tag mit unbeschriebenem On-Tag-Verbrauchsfeld sperrt 0x02/0x03-Daten; 0x5c = Schlüssel-Lade-/Lesepfad I²C 0x60, kausal getrennt). Host-Burst-Timing → BOOTLOADER-HOST-BEFUND-2026-10-17.md §3: [00 02] = Maske 0 → Timeout 0 × 300 s = 0 → 5 Sendungen direkt hintereinander (live 1–8 ms); Stock sendet op 2/3 nur bei leerem Kopfsensor, im Druck nur mit force.
 
 ### GPIO-Phase / MCU-Schnittstelle (16.10.2026, GPIO-PHASE-BEFUND-2026-10-16.md)
 - [x] MCU-Data-Dictionaries (Main + Düse) extrahiert; Creality-Befehle `query_gpio_status`/`gpio_status`,
   `transparent_*`, `prtouch_*`, `fancheck` identifiziert; Strapping mit Upstream-`set_digital_out` möglich
 - [x] Strapping-Mechanismus: `[duplicate_pin_override]` + Zeitmultiplex, kein Spezialbefehl
 - [x] Pi-Host-Modul: Strapping über digital_out vor Broadcast + Extruder über transparent_send nachbauen  **ENTWURF 16.10.2026 in pi-host/ (TransparentTransport, [k2_motor]) – Gerätetest offen**
-- [ ] `mcu0_130`-Dictionary ohne `transparent_*` prüfen (vermutl. Extraktionslücke)
+- [x] `mcu0_130`-Dictionary ohne `transparent_*` prüfen – **geklärt 17.10.2026: KEINE Extraktionslücke.** Das im Binary eingebettete zlib-Dictionary (`fw/F008/mcu0_130…bin` @0x60ec, 7327 B) enthält kein `transparent`; `mcu0_140` (@0x6898) und `mcu0_120` (F012) enthalten es. Für den Pi irrelevant: `k2_motor` nutzt `transparent_*` auf der Düsen-MCU (noz0_130 hat es).
 - [x] Pi-Host-Modul ENTWURF `pi-host/` (16.10.2026): k2_transport.py (RS485 + transparent_send), k2_motor_init.py
   ([k2_motor] für Upstream-Klipper: Strapping, Init P0–P9, Param-Abgleich, Extruder via transparent 0x81),
   test_k2_motor.py 9/9 offline. Review-Fixes: Pins vor Connect, gültige print_time, query_gpio_status
-- [ ] pi-host: Test mit echtem Upstream-Klipper (Pi) + Creality-MCU-FW; Rs485Transport an Klipper-Reactor anbinden
+- [~] pi-host: Test mit echtem Upstream-Klipper (Pi) + Creality-MCU-FW; Rs485Transport an Klipper-Reactor anbinden – **Stand 17.10.2026:** Reactor-Anbindung für die langen Box-Vorgänge erledigt (`k2_box.ReactorBusProxy`, Bus-Aufruf im Hilfs-Thread, Reactor pausiert in 20-ms-Schritten); k2_motor/k2_belt senden kurze Einzelframes direkt, Wartezeiten über `reactor.pause`. Offen: Test am Pi mit echter MCU-FW.
 
 ### Kanal A – GELÖST 16.10.2026
 - [x] Ursache: gebrochener Filamentrest von Slot A im Hub bis zum Extruder → Hub-Sensor A dauerhaft aktiv
@@ -508,7 +531,8 @@ box 179 · boxmini 17 · cfsseq 28 · motor 134 · motor_mini 43 · auto_addr 33
 - [x] Live-Mitschnitt Auto-Nivellierung ausgewertet (99 Tastungen, Mesh 9×9, Rechenweg zoft belegt)
 - [x] Cut-Kalibrierung live (Stall-Mode 3 für Suche, Kp 300/100) – LIVE-ABFRAGEN-2026-10-16.md
 - [x] Entscheidung Pi-Weg: PrTouch-Ersatz (eigenes Probe-Modul) oder Eddy-Sensor  **ENTSCHIEDEN 16.10.2026: eigenes Modul für den eingebauten Kraftsensor (Weg A); Eddy optional später**
-- [ ] (für A) MCU-Bit-Ebene der prtouch-Frames: Schwellen/Filter/Register
+- [x] (für A) MCU-Bit-Ebene der prtouch-Frames: Schwellen/Filter/Register
+  **STATISCH GEKLÄRT 17.10.2026 (PRTOUCH-MCU-BEFUND-2026-10-17.md):** CS1237 per Bitbang (27/46 Takte, 24 Bit → s32), cfg_regs = CS1237-Register (60 = 1280 Hz/PGA 128); Filter Hochpass (Mittel 37–49 ms alt) → 5er-Ausreißer → Glättung a = ned_lftr/1000 (1000.0f selbst nachgeprüft); Auslösung 3 steigende Samples ≥ min/min+add/min+2·add; Totzeit lmt_dead Samples (≥ 64); Auslösung → PA15 = 0 + beide Puffer eingefroren. ned_tftr/ned_hftr nur Schalter, max_hold nur Modus-Umschaltung.
 
 ### 16.10.2026 abends
 - [x] `serial485.py`: `_done` begrenzt (MAX 128 + cleanup) und erwartete Antworten werden vom Hintergrund-Thread geparkt statt
@@ -537,9 +561,23 @@ box 179 · boxmini 17 · cfsseq 28 · motor 134 · motor_mini 43 · auto_addr 33
 - [ ] Bustest Teil 2 (schreibend/MCU): Motor-Init mit Strapping, Extruder transparent, Box-Preload – braucht Klipper bzw. Pi
 - [x] KORREKTUR: Klipper-MCU-Basis 0x08003000 (Main + Düse); PrTouch „stoppt nicht selbst“ mit korrekter Basis bestätigt
 - [x] PrTouch-Stopp-Weg BEWIESEN (statisch): Host bricht ab, Swap-Leitung nur Synchronisation, kein trsync/Endstop – PRTOUCH-STOPP-BEWEIS-2026-10-16.md
-- [ ] PrTouch-Modul schreiben (kurze Schritte + Abbruch nach jedem Schritt)
+- [x] PrTouch-Modul schreiben (kurze Schritte + Abbruch nach jedem Schritt) **(erledigt 16.10.2026: `pi-host/k2_prtouch.py`, step_mm 0,02/max 0,05; abgehakt 17.10.)**
 - [x] RE-Reste-Sammelbefund (RE-RESTE-BEFUND-2026-10-16.md): überwiegend TEILWEISE geklärt, Restpunkte brauchen Live-Tests
 - [x] Entwurf `pi-host/k2_prtouch.py` ([k2_prtouch]: eingebauter Kraftsensor, kurze Schritte ≤ 0,05 mm @ ≤ 5 mm/s, Abbruch
   nach jedem Schritt, Notgrenze, max_travel ≤ 10 mm, allow_move-Freigabe, TEST_SWAP + Ruhetest) – offline 43/43, Gerätetest offen
 - [ ] k2_prtouch am Gerät: ANNAHMEN prüfen (clk/sdo PB13/PB14, Datenformat u32/s32, ned_lftr-Skalierung, lmt_dead, aqc_tick),
   zuerst allow_move: False (nur Sensor lesen), dann eine Antastung über leerem Bett mit Hand am Not-Aus
+  **Statisch erledigt 17.10.2026 (PRTOUCH-MCU-BEFUND-2026-10-17.md):** clk/sdo, Datenformat (gepackt, s32/u32), ned_lftr ×1000, lmt_dead (Samples, ≥ 64), aqc_tick (Main-Takte). Offen am Gerät: Stopp unter Bewegung, Kraftanstieg/Mindestgeschwindigkeit, eingefrorenen Puffer nach echter Antastung lesen.
+- [x] k2_prtouch abgesichert 17.10.2026 (PRTOUCH-MCU-BEFUND §7, README-k2_prtouch A.8): Config-Prüfung beim Laden
+  (min_hold ≠ max_hold, ned_hftr > 0, ned_lftr 0/1…1000, lmt_dead ≥ 64, cfg_regs 60/56/44, min_hold ≥ 1000, add_hold ≥ 0,
+  pres_idx 0), arm_settle_s ≥ 1,5 × max(lmt_dead,128)/Rate (Stock 0,15 s), Mindestgeschwindigkeit 2,5 mm/s (ANNAHME),
+  Ruhetest mit Tickabstand/−1/24 Bit/gefiltertem Kanal, Blocklesen idx += n, Endstop ^!PC7 (Pull-Up wie Stock-Endzustand;
+  Batch: config_endstop PC7 pull_up=1). test_k2_prtouch 248/248. KTWO_PRTOUCH_READ macht jetzt die Vorabprüfung (scharf → Ruhe → entschärft).
+- [ ] PrTouch am Gerät: KTWO_PRTOUCH_READ (Vorabprüfung) – tick_median_ms/filt_max_abs notieren; nach erster Antastung
+  eingefrorenes Register is_src 0/1 lesen → Rampe Counts/Sample bei 5 mm/s → Mindestgeschwindigkeit/rest_filt_max_frac nachschärfen.
+- [ ] k2_prtouch `mode: steps` (Rückfallweg): Ruhetest liest vor start_prtouch_pres (Register leer) – unbenutzbar (Altfehler, README A.8).
+- [x] Nachbau-Korrekturen aus den RE-Befunden – ERLEDIGT 17.10.2026: read_phase_currents(phase_order_invert=0) (idx 10 = +Ib
+  bei 0; motor.py/motor_mini.py); Erase für Motorziele → ValueError (nur dev_type 1/10); Sendeschutz serial485.check_tx_frame
+  + k2_transport (≤ 100 Datenbytes, fun 0xF0 ≤ 0x80, len ≤ 0xFC, RX 255; nie 0xFF/0xFD mit 0x01/0x0B außer FF 0B [01]);
+  preload_force_timeout = max(180+200·n, 300·n) = 380/600/900/1200 s, retries 0; cfswatch: 0x05 [01]/[02] erwartet stumm,
+  [04] ohne Antwort = Fehler; idx 15/16 benannt (encoder_single_turn/encoder_fdb). serial485 111/111, alle Selbsttests grün.

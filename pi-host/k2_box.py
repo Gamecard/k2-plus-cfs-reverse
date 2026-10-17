@@ -93,8 +93,9 @@ Stock-Tn aus box_wrapper.so – Belege s. README-k2_box.md §8 und
 config-pi/NOTIZ-cfs.md). Jeder Schritt ist einzeln aufrufbar und ein
 Glied der Makrokette (config-pi/macros.cfg: T0–T15, M8200):
 
-- ``KTWO_BOX_PRE_OPT [TNN=T1A] [Z_HOP=mm]`` (= M8200 P / CR_BOX_PRE_OPT):
-  Kette beginnen, Kopfsensor sperren, Zustand sichern, Z-Hop.
+- ``KTWO_BOX_PRE_OPT [TNN=T1A] [Z_HOP=mm] [SOURCE=T]`` (= M8200 P /
+  CR_BOX_PRE_OPT): Kette beginnen, Kopfsensor sperren, Zustand sichern,
+  Z-Hop. SOURCE=T = T<n>-Befehl (nachholbar, s. unten).
 - ``KTWO_BOX_CUT`` (= M8200 C / CR_BOX_CUT): Schneidfahrt
   pre_cut_pos → cut_pos_x (SAVE_CONFIG-Wert) → zurück.
 - ``KTWO_BOX_GO_EXTRUDE_POS`` / ``KTWO_BOX_SAFE_POS``: in den / aus dem
@@ -108,7 +109,8 @@ Glied der Makrokette (config-pi/macros.cfg: T0–T15, M8200):
 - ``KTWO_BOX_WIPE`` (Abstreifen, Stock-T0-Beispiel 10.1–10.3),
   ``KTWO_BOX_WASTE`` (= M8200 W, hier nur Hinweis),
   ``KTWO_BOX_END_OPT [RETURN=0|1]`` (= M8200 O), ``KTWO_BOX_WAIT``
-  (Box-Zustand abwarten, Stock BOX_MODE_WAIT), ``KTWO_BOX_ERROR_CLEAR``,
+  (Box-Zustand abwarten, Stock BOX_MODE_WAIT), ``KTWO_BOX_ERROR_CLEAR
+  [HEAD_LOADED=1]``,
   ``KTWO_BOX_RESUME_FIX [CLEAR=1]`` (aus RESUME, Z nach Abbruch im
   Wechsel; CLEAR=1 aus PAUSE = Z steckt im Rückfahrziel, s. unten).
 
@@ -118,6 +120,21 @@ Fehlerposition (z. B. am Schneidhebel X -7,8 / Y200 oder im Schacht) – das
 PAUSE-Makro merkt sie als Rückfahrziel, RESUME fährt dorthin und setzt die
 Upstream-PAUSE_STATE darauf (RESUME_BASE = Nullfahrt). Fahrten in den Schacht
 verlassen den Schneidbereich (X < pre_cut_pos_x) zuerst nur in X.
+
+RESUME nach abgebrochenem Wechsel (17.10.2026 spät, BOOTLOADER-HOST-BEFUND
+§5, config-pi/NOTIZ-reinigung-resume.md §6a.7, README-k2_box.md §11):
+
+- ``_fail`` merkt den Abbruch (Schritt, Ziel-TNN, Herkunft – Stock
+  ``recode_err``/``save_resume_tnn``); Status ``change_aborted``,
+  ``resume_tnn``, ``head_filament``.
+- ``KTWO_BOX_RESUME_CHECK [MOVE=0|1] [TEMP=]`` (aus dem RESUME-Makro, vor
+  jeder Bewegung): Kopf-Filamentsensor meldet Filament -> RESUME frei;
+  LEER -> RESUME gesperrt (Druck bleibt pausiert, Meldung: T<n> in der
+  Pause, dann RESUME); unbekannt (kein Sensor) -> gesperrt bis
+  ``KTWO_BOX_ERROR_CLEAR HEAD_LOADED=1``. Mit ``resume_redo_change: True``
+  (Default False) + beiden Freigaben + MOVE=1 holt die vorhandene Kette
+  einen abgebrochenen T<n>-Wechsel nach (Stock ``error_resume_process``),
+  jeder Fehler sperrt RESUME (Stock ``resume_err``).
 
 Auto-Nachladen bei Runout (A7, 17.10.2026 – Belege/ANNAHMEN in
 config-pi/NOTIZ-runout.md, README-k2_box.md §9):
@@ -691,6 +708,8 @@ def parse_options(opts):
       "filament_sensor"), cut_sensor (Default leer) und alle Stock-[box]-
       Werte aus CHANGE_DEFAULTS (Positionen, Längen, Temperaturen,
       Geschwindigkeiten; cut_pos_x Default = SAVE_CONFIG -7.80).
+    - Runout/RESUME: runout_refill, runout_require_color, runout_resume,
+      resume_redo_change (Default False, s. cmd_resume_check).
     """
     o = {str(k).strip().lower(): v for k, v in dict(opts).items()}
 
@@ -736,6 +755,12 @@ def parse_options(opts):
         "runout_refill": _bool("runout_refill", False),
         "runout_require_color": _bool("runout_require_color", True),
         "runout_resume": _bool("runout_resume", True),
+        # RESUME nach abgebrochenem T<n>-Wechsel bei LEEREM Kopf: Wechsel
+        # automatisch nachholen (Stock error_resume_process, BOOTLOADER-
+        # HOST-BEFUND §5.2). Default AUS – dann sperrt RESUME nur
+        # (cmd_resume_check); wirkt zusätzlich nur mit allow_write UND
+        # allow_move.
+        "resume_redo_change": _bool("resume_redo_change", False),
     }
     for key, default in CHANGE_DEFAULTS.items():
         if key in CHANGE_INT_KEYS:
@@ -819,7 +844,8 @@ def parse_klipper_config(config):
     for k in (("box_addr", "allow_write", "shutdown_on_failure", "auto_init",
                "poll_interval", "allow_move", "pause_on_failure",
                "filament_sensor", "cut_sensor", "runout_refill",
-               "runout_require_color", "runout_resume")
+               "runout_require_color", "runout_resume",
+               "resume_redo_change")
               + tuple(CHANGE_DEFAULTS)):
         if k not in opts:
             v = _g(k, None)
@@ -1490,6 +1516,15 @@ class PrinterK2Box:
         # Position vor einem Einzelschritt im laufenden Druck ohne Kette
         # (z. B. M8200 C ohne P) -> Rückfahrziel bei dessen Abbruch.
         self._step_start = None
+        # Abgebrochener Wechsel im Druck (_fail, Pausenpfad): RESUME prüft
+        # dann den Kopfsensor (cmd_resume_check) – leer = gesperrt bzw.
+        # Nachholen (resume_redo_change). Dict step/tnn/source oder None.
+        # Stock-Gegenstück: BoxSave.recode_err -> save_resume_tnn
+        # (BOOTLOADER-HOST-BEFUND §5.1). Lebt bis zum erfolgreichen RESUME
+        # (KTWO_BOX_RESUME_FIX) bzw. bis zu einer NEUEN Pause, die nicht
+        # aus _fail stammt (KTWO_BOX_RESUME_FIX CLEAR=1, s. _pause_from_fail).
+        self.aborted = None
+        self._pause_from_fail = False
         # Auto-Nachladen bei Runout (A7): Laufzeit-Schalter (Start = Config
         # runout_refill, Stock BOX_ENABLE_AUTO_REFILL), Gleich-Material-Liste
         # (Stock BOX_UPDATE_SAME_MATERIAL_LIST, hier manuell), letzte Meldung.
@@ -1524,6 +1559,10 @@ class PrinterK2Box:
                 ("KTWO_BOX_RESUME_FIX", self.cmd_resume_fix,
                  "Nach RESUME: Z auf Höhe vor dem abgebrochenen Wechsel "
                  "[CLEAR=1] (CLEAR aus PAUSE: Z steckt im Rückfahrziel)"),
+                ("KTWO_BOX_RESUME_CHECK", self.cmd_resume_check,
+                 "RESUME-Prüfung nach abgebrochenem Wechsel: Kopf leer -> "
+                 "gesperrt bzw. nachholen (resume_redo_change) [MOVE=0|1] "
+                 "[TEMP=] (aus RESUME)"),
                 ("KTWO_BOX_RUNOUT", self.cmd_runout,
                  "Runout: aus der CFS nachladen (= Stock BOX_CHECK_MATERIAL_"
                  "REFILL) [SLOT=A..D] [TEMP=] [DRY_RUN=1]"),
@@ -1639,6 +1678,14 @@ class PrinterK2Box:
             "chain_skip": bool(self.chain.get("skip")),
             "chain_error": self.chain_error or "",
             "pending_resume_z": self.pending_resume_z,
+            # RESUME nach abgebrochenem Wechsel (cmd_resume_check):
+            # change_aborted -> RESUME-Makro ruft KTWO_BOX_RESUME_CHECK;
+            # resume_tnn = Ziel des abgebrochenen Wechsels (Stock-Name);
+            # head_filament = Kopfsensor True/False/None (None = unbekannt)
+            "change_aborted": bool(self.aborted),
+            "resume_tnn": (self.aborted or {}).get("tnn") or "",
+            "head_filament": self._head_filament(),
+            "resume_redo_change": bool(self.cfg.get("resume_redo_change")),
             # Auto-Nachladen (Stock-Statusnamen 'auto_refill'/'same_material')
             "auto_refill": 1 if self.auto_refill else 0,
             "same_material": [["T%d%s" % (self.cfg.get("box_addr", 1), x)
@@ -1825,7 +1872,7 @@ class PrinterK2Box:
     def _new_chain():
         return {"active": False, "skip": False, "skip_reason": "",
                 "tnn": "", "start_pos": None, "hop": 0.0,
-                "paused_at_start": False,
+                "paused_at_start": False, "source": "",
                 "state_saved": False, "sensor_was_enabled": None,
                 "orig_target": None, "temp_changed": False}
 
@@ -2077,9 +2124,49 @@ class PrinterK2Box:
             return None
         return sp
 
-    def _fail(self, gcmd, name, text):
+    @staticmethod
+    def _tool_of(tnn):
+        """'T1B' -> 'T1' (Werkzeugnummer wie macros.cfg T0..T15)."""
+        try:
+            box, idx, _l, _t = parse_tnn(tnn)
+        except ValueError:
+            return ""
+        return "T%d" % ((box - 1) * len(SLOT_LETTERS) + idx)
+
+    def _record_abort(self, gcmd, name):
+        """Abgebrochenen Wechsel für RESUME merken (Stock recode_err ->
+        save_resume_tnn): Schritt, Ziel-TNN, Herkunft der Kette. Ein
+        Einzelschritt ohne eigene Kette/TNN (z. B. KTWO_BOX_CUT von Hand in
+        der Pause) behält Ziel und Herkunft des früheren Abbruchs."""
+        ch = self.chain
+        old = self.aborted or {}
+        if ch.get("active") and ch.get("tnn"):
+            tnn, src = ch["tnn"], ch.get("source") or ""
+        else:
+            tnn = ""
+            try:
+                raw = gcmd.get("TNN", None)
+            except Exception:
+                raw = None
+            if raw:
+                try:
+                    tnn = parse_tnn(raw)[3]
+                except ValueError:
+                    tnn = ""
+            if not tnn:
+                tnn = old.get("tnn") or ""
+            src = (ch.get("source") if ch.get("active") else "") or (
+                old.get("source", "") if tnn and tnn == old.get("tnn") else "")
+        self.aborted = {"step": name, "tnn": tnn, "source": src or ""}
+
+    def _fail(self, gcmd, name, text, record=True):
         """Fehler im Wechsel: im Druck PAUSE (kein Shutdown, kein Abbruch),
         Folgeschritte überspringen; sonst Aufräumen + G-Code-Fehler.
+
+        Im Druck merkt ``_record_abort`` den abgebrochenen Wechsel (Ziel-TNN):
+        RESUME prüft dann den Kopfsensor (cmd_resume_check, leer = gesperrt
+        bzw. Nachholen). ``record=False`` nur für eine Ablehnung ohne jede
+        Aktion (PRE_OPT bei offenem Fehler).
 
         Löst DIESER Fehler die Pause aus (Druck lief), bekommt PAUSE das
         Rückfahrziel ``CFS_RETURN_X/Y/Z`` (= _resume_target, Z ohne Hop):
@@ -2093,6 +2180,8 @@ class PrinterK2Box:
         if self._print_active() and self.cfg.get("pause_on_failure"):
             if not self.chain_error:
                 self.chain_error = msg
+            if record:
+                self._record_abort(gcmd, name)
             ch = self.chain
             was_paused = self._is_paused()
             if ch.get("start_pos") is not None:
@@ -2106,20 +2195,29 @@ class PrinterK2Box:
                 hint = (" Rückfahrziel für RESUME = Druckposition vor dem "
                         "Wechsel X%s Y%s Z%s (nicht die Fehlerposition)."
                         % tuple(_n(v) for v in target))
+            # Reihenfolge (Fix 17.10. spät): ein T<n> bei offenem Fehler lehnt
+            # PRE_OPT ab -> erst quittieren, dann wiederholen. RESUME prüft
+            # danach den Kopfsensor (leer = gesperrt, cmd_resume_check).
             self._respond_error(
                 "%s – Druck wird PAUSIERT (kein Abbruch). Ursache beheben, "
-                "Schritt bzw. Wechsel (T<n>) von Hand wiederholen, dann "
-                "KTWO_BOX_ERROR_CLEAR und RESUME.%s" % (msg, hint))
+                "KTWO_BOX_ERROR_CLEAR, Wechsel (T<n>) bzw. Schritt von Hand "
+                "wiederholen, dann RESUME (gesperrt, solange der "
+                "Kopf-Filamentsensor leer meldet).%s" % (msg, hint))
             if not was_paused:
                 line = "PAUSE"
                 if target is not None:
                     line += (" CFS_RETURN_X=%s CFS_RETURN_Y=%s CFS_RETURN_Z=%s"
                              % tuple(_n(v) for v in target))
+                # PAUSE-Makro ruft KTWO_BOX_RESUME_FIX CLEAR=1: diese Pause
+                # stammt aus _fail -> den gerade gemerkten Abbruch behalten
+                self._pause_from_fail = True
                 try:
                     self._script([line])
                 except Exception as exc:
                     self._respond_error("[k2_box] PAUSE fehlgeschlagen: %s"
                                         % (exc,))
+                finally:
+                    self._pause_from_fail = False
             return None
         self._chain_cleanup(gcmd)
         if hasattr(gcmd, "error"):
@@ -2157,11 +2255,19 @@ class PrinterK2Box:
             self._chain_cleanup(gcmd)
         ch = self._new_chain()
         ch["active"] = True
+        # Herkunft der Kette: T = T<n>-Befehl (macros.cfg _KTWO_TOOL_CHANGE
+        # bzw. Nachholen im RESUME) – nur dieser Wechsel wird beim RESUME
+        # nachgeholt (Stock: resume_tnn nur für Tn_action-Fehler, nicht für
+        # die M8200-Kette, BOOTLOADER-HOST-BEFUND §5.1); leer = M8200/Runout/
+        # von Hand.
+        ch["source"] = str(gcmd.get("SOURCE", "") or "").strip().upper()
         self.chain = ch
         if self.chain_error:
+            # Ablehnung ohne jede Aktion: den gemerkten Abbruch (Ziel-TNN)
+            # NICHT durch diesen leeren Versuch ersetzen (record=False)
             return self._fail(gcmd, "PRE_OPT", (
-                "Wechsel-Fehler offen (%s) – erst beheben und "
-                "KTWO_BOX_ERROR_CLEAR" % (self.chain_error,)))
+                "Wechsel-Fehler offen (%s) – erst KTWO_BOX_ERROR_CLEAR, dann "
+                "den Wechsel wiederholen" % (self.chain_error,)), record=False)
 
         def body(gcmd):
             c = self.cfg
@@ -2478,6 +2584,25 @@ class PrinterK2Box:
                 msg += "; Box 0x04 [00 01] IDLE (löscht Box-ERROR, live belegt)"
             except Exception as exc:
                 msg += "; Box nicht erreichbar: %s" % (exc,)
+        # HEAD_LOADED=1: Bestätigung von Hand, dass der Kopf geladen ist –
+        # NUR wirksam, wenn der Kopfsensor keinen Zustand liefert (nicht
+        # konfiguriert/fehlt). Meldet er "leer", hat der Sensor Vorrang.
+        if gcmd.get_int("HEAD_LOADED", 0) and self.aborted:
+            head = self._head_filament()
+            if head is False:
+                msg += ("; HEAD_LOADED abgelehnt: Kopfsensor %s meldet KEIN "
+                        "Filament (Sensor hat Vorrang) – erst laden (T<n>)"
+                        % (self.cfg.get("filament_sensor"),))
+            else:
+                self.aborted = None
+                msg += ("; Kopf als geladen bestätigt (HEAD_LOADED=1, "
+                        "Kopfsensor %s) – RESUME prüft den Kopf nach diesem "
+                        "Abbruch nicht mehr" % (
+                            "unbekannt" if head is None else "meldet Filament",))
+        elif self.aborted:
+            msg += ("; RESUME prüft den Kopf-Filamentsensor (abgebrochener "
+                    "Wechsel %s): leer = gesperrt" % (
+                        self.aborted.get("tnn") or "ohne Ziel-TNN",))
         gcmd.respond_info(msg)
 
     def cmd_resume_fix(self, gcmd):
@@ -2492,7 +2617,14 @@ class PrinterK2Box:
                                   "Z bzw. neue Pause)"
                                   % (_n(self.pending_resume_z),))
             self.pending_resume_z = None
+            # Neue Pause, die NICHT aus _fail stammt (Hand-PAUSE, Runout,
+            # neuer Druck nach CANCEL): ein alter Abbruch-Merker ist veraltet
+            if self.aborted and not self._pause_from_fail:
+                self.aborted = None
             return
+        # Ohne CLEAR = Ende eines RESUME (nach RESUME_BASE): der Abbruch ist
+        # erledigt (RESUME hatte den Kopf geprüft bzw. nachgeholt)
+        self.aborted = None
         z = self.pending_resume_z
         if z is None:
             return
@@ -2502,6 +2634,165 @@ class PrinterK2Box:
                        ["G90", "G1 Z%s F%s" % (_n(z), _n(self.cfg["z_velocity"]))])
         except Exception as exc:
             raise gcmd.error("[k2_box] RESUME_FIX: %s" % (exc,))
+
+    # =================================================================
+    # RESUME nach abgebrochenem Wechsel: Kopfsensor prüfen / nachholen
+    # (17.10.2026 spät, BOOTLOADER-HOST-BEFUND §5, NOTIZ-reinigung-resume
+    # §6a.7, README-k2_box.md §11)
+    # =================================================================
+    # Stock (box_wrapper.so error_resume_process @0x7cd28): CFS an,
+    # pausiert, resume_tnn gesetzt, Kopfsensor LEER -> go_to_extrude_pos,
+    # box_retrude_material, box_extrude_material, extruder_extrude,
+    # material_change_flush; Fehler -> resume_err. Kopfsensor belegt ->
+    # nichts. Pi: Kopf leer -> RESUME GESPERRT (Default); mit
+    # resume_redo_change + allow_write + allow_move + MOVE=1 holt die
+    # vorhandene Kette den Wechsel nach (PRE_OPT Z_HOP=0 -> Schacht/Heizen
+    # -> RETRUDE (nur wenn der Hub belegt ist) -> EXTRUDE -> WASTE -> FLUSH
+    # -> END_OPT RETURN=0); jeder Fehler -> chain_error, RESUME gesperrt,
+    # Druck bleibt pausiert, keine Rückfahrt.
+    def _abort_text(self, ab):
+        tnn = ab.get("tnn") or ""
+        tool = self._tool_of(tnn) if tnn else ""
+        return "%s fehlgeschlagen%s" % (
+            ab.get("step") or "?",
+            ("; Ziel %s = %s" % (tnn, tool)) if tnn else "; Ziel-TNN unbekannt")
+
+    def _resume_block(self, gcmd, ab, head_txt, todo, why=""):
+        msg = ("RESUME gesperrt nach abgebrochenem CFS-Wechsel (%s): %s. "
+               "Druck bleibt PAUSIERT. %s%s" % (
+                   self._abort_text(ab), head_txt, todo,
+                   (" Kein automatisches Nachholen: %s." % (why,))
+                   if why else ""))
+        raise gcmd.error(msg)
+
+    def _redo_block_reason(self, gcmd, ab):
+        """None = Nachholen erlaubt, sonst Klartext, warum nicht."""
+        c = self.cfg
+        if not c.get("resume_redo_change"):
+            return "aus ([k2_box] resume_redo_change: False)"
+        if not self._released():
+            return ("CFS-Wechsel nicht freigegeben ([k2_box] allow_write=%s, "
+                    "allow_move=%s)" % (c.get("allow_write"),
+                                        c.get("allow_move")))
+        if not gcmd.get_int("MOVE", 0):
+            return ("RESUME darf nicht fahren (_PI_FREIGABE allow_move, "
+                    "Referenz X/Y/Z oder Pausenposition fehlt)")
+        if ab.get("source") != "T":
+            return ("Abbruch stammt nicht aus einem T<n>-Wechsel (M8200-Kette, "
+                    "Runout oder Einzelschritt) – Stock holt nur T<n>-Wechsel "
+                    "nach")
+        if not ab.get("tnn"):
+            return "Ziel-TNN des abgebrochenen Wechsels unbekannt"
+        if self.chain.get("active"):
+            return "Wechselkette noch offen (%s)" % (
+                self.chain.get("tnn") or "ohne TNN",)
+        if not self._homed_ok():
+            return "X/Y/Z nicht referenziert"
+        return None
+
+    def cmd_resume_check(self, gcmd):
+        """Aus dem RESUME-Makro (nur pausiert, nur bei change_aborted), VOR
+        jeder Bewegung: Kopfsensor meldet Filament -> frei; leer -> gesperrt
+        bzw. Nachholen (resume_redo_change); unbekannt -> gesperrt, bis
+        KTWO_BOX_ERROR_CLEAR HEAD_LOADED=1. MOVE=1: RESUME darf danach
+        fahren (macros.cfg). Fehler = gcmd.error -> RESUME bricht ab."""
+        ab = self.aborted
+        if not ab:
+            gcmd.respond_info("[k2_box] RESUME-Prüfung: kein abgebrochener "
+                              "Wechsel offen")
+            return
+        if not self._is_paused():
+            gcmd.respond_info("[k2_box] RESUME-Prüfung: nicht pausiert – "
+                              "nichts zu prüfen")
+            return
+        if self.chain_error:
+            raise gcmd.error(
+                "RESUME gesperrt – CFS-Wechsel fehlgeschlagen: %s. Ursache "
+                "beheben, KTWO_BOX_ERROR_CLEAR, Wechsel (T<n>) bzw. Schritt "
+                "von Hand wiederholen, dann RESUME." % (self.chain_error,))
+        sens = self.cfg.get("filament_sensor") or "(nicht konfiguriert)"
+        tnn = ab.get("tnn") or ""
+        tool = self._tool_of(tnn) if tnn else ""
+        load = ("%s (lädt %s)" % (tool, tnn) if tool
+                else "T<n> des gewünschten Werkzeugs")
+        head = self._head_filament()
+        if head is True:
+            gcmd.respond_info(
+                "[k2_box] RESUME-Prüfung: Kopfsensor %s meldet Filament nach "
+                "dem abgebrochenen Wechsel (%s) – RESUME frei (ob es das "
+                "Ziel-Filament ist, prüft der Pi nicht; Stock ebenso)."
+                % (sens, self._abort_text(ab)))
+            return
+        if head is None:
+            name = self.cfg.get("filament_sensor")
+            what = ("Kopf-Filamentsensor (nicht konfiguriert, [k2_box] "
+                    "filament_sensor leer) liefert keinen Zustand" if not name
+                    else "Kopf-Filamentsensor %s liefert keinen Zustand "
+                    "([filament_switch_sensor %s] fehlt)" % (name, name))
+            return self._resume_block(
+                gcmd, ab, "%s – ob der Kopf leer ist, ist UNBEKANNT (RESUME "
+                "könnte ohne Filament weiterdrucken)" % (what,),
+                "Kopf von Hand prüfen bzw. laden (%s), dann "
+                "KTWO_BOX_ERROR_CLEAR HEAD_LOADED=1 und RESUME." % (load,),
+                "ohne Kopfsensor nie (Stock prüft ihn ebenso)")
+        why = self._redo_block_reason(gcmd, ab)
+        if why:
+            hint = ""
+            if self.chain.get("active"):
+                hint = (" Offene Kette (M8200): alternativ KTWO_BOX_EXTRUDE "
+                        "TNN=%s als Kettenschritt." % (tnn or "T1A..T1D",))
+            return self._resume_block(
+                gcmd, ab, "Kopf-Filamentsensor %s meldet KEIN Filament – "
+                "RESUME würde ohne Filament weiterdrucken" % (sens,),
+                "In der Pause nachholen: %s, dann RESUME.%s" % (load, hint),
+                why)
+        return self._redo_change(gcmd, ab)
+
+    def _redo_change(self, gcmd, ab):
+        c = self.cfg
+        tnn = ab["tnn"]
+        temp = self._runout_temp(gcmd)
+        gcmd.respond_info(
+            "[k2_box] RESUME: Kopf leer nach abgebrochenem Wechsel (%s) – "
+            "Wechsel wird NACHGEHOLT (resume_redo_change, Stock "
+            "error_resume_process): Schacht, %s °C, Rückzug nur bei belegtem "
+            "Hub, Einzug %s, Spülen; danach RESUME wie üblich"
+            % (self._abort_text(ab), _n(temp), tnn))
+        self._script(["KTWO_BOX_PRE_OPT TNN=%s Z_HOP=0 SOURCE=T" % (tnn,)])
+        ch = self.chain
+        if ch.get("active") and not ch.get("skip") and not self.chain_error:
+            def heat(gcmd):
+                # Schacht zuerst und ankommen (M400: Tropfen beim Aufheizen
+                # fallen in den Schacht), dann heizen: auch ein Box-Rückzug
+                # mit Extruder-E-10 braucht die heiße Düse (RETRUDE heizt
+                # nur, wenn der Kopfsensor Filament meldet).
+                if self._go_extrude_pos(gcmd):
+                    self._move(gcmd, "Schacht erreicht", ["M400"], wrap=False)
+                self._heat(gcmd, temp)
+            self._run_step(gcmd, "REDO_HEAT", heat)
+        self._script([
+            "KTWO_BOX_RETRUDE",
+            "KTWO_BOX_EXTRUDE TNN=%s TEMP=%s" % (tnn, _n(temp)),
+            "KTWO_BOX_WASTE",
+            "KTWO_BOX_FLUSH TNN=%s TEMP=%s" % (tnn, _n(temp)),
+            "KTWO_BOX_END_OPT RETURN=0"])
+        if self.chain_error:
+            raise gcmd.error(
+                "RESUME gesperrt: Nachholen des Wechsels %s fehlgeschlagen "
+                "(%s) – Druck bleibt PAUSIERT, keine Rückfahrt (Stock "
+                "resume_err). Ursache beheben, KTWO_BOX_ERROR_CLEAR, dann "
+                "RESUME (holt erneut nach) oder %s von Hand."
+                % (tnn, self.chain_error, self._tool_of(tnn)))
+        if self._head_filament() is not True:
+            raise gcmd.error(
+                "RESUME gesperrt: nach dem Nachholen von %s meldet der "
+                "Kopfsensor %s kein Filament – Druck bleibt PAUSIERT. Kopf "
+                "prüfen, %s von Hand, dann RESUME." % (
+                    tnn, c.get("filament_sensor"), self._tool_of(tnn)))
+        gcmd.respond_info("[k2_box] RESUME: Wechsel auf %s nachgeholt "
+                          "(Kopfsensor meldet Filament) – weiter mit Schacht/"
+                          "Vorextrusion/Rückfahrt" % (tnn,))
+        return None
 
     # =================================================================
     # Auto-Nachladen bei Runout (A7) – Ersatz für Stock
