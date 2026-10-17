@@ -617,6 +617,9 @@ box 179 · boxmini 17 · cfsseq 28 · motor 134 · motor_mini 43 · auto_addr 33
 - [x] 17.10. spät ERLEDIGT: CHELPER-BEFUND (c_helper.so 1.1.7.0 SHA256-gleich 1.1.3.13 → flush.py belegt),
   SDCARD-GCODEMOVE-BEFUND (Matrix flush_para, Index = Slicer-T<n>, nur bei printing; Power-Loss EEPROM 24C16; SET_LIMITS =
   X/Y-Positionsgrenzen, nicht Beschleunigung), REMAIN-MATERIAL-BEFUND (userdata/box/remain_material_data.json, am Gerät bestätigt)
-- [ ] Umsetzen: k2_box `remain_material_file` (atomar, Stock-Format, Startwert von Drucker übernehmbar); `flush_mode: matrix`
+- [x] UMGESETZT 17.10.2026 spät (test_k2_box 52/52, flush-material 26/26, remain-test 31/31): k2_box `remain_material_file` (atomar, Stock-Format, Startwert von Drucker übernehmbar); `flush_mode: matrix`
   (Header der G-Code-Datei selbst lesen, TOOL=<n> durchreichen, nur printing); M600-Makro (→ PAUSE); Doku-Fix SET_LIMITS
   in NOTIZ-cutcal.md:13/56/153 + PAUSE-RESUME-MATERIAL-BEFUND A.4/D.3
+- [ ] Am Gerät (Pi): remain_material erste Speicherung + Neustart; Stock-Datei per install.sh --remain-material als Startwert;
+  Orca-Mehrfarbdatei: Zeilenform flush_volumes_matrix (ANNAHME) + Spülmengen vs. Orca-Anzeige, erst dann flush_mode: matrix;
+  M600 aus Orca-Datei → PAUSE/RESUME.

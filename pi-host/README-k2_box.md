@@ -544,7 +544,8 @@ sonst `go_to_extrude_pos` → `box_retrude_material` → `box_extrude_material`
 | Option | Default | Wirkung / Fallback |
 |---|---|---|
 | `material_database` | leer (aus) | Pfad zur Creality-`material_database.json` (Zielpfad von `install.sh`: `~/printer_data/config/k2/material_database.json`, nicht im Repo). Leer/fehlt/kaputt → bisheriges Verhalten + Meldung beim Connect, kein Config-Fehler |
-| `flush_mode` | `color` | `color` = Stock-Spülmenge aus alter/neuer RFID-Farbe (unbekannt → `Tn_extrude` 140 → 90 + 70 mm = bisher), `LENGTH=` über `cal_flush_list`; `fixed` = immer `box_first + box_need`, `LENGTH=` in 90er-Stücken (Stand bis 17.10.) |
+| `flush_mode` | `color` | `color` = Stock-Spülmenge aus alter/neuer RFID-Farbe (unbekannt → `Tn_extrude` 140 → 90 + 70 mm = bisher), `LENGTH=` über `cal_flush_list`; `fixed` = immer `box_first + box_need`, `LENGTH=` in 90er-Stücken (Stand bis 17.10.); **`matrix`** (neu, §12.4) = im laufenden Druck die Slicer-Spülmatrix der G-Code-Datei, sonst wie `color` |
+| `remain_material_file` | `~/printer_data/config/k2/remain_material.json` | **neu (§12.4):** Düsen-Material über Neustarts (Stock `remain_material_data.json`, gleiches Format). Leer = aus (nur im Speicher, Stand bis 17.10.). Tilde wird aufgelöst |
 | `flush_clean` | `stock` | `stock` = Blech zwischen den Abschnitten, Silikon-Kreise + Schacht verlassen nur am Ende; `legacy` = volles Abstreifen (`gcode_wipe`) nach jedem Abschnitt |
 | `flush_wipe_offset` | 3 | Kreisstart-Versatz `monotonic() % 3` mm (Stock `clean_offset_pos`); 0 = immer dieselbe Stelle (Tests) |
 | `wipe_minimum_cruise_ratio` | 0 | Upstream-Ersatz für Stock `ACCEL_TO_DECEL=ACCEL` (9cb9975 kennt nur `MINIMUM_CRUISE_RATIO`); danach alter Wert, nur wenn lesbar |
@@ -573,7 +574,8 @@ sonst `go_to_extrude_pos` → `box_retrude_material` → `box_extrude_material`
   letzten Abschnitt), Abschnitte `flush_segment_lines`, Blasen
   `gcode_blow`, Reinigung `gcode_nozzle_clean` (G2/G3 mit `[gcode_arcs]`,
   sonst 16-Eck). Nach ausgeführtem Spülen `remain_material` = Ziel
-  (Typ/Farbe, nur im Speicher – nach Neustart unbekannt → 90 + 70 mm).
+  (Typ/Farbe/Slot; mit `remain_material_file` auch nach Neustart bekannt,
+  §12.4, ohne → unbekannt → 90 + 70 mm).
 - **RESUME-Vorextrusion** (P2): Status `prime_speed` = `vol/2,4·60·0,8` des
   Materials in der Düse (unbekannt 288), 0 ohne DB → `_PI_RESUME_PRIME`
   nimmt dann `resume_prime_speed` 460.
@@ -584,16 +586,101 @@ sonst `go_to_extrude_pos` → `box_retrude_material` → `box_extrude_material`
   abgelehnt (`preload_block_reason`) – gesperrt = nichts gesendet.
   N5 (`0x0d [0f 01]` beim Connect) bewusst NICHT eingebaut – offener Gerätetest.
 - **Status** neu: `material_db`, `material_db_info`, `remain_material`,
-  `prime_speed`, `flush_mode`, `flush_last`.
+  `prime_speed`, `flush_mode`, `flush_last`; ab §12.4 zusätzlich
+  `remain_material_file`, `remain_material_load`, `remain_material_info`.
 
 ### 12.3 Offen / am Gerät
 
 - Spülbahn am Gerät (Blech ohne Kreise zwischen den Abschnitten, Kreise am
   Ende, 5-s-Blasen), DB-Temperaturen (PETG 250, PLA→PLA Spitze 240).
-- `remain_material` wird nicht persistiert (Stock: Datei) – erster Wechsel
-  nach Klipper-Start spült 90 + 70 mm.
-- Slicer-Spülmatrix im Druck (`flush_volumes_matrix`) nicht umgesetzt.
+- ~~`remain_material` wird nicht persistiert~~ → §12.4 (`remain_material_file`).
+- ~~Slicer-Spülmatrix nicht umgesetzt~~ → §12.4 (`flush_mode: matrix`, Default aus).
 - `KTWO_BOX_WIPE`/`_PI_NOZZLE_CLEAN` (G28/START_PRINT/G29/RESUME) unverändert
   (erstes X 160 statt Stock 170, ohne Versatz) – Bahn bleibt == `_PI_CLEAN_PATH`.
 - N5 (Preload-Freigabe `[0f 01]` nach Box-Reset) am Gerät prüfen.
 
+### 12.4 Düsen-Material persistent, Slicer-Spülmatrix, M600 (Ergänzung 17.10.2026)
+
+> **ENTWURF – am Gerät UNGETESTET.** Belege: `REMAIN-MATERIAL-BEFUND-2026-10-17.md`
+> (§1/§4/§6 + Nachtrag Gegenprobe), `SDCARD-GCODEMOVE-BEFUND-2026-10-17.md`
+> (A, D.1, D.3), `FLUSH-BEFUND-2026-10-17.md` §2/§3. Rechnung
+> `nachbau/flush.py` (`gcode_matrix_flush_len`, `finish_flush_len`).
+> Offline: `test_k2_box.py` 52/52; Batch `upstream-test/flush-material` 26/26.
+
+**`remain_material_file`** (Default `~/printer_data/config/k2/remain_material.json`, leer = aus)
+
+- Format Stock-kompatibel: `{"remain_material": {"color": "0RRGGBB"|null,
+  "type": "<id>"|null}}`; k2_box schreibt zusätzlich `"tnn": "T1A"` (Slot
+  des gespülten Filaments, Stock ignoriert ihn), liest weitere Schlüssel
+  tolerant. Die Stock-Datei `/mnt/UDISK/creality/userdata/box/
+  remain_material_data.json` kann 1:1 als Startwert dienen (dann ohne Slot →
+  `flush_mode: matrix` nutzt die Matrix erst ab dem ersten Spülen). Farben
+  `-1`/`none`/`unknown` = unbekannt (Stock `ignore_ops`). Hinweis: Stock
+  speichert als `type` das `material_type` von `Tn_data`, k2_box die
+  RFID-`mat_id` – gleiche Rolle (Material-DB-Schlüssel), Stock-Werte werden
+  unverändert übernommen.
+- **Lesen** genau einmal bei `klippy:connect`. Fehlt → Hinweis (Datei wird
+  nach dem nächsten Spülen angelegt). Unlesbar, kein JSON, falsche Struktur
+  (`{}`, `null`, Liste, fehlende `color`/`type`), Farbe ≠ `^0[0-9A-Fa-f]{6}$`,
+  ungültiger Typ → **nur WARNUNG**, Material unbekannt (90 + 70 mm wie
+  bisher), **nie Config-Fehler**. Eine inhaltlich kaputte Datei wird **nicht
+  überschrieben**, sondern nach `<datei>.defekt-<JJJJMMTT-hhmmss>` umbenannt
+  (Inhalt bleibt zur Diagnose). Stock dagegen überschreibt sie mit `null`
+  bzw. bricht den Klippy-Start ab (Befund §4).
+- **Schreiben** nur nach erfolgreichem `KTWO_BOX_FLUSH` (wirklich gespült,
+  `allow_move`) und nur, wenn Farbe/Typ/Slot sich ändern – **nicht** bei
+  Cut, Rückzug/Entladen, Einzug, Spülfehler, Abbruch/Pause, Plan ohne
+  `allow_move` (wie Stock: einziger `save`-Aufruf nach dem Spülen).
+  Atomar: `<datei>.tmp` im selben Verzeichnis, `flush` + `fsync`,
+  `os.replace`, `fsync` des Verzeichnisses, fehlende Verzeichnisse werden
+  angelegt; andere Top-Level-Schlüssel einer gültigen Datei bleiben.
+  Schreibfehler = WARNUNG, der Wert gilt bis zum Neustart, der Wechsel läuft
+  weiter.
+- **`KTWO_BOX_REMAIN [COLOR=0RRGGBB|#RRGGBB|none] [TYPE=<id>|none]
+  [TNN=T1A] [CLEAR=1]`** – **Nicht-Stock** (Stock hat kein Reset-Kommando):
+  ohne Parameter Anzeige; sonst Korrektur nach Handarbeit an der Düse
+  (gilt für den nächsten Wechsel, wird gespeichert, wenn an). Bewegt und
+  sendet nichts. Das in der Aufgabe skizzierte `KTWO_BOX_REMAIN SET …` ist
+  unter Upstream nicht möglich (Wort ohne `=` = „Malformed command“) – daher
+  nur `KEY=VALUE`.
+- **Status:** `remain_material_file` (absoluter Pfad, `''` = aus),
+  `remain_material_load` (`aus`/`ungelesen`/`fehlt`/`geladen`/`fehler`),
+  `remain_material_info` (Meldung).
+- Install-Hinweis: Den Holschritt der Stock-Datei baut `install.sh
+  --remain-material` (eigener Arbeitsgang, Zielpfad = obiger Default).
+
+**`flush_mode: matrix`** (Default bleibt `color`)
+
+- k2_box liest die Slicer-Spülmatrix selbst aus der laufenden Druckdatei
+  (Upstream `virtual_sdcard.file_path()`): die letzten **und** ersten
+  256 KiB (kleine Dateien ganz) nach `; flush_volumes_matrix = …` und
+  `; flush_multiplier = …` (Ende hat Vorrang = Orca-CONFIG_BLOCK; Zeilenform
+  **ANNAHME**, am ersten Orca-Mehrfarbdruck prüfen). Cache nach Pfad +
+  Größe + mtime, geleert bei `virtual_sdcard:reset_file`.
+- Index wie Stock `[alt][neu]` = Slicer-Werkzeugnummer, aber **direkt
+  durchgereicht** statt rückwärts gesucht: `KTWO_BOX_FLUSH … TOOL=<n>`
+  (`_KTWO_TOOL_CHANGE T=<n>` und `M8200 L I<n>` → `M8200 F` reichen `n`
+  durch); ohne `TOOL=` feste Zuordnung aus `TNN`. Altes Werkzeug = Slot des
+  zuletzt gespülten Filaments (`remain_material.tnn`, auch aus der Datei).
+- Nur bei `print_stats.state == "printing"` (Stock BW Z.4429; in der Pause,
+  beim Nachholen/Runout und von Hand → Farbweg mit HINWEIS), ohne `LENGTH=`
+  und mit bekanntem altem Werkzeug. Länge = `M[alt][neu] / 2,4 ×
+  flush_multiplier` (fehlt → 1, **ohne** `nozzle_volume`), danach
+  `finish_flush_len` (anderes Material ×2/min 370, sonst min 160).
+- Rückfall auf `color` mit **WARNUNG** (kein Fehler, keine Pause): keine
+  Druckdatei, keine Matrix, leer, nicht quadratisch, Index ≥ n (z. B.
+  Creality-Print-Dateien mit `[0]`), altes Werkzeug unbekannt, `TOOL` passt
+  nicht zu `TNN`. Der FLUSH-Plan nennt die Quelle („Slicer-Matrix [i][j] =
+  V mm³ / 2,4 × m“).
+
+**`M600`** (`macros.cfg`): Stock-`virtual_sdcard` macht aus `M600` im
+Dateistrom `PAUSE` (VS:1228, dort nur mit Power-Loss-Schalter). Upstream
+kennt kein `M600` (geprüft) → Makro `M600` → `PAUSE` (unser PAUSE-Makro:
+Parken, 140 °C, RESUME wie gewohnt), nur im laufenden, nicht pausierten
+Druck; sonst nur Meldung (kein Parken außerhalb eines Drucks). Kein
+`rename_existing` nötig, kein Konflikt.
+
+**Offen / am Gerät:** erste Speicherung + Neustart (Datei im Mainsail-Editor
+sichtbar, Inhalt), Zeilenform der Orca-Matrix in einer echten Mehrfarbdatei
+und Spülmengen gegen Orca-Anzeige, `M600` aus einer Orca-Datei (Pause,
+RESUME), Stock-Datei als Startwert nach `install.sh --remain-material`.

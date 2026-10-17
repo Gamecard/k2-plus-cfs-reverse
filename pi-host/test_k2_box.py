@@ -33,6 +33,12 @@ RESUME nach abgebrochenem Wechsel (17.10.2026 spät, BOOTLOADER-HOST-BEFUND §5)
 Kopf leer -> gesperrt / voll -> frei, Kopfsensor fehlt -> gesperrt bis
 HEAD_LOADED=1, Abbruch-Merker (Ziel-TNN), Nachholen (resume_redo_change)
 inkl. Fehlerfall + Sperren, RESUME-Makro ruft KTWO_BOX_RESUME_CHECK.
+Düsen-Material persistent + Slicer-Matrix + M600 (17.10.2026, REMAIN-
+MATERIAL-BEFUND §6, SDCARD-GCODEMOVE-BEFUND D.1/D.3): remain_material_file
+lesen (ok/fehlt/kaputt/Struktur/Farbe, .defekt-…), atomar schreiben nur
+nach FLUSH + Änderung, flush_mode matrix (Kopf/Ende, 16×16 asymmetrisch,
+TOOL=, nur printing, Rückfälle), Makro M600 -> PAUSE. HOME zeigt im Test
+auf ein Wegwerf-Verzeichnis (Default-Pfad unter ~).
 
 Fakes:
 - FakeBoxBus: simuliert Box-Zustände (IDLE/PRELOAD/PRINT/ERROR), Hub-Maske,
@@ -61,6 +67,25 @@ if os.path.isdir(_NACHBAU) and _NACHBAU not in sys.path:
 
 import k2_box as K
 import logging
+import tempfile as _tempfile
+
+# Schutz: remain_material_file hat einen Default unter ~ – Tests dürfen nie
+# ins echte Home schreiben. HOME zeigt für den ganzen Lauf auf ein
+# Wegwerf-Verzeichnis (Tilde-Auflösung), test_options() schaltet die
+# Persistenz zusätzlich aus (Tests mit Datei setzen einen tmp-Pfad).
+_TEST_HOME = _tempfile.mkdtemp(prefix="k2box-home-")
+os.environ["HOME"] = _TEST_HOME
+_TMP_DIRS = [_TEST_HOME]
+
+
+def _cleanup_tmp():
+    import shutil
+    for d in _TMP_DIRS:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+import atexit as _atexit  # noqa: E402
+_atexit.register(_cleanup_tmp)
 logging.getLogger().setLevel(logging.CRITICAL)  # Fehlerpfad-Tests ohne Log-Rauschen
 
 try:
@@ -633,7 +658,7 @@ class FakeGcmd:
 def test_options(**over):
     o = {"box_addr": "1", "allow_write": "True",
          "shutdown_on_failure": "False", "auto_init": "True",
-         "poll_interval": "4.0"}
+         "poll_interval": "4.0", "remain_material_file": ""}
     o.update(over)
     return o
 
@@ -2243,11 +2268,12 @@ def test_makros_cfg():
     class _Raise(Exception):
         pass
 
-    def render(name, params=None, k2=None, m8200_tnn=""):
+    def render(name, params=None, k2=None, m8200_tnn="", m8200_tool=-1):
         src, _vars = macros[name]
         printer = {"k2_box": dict({"change_enabled": True, "chain_error": ""},
                                   **(k2 or {})),
-                   "gcode_macro M8200": {"tnn": m8200_tnn},
+                   "gcode_macro M8200": {"tnn": m8200_tnn,
+                                         "tool": m8200_tool},
                    "gcode_macro _PI_PARAM": {"hotend_temp": 0, "fan0_speed": 0,
                                              "fan2_speed": 0},
                    "gcode_macro _KTWO_FAN_SAVE": {"fan2_value": 0.0},
@@ -2281,7 +2307,7 @@ def test_makros_cfg():
         assert lines == ["_KTWO_FAN_SAVE", "KTWO_BOX_PRE_OPT TNN=%s SOURCE=T" % tnn,
                          "KTWO_BOX_CUT", "KTWO_BOX_RETRUDE",
                          "KTWO_BOX_EXTRUDE TNN=%s" % tnn, "KTWO_BOX_WASTE",
-                         "KTWO_BOX_FLUSH TNN=%s" % tnn,
+                         "KTWO_BOX_FLUSH TNN=%s TOOL=%d" % (tnn, i),
                          "KTWO_BOX_END_OPT RETURN=1", "_KTWO_FAN_RESTORE"], lines
     # M8200-Kette (Stock box.cfg-Semantik)
     cases = [({"P": ""}, ["KTWO_BOX_PRE_OPT Z_HOP=0"]),
@@ -2291,11 +2317,13 @@ def test_makros_cfg():
              ({"R": "", "E": "20"}, ["KTWO_BOX_RETRUDE LENGTH=20.0"]),
              ({"L": "", "I": "0"}, ["KTWO_BOX_EXTRUDE TNN=T1A",
                                     "SET_GCODE_VARIABLE MACRO=M8200 VARIABLE=tnn VALUE='\"T1A\"'",
+                                    "SET_GCODE_VARIABLE MACRO=M8200 VARIABLE=tool VALUE=0",
                                     "KTWO_BOX_WASTE"]),
              ({"L": "", "I": "=7"}, None),
              ({"W": ""}, ["KTWO_BOX_WASTE"]),
              ({"F": "", "S": "600", "L": "100"}, ["KTWO_BOX_FLUSH",
-                                                 "SET_GCODE_VARIABLE MACRO=M8200 VARIABLE=tnn VALUE='\"\"'"]),
+                                                 "SET_GCODE_VARIABLE MACRO=M8200 VARIABLE=tnn VALUE='\"\"'",
+                                                 "SET_GCODE_VARIABLE MACRO=M8200 VARIABLE=tool VALUE=-1"]),
              ({"O": ""}, ["KTWO_BOX_END_OPT RETURN=0"])]
     for params, want in cases:
         lines, msgs = render("M8200", params)
@@ -2305,6 +2333,9 @@ def test_makros_cfg():
             assert lines == want, (params, lines)
     lines, _m = render("M8200", {"F": ""}, m8200_tnn="T1C")
     assert lines[0] == "KTWO_BOX_FLUSH TNN=T1C", lines
+    # TOOL aus M8200 L I<n> durchreichen (flush_mode matrix)
+    lines, _m = render("M8200", {"F": ""}, m8200_tnn="T1C", m8200_tool=2)
+    assert lines[0] == "KTWO_BOX_FLUSH TNN=T1C TOOL=2", lines
     # RESUME gesperrt bei offenem Wechsel-Fehler, sonst mit RESUME_FIX
     try:
         render("RESUME", k2={"chain_error": "EXTRUDE fehlgeschlagen"})
@@ -3193,6 +3224,593 @@ def test_box_wait_timeout():
 
 
 # =====================================================================
+# Düsen-Material persistent (remain_material_file) – 17.10.2026
+# REMAIN-MATERIAL-BEFUND-2026-10-17.md §6
+# =====================================================================
+
+def _prep_chain(bus):
+    """Wie _hull_t1b_ok: Slot A geladen, Einzug erreicht den Kopfsensor."""
+    bus.hub_mask, bus.head = 0x01, True
+    bus.head_at_mm = bus.odo + 300.0
+    bus.need_extruder_for_mode7 = True
+
+
+def _rm_dir():
+    d = _tempfile.mkdtemp(prefix="k2box-remain-")
+    _TMP_DIRS.append(d)
+    return d
+
+
+def _write(path, text):
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(text)
+
+
+def _read_json(path):
+    import json
+    with open(path, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+# Stock-Format (Nachtrag Gegenprobe 17.10.: kompakt, eine Zeile, json.dump);
+# Farbe/Typ synthetisch
+STOCK_REMAIN = '{"remain_material": {"color": "0ce58f8", "type": "190002"}}'
+
+
+def test_remain_laden():
+    import glob
+    d = _rm_dir()
+    # Default + Tilde (HOME zeigt im Test auf ein Wegwerf-Verzeichnis)
+    cfg = K.parse_options({})
+    assert cfg["remain_material_file"] == \
+        "~/printer_data/config/k2/remain_material.json"
+    assert K.remain_path(cfg["remain_material_file"]) == os.path.join(
+        _TEST_HOME, "printer_data", "config", "k2", "remain_material.json")
+    assert K.parse_options({"remain_material_file": ""})[
+        "remain_material_file"] == ""
+    assert K.load_remain_material("") == (None, "aus", "")
+    # Auslieferung k2-module.cfg: Persistenz an (Default-Pfad), matrix aus
+    import configparser
+    cp = configparser.ConfigParser(interpolation=None, strict=False)
+    cp.read(os.path.join(_HERE, "config-pi", "k2-module.cfg"),
+            encoding="utf-8")
+    kb = dict(cp.items("k2_box"))
+    assert kb["remain_material_file"] == \
+        "~/printer_data/config/k2/remain_material.json" and \
+        kb["flush_mode"] == "color", kb.get("remain_material_file")
+    # Stock-Datei als Startwert (ohne tnn)
+    p = os.path.join(d, "stock.json")
+    _write(p, STOCK_REMAIN)
+    rm, st, info = K.load_remain_material(p)
+    assert st == "geladen" and rm == {"type": "190002", "color": "0CE58F8",
+                                       "tnn": ""}, (rm, st)
+    assert "0CE58F8" in info
+    # mit tnn + Zusatzschlüssel (toleriert), null-Werte
+    _write(p, '{"x": 1, "remain_material": {"color": null, "type": null, '
+              '"tnn": "t1b", "saved_at": 5}}')
+    assert K.load_remain_material(p)[:2] == (
+        {"type": None, "color": None, "tnn": "T1B"}, "geladen")
+    _write(p, '{"remain_material": {"color": "-1", "type": "190001", '
+              '"tnn": "T9Z"}}')
+    rm, st, info = K.load_remain_material(p)
+    assert st == "geladen" and rm["color"] is None and rm["tnn"] == "" \
+        and "ignoriert" in info, (rm, info)
+    # fehlt -> nur Meldung, nichts angelegt
+    q = os.path.join(d, "neu", "remain.json")
+    rm, st, info = K.load_remain_material(q)
+    assert (rm, st) == (None, "fehlt") and not os.path.exists(q), info
+    # kaputt / falsche Struktur / Farbe ungültig -> fehler + beiseitegelegt,
+    # Inhalt bleibt erhalten (nie überschrieben)
+    bad = ["", "{kaputt", "[]", "null", '{"remain_material": {}}',
+           '{"remain_material": null}', '{"anders": 1}',
+           '{"remain_material": [1, 2]}',
+           '{"remain_material": {"color": "0GGGGGG", "type": "1"}}',
+           '{"remain_material": {"color": "12345", "type": "1"}}',
+           '{"remain_material": {"color": "0FFFFFF", "type": {"a": 1}}}']
+    for i, text in enumerate(bad):
+        b = os.path.join(d, "bad%d.json" % i)
+        _write(b, text)
+        rm, st, info = K.load_remain_material(b)
+        assert rm is None and st == "fehler", (text, st, info)
+        moved = glob.glob(b + ".defekt-*")
+        assert not os.path.exists(b) and len(moved) == 1, (text, moved)
+        assert open(moved[0], encoding="utf-8").read() == text
+        assert "beiseitegelegt" in info, info
+    # Hülle: Laden erst bei klippy:connect, Status, kein Config-Fehler
+    _write(p, STOCK_REMAIN)
+    bus = FakeBoxBus()
+    printer = FakePrinter(bus, with_motion=True)
+    mod = K.PrinterK2Box(FakeConfig(printer, test_options(
+        allow_move="True", remain_material_file=p)))
+    assert mod.get_status()["remain_material_load"] == "ungelesen"
+    assert mod.remain_material["color"] is None
+    printer.fire("klippy:connect")
+    st = mod.get_status()
+    assert st["remain_material_file"] == p and st["remain_material_load"] == \
+        "geladen" and st["remain_material"]["color"] == "0CE58F8", st
+    printer.fire("klippy:connect")      # zweites connect liest nicht erneut
+    b = os.path.join(d, "kaputt.json")
+    _write(b, "{")
+    printer = FakePrinter(FakeBoxBus(), with_motion=True)
+    mod = K.PrinterK2Box(FakeConfig(printer, test_options(
+        remain_material_file=b)))
+    printer.fire("klippy:connect")
+    st = mod.get_status()
+    assert st["remain_material_load"] == "fehler" and \
+        st["remain_material"]["color"] is None
+    assert any("WARNUNG" in m and "ungültig" in m for m in printer.gcode.infos)
+    # Stock-Datei als Startwert -> erster Wechsel nutzt die alte Farbe
+    _write(p, STOCK_REMAIN)
+    bus, printer, mod, ctl = _flush_hull(remain_material_file=p)
+    g = FakeGcmd({"TNN": "T1A"})
+    mod.cmd_flush(g)
+    assert any("Farbe 0CE58F8 -> 0FFFFFF" in m for m in g.infos), g.infos
+    return ("ok/fehlt/kaputt (11 Fälle, .defekt-…, Inhalt erhalten)/null/"
+            "tnn tolerant, Laden bei connect, Status, Stock-Datei als Startwert")
+
+
+def test_remain_schreiben():
+    d = _rm_dir()
+    p = os.path.join(d, "tief", "k2", "remain.json")     # Verzeichnis fehlt
+    # atomar: makedirs, tmp + fsync + os.replace + Verzeichnis-fsync
+    calls = []
+    o_rep, o_fs = K.os.replace, K.os.fsync
+    K.os.replace = lambda a, b: (calls.append(("replace", a, b)), o_rep(a, b))[1]
+    K.os.fsync = lambda fd: (calls.append(("fsync", fd)), o_fs(fd))[1]
+    try:
+        K.save_remain_material(p, {"type": "190003", "color": "026eeee",
+                                   "tnn": "T1C"})
+    finally:
+        K.os.replace, K.os.fsync = o_rep, o_fs
+    assert [c[0] for c in calls] == ["fsync", "replace", "fsync"], calls
+    assert calls[1][1] == p + ".tmp" and calls[1][2] == p
+    assert _read_json(p) == {"remain_material": {
+        "color": "026EEEE", "type": "190003", "tnn": "T1C"}}
+    assert not os.path.exists(p + ".tmp")
+    # andere Top-Level-Schlüssel bleiben (Stock read-modify-write)
+    _write(p, '{"fremd": [1], "remain_material": {"color": null, "type": null}}')
+    K.save_remain_material(p, {"type": None, "color": None, "tnn": ""})
+    assert _read_json(p) == {"fremd": [1], "remain_material": {
+        "color": None, "type": None}}
+    # vorhandene kaputte Datei beim Schreiben: erst beiseitelegen, nie
+    # überschreiben; ungültiger Typ wird als null geschrieben
+    import glob
+    _write(p, "{kaputt")
+    K.save_remain_material(p, {"type": "a b", "color": "0abcdef", "tnn": ""})
+    assert _read_json(p) == {"remain_material": {"color": "0ABCDEF",
+                                                 "type": None}}
+    moved = glob.glob(p + ".defekt-*")
+    assert len(moved) == 1 and open(moved[0]).read() == "{kaputt", moved
+    # Schreibfehler mitten im dump: Original bleibt, tmp weg
+    _write(p, STOCK_REMAIN)
+    o_dump = K.json.dump
+
+    def boom(*a, **k):
+        raise OSError("Platte voll")
+    K.json.dump = boom
+    try:
+        K.save_remain_material(p, {"type": "1", "color": None, "tnn": ""})
+    except OSError:
+        pass
+    else:
+        raise AssertionError("OSError erwartet")
+    finally:
+        K.json.dump = o_dump
+    assert open(p, encoding="utf-8").read() == STOCK_REMAIN
+    assert not os.path.exists(p + ".tmp")
+    # Hülle: Schreiben NUR nach erfolgreichem FLUSH und nur bei Änderung
+    f = os.path.join(d, "hull", "remain.json")
+    saves = []
+    o_save = K.save_remain_material
+
+    def counting(path, remain):
+        saves.append(dict(remain))
+        return o_save(path, remain)
+    K.save_remain_material = counting
+    try:
+        bus, printer, mod, ctl = _flush_hull(remain_material_file=f)
+        assert mod.get_status()["remain_material_load"] == "fehlt"
+        _prep_chain(bus)
+        # Kette OHNE Flush (Cut/Rückzug/Einzug/End) -> kein Schreiben
+        for fn, prm in ((mod.cmd_pre_opt, {"TNN": "T1B"}), (mod.cmd_cut, {}),
+                        (mod.cmd_retrude, {}), (mod.cmd_extrude, {"TNN": "T1B"}),
+                        (mod.cmd_waste, {}), (mod.cmd_end_opt, {"RETURN": "0"})):
+            fn(FakeGcmd(prm))
+        assert not saves and not os.path.exists(f), saves
+        # Flush -> geschrieben
+        mod.cmd_flush(FakeGcmd({"TNN": "T1B"}))
+        assert len(saves) == 1 and _read_json(f) == {"remain_material": {
+            "color": "0CE58F8", "type": "190002", "tnn": "T1B"}}, saves
+        # gleiches Material erneut -> KEIN Schreiben
+        mod.cmd_flush(FakeGcmd({"TNN": "T1B"}))
+        assert len(saves) == 1, saves
+        # Spülfehler (G-Code-Fehler im Abschnitt, ohne Druck) -> kein Schreiben
+        printer.fail_on = "G1 E"
+        try:
+            mod.cmd_flush(FakeGcmd({"TNN": "T1C"}))
+        except Exception:
+            pass
+        printer.fail_on = None
+        mod.chain_error = ""
+        assert len(saves) == 1 and mod.remain_material["tnn"] == "T1B"
+        # Abbruch im Druck (-> PAUSE, wie Cancel-Pfad) -> kein Schreiben
+        printer.set_printing(True)
+        printer.fail_on = "G1 E"
+        mod.cmd_flush(FakeGcmd({"TNN": "T1C"}))
+        printer.fail_on = None
+        assert printer.paused and len(saves) == 1, saves
+        printer.paused = False
+        printer.set_printing(False)
+        mod.chain_error = ""
+        mod.aborted = None
+        # nur Plan (allow_move False) -> kein Schreiben
+        bus2, pr2, mod2, _c2 = _flush_hull(remain_material_file=f,
+                                           allow_move="False")
+        assert mod2.remain_material["tnn"] == "T1B"     # Neustart: geladen
+        mod2.cmd_flush(FakeGcmd({"TNN": "T1C"}))
+        assert len(saves) == 1
+        # anderes Material -> geschrieben
+        mod.cmd_flush(FakeGcmd({"TNN": "T1C"}))
+        assert len(saves) == 2 and _read_json(f)["remain_material"]["type"] \
+            == "190003"
+        # Neustart-Simulation: neuer Lauf liest den Wert, Spülplan nutzt ihn
+        bus3, pr3, mod3, _c3 = _flush_hull(remain_material_file=f)
+        g = FakeGcmd({"TNN": "T1A"})
+        mod3.cmd_flush(g)
+        assert any("Farbe 026EEEE -> 0FFFFFF" in m and "anderes Material" in m
+                   for m in g.infos), g.infos
+        # Schreibfehler (Elternpfad ist eine Datei) -> nur WARNUNG, FLUSH ok
+        blocker = os.path.join(d, "blocker")
+        _write(blocker, "x")
+        bus4, pr4, mod4, _c4 = _flush_hull(
+            remain_material_file=os.path.join(blocker, "remain.json"))
+        g = FakeGcmd({"TNN": "T1B"})
+        mod4.cmd_flush(g)
+        assert any("WARNUNG Düsen-Material nicht gespeichert" in m
+                   for m in g.infos) and any("ok" in m for m in g.infos) \
+            and mod4.remain_material["type"] == "190002" \
+            and mod4.chain_error == "", g.infos
+        # KTWO_BOX_REMAIN (Nicht-Stock): Anzeige, Setzen, CLEAR, Fehler
+        n0 = len(saves)
+        g = FakeGcmd({})
+        mod.cmd_remain(g)
+        assert len(saves) == n0 and "Farbe 026EEEE" in g.infos[-1], g.infos
+        mod.cmd_remain(FakeGcmd({"COLOR": "#00ff00", "TYPE": "190001",
+                                 "TNN": "T1A"}))
+        assert _read_json(f)["remain_material"] == {
+            "color": "000FF00", "type": "190001", "tnn": "T1A"}
+        mod.cmd_remain(FakeGcmd({"COLOR": "000FF00"}))        # unverändert
+        assert len(saves) == n0 + 1
+        mod.cmd_remain(FakeGcmd({"CLEAR": "1"}))
+        assert _read_json(f)["remain_material"] == {"color": None,
+                                                    "type": None}
+        for bad in ({"COLOR": "rot"}, {"TYPE": "a b"}, {"TNN": "T9A"}):
+            try:
+                mod.cmd_remain(FakeGcmd(bad))
+            except Exception as exc:
+                assert "KTWO_BOX_REMAIN" in str(exc), exc
+            else:
+                raise AssertionError("Fehler erwartet: %r" % bad)
+        # aus (leer): nie schreiben
+        bus5, pr5, mod5, _c5 = _flush_hull()
+        mod5.cmd_flush(FakeGcmd({"TNN": "T1C"}))
+        assert mod5.get_status()["remain_material_file"] == "" and \
+            mod5.get_status()["remain_material_load"] == "aus"
+    finally:
+        K.save_remain_material = o_save
+    assert not os.path.exists(os.path.join(_TEST_HOME, "printer_data"))
+    return ("atomar (tmp/fsync/replace/Verz.-fsync, makedirs), Fehler -> "
+            "Original bleibt; nur nach FLUSH + bei Änderung (nicht Cut/Rückzug/"
+            "Einzug/Fehler/Abbruch/Plan), Neustart, Schreibfehler = WARNUNG, "
+            "KTWO_BOX_REMAIN")
+
+
+# =====================================================================
+# Slicer-Spülmatrix (flush_mode matrix) – SDCARD-GCODEMOVE-BEFUND D.1
+# =====================================================================
+
+def _matrix16():
+    """Synthetische 16×16-Matrix, Diagonale 0, ASYMMETRISCH ([0][1]=569,
+    [1][0]=419 wie Live-Beispiel A.2, sonst 300 + 7·i + 3·j)."""
+    m = []
+    for i in range(16):
+        for j in range(16):
+            m.append(0 if i == j else 300 + 7 * i + 3 * j)
+    m[0 * 16 + 1] = 569
+    m[1 * 16 + 0] = 419
+    return m
+
+
+def _gcode_file(d, name, matrix=None, mult="1.3", where="end", filler_kb=600):
+    """Synthetische G-Code-Datei (KEIN echter Druckauftrag)."""
+    lines = []
+    cfg = []
+    if matrix is not None:
+        cfg.append("; flush_volumes_matrix = " + ",".join(
+            "%g" % v for v in matrix))
+    if mult is not None:
+        cfg.append("; flush_multiplier = %s" % mult)
+    head = ["; HEADER_BLOCK_START", "; generated by Testgenerator",
+            "; HEADER_BLOCK_END"]
+    if where == "head":
+        head += cfg
+    lines += head
+    body = "G1 X10 Y10 E0.1 ; Fülltext\n" * (filler_kb * 1024 // 27)
+    tail = ["; CONFIG_BLOCK_START"] + (cfg if where == "end" else []) + \
+        ["; CONFIG_BLOCK_END"]
+    p = os.path.join(d, name)
+    with open(p, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n" + body + "\n".join(tail) + "\n")
+    return p
+
+
+class _VSD:
+    """Upstream virtual_sdcard (file_path()/get_status, UP-VS:104-112)."""
+
+    def __init__(self, path):
+        self.path = path
+
+    def file_path(self):
+        return self.path
+
+    def get_status(self, eventtime=None):
+        return {"file_path": self.path}
+
+
+def test_matrix_parsen():
+    d = _rm_dir()
+    M = _matrix16()
+    p_end = _gcode_file(d, "ende.gcode", M)
+    assert os.path.getsize(p_end) > 2 * K.MATRIX_SCAN_BYTES
+    info = K.read_flush_matrix(p_end)
+    assert info["n"] == 16 and info["multiplier"] == 1.3 and \
+        info["where"] == "Dateiende" and info["matrix"] == [float(v) for v in M]
+    p_head = _gcode_file(d, "kopf.gcode", M, where="head")
+    info_h = K.read_flush_matrix(p_head)
+    assert info_h["where"] == "Dateikopf" and info_h["n"] == 16
+    small = _gcode_file(d, "klein.gcode", M, filler_kb=1)
+    assert K.read_flush_matrix(small)["where"] == "Datei"
+    # Matrix außerhalb der Fenster (Mitte) -> nicht gefunden
+    mid = os.path.join(d, "mitte.gcode")
+    with open(mid, "w", encoding="utf-8") as fh:
+        fh.write("G1 X1\n" * 100000 + "; flush_volumes_matrix = 0,1,1,0\n"
+                 + "G1 X1\n" * 100000)
+    for path, text in ((mid, "keine"),
+                       (_gcode_file(d, "ohne.gcode", None), "keine"),
+                       (_gcode_file(d, "15.gcode", list(range(15))),
+                        "nicht quadratisch")):
+        try:
+            K.read_flush_matrix(path)
+        except ValueError as exc:
+            assert text in str(exc), exc
+        else:
+            raise AssertionError("ValueError erwartet: %s" % path)
+    # ohne Multiplikator -> None (= 1 wie Stock)
+    assert K.read_flush_matrix(_gcode_file(d, "om.gcode", [0, 240, 120, 0],
+                                           mult=None))["multiplier"] is None
+    # Länge = M[alt][neu] / 2,4 · m (flush.py gcode_matrix_flush_len)
+    l01, w01 = K.slicer_matrix_flush(info, 0, 1)
+    l10, _w = K.slicer_matrix_flush(info, 1, 0)
+    assert abs(l01 - 569 / 2.4 * 1.3) < 1e-9 and abs(l01 - 308.2083333) < 1e-6
+    assert abs(l10 - 419 / 2.4 * 1.3) < 1e-9 and abs(l10 - 226.9583333) < 1e-6
+    assert "[0][1] = 569" in w01 and "1.3" in w01, w01
+    assert abs(K.slicer_matrix_flush(info, 15, 14)[0]
+               - (300 + 105 + 42) / 2.4 * 1.3) < 1e-9
+    for a, b in ((16, 0), (0, 16), (-1, 0), (None, 1)):
+        try:
+            K.slicer_matrix_flush(info, a, b)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("Index %r/%r hätte scheitern müssen" % (a, b))
+    # plan_flush_lengths: matrix -> Stock-Nachbearbeitung, sonst wie color
+    c = K.parse_options({"flush_mode": "matrix"})
+    segs, why = K.plan_flush_lengths(c, None, "0FFFFFF", "0CE58F8", False,
+                                     matrix={"len": l01, "why": w01})
+    assert abs(sum(segs) - l01) < 1e-9 and "Slicer-Matrix" in why, (segs, why)
+    segs, _w = K.plan_flush_lengths(c, None, None, None, True,
+                                    matrix={"len": 100.0, "why": "x"})
+    assert sum(segs) == 370.0                     # anders: max(200, 370)
+    segs, _w = K.plan_flush_lengths(c, None, None, None, False,
+                                    matrix={"len": 50.0, "why": "x"})
+    assert sum(segs) == 160.0                     # gleich: min 90 + 70
+    assert K.plan_flush_lengths(c, None, "0FFFFFF", "0CE58F8", False) == \
+        K.plan_flush_lengths(K.parse_options({}), None, "0FFFFFF", "0CE58F8",
+                             False)               # ohne Matrix = color
+    assert K.parse_options({"flush_mode": "MATRIX"})["flush_mode"] == "matrix"
+    return ("Kopf/Ende/klein/Mitte (256 KiB), 16×16 asymmetrisch [0][1]=569 -> "
+            "308,21 / [1][0]=419 -> 226,96 (×1,3), Index-/Formfehler, "
+            "Nachbearbeitung min 160 / anders min 370")
+
+
+def _matrix_hull(gfile, **opt):
+    o = dict(flush_mode="matrix")
+    o.update(opt)
+    bus, printer, mod, ctl = _flush_hull(**o)
+    printer.objects["virtual_sdcard"] = _VSD(gfile)
+    printer.set_printing(True)
+    return bus, printer, mod, ctl
+
+
+def _plan_line(g):
+    return [m for m in g.infos if "FLUSH-Plan" in m][-1]
+
+
+def test_matrix_flush():
+    d = _rm_dir()
+    gf = _gcode_file(d, "druck.gcode", _matrix16())
+    bus, printer, mod, ctl = _matrix_hull(gf)
+    reads = []
+    o_read = K.read_flush_matrix
+    K.read_flush_matrix = lambda p, *a: (reads.append(p), o_read(p, *a))[1]
+    try:
+        # T0 (T1A, weiß PLA) in der Düse -> T1 (T1B, violett PLA): [0][1]
+        mod.remain_material = {"type": "190001", "color": "0FFFFFF",
+                               "tnn": "T1A"}
+        g = FakeGcmd({"TNN": "T1B", "TOOL": "1"})
+        mod.cmd_flush(g)
+        pl = _plan_line(g)
+        assert "Slicer-Matrix [0][1] = 569 mm³ / 2,4 × 1.3" in pl and \
+            "308.208 mm" in pl, pl
+        assert mod.remain_material["tnn"] == "T1B"
+        ext = sum(float(l.split()[1][1:]) for l in printer.gcode.scripts
+                  if l.startswith("G1 E"))
+        assert abs(ext - 308.208) < 0.01, ext
+        # zurück: [1][0] = 419 (Richtung zählt)
+        g = FakeGcmd({"TNN": "T1A", "TOOL": "0"})
+        mod.cmd_flush(g)
+        assert "[1][0] = 419" in _plan_line(g) and "226.958 mm" in \
+            _plan_line(g), _plan_line(g)
+        assert len(reads) == 1, "Cache (Pfad/Größe/mtime)"
+        # ohne TOOL: Index aus TNN (feste Zuordnung), anderes Material ×2
+        g = FakeGcmd({"TNN": "T1C"})
+        mod.cmd_flush(g)
+        want = max(2 * (300 + 0 + 6) / 2.4 * 1.3, 370)
+        assert "[0][2] = 306" in _plan_line(g) and "anderes Material" in \
+            _plan_line(g) and ("%s mm" % K._n(want)) in _plan_line(g), \
+            _plan_line(g)
+        # Reset-Ereignis bzw. geänderte Datei -> neu lesen
+        printer.fire("virtual_sdcard:reset_file")
+        mod.cmd_flush(FakeGcmd({"TNN": "T1B", "TOOL": "1"}))
+        assert len(reads) == 2, reads
+        with open(gf, "a", encoding="utf-8") as fh:
+            fh.write("; Nachtrag\n")
+        mod.cmd_flush(FakeGcmd({"TNN": "T1A", "TOOL": "0"}))
+        assert len(reads) == 3, reads
+    finally:
+        K.read_flush_matrix = o_read
+
+    def fallback(setup, params, text, warn=True):
+        bus, printer, mod, ctl = _matrix_hull(gf)
+        mod.remain_material = {"type": "190001", "color": "0FFFFFF",
+                               "tnn": "T1A"}
+        setup(printer, mod)
+        was_paused = printer.paused
+        g = FakeGcmd(params)
+        mod.cmd_flush(g)
+        pl = _plan_line(g)
+        assert "Slicer-Matrix [" not in pl and "Farbe 0FFFFFF -> 0" in \
+            pl, (text, pl)
+        hits = [m for m in g.infos if text in m]
+        assert hits, (text, g.infos)
+        assert ("WARNUNG" in hits[0]) == warn, hits
+        assert mod.chain_error == "" and printer.paused == was_paused
+        return g
+
+    ok = lambda pr, mod: None
+    # nur im Druck: standby / paused -> Hinweis (keine Warnung) + color
+    fallback(lambda pr, m: pr.set_printing(False), {"TNN": "T1B", "TOOL": "1"},
+             "nur im laufenden Druck (Zustand standby)", warn=False)
+
+    def paused(pr, m):
+        pr.paused = True
+        pr.print_state = "paused"
+        pr._refresh()
+    fallback(paused, {"TNN": "T1B", "TOOL": "1"},
+             "nur im laufenden Druck (Zustand paused)", warn=False)
+    # altes Werkzeug unbekannt (Düsen-Material ohne Slot, z. B. Stock-Datei)
+    fallback(lambda pr, m: m.remain_material.update(tnn=""),
+             {"TNN": "T1B", "TOOL": "1"}, "altes Werkzeug unbekannt")
+    # TOOL passt nicht zu TNN
+    fallback(ok, {"TNN": "T1B", "TOOL": "2"}, "passt nicht zu TNN")
+    # keine Datei / keine Matrix / nicht quadratisch / Index >= n
+    fallback(lambda pr, m: pr.objects.pop("virtual_sdcard"),
+             {"TNN": "T1B", "TOOL": "1"}, "keine laufende Druckdatei")
+    fallback(lambda pr, m: setattr(pr.objects["virtual_sdcard"], "path",
+                                   _gcode_file(d, "o.gcode", None)),
+             {"TNN": "T1B", "TOOL": "1"}, "keine '; flush_volumes_matrix")
+    fallback(lambda pr, m: setattr(pr.objects["virtual_sdcard"], "path",
+                                   _gcode_file(d, "q.gcode", [1] * 15)),
+             {"TNN": "T1B", "TOOL": "1"}, "nicht quadratisch")
+    fallback(lambda pr, m: setattr(pr.objects["virtual_sdcard"], "path",
+                                   _gcode_file(d, "z.gcode", [0, 5, 5, 0])),
+             {"TNN": "T1C", "TOOL": "2"}, "außerhalb der 2x2-Matrix")
+    fallback(lambda pr, m: setattr(pr.objects["virtual_sdcard"], "path",
+                                   _gcode_file(d, "cp.gcode", [0])),
+             {"TNN": "T1B", "TOOL": "1"}, "außerhalb der 1x1-Matrix")
+    # LENGTH= hat Vorrang (kein Matrix-Versuch), flush_mode color ignoriert
+    # die Matrix
+    bus, printer, mod, ctl = _matrix_hull(gf)
+    mod.remain_material = {"type": "190001", "color": "0FFFFFF", "tnn": "T1A"}
+    g = FakeGcmd({"TNN": "T1B", "TOOL": "1", "LENGTH": "95"})
+    mod.cmd_flush(g)
+    assert ": 95 mm (95;" in _plan_line(g) and not any(
+        "Slicer-Matrix" in m for m in g.infos), g.infos
+    bus, printer, mod, ctl = _matrix_hull(gf, flush_mode="color")
+    mod.remain_material = {"type": "190001", "color": "0FFFFFF", "tnn": "T1A"}
+    g = FakeGcmd({"TNN": "T1B", "TOOL": "1"})
+    mod.cmd_flush(g)
+    assert not any("Slicer-Matrix" in m for m in g.infos), g.infos
+    # Kette über die Hülle (wie _KTWO_TOOL_CHANGE T=1: FLUSH TNN=T1B TOOL=1)
+    bus, printer, mod, ctl = _matrix_hull(gf)
+    mod.remain_material = {"type": "190001", "color": "0FFFFFF", "tnn": "T1A"}
+    ctl.loaded_slot = "A"
+    _prep_chain(bus)
+    infos = []
+    for fn, prm in ((mod.cmd_pre_opt, {"TNN": "T1B", "SOURCE": "T"}),
+                    (mod.cmd_cut, {}), (mod.cmd_retrude, {}),
+                    (mod.cmd_extrude, {"TNN": "T1B"}), (mod.cmd_waste, {}),
+                    (mod.cmd_flush, {"TNN": "T1B", "TOOL": "1"}),
+                    (mod.cmd_end_opt, {"RETURN": "1"})):
+        g = FakeGcmd(prm)
+        fn(g)
+        infos.extend(g.infos)
+    assert any("Slicer-Matrix [0][1] = 569" in m for m in infos), infos
+    assert mod.chain_error == "" and not printer.paused, mod.chain_error
+    return ("Hülle: [0][1]=569 -> 308,208 mm (TOOL=1), [1][0]=419 -> 226,958, "
+            "TNN-Zuordnung ohne TOOL, anderes Material ×2, Cache + reset_file/"
+            "mtime; Rückfälle standby/paused/alt unbekannt/TOOL≠TNN/keine "
+            "Datei/keine Matrix/nicht quadratisch/Index ≥ n -> color; LENGTH=; "
+            "Kette T1A->T1B")
+
+
+def test_makro_m600():
+    try:
+        import jinja2
+    except Exception:
+        return "SKIP (jinja2 fehlt)"
+    path = os.path.join(_HERE, "config-pi", "macros.cfg")
+    macros = _macro_sources(path)
+    assert "M600" in macros, "Makro M600 fehlt"
+    env = jinja2.Environment("{%", "%}", "{", "}")
+
+    def render(state, paused=False):
+        msgs = []
+        out = env.from_string(macros["M600"][0]).render(
+            params={}, rawparams="",
+            printer={"print_stats": {"state": state},
+                     "pause_resume": {"is_paused": paused}},
+            action_respond_info=lambda m: msgs.append(m) or "",
+            action_raise_error=lambda m: (_ for _ in ()).throw(ValueError(m)))
+        return [l.strip() for l in out.split("\n")
+                if l.strip() and not l.strip().startswith("#")], msgs
+
+    lines, msgs = render("printing")
+    assert lines == ["PAUSE"] and "Filamentwechsel" in msgs[0], (lines, msgs)
+    for st, pa in (("standby", False), ("paused", True), ("printing", True),
+                   ("complete", False)):
+        lines, msgs = render(st, pa)
+        assert lines == [] and "ignoriert" in msgs[0], (st, lines, msgs)
+    # kein Konflikt: genau ein [gcode_macro M600], kein rename_existing,
+    # Upstream kennt kein M600 (Referenz-Klon, falls vorhanden)
+    txt = open(path, encoding="utf-8").read()
+    assert txt.count("[gcode_macro M600]") == 1
+    sec = txt.split("[gcode_macro M600]", 1)[1].split("\n[", 1)[0]
+    assert "rename_existing" not in sec
+    up = os.path.join(_REPO, "arbeitsdateien-lokal", "upstream-klipper",
+                      "klippy")
+    if os.path.isdir(up):
+        for root, _dirs, files in os.walk(up):
+            for fn in files:
+                if fn.endswith(".py"):
+                    with open(os.path.join(root, fn), encoding="utf-8",
+                              errors="replace") as fh:
+                        assert "M600" not in fh.read(), fn
+        return "M600 im Druck -> PAUSE, sonst Meldung; Upstream ohne M600 (geprüft)"
+    return "M600 im Druck -> PAUSE, sonst Meldung"
+
+
+# =====================================================================
 # Runner
 # =====================================================================
 
@@ -3256,6 +3874,15 @@ TESTS = [
     ("Runout/Nachholen BASE_TEMP + DB", test_runout_redo_basistemperatur),
     ("Preload-Sperren (Kopf, Druck/FORCE, Maske 0)", test_preload_sperren),
     ("box_wait_timeout >= 380 s", test_box_wait_timeout),
+    ("Düsen-Material-Datei lesen (ok/fehlt/kaputt/Struktur/Farbe)",
+     test_remain_laden),
+    ("Düsen-Material-Datei schreiben (atomar, nur nach FLUSH/Änderung)",
+     test_remain_schreiben),
+    ("Slicer-Matrix parsen (Kopf/Ende, 16×16 asymmetrisch)",
+     test_matrix_parsen),
+    ("FLUSH flush_mode matrix (TOOL, nur printing, Rückfälle)",
+     test_matrix_flush),
+    ("Makro M600 -> PAUSE", test_makro_m600),
     ("Python-3.9-Syntax", test_python39),
 ]
 

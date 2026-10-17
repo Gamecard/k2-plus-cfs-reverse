@@ -33,6 +33,12 @@ MATDB_QUELLE=""
 MATDB_REL=k2/material_database.json
 MATDB_STOCK_BENUTZER=/mnt/UDISK/creality/userdata/box/material_database.json
 MATDB_STOCK_DEFAULT=/etc/sysConfig/defData/material/material_database.json
+REMAIN_QUELLE=""
+# Material in der Düse (Stock RemainMaterial, nur color/type): fester Zielpfad =
+# Default von [k2_box] remain_material_file. k2_box schreibt die Datei im Betrieb
+# selbst – install.sh überschreibt sie NUR mit --remain-material.
+REMAIN_REL=k2/remain_material.json
+REMAIN_STOCK=/mnt/UDISK/creality/userdata/box/remain_material_data.json
 
 hilfe() {
   cat <<'EOF'
@@ -50,6 +56,12 @@ Aufruf: ./install.sh [Optionen]
                              nach CONFIG_DIR/k2/material_database.json kopieren
                              (geprüft: JSON + Struktur; vorhandene Datei kommt ins Backup).
                              Ohne Option bleibt eine vorhandene Datei unverändert.
+  --remain-material DATEI    Stock-Datei remain_material_data.json (Material in der Düse,
+                             vorher vom Stock-Drucker geholt) als Startwert nach
+                             CONFIG_DIR/k2/remain_material.json kopieren (geprüft: JSON,
+                             Struktur, Farbe 0RRGGBB/null; vorhandene Datei kommt ins Backup).
+                             Ohne Option bleibt eine vorhandene Datei unverändert
+                             (k2_box schreibt sie im Betrieb selbst).
   --dienst NAME              systemd-Dienst (Standard: klipper, automatisch erkannt)
   --starten                  Klipper-Dienst am Ende starten (Standard: bleibt gestoppt)
   --ohne-tests               Offline-Tests überspringen
@@ -70,6 +82,7 @@ while [ $# -gt 0 ]; do
     --duese-serial) [ $# -ge 2 ] || { echo "FEHLER: $1 braucht einen Wert" >&2; exit 2; }; SET_ARGS+=(--set "mcu nozzle_mcu=$2"); shift ;;
     --rs485-serial) [ $# -ge 2 ] || { echo "FEHLER: $1 braucht einen Wert" >&2; exit 2; }; SET_ARGS+=(--set "k2_485=$2"); shift ;;
     --material-db)  [ $# -ge 2 ] || { echo "FEHLER: $1 braucht einen Wert" >&2; exit 2; }; MATDB_QUELLE=$2; shift ;;
+    --remain-material) [ $# -ge 2 ] || { echo "FEHLER: $1 braucht einen Wert" >&2; exit 2; }; REMAIN_QUELLE=$2; shift ;;
     --dienst)       [ $# -ge 2 ] || { echo "FEHLER: $1 braucht einen Wert" >&2; exit 2; }; DIENST=$2; shift ;;
     --starten)      STARTEN=1 ;;
     --ohne-tests)   TESTS=0 ;;
@@ -117,6 +130,7 @@ ok "Klipper unter $KLIPPER_DIR"
 [ -d "$CONFIG_DIR" ] || fehler "Config-Ordner fehlt: $CONFIG_DIR"
 ok "Config-Ordner $CONFIG_DIR"
 MATDB_ZIEL=$CONFIG_DIR/$MATDB_REL
+REMAIN_ZIEL=$CONFIG_DIR/$REMAIN_REL
 
 # Materialdatenbank prüfen: Exit 0 = ok, Ausgabe = Zählwerte (material_db.py --struktur)
 matdb_pruefen() {
@@ -130,6 +144,39 @@ matdb_pruefen() {
 }
 matdb_wert() { printf '%s\n' "$1" | sed -n "s/^$2: //p"; }
 
+# remain_material-Datei prüfen (Stock-Format {"remain_material": {"color": "0RRGGBB"|null,
+# "type": "<id>"|null}}, Zusatzschlüssel erlaubt). Exit 0 = ok, Ausgabe "color: …"/"type: …",
+# sonst Ausgabe = Grund.
+remain_pruefen() {
+  python3 -I - "$1" <<'PY'
+import json, re, sys
+def nein(grund):
+    print(grund); sys.exit(1)
+try:
+    with open(sys.argv[1], encoding="utf-8") as f:
+        d = json.load(f)
+except Exception as e:
+    nein("kein gültiges JSON (%s)" % type(e).__name__)
+if not isinstance(d, dict):
+    nein("oberste Ebene ist kein JSON-Objekt")
+if "remain_material" not in d:
+    nein("Schlüssel remain_material fehlt")
+r = d["remain_material"]
+if not isinstance(r, dict):
+    nein("remain_material ist kein Objekt")
+for k in ("color", "type"):
+    if k not in r:
+        nein("remain_material.%s fehlt" % k)
+c, t = r["color"], r["type"]
+if c is not None and not (isinstance(c, str) and re.fullmatch(r"0[0-9A-Fa-f]{6}", c)):
+    nein("remain_material.color weder null noch 0RRGGBB: %r" % (c,))
+if t is not None and not (isinstance(t, str) and t.strip()):
+    nein("remain_material.type weder null noch Text: %r" % (t,))
+print("color: %s" % (c if c is not None else "null"))
+print("type: %s" % (t if t is not None else "null"))
+PY
+}
+
 command -v python3 >/dev/null || fehler "python3 fehlt (für k2cfg.py / Material-DB-Prüfung)"
 if [ -n "$MATDB_QUELLE" ]; then
   [ -f "$MATDB_QUELLE" ] && [ -r "$MATDB_QUELLE" ] || fehler "--material-db: Datei nicht lesbar: $MATDB_QUELLE"
@@ -139,6 +186,14 @@ if [ -n "$MATDB_QUELLE" ]; then
   [ "$(matdb_wert "$MATDB_REP" keine_objekte)" = 0 ] || warn "Material-DB: $(matdb_wert "$MATDB_REP" keine_objekte) Listeneinträge sind keine Objekte (werden ignoriert)"
   [ "$(matdb_wert "$MATDB_REP" unlesbar_kv.nozzle_temperature)" = 0 ] \
     || info "Material-DB: $(matdb_wert "$MATDB_REP" unlesbar_kv.nozzle_temperature) Einträge ohne lesbare nozzle_temperature (Stock-Fallback 220 °C)"
+fi
+if [ -n "$REMAIN_QUELLE" ]; then
+  [ -f "$REMAIN_QUELLE" ] && [ -r "$REMAIN_QUELLE" ] || fehler "--remain-material: Datei nicht lesbar: $REMAIN_QUELLE"
+  REMAIN_QUELLE=$(cd "$(dirname "$REMAIN_QUELLE")" && pwd)/$(basename "$REMAIN_QUELLE")
+  REMAIN_REP=$(remain_pruefen "$REMAIN_QUELLE") || fehler "--remain-material $REMAIN_QUELLE: $REMAIN_REP – nichts verändert"
+  ok "remain_material $REMAIN_QUELLE: color $(matdb_wert "$REMAIN_REP" color), type $(matdb_wert "$REMAIN_REP" type)"
+  [ "$(matdb_wert "$REMAIN_REP" color)$(matdb_wert "$REMAIN_REP" type)" != nullnull ] \
+    || info "remain_material: color und type null (Stock-Grundzustand) – Düsenmaterial bleibt unbekannt"
 fi
 
 FREI=$(df -Pk "$HOME" | awk 'NR==2 {print $4}')
@@ -319,6 +374,40 @@ else
   info "keine Material-DB ($MATDB_REL) – k2_box nutzt Festwerte; Holen s. Zusammenfassung"
 fi
 echo "MATDB_STATUS=$MATDB_STATUS" >> "$BK/state.env"
+# Material in der Düse (nie im Paket; nur mit --remain-material kopiert, sonst
+# gehört die Datei k2_box, das sie im Betrieb schreibt)
+REMAIN_STATUS=fehlt
+if [ -e "$REMAIN_ZIEL" ]; then
+  mkdir -p "$BK/remain-material"
+  cp -a "$REMAIN_ZIEL" "$BK/remain-material/remain_material.json"
+  echo "REMAIN_BACKUP=1" >> "$BK/state.env"
+fi
+if [ -n "$REMAIN_QUELLE" ]; then
+  if [ -f "$REMAIN_ZIEL" ] && cmp -s "$REMAIN_QUELLE" "$REMAIN_ZIEL"; then
+    REMAIN_STATUS=unveraendert; chmod 0644 "$REMAIN_ZIEL"
+    ok "remain_material $REMAIN_REL identisch mit --remain-material – unverändert"
+  else
+    [ -e "$REMAIN_ZIEL" ] && REMAIN_STATUS=ersetzt || REMAIN_STATUS=neu
+    [ $REMAIN_STATUS = ersetzt ] && warn "vorhandene $REMAIN_REL (ggf. von k2_box im Betrieb geschrieben) wird durch --remain-material ersetzt"
+    mkdir -p "$(dirname "$REMAIN_ZIEL")"
+    install -m 0644 "$REMAIN_QUELLE" "$REMAIN_ZIEL.k2tmp"
+    mv -f "$REMAIN_ZIEL.k2tmp" "$REMAIN_ZIEL"
+    cmp -s "$REMAIN_QUELLE" "$REMAIN_ZIEL" || fehler "Kopie remain_material fehlerhaft"
+    echo "$REMAIN_REL" >> "$BK/config-installiert.txt"
+    ok "remain_material -> $REMAIN_REL ($REMAIN_STATUS$([ $REMAIN_STATUS = ersetzt ] && echo ", alte Datei: $BK/remain-material/"), 0644)"
+  fi
+elif [ -e "$REMAIN_ZIEL" ]; then
+  REMAIN_STATUS=vorhanden
+  if R=$(remain_pruefen "$REMAIN_ZIEL"); then
+    ok "remain_material $REMAIN_REL vorhanden, bleibt (color $(matdb_wert "$R" color), type $(matdb_wert "$R" type))"
+  else
+    REMAIN_STATUS=defekt
+    warn "remain_material $REMAIN_REL vorhanden, aber unbrauchbar ($R) – bleibt unverändert; k2_box startet dann ohne bekanntes Düsenmaterial"
+  fi
+else
+  info "keine $REMAIN_REL – Düsenmaterial nach Start unbekannt (erste Spülung pauschal); Holen s. Zusammenfassung"
+fi
+echo "REMAIN_STATUS=$REMAIN_STATUS" >> "$BK/state.env"
 if [ -e "$CONFIG_DIR/mainsail.cfg" ]; then
   info "mainsail.cfg vorhanden, wird von der K2-printer.cfg absichtlich NICHT eingebunden"
   info "(eigene PAUSE/RESUME/CANCEL_PRINT + [virtual_sdcard]/[pause_resume]/[display_status] in der K2-Config)"
@@ -388,6 +477,7 @@ ZUSAMMENFASSUNG
   Module:    $E/k2_*.py + k2_nachbau/
   Config:    $CONFIG_DIR (Hauptdatei $PZIEL)
   Mat.-DB:   $MATDB_REL: $MATDB_STATUS
+  Düse:      $REMAIN_REL: $REMAIN_STATUS
   Backup:    $BK   (Rückbau: $BK/uninstall.sh  bzw.  ./uninstall.sh)
   Prüfungen: Tests $([ $TESTS -eq 1 ] && echo grün || echo übersprungen), Batch $([ $BATCH -eq 1 ] && echo 'EXIT 0' || echo übersprungen)
   Dienst:    $([ $STARTEN -eq 1 ] && echo gestartet || echo gestoppt)
@@ -418,6 +508,15 @@ holen (solange das Stock-Upper-Board läuft), dann erneut installieren:
   scp root@<drucker>:$MATDB_STOCK_BENUTZER .
   ./install.sh --material-db material_database.json [übrige Optionen]
   Fehlt dort die Benutzer-Kopie: Firmware-Default $MATDB_STOCK_DEFAULT
+EOF
+;; esac
+case "$REMAIN_STATUS" in fehlt|defekt)
+  cat <<EOF
+
+remain_material ($REMAIN_STATUS): Material in der Düse (Farbe/Typ) als Startwert vom
+Stock-Drucker übernehmen (optional; sonst spült der erste Wechsel pauschal):
+  scp root@<drucker>:$REMAIN_STOCK .
+  ./install.sh --remain-material remain_material_data.json [übrige Optionen]
 EOF
 ;; esac
 cat <<'EOF'

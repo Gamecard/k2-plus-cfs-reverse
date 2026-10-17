@@ -162,8 +162,24 @@ mit echtem Port, `KTWO_BOX_STATUS` liefert Zustand/Hub/Temp.
   220) – EXTRUDE/FLUSH bekommen `BASE_TEMP=` (NOTIZ-reinigung-resume §7).
 - **Reactor:** lange Box-Antworten laufen über `ReactorBusProxy` in einem
   Hilfs-Thread; am Gerät prüfen, dass Heizung/MCU dabei stabil bleiben.
-- **Mehrere Boxen**, WASTE-Prüfung, Slicer-Spülmatrix (`flush_volumes_matrix`
-  im G-Code-Kopf, Stock im Druck): nicht umgesetzt. Farbabhängige
+- **Mehrere Boxen**, WASTE-Prüfung: nicht umgesetzt. Farbabhängige
   Spülmengen (RFID-Farbe): seit 17.10.2026 abends umgesetzt.
+- **Slicer-Spülmatrix** (17.10.2026, README-k2_box.md §12.4): `[k2_box]
+  flush_mode: matrix` (Default `color`) liest `; flush_volumes_matrix =` /
+  `; flush_multiplier =` aus Kopf + Ende der laufenden Druckdatei (je
+  256 KiB) und nutzt `M[alt][neu]/2,4·m` + Stock-Nachbearbeitung – nur im
+  Zustand `printing`, Index aus `TOOL=<n>` (T<n>-Makro bzw. `M8200 L I<n>`
+  reichen ihn an `KTWO_BOX_FLUSH` durch); sonst bzw. bei Fehlern WARNUNG/
+  HINWEIS + Farbweg. Zeilenform der Orca-Datei = ANNAHME, erst nach Prüfung
+  am ersten Orca-Mehrfarbdruck einschalten.
+- **Material in der Düse persistent** (17.10.2026, README §12.4):
+  `remain_material_file` (Default `~/printer_data/config/k2/
+  remain_material.json`, leer = aus), Stock-Format, gelesen bei
+  `klippy:connect`, geschrieben nur nach erfolgreichem FLUSH bei Änderung
+  (atomar); kaputte Datei → WARNUNG + `.defekt-<zeit>`, nie überschrieben.
+  Korrektur von Hand: `KTWO_BOX_REMAIN [COLOR=] [TYPE=] [TNN=] [CLEAR=1]`
+  (Nicht-Stock).
+- **M600** aus der Druckdatei → `PAUSE` (Makro in `macros.cfg`, wie Stock
+  `virtual_sdcard`), außerhalb eines Drucks nur Meldung.
 - **Auto-Nachladen** (Stock `BOX_CHECK_MATERIAL_REFILL`): **umgesetzt 16.10.2026** als
   `KTWO_BOX_RUNOUT` (Default aus, `runout_refill`), siehe `NOTIZ-runout.md`.

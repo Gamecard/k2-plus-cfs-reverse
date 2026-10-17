@@ -104,12 +104,18 @@ Glied der Makrokette (config-pi/macros.cfg: T0–T15, M8200):
   dazwischen Extruder-Rückzug Tn_retrude (live 3× −10 mm).
 - ``KTWO_BOX_EXTRUDE TNN=T1A|SLOT=A`` (= M8200 L I0): Box-Einzug bis zum
   Kopfsensor, Stage 7 (Extruder greift), Box PRINT.
-- ``KTWO_BOX_FLUSH [TNN=] [LENGTH=] [VELOCITY=] [TEMP=|BASE_TEMP=]``
+- ``KTWO_BOX_FLUSH [TNN=] [TOOL=n] [LENGTH=] [VELOCITY=] [TEMP=|BASE_TEMP=]``
   (= M8200 F): Spülen wie Stock (17.10.2026, FLUSH-BEFUND-2026-10-17.md):
   Menge farbabhängig (nachbau/flush.py, unbekannt -> 90 + 70 mm),
   Abschnitte cal_flush_list, 20 % v + 80 % 1,2·v, Temperatur/Geschwindig-
   keit aus der Material-DB (``material_database``, aus = bisher), Blasen,
   Blech nach jedem Abschnitt, Silikon-Kreise nur am Ende (README §12).
+  ``flush_mode: matrix`` (Default color): im Druck Slicer-Spülmatrix aus
+  der Druckdatei, Index TOOL= (README §12.4). Nach Erfolg Düsen-Material
+  merken, mit ``remain_material_file`` atomar gespeichert (nur bei
+  Änderung; Stock remain_material.save).
+- ``KTWO_BOX_REMAIN [COLOR=] [TYPE=] [TNN=] [CLEAR=1]`` (Nicht-Stock):
+  Düsen-Material anzeigen/korrigieren.
 - ``KTWO_BOX_WIPE`` (Abstreifen, Stock-T0-Beispiel 10.1–10.3),
   ``KTWO_BOX_WASTE`` (= M8200 W, hier nur Hinweis),
   ``KTWO_BOX_END_OPT [RETURN=0|1]`` (= M8200 O), ``KTWO_BOX_WAIT``
@@ -166,9 +172,11 @@ G-Code-Fehler. Lange Box-Antworten (mode 0 ~4,5 s, 0x11 p1 bis 23 s) laufen
 in einem Hilfs-Thread, der Reactor pausiert derweil (ReactorBusProxy).
 """
 
+import json
 import logging
 import math
 import os
+import re
 import struct
 import threading
 import time
@@ -368,7 +376,14 @@ CHANGE_DEFAULTS = {
     "runout_tail_velocity": 600.0,
 }
 CHANGE_INT_KEYS = ("wipe_shakes", "max_temp_flush_times")
-FLUSH_MODES = ("color", "fixed")
+FLUSH_MODES = ("color", "fixed", "matrix")
+# Düsen-Material persistent (REMAIN-MATERIAL-BEFUND-2026-10-17.md §6):
+# Default-Pfad (leer = aus); Stock: /mnt/UDISK/creality/userdata/box/
+# remain_material_data.json, gleiches Format.
+REMAIN_MATERIAL_FILE_DEFAULT = "~/printer_data/config/k2/remain_material.json"
+# Slicer-Spülmatrix (SDCARD-GCODEMOVE-BEFUND-2026-10-17.md D.1): so viel
+# von Kopf und Ende der laufenden G-Code-Datei durchsuchen.
+MATRIX_SCAN_BYTES = 256 * 1024
 FLUSH_CLEAN_MODES = ("stock", "legacy")
 # Stock-Fallback der RESUME-Vorextrusion ohne Materialdaten:
 # [filament_rack] velocity 360 (OHNE ·60) · 0,8 = 288 mm/min (B.3/B.5)
@@ -647,7 +662,7 @@ def flush_cfg(c):
 
 
 def plan_flush_lengths(c, length=None, src_color=None, dst_color=None,
-                       different=False):
+                       different=False, matrix=None):
     """Spül-Abschnitte -> (Liste mm, Begründung).
 
     flush_mode color (Stock MCMBW.get_flush_len + BoxAction.get_flush_len +
@@ -658,12 +673,17 @@ def plan_flush_lengths(c, length=None, src_color=None, dst_color=None,
     Stock) -> cal_flush_list -> [90, 70] = bisheriges Ergebnis. LENGTH> 0 ->
     cal_flush_list(LENGTH) (Stock teilt jede Länge so).
     flush_mode fixed (bzw. flush.py fehlt / box_*_clean_length 0): wie bis
-    17.10. (flush_segments)."""
+    17.10. (flush_segments).
+    flush_mode matrix: matrix = {"len": Rohlänge M[alt][neu]/2,4·m, "why":
+    Text} aus slicer_matrix_flush (nur im Druck, sonst None) -> dieselbe
+    Stock-Nachbearbeitung finish_flush_len (anders ×2/min 370, sonst min
+    160) -> cal_flush_list; matrix None -> wie color (Stock-Rückfall)."""
     mode = c.get("flush_mode", "color")
     first = float(c["box_first_clean_length"])
     need = float(c["box_need_clean_length"])
-    if mode != "color" or _FLUSH is None or first <= 0 or need <= 0:
-        if mode != "color":
+    if mode not in ("color", "matrix") or _FLUSH is None or first <= 0 \
+            or need <= 0:
+        if mode not in ("color", "matrix"):
             why = "flush_mode fixed"
         elif _FLUSH is None:
             why = "nachbau/flush.py fehlt – fest"
@@ -683,6 +703,17 @@ def plan_flush_lengths(c, length=None, src_color=None, dst_color=None,
         except (TypeError, ValueError):  # Stock convert_scv -> False
             return None
 
+    if mode == "matrix" and matrix is not None:
+        raw = float(matrix["len"])
+        total = _FLUSH.finish_flush_len(raw, bool(different), fc)
+        why = ("%s -> %s mm%s -> %s mm" % (
+            matrix.get("why") or "Slicer-Matrix", _n(raw),
+            " (anderes Material: ×2, min %s)" % _n(
+                fc["diff_material_type_min_flush_len"]) if different
+            else " (min %s)" % _n(fc["box_first_clean_length"]
+                                  + fc["box_need_clean_length"]),
+            _n(total)))
+        return [float(x) for x in _FLUSH.cal_flush_list(float(total), fc)], why
     scv, tcv = _parse(src_color), _parse(dst_color)
     if scv is None or tcv is None:
         total = fc["Tn_extrude"]
@@ -697,6 +728,301 @@ def plan_flush_lengths(c, length=None, src_color=None, dst_color=None,
                       fc["diff_material_type_min_flush_len"])
                   if different else "", _n(total)))
     return [float(x) for x in _FLUSH.cal_flush_list(float(total), fc)], why
+
+
+# ---------------------------------------------------------------------
+# Slicer-Spülmatrix aus der laufenden G-Code-Datei (flush_mode matrix)
+# ---------------------------------------------------------------------
+# Beleg: SDCARD-GCODEMOVE-BEFUND-2026-10-17.md A.2/A.3/D.1 (Stock
+# get_flush_length_from_gcode Z.4357–4406; Matrix flach, zeilenweise, n²,
+# Index [alt][neu] = Slicer-Werkzeug T<n>, Länge = V/2,4·flush_multiplier
+# OHNE nozzle_volume). Stock liest sie über Crealitys metadata.py
+# (virtual_sdcard.get_gcode_flush_para) – Upstream hat das nicht, k2_box
+# liest die Kommentarzeilen selbst. Zeilenform (Orca-CONFIG_BLOCK)
+# ``; flush_volumes_matrix = 0,569,...`` / ``; flush_multiplier = 1.3`` =
+# ANNAHME, am ersten echten Orca-Mehrfarbdruck prüfen.
+_MATRIX_RE = re.compile(r"^[ \t]*;[ \t]*flush_volumes_matrix[ \t]*=[ \t]*"
+                        r"([^\r\n]*)$", re.M)
+_MULT_RE = re.compile(r"^[ \t]*;[ \t]*flush_multiplier[ \t]*=[ \t]*"
+                      r"([^\r\n]*)$", re.M)
+
+
+def parse_flush_matrix_text(text):
+    """Text (Kopf oder Ende einer G-Code-Datei) -> (matrix, multiplier).
+
+    matrix = flache Liste float (letzte Fundstelle) oder None;
+    multiplier = float (erster Wert, falls kommagetrennt) oder None.
+    ValueError bei unlesbaren Zahlen."""
+    mat = mult = None
+    found = _MATRIX_RE.findall(text or "")
+    if found:
+        raw = found[-1].strip().strip('"')
+        vals = [v.strip() for v in raw.replace(";", ",").split(",")]
+        vals = [v for v in vals if v]
+        try:
+            mat = [float(v) for v in vals]
+        except ValueError:
+            raise ValueError("flush_volumes_matrix nicht lesbar: %r"
+                             % (raw[:60],))
+        if any(not math.isfinite(v) or v < 0 for v in mat):
+            raise ValueError("flush_volumes_matrix enthält ungültige Werte")
+    found = _MULT_RE.findall(text or "")
+    if found:
+        raw = found[-1].strip().strip('"').split(",")[0].strip()
+        try:
+            mult = float(raw)
+        except ValueError:
+            raise ValueError("flush_multiplier nicht lesbar: %r" % (raw[:30],))
+        if not math.isfinite(mult) or mult < 0:
+            raise ValueError("flush_multiplier ungültig: %r" % (raw,))
+    return mat, mult
+
+
+def read_flush_matrix(path, scan_bytes=MATRIX_SCAN_BYTES):
+    """Spülmatrix aus Kopf UND Ende einer G-Code-Datei -> dict
+    {matrix, multiplier, n, where}; ValueError/OSError bei Fehlern.
+
+    Liest höchstens scan_bytes vom Anfang und vom Ende (kleine Dateien
+    ganz). Ende hat Vorrang (Orca-CONFIG_BLOCK), sonst Kopf; Multiplikator
+    aus derselben Stelle, sonst aus der anderen, sonst None (= 1 wie Stock).
+    Prüfung wie Stock: Matrix vorhanden + Länge Quadratzahl."""
+    size = os.path.getsize(path)
+    with open(path, "rb") as fh:
+        if size <= 2 * scan_bytes:
+            head, tail = fh.read(), b""
+        else:
+            head = fh.read(scan_bytes)
+            fh.seek(size - scan_bytes)
+            tail = fh.read(scan_bytes)
+            # angeschnittene Zeilen an den Fenstergrenzen verwerfen
+            head = head[:head.rfind(b"\n") + 1] if b"\n" in head else b""
+            tail = tail[tail.find(b"\n") + 1:] if b"\n" in tail else b""
+    th = head.decode("utf-8", "replace")
+    tt = tail.decode("utf-8", "replace")
+    m_t, k_t = parse_flush_matrix_text(tt)
+    m_h, k_h = parse_flush_matrix_text(th)
+    if m_t is not None:
+        mat, where = m_t, "Dateiende" if tail else "Datei"
+        mult = k_t if k_t is not None else k_h
+    elif m_h is not None:
+        mat, where = m_h, "Dateikopf" if tail else "Datei"
+        mult = k_h if k_h is not None else k_t
+    else:
+        raise ValueError("keine '; flush_volumes_matrix =' in Kopf/Ende "
+                         "(je %d KiB)" % (scan_bytes // 1024))
+    if not mat:
+        raise ValueError("flush_volumes_matrix leer (Stock: gcode has no "
+                         "flush parameters)")
+    n = int(round(math.sqrt(len(mat))))
+    if n * n != len(mat):
+        raise ValueError("flush_volumes_matrix mit %d Werten nicht quadratisch "
+                         "(Stock: flushing parameter format is abnormal)"
+                         % len(mat))
+    return {"matrix": mat, "multiplier": mult, "n": n, "where": where}
+
+
+def slicer_matrix_flush(info, old_idx, new_idx):
+    """Rohlänge aus der Matrix (Stock get_flush_length_from_gcode, Rechnung
+    nachbau/flush.py gcode_matrix_flush_len) -> (Länge, Text); ValueError
+    bei Index außerhalb (Stock: box address does not comply)."""
+    if _FLUSH is None:
+        raise ValueError("nachbau/flush.py fehlt")
+    n = int(info["n"])
+    for name, i in (("alt", old_idx), ("neu", new_idx)):
+        if not isinstance(i, int) or isinstance(i, bool) or not 0 <= i < n:
+            raise ValueError("Werkzeug %s T%s außerhalb der %dx%d-Matrix"
+                             % (name, i, n, n))
+    mult = info.get("multiplier")
+    ln = _FLUSH.gcode_matrix_flush_len(info["matrix"], old_idx, new_idx, mult)
+    if ln is None:  # pragma: no cover – oben schon geprüft
+        raise ValueError("Matrix-Formfehler")
+    vol = info["matrix"][old_idx * n + new_idx]
+    why = ("Slicer-Matrix [%d][%d] = %s mm³ / 2,4 × %s (%s)" % (
+        old_idx, new_idx, _n(vol), _n(1 if mult is None else mult),
+        info.get("where", "Datei")))
+    return float(ln), why
+
+
+# ---------------------------------------------------------------------
+# Düsen-Material persistent (remain_material_file)
+# ---------------------------------------------------------------------
+# Beleg: REMAIN-MATERIAL-BEFUND-2026-10-17.md §1/§4/§6 + Nachtrag: Stock
+# RemainMaterial liest die Datei einmal beim Start und schreibt nach jedem
+# erfolgreichen Spülen {"remain_material": {"color": "0RRGGBB"|null,
+# "type": "<id>"|null}}. Hier robuster: jeder Lesefehler = Warnung +
+# unbekannt (nie Config-Fehler), kaputte Datei wird NICHT überschrieben,
+# sondern nach <datei>.defekt-<JJJJMMTT-hhmmss> umbenannt; Schreiben atomar.
+REMAIN_COLOR_RE = re.compile(r"^0[0-9A-Fa-f]{6}$")
+_REMAIN_TYPE_RE = re.compile(r"^[0-9A-Za-z_.-]{1,32}$")
+# Stock ignore_ops (MCMBW.get_flush_len): solche Farben = unbekannt
+_REMAIN_IGNORE = ("-1", "none", "unknown", "")
+
+
+def remain_path(raw):
+    """Option -> absoluter Pfad ('' = aus), Tilde aufgelöst."""
+    raw = str(raw or "").strip()
+    return os.path.abspath(os.path.expanduser(raw)) if raw else ""
+
+
+def normalize_remain_color(value):
+    """'0RRGGBB' / 'RRGGBB' / '#RRGGBB' -> '0RRGGBB' (groß); None/'-1'/
+    'none'/'unknown'/'' -> None; sonst ValueError."""
+    if value is None:
+        return None
+    s = str(value).strip()
+    if s.lower() in _REMAIN_IGNORE:
+        return None
+    if REMAIN_COLOR_RE.match(s):
+        return s.upper()
+    if re.match(r"^#?[0-9A-Fa-f]{6}$", s):
+        return "0" + s.lstrip("#").upper()
+    raise ValueError("Farbe muss 0RRGGBB sein: %r" % (value,))
+
+
+def normalize_remain_type(value):
+    """Material-ID (Stock material_type bzw. RFID mat_id) -> str oder None."""
+    if value is None:
+        return None
+    s = str(value).strip()
+    if s.lower() in ("", "none", "null"):
+        return None
+    if not _REMAIN_TYPE_RE.match(s):
+        raise ValueError("Typ muss 1-32 Zeichen [0-9A-Za-z_.-] sein: %r"
+                         % (value,))
+    return s
+
+
+def _remain_quarantine(path, now=None):
+    """Kaputte Datei beiseitelegen (nie überschreiben) -> neuer Name/None."""
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(now))
+    dst = "%s.defekt-%s" % (path, stamp)
+    k = 1
+    while os.path.exists(dst):
+        k += 1
+        dst = "%s.defekt-%s-%d" % (path, stamp, k)
+    try:
+        os.rename(path, dst)
+        return dst
+    except OSError:
+        return None
+
+
+def load_remain_material(path):
+    """remain_material_file lesen -> (remain dict oder None, Status, Text).
+
+    Status: 'aus' (Pfad leer), 'fehlt', 'geladen', 'fehler'. remain =
+    {"type", "color", "tnn"} (tnn optional, Stock-Datei ohne -> "").
+    Fehler (unlesbar, kein JSON, falsche Struktur, ungültige Farbe/Typ) ->
+    None + Warnungstext; Inhaltsfehler -> Datei umbenannt (.defekt-…)."""
+    p = remain_path(path)
+    if not p:
+        return None, "aus", ""
+    if not os.path.exists(p):
+        return None, "fehlt", ("Düsen-Material-Datei %s fehlt – Material in "
+                               "der Düse unbekannt (wird nach dem nächsten "
+                               "Spülen angelegt)" % p)
+    try:
+        with open(p, "r", encoding="utf-8") as fh:
+            raw = fh.read()
+    except (OSError, UnicodeDecodeError) as exc:
+        return None, "fehler", ("Düsen-Material-Datei %s nicht lesbar (%s) – "
+                                "Material unbekannt" % (
+                                    p, exc.__class__.__name__))
+    try:
+        data = json.loads(raw)
+        if not isinstance(data, dict) or not isinstance(
+                data.get("remain_material"), dict):
+            raise ValueError("Struktur muss {\"remain_material\": {\"color\": "
+                             "…, \"type\": …}} sein")
+        rm = data["remain_material"]
+        if "color" not in rm or "type" not in rm:
+            raise ValueError("Schlüssel color/type fehlen")
+        color = normalize_remain_color(rm.get("color"))
+        mtype = normalize_remain_type(rm.get("type"))
+    except ValueError as exc:   # json.JSONDecodeError ist ValueError
+        moved = _remain_quarantine(p)
+        return None, "fehler", (
+            "Düsen-Material-Datei %s ungültig (%s) – Material unbekannt; %s" % (
+                p, str(exc)[:120], ("beiseitegelegt als %s" % moved) if moved
+                else "Umbenennen fehlgeschlagen, Datei bleibt unverändert"))
+    tnn, note = "", ""
+    raw_tnn = rm.get("tnn")
+    if raw_tnn not in (None, ""):
+        try:
+            tnn = parse_tnn(raw_tnn)[3]
+        except ValueError:
+            note = ", tnn %r ignoriert" % (raw_tnn,)
+    return ({"type": mtype, "color": color, "tnn": tnn}, "geladen",
+            "Düsen-Material aus %s: Farbe %s, Typ %s%s%s" % (
+                p, color or "unbekannt", mtype or "unbekannt",
+                (", %s" % tnn) if tnn else "", note))
+
+
+def remain_key(remain):
+    """Vergleichswert der persistierten Felder (Schreiben nur bei Änderung)."""
+    r = remain or {}
+    col = r.get("color")
+    return ((str(col).upper() if col else None), r.get("type") or None,
+            r.get("tnn") or "")
+
+
+def save_remain_material(path, remain):
+    """Atomar schreiben (tmp im selben Verzeichnis, flush+fsync, os.replace,
+    Verzeichnis-fsync, makedirs). Andere Top-Level-Schlüssel einer gültigen
+    Datei bleiben (wie Stock read-modify-write); eine kaputte vorhandene
+    Datei wird vorher beiseitegelegt. Ausnahmen gehen an den Aufrufer."""
+    p = remain_path(path)
+    if not p:
+        raise ValueError("remain_material_file ist aus")
+    d = os.path.dirname(p)
+    os.makedirs(d, exist_ok=True)
+    data = {}
+    if os.path.exists(p):
+        try:
+            with open(p, "r", encoding="utf-8") as fh:
+                old = json.load(fh)
+        except (OSError, ValueError):
+            old = None
+        if isinstance(old, dict):
+            data = old
+        elif _remain_quarantine(p) is None:
+            # kaputte Datei NIE überschreiben (Umbenennen unmöglich)
+            raise OSError("vorhandene Datei ungültig und nicht umbenennbar")
+    col, mtype, tnn = remain_key(remain)
+    try:
+        col = normalize_remain_color(col)
+    except ValueError:
+        col = None
+    try:
+        mtype = normalize_remain_type(mtype)
+    except ValueError:
+        mtype = None
+    inner = {"color": col, "type": mtype}
+    if tnn:
+        inner["tnn"] = tnn
+    data["remain_material"] = inner
+    tmp = p + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)   # Stock-Form (json.dump ohne indent)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, p)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    try:
+        fd = os.open(d, getattr(os, "O_DIRECTORY", 0) | os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+    return p
 
 
 def flush_velocity_base(c, vol=None, nozzle=None):
@@ -1036,7 +1362,10 @@ def parse_options(opts):
     - Runout/RESUME: runout_refill, runout_require_color, runout_resume,
       resume_redo_change (Default False, s. cmd_resume_check).
     - Material/Spülen (17.10.2026, README-k2_box.md §12): material_database
-      (Pfad, Default leer = aus), flush_mode color|fixed (Default color),
+      (Pfad, Default leer = aus), flush_mode color|fixed|matrix (Default
+      color; matrix = Slicer-Spülmatrix aus der Druckdatei, sonst color),
+      remain_material_file (Pfad, Default
+      ~/printer_data/config/k2/remain_material.json, leer = aus),
       flush_clean stock|legacy (Default stock), flush_blow (Default True),
       flush_blow_fan (Default fan0), flush_clog_check (Default False) und
       die Stock-[box]-Werte nozzle_volume, flush_multiplier, … (s. oben).
@@ -1098,6 +1427,10 @@ def parse_options(opts):
         # -> Tn_extrude 140 -> [90, 70] wie bisher); fixed = immer
         # [box_first, box_need] bzw. LENGTH= in box_first-Stücken (bis 17.10.)
         "flush_mode": _str("flush_mode", "color").lower(),
+        # Düsen-Material über Neustarts (Stock remain_material_data.json,
+        # REMAIN-MATERIAL-BEFUND §6). Leer = aus (nur im Speicher).
+        "remain_material_file": _str("remain_material_file",
+                                     REMAIN_MATERIAL_FILE_DEFAULT),
         # Reinigung je Abschnitt: stock = Blech zwischen den Abschnitten,
         # Silikon-Kreise nur am Ende; legacy = volles Abstreifen nach jedem
         "flush_clean": _str("flush_clean", "stock").lower(),
@@ -1216,7 +1549,7 @@ def parse_klipper_config(config):
                "filament_sensor", "cut_sensor", "runout_refill",
                "runout_require_color", "runout_resume",
                "resume_redo_change", "material_database", "flush_mode",
-               "flush_clean", "flush_blow", "flush_blow_fan",
+               "remain_material_file", "flush_clean", "flush_blow", "flush_blow_fan",
                "flush_clog_check")
               + tuple(CHANGE_DEFAULTS)):
         if k not in opts:
@@ -1889,14 +2222,32 @@ class PrinterK2Box:
             except Exception:
                 pass
         # Material in der Düse (Stock box_action.remain_material: color/type
-        # nach jedem erfolgreichen Spülen, remain_material.save). Nur im
-        # Speicher (Stock persistiert) – nach dem Start unbekannt.
+        # nach jedem erfolgreichen Spülen, remain_material.save). Persistent
+        # über remain_material_file (Stock remain_material_data.json,
+        # REMAIN-MATERIAL-BEFUND §6): gelesen EINMAL bei klippy:connect,
+        # geschrieben nur nach erfolgreichem FLUSH (bzw. KTWO_BOX_REMAIN)
+        # und nur bei Änderung. Leer = aus: nach dem Start unbekannt.
         self.remain_material = {"type": None, "color": None, "tnn": ""}
+        self.remain_file = remain_path(self.cfg.get("remain_material_file"))
+        self.remain_load = "aus" if not self.remain_file else "ungelesen"
+        self.remain_info = ""
+        self._remain_saved = None      # remain_key() des Dateiinhalts
+        self._remain_loaded = False
+        # Slicer-Spülmatrix (flush_mode matrix): Cache (Pfad, Größe, mtime)
+        # -> Ergebnis/Fehlertext; Reset bei virtual_sdcard:reset_file.
+        self._matrix_cache = None
         self.flush_last = ""
         self._bus = None  # ANNAHME: geteilte ttyS5-Instanz (s. _ensure_bus)
         self.controller = None
         self.printer.register_event_handler("klippy:connect",
                                             self.handle_connect)
+        # Upstream virtual_sdcard sendet das bei jedem Datei-Reset (neue
+        # Datei, Druckende, Abbruch) -> Matrix-Cache leeren.
+        try:
+            self.printer.register_event_handler("virtual_sdcard:reset_file",
+                                                self._matrix_reset)
+        except Exception:
+            pass
         # Adressvergabe erst nach Motor-Init (gleiche Reihenfolge wie Stock).
         try:
             self.printer.register_event_handler("k2_motor:ready",
@@ -1954,7 +2305,8 @@ class PrinterK2Box:
                 ("KTWO_BOX_EXTRUDE", self.cmd_extrude,
                  "Filament einziehen (= M8200 L I..) TNN=T1A|SLOT=A"),
                 ("KTWO_BOX_FLUSH", self.cmd_flush,
-                 "Spülen + Abstreifen (= M8200 F) [LENGTH=] [VELOCITY=] [TEMP=]"),
+                 "Spülen + Abstreifen (= M8200 F) [TNN=] [TOOL=n] [LENGTH=] "
+                 "[VELOCITY=] [TEMP=]"),
                 ("KTWO_BOX_WIPE", self.cmd_wipe,
                  "Düse am Schacht abstreifen (Stock-T0-Beispiel 10.1-10.3)"),
                 ("KTWO_BOX_WASTE", self.cmd_waste,
@@ -1978,6 +2330,9 @@ class PrinterK2Box:
                 ("KTWO_BOX_AUTO_REFILL", self.cmd_auto_refill,
                  "Auto-Nachladen an/aus (= Stock BOX_ENABLE_AUTO_REFILL) "
                  "[ENABLE=0|1]"),
+                ("KTWO_BOX_REMAIN", self.cmd_remain,
+                 "Material in der Düse anzeigen/korrigieren (Nicht-Stock) "
+                 "[COLOR=0RRGGBB] [TYPE=<id>] [TNN=T1A] [CLEAR=1]"),
                 ("KTWO_BOX_SAME_MATERIAL", self.cmd_same_material,
                  "Gleich-Material-Gruppen (= Stock BOX_UPDATE_SAME_MATERIAL_"
                  "LIST) [LIST=T1A,T1C/T1B,T1D] [CLEAR=1]")):
@@ -2015,7 +2370,67 @@ class PrinterK2Box:
             self.controller.clock = self.reactor.monotonic
         return self.controller
 
+    def _load_remain(self):
+        """remain_material_file einmal lesen (klippy:connect) – nie Fehler."""
+        if self._remain_loaded:
+            return
+        self._remain_loaded = True
+        try:
+            rm, st, info = load_remain_material(self.remain_file)
+        except Exception as exc:  # pragma: no cover – Sicherheitsnetz
+            rm, st, info = None, "fehler", "Düsen-Material-Datei: %s" % exc
+        self.remain_load, self.remain_info = st, info
+        if rm is not None:
+            self.remain_material = dict(rm)
+            self._remain_saved = remain_key(rm)
+        if info:
+            try:
+                (logging.warning if st == "fehler"
+                 else logging.info)("[k2_box] %s" % info)
+            except Exception:
+                pass
+            try:
+                self.gcode.respond_info("[k2_box] %s%s" % (
+                    "WARNUNG " if st == "fehler" else "", info))
+            except Exception:
+                pass
+
+    def _persist_remain(self, gcmd=None):
+        """Nach erfolgreichem FLUSH (bzw. KTWO_BOX_REMAIN): Datei atomar
+        schreiben – nur wenn an und geändert. Fehler = nur Meldung."""
+        if not self.remain_file:
+            return False
+        key = remain_key(self.remain_material)
+        if key == self._remain_saved:
+            return False
+        try:
+            save_remain_material(self.remain_file, self.remain_material)
+        except Exception as exc:
+            msg = ("[k2_box] WARNUNG Düsen-Material nicht gespeichert (%s: %s) "
+                   "– Wert gilt bis zum Neustart" % (
+                       self.remain_file, self._exc_text(exc)))
+            try:
+                logging.warning(msg)
+            except Exception:
+                pass
+            try:
+                (gcmd or self.gcode).respond_info(msg)
+            except Exception:
+                pass
+            return False
+        self._remain_saved = key
+        try:
+            logging.info("[k2_box] Düsen-Material gespeichert: color %s, "
+                         "type %s, tnn %s" % key)
+        except Exception:
+            pass
+        return True
+
+    def _matrix_reset(self, *args):
+        self._matrix_cache = None
+
     def handle_connect(self):
+        self._load_remain()
         try:
             self._ensure_controller()
         except Exception as exc:
@@ -2111,6 +2526,11 @@ class PrinterK2Box:
             "material_db": self.material_db is not None,
             "material_db_info": self.material_db_info or "",
             "remain_material": dict(self.remain_material),
+            # Persistenz (remain_material_file): Pfad ('' = aus), Ladeergebnis
+            # aus|ungelesen|fehlt|geladen|fehler, Meldung
+            "remain_material_file": self.remain_file or "",
+            "remain_material_load": self.remain_load,
+            "remain_material_info": self.remain_info or "",
             "prime_speed": self._prime_speed(),
             "flush_mode": self.cfg.get("flush_mode", "color"),
             "flush_last": self.flush_last or "",
@@ -3175,13 +3595,101 @@ class PrinterK2Box:
             return letter, "T%d%s" % (int(self.cfg.get("box_addr", 1)), letter)
         return None, ""
 
-    def _flush_plan(self, gcmd, letter, length, velocity):
+    def _tool_param(self, gcmd, tnn):
+        """TOOL=<n> (Slicer-Werkzeug aus T<n>/M8200 L I<n>) -> int oder
+        None; muss zu TNN passen (feste Zuordnung tnn_from_index)."""
+        raw = gcmd.get("TOOL", None)
+        if raw is None or str(raw).strip() == "":
+            return None
+        tool_tnn = tnn_from_index(raw)          # ValueError bei 0..15-Verstoß
+        tool = int(str(raw).strip().lstrip("="))
+        if tnn and tool_tnn != tnn:
+            raise BoxChangeError("TOOL=%d (= %s) passt nicht zu TNN=%s"
+                                 % (tool, tool_tnn, tnn))
+        return tool
+
+    @staticmethod
+    def _tool_of_tnn(tnn):
+        """Feste Zuordnung TNN -> Werkzeug (T1A=0 … T4D=15), None = ?"""
+        if not tnn:
+            return None
+        try:
+            box, idx, _l, _t = parse_tnn(tnn)
+        except ValueError:
+            return None
+        return (box - 1) * 4 + idx
+
+    def _flush_matrix_info(self):
+        """Matrix der laufenden Druckdatei (Cache Pfad/Größe/mtime) -> dict;
+        ValueError mit Grund, wenn nicht nutzbar."""
+        vsd = self._lookup("virtual_sdcard")
+        path = None
+        if vsd is not None:
+            try:
+                path = vsd.file_path()
+            except Exception:
+                path = self._obj_status("virtual_sdcard").get("file_path")
+        if not path:
+            raise ValueError("keine laufende Druckdatei (virtual_sdcard)")
+        try:
+            stt = os.stat(path)
+        except OSError as exc:
+            raise ValueError("Druckdatei nicht lesbar (%s)"
+                             % exc.__class__.__name__)
+        key = (path, stt.st_size, stt.st_mtime)
+        cache = self._matrix_cache
+        if cache is None or cache[0] != key:
+            try:
+                res = read_flush_matrix(path)
+            except (OSError, ValueError) as exc:
+                res = str(exc) or exc.__class__.__name__
+            cache = self._matrix_cache = (key, res)
+        if isinstance(cache[1], str):
+            raise ValueError(cache[1])
+        return cache[1]
+
+    def _flush_matrix(self, gcmd, tnn, length, notes):
+        """flush_mode matrix: Rohlänge aus der Slicer-Matrix -> dict
+        {len, why, tool} oder None (Rückfall Farbweg, Meldung in notes).
+        Wie Stock (BW Z.4429) nur bei print_stats 'printing' und bekanntem
+        alten Werkzeug; Index direkt aus TOOL= (sonst feste TNN-Zuordnung)."""
+        if self.cfg.get("flush_mode") != "matrix" or length is not None:
+            return None
+        state = self._obj_status("print_stats").get("state")
+        if state != "printing":
+            notes.append("Spülen: Slicer-Matrix nur im laufenden Druck "
+                         "(Zustand %s) – Farbweg" % (state or "unbekannt"))
+            return None
+        try:
+            new_idx = self._tool_param(gcmd, tnn)
+            if new_idx is None:
+                new_idx = self._tool_of_tnn(tnn)
+            old_idx = self._tool_of_tnn(self.remain_material.get("tnn"))
+            if new_idx is None:
+                raise ValueError("Ziel-Werkzeug unbekannt (TOOL=/TNN= fehlt)")
+            if old_idx is None:
+                raise ValueError("altes Werkzeug unbekannt (Düsen-Material "
+                                 "ohne Slot)")
+            info = self._flush_matrix_info()
+            ln, why = slicer_matrix_flush(info, old_idx, new_idx)
+        except (ValueError, BoxChangeError) as exc:
+            msg = ("WARNUNG Slicer-Matrix nicht nutzbar (%s) – Rückfall "
+                   "Farbweg" % (self._exc_text(exc),))
+            notes.append(msg)
+            try:
+                logging.warning("[k2_box] %s" % msg)
+            except Exception:
+                pass
+            return None
+        return {"len": ln, "why": why, "tool": new_idx}
+
+    def _flush_plan(self, gcmd, letter, length, velocity, tnn=""):
         """Spül-Plan (rein rechnend + RFID lesen) -> dict."""
         c = self.cfg
         db = self.material_db
         notes = []
-        new_tag = self._slot_tag(letter) if (
-            letter and (c["flush_mode"] == "color" or db is not None)) else None
+        new_tag = self._slot_tag(letter) if (letter and (
+            c["flush_mode"] in ("color", "matrix") or db is not None)) else None
         new_key = new_tag[0] if new_tag else None
         new_col = new_tag[1] if new_tag else None
         old_key = self.remain_material.get("type")
@@ -3193,7 +3701,9 @@ class PrinterK2Box:
                 different = bool(db.is_different_type(old_key, new_key))
             except Exception:
                 different = False
-        segs, why = plan_flush_lengths(c, length, old_col, new_col, different)
+        mx = self._flush_matrix(gcmd, tnn, length, notes)
+        segs, why = plan_flush_lengths(c, length, old_col, new_col, different,
+                                       matrix=mx)
         # Geschwindigkeit (Stock get_flush_velocity, Material = neu)
         if velocity is not None:
             v = float(velocity)
@@ -3237,7 +3747,7 @@ class PrinterK2Box:
             length = gcmd.get_float("LENGTH", None, minval=0.)
             vel = gcmd.get_float("VELOCITY", None, above=0.)
             letter, tnn = self._flush_target(gcmd)
-            pl = self._flush_plan(gcmd, letter, length, vel)
+            pl = self._flush_plan(gcmd, letter, length, vel, tnn)
             segs, v, temp, max_temp = (pl["segs"], pl["v"], pl["temp"],
                                        pl["max_temp"])
             n = len(segs)
@@ -3343,9 +3853,12 @@ class PrinterK2Box:
                     "blocked“; hier nur Warnung, flush_clog_check)" % (
                         _n(wheel_sum), _n(c["flush_clog_min_mm"])))
             if ran:
-                # Stock remain_material.save(color, type) nach Erfolg
+                # Stock remain_material.save(color, type) nach Erfolg –
+                # NUR hier (nicht bei Cut/Rückzug/Laden/Cancel), Datei nur
+                # bei Änderung (remain_material_file, atomar)
                 self.remain_material = {"type": pl["new_key"],
                                         "color": pl["new_col"], "tnn": tnn}
+                self._persist_remain(gcmd)
             self.flush_last = ("%s: %s mm (%s), F%s, %s °C" % (
                 tnn or "?", _n(sum(segs)), " + ".join(_n(x) for x in segs),
                 _n(v), _n(temp)))
@@ -3875,6 +4388,45 @@ class PrinterK2Box:
                 if self.same_material else "RFID gleiches Material",
                 "muss passen" if self.cfg.get("runout_require_color")
                 else "egal"))
+
+    def cmd_remain(self, gcmd):
+        """KTWO_BOX_REMAIN [COLOR=0RRGGBB|none] [TYPE=<id>|none] [TNN=T1A]
+        [CLEAR=1] – Material in der Düse anzeigen bzw. von Hand setzen.
+
+        NICHT-Stock (Stock hat kein Reset-Kommando, REMAIN-MATERIAL-BEFUND
+        §2/§6.4): Ersatz für die Korrektur nach Handarbeit an der Düse.
+        Ohne Parameter nur Anzeige; gesetzte Werte gehen in die Spülmenge des
+        NÄCHSTEN Wechsels ein und werden (wenn an) gespeichert. Bewegt nichts,
+        sendet nichts – daher ohne allow_write/allow_move."""
+        try:
+            clear = gcmd.get_int("CLEAR", 0)
+            col_raw = gcmd.get("COLOR", None)
+            typ_raw = gcmd.get("TYPE", None)
+            tnn_raw = gcmd.get("TNN", None)
+            new = dict(self.remain_material)
+            if clear:
+                new = {"type": None, "color": None, "tnn": ""}
+            if col_raw is not None:
+                new["color"] = normalize_remain_color(col_raw)
+            if typ_raw is not None:
+                new["type"] = normalize_remain_type(typ_raw)
+            if tnn_raw is not None:
+                new["tnn"] = (parse_tnn(tnn_raw)[3]
+                              if str(tnn_raw).strip().lower()
+                              not in ("", "none") else "")
+        except ValueError as exc:
+            raise gcmd.error("[k2_box] KTWO_BOX_REMAIN: %s" % (exc,))
+        changed = clear or col_raw is not None or typ_raw is not None \
+            or tnn_raw is not None
+        if changed:
+            self.remain_material = new
+            self._persist_remain(gcmd)
+        r = self.remain_material
+        gcmd.respond_info(
+            "[k2_box] Düsen-Material%s: Farbe %s, Typ %s, Slot %s; Datei %s "
+            "(%s)" % (" gesetzt" if changed else "", r.get("color") or "unbekannt",
+                      r.get("type") or "unbekannt", r.get("tnn") or "-",
+                      self.remain_file or "aus", self.remain_load))
 
     def cmd_same_material(self, gcmd):
         if gcmd.get_int("CLEAR", 0):

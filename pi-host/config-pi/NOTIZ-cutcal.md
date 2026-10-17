@@ -10,8 +10,13 @@
 **Makro** (`live-logs-2026-10-16/config-aktuell/gcode_macro.cfg:790–800`):
 `G28` (falls nicht `xyz`), `SET_LIMITS`, `MOTOR_SYS_PARAM NUM=1 DATA=1 ID=70
 PARAMS=300 PARAMS_TYPE=float`, `MOTOR_CHECK_CUT_POS`, `M400`, `… PARAMS=100`,
-`RESTORE_LIMITS`. `SET_LIMITS`/`RESTORE_LIMITS` stecken in `box_wrapper.so`
-(nur Strings, Semantik unbelegt).
+`RESTORE_LIMITS`. ~~`SET_LIMITS`/`RESTORE_LIMITS` stecken in `box_wrapper.so`
+(nur Strings, Semantik unbelegt).~~ **Korrigiert 17.10.2026** (§8,
+`SDCARD-GCODEMOVE-BEFUND-2026-10-17.md` §C.1): beide sind Befehle aus Creality-
+`gcode_move.py` (GM:61-62). `SET_LIMITS` setzt die X/Y-Positionsgrenzen der
+Kinematik auf die Config-Werte `[stepper_x/y] position_min/max` (GM:96-101),
+`RESTORE_LIMITS` stellt sie zurück (`kin.restore_limits()`, GM:103-104).
+Mit Beschleunigung hat das nichts zu tun.
 
 **Parameter:** `box.cfg` `pre_cut_cal_pos_x: -5` („Vorposition, spart Zeit“),
 `check_cut_pos_x_min/max: -9.5/-5.5`, `cut_pos_y: 200`; `motor_control.cfg`
@@ -53,7 +58,9 @@ die dortige Lesart „Mode 4“ ist der LESE-Request `0x11 [04]` (live).
 Befehl, damit der Rückbau auch bei jedem Fehler läuft:
 
 1. Sperren prüfen (s. §3), `wait_moves`.
-2. Beschleunigung auf `min(cut_cal_accel 25000, max_accel)` (≙ SET_LIMITS).
+2. Beschleunigung auf `min(cut_cal_accel 25000, max_accel)` (Stock:
+   `SET_VELOCITY_LIMIT ACCEL=25000` in `motor_check_cut_pos`, REA). ~~(≙ SET_LIMITS)~~
+   – korrigiert 17.10.2026: `SET_LIMITS` sind Positionsgrenzen, s. §8.
 3. `81 09 00 06 01 46 00 00 96 43` (Kp 300, `cut_cal_pos_kp`).
 4. Park X 50 / Y = `[k2_box] cut_pos_y` (200).
 5. `81 04 00 11 04` lesen, `81 04 00 11 03` setzen (Echo-Prüfung).
@@ -110,7 +117,9 @@ bisher nur durchgereicht) wird jetzt gelesen. Prüfbereich und Y kommen aus
   Host-Latch: kein neues MCU-Objekt, kein Config-Eingriff; der Anstoß stoppt
   beim Stall sofort (Stock fährt bis zum Ziel). Nachlauf-Abfrage deckt späte
   Stalls ab.
-- Kp/Stall-Mode/Limits im Modul statt im Makro (Rückbau-Garantie).
+- Kp/Stall-Mode/Beschleunigung im Modul statt im Makro (Rückbau-Garantie).
+  `SET_LIMITS`/`RESTORE_LIMITS` (X/Y-Positionsgrenzen) bildet der Pi nicht nach –
+  nicht nötig, s. §8.
 - Nur X/Y müssen referenziert sein (`G28 X Y`), Stock: `G28` komplett.
 - Kein automatisches SAVE_CONFIG (Upstream startet dabei neu); `SAVE=1` im Makro.
 - Mode-Rückbau immer auf 2 (Stock: gelesener Wert, live = 2 → gleiche Frames).
@@ -150,9 +159,38 @@ Kommentar über `[k2_box]` („kein CALIBRATE_CUT_POS auf dem Pi“) dabei anpas
   waren es zwei aufeinanderfolgende.
 - Park X 50, Anstoß 166,7 mm/s, Rückfahrt 200 mm/s aus Vanilla (Zeitbild
   1,84 s/Anstoß nicht vollständig erklärt – Stock ist langsamer, Grund offen).
-- Beschleunigung 25000 (REA-String), Wirkung von `SET_LIMITS` unbelegt.
+- Beschleunigung 25000 (REA-String). ~~Wirkung von `SET_LIMITS` unbelegt.~~
+  Belegt 17.10.2026 (§8): X/Y-Positionsgrenzen, keine Beschleunigung.
+  Offen bleibt nur die Wirkung von `RESTORE_LIMITS` (Creality-`corexy` liegt
+  nicht vor).
 - Treffer vor `check_cut_pos_x_max` werden ignoriert (Vanilla würde sie in den
   nächsten zählenden Schritt mitnehmen).
 - Filamentsensor-Sperre im Makro = Stock key854 (Bedeutung aus REA-Fehlertext).
 - Das Ergebnis muss in `check_cut_pos_x_min/max` liegen (Stock prüft
   vermutlich den Messwert; live lagen Messwert und Ergebnis beide im Bereich).
+
+## 8. Korrektur `SET_LIMITS` (17.10.2026)
+
+Quelle: `SDCARD-GCODEMOVE-BEFUND-2026-10-17.md` §C/§C.1 (Creality-`gcode_move.py`).
+
+- **Alt (falsch):** `SET_LIMITS`/`RESTORE_LIMITS` kämen aus `box_wrapper.so`,
+  Semantik unbelegt; Schritt 2 (Beschleunigung) entspreche `SET_LIMITS`.
+- **Richtig (B):** `SET_LIMITS` ist in `gcode_move.py` registriert (GM:61) und
+  setzt die X/Y-Positionsgrenzen auf `[stepper_x/y] position_min/max` aus der
+  Config (GM:96-101; Stock X −10…352.5, Y −6.2…400). `RESTORE_LIMITS` stellt die
+  vorherigen Grenzen wieder her (GM:103-104; Werte ANNAHME, Creality-Kinematik
+  fehlt). `box_wrapper` *ruft* die Befehle nur: `set_flushing_sign` → `M400` +
+  `SET_LIMITS`, `reset_flushing_sign` → `M400` + `RESTORE_LIMITS`.
+- Die Beschleunigung 25000 stammt unabhängig davon aus `motor_check_cut_pos`
+  (REA, `SET_VELOCITY_LIMIT ACCEL=25000`) und bleibt so.
+
+**Folge für `KTWO_MOTOR_CUT_CAL`: keine Verhaltensänderung nötig** (nur
+dokumentiert). Stock weitet mit `SET_LIMITS` die Grenzen, damit die Anstöße bis
+X −9,5 erlaubt sind. Upstream-Klipper setzt beim Homing genau die Config-Grenzen
+(`printer.cfg` `[stepper_x]` −10…352.5, `[stepper_y]` −6.2…400). Der Pi steht
+also nach `G28 X Y` dauerhaft im „SET_LIMITS-Zustand“: Anstöße bis
+`check_cut_pos_x_min` (−9,5) liegen innerhalb, die harte Grenze „nie unter
+`[stepper_x] position_min`“ (§3) deckt sich mit dem Stock-Bereich. Ein Gegenstück
+zu `RESTORE_LIMITS` braucht der Rückbau nicht. Ob Stock außerhalb der
+Kalibrierung engere Grenzen hält (Schutzwirkung, die dem Pi fehlt), ist ANNAHME
+und betrifft die Kalibrierung nicht.

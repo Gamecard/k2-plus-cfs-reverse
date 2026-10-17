@@ -17,6 +17,7 @@ STARTEN=0
 JA=0
 ZIEL_COMMIT=9cb99754c035b90206ef0a02660f674fc9517e9b
 MATDB_REL=k2/material_database.json   # wie install.sh
+REMAIN_REL=k2/remain_material.json    # wie install.sh (Material in der Düse, k2_box)
 
 hilfe() {
   cat <<'EOF'
@@ -110,20 +111,24 @@ if [ -f "$BK/config-installiert.txt" ]; then
 fi
 tar -xzf "$BK/config.tar.gz" -C "$(dirname "$CONFIG_DIR")"
 ok "Config-Ordner aus $BK/config.tar.gz wiederhergestellt"
-# Material-DB: Zustand dieses Backups herstellen (auch bei --aelteste, wenn sie
-# erst ein späterer Lauf angelegt hat)
-MZ=$CONFIG_DIR/$MATDB_REL
-if [ -f "$BK/material-db/material_database.json" ]; then
-  if ! cmp -s "$BK/material-db/material_database.json" "$MZ"; then
-    mkdir -p "$(dirname "$MZ")"; cp -a "$BK/material-db/material_database.json" "$MZ"
+# Material-DB und remain_material: Zustand dieses Backups herstellen (auch bei
+# --aelteste, wenn sie erst ein späterer Lauf bzw. k2_box im Betrieb angelegt hat)
+datei_auf_backupstand() {   # REL BACKUPDATEI NAME
+  local mz=$CONFIG_DIR/$1
+  if [ -f "$2" ]; then
+    if ! cmp -s "$2" "$mz"; then
+      mkdir -p "$(dirname "$mz")"; cp -a "$2" "$mz"
+    fi
+    ok "$3 $1 = Backup-Stand ($(dirname "$2")/)"
+  elif [ -f "$BK/config-vorher.txt" ] && ! grep -qxF "$1" "$BK/config-vorher.txt"; then
+    if [ -e "$mz" ]; then rm -f "$mz"; info "entfernt: $1 (gab es vor diesem Lauf nicht)"; fi
+    if ! grep -qxF "$(dirname "$1")" "$BK/config-vorher.txt"; then
+      rmdir "$CONFIG_DIR/$(dirname "$1")" 2>/dev/null && info "entfernt: leerer Ordner $(dirname "$1")/" || true
+    fi
   fi
-  ok "Material-DB $MATDB_REL = Backup-Stand ($BK/material-db/)"
-elif [ -f "$BK/config-vorher.txt" ] && ! grep -qxF "$MATDB_REL" "$BK/config-vorher.txt"; then
-  if [ -e "$MZ" ]; then rm -f "$MZ"; info "entfernt: $MATDB_REL (gab es vor diesem Lauf nicht)"; fi
-  if ! grep -qxF "$(dirname "$MATDB_REL")" "$BK/config-vorher.txt"; then
-    rmdir "$CONFIG_DIR/$(dirname "$MATDB_REL")" 2>/dev/null && info "entfernt: leerer Ordner $(dirname "$MATDB_REL")/" || true
-  fi
-fi
+}
+datei_auf_backupstand "$MATDB_REL" "$BK/material-db/material_database.json" Material-DB
+datei_auf_backupstand "$REMAIN_REL" "$BK/remain-material/remain_material.json" remain_material
 else
   info "kein Config-Backup in diesem Lauf – übersprungen"
 fi
