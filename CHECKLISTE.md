@@ -611,9 +611,9 @@ box 179 · boxmini 17 · cfsseq 28 · motor 134 · motor_mini 43 · auto_addr 33
   Speicher → erster Wechsel nach Klipper-Neustart spült 90+70; Slicer-Spülmatrix nicht umgesetzt.
 
 ## RE-Vormerkliste (17.10.2026, User: „die anderen Punkte merken, die machen wir auch“)
-- [ ] REA: Spül-Sonderfälle in box_wrapper (`flush_material`, `power_loss_clean`, `is_use_ending_material_flush`, `set_flushing_sign`)
-- [ ] REA: Motor-Kalibrierung verstehen (`systemid`, `encoder_calibrate`, `elec_offset_calibrate`, `set_flash_param`) – NUR Doku, nichts ausführen (schreibt Motor-Flash)
-- [ ] REA: PrTouch `start_prtouch_apax` (Düsen-FW, Modus unklar)
+- [x] ERLEDIGT 17.10. (FLUSH-SONDERFAELLE-BEFUND): Spül-Sonderfälle in box_wrapper (`flush_material`, `power_loss_clean`, `is_use_ending_material_flush`, `set_flushing_sign`)
+- [x] ERLEDIGT 17.10. (MOTOR-KALIBRIERUNG-BEFUND, motor.py-Docstrings): Motor-Kalibrierung verstehen (`systemid`, `encoder_calibrate`, `elec_offset_calibrate`, `set_flash_param`) – NUR Doku, nichts ausführen (schreibt Motor-Flash)
+- [x] ERLEDIGT 17.10. (PRTOUCH-APAX-BEFUND = Pressure-Advance-Messkanal + PRES_CHECK): PrTouch `start_prtouch_apax` (Düsen-FW, Modus unklar)
 - [x] 17.10. spät ERLEDIGT: CHELPER-BEFUND (c_helper.so 1.1.7.0 SHA256-gleich 1.1.3.13 → flush.py belegt),
   SDCARD-GCODEMOVE-BEFUND (Matrix flush_para, Index = Slicer-T<n>, nur bei printing; Power-Loss EEPROM 24C16; SET_LIMITS =
   X/Y-Positionsgrenzen, nicht Beschleunigung), REMAIN-MATERIAL-BEFUND (userdata/box/remain_material_data.json, am Gerät bestätigt)
@@ -623,3 +623,8 @@ box 179 · boxmini 17 · cfsseq 28 · motor 134 · motor_mini 43 · auto_addr 33
 - [ ] Am Gerät (Pi): remain_material erste Speicherung + Neustart; Stock-Datei per install.sh --remain-material als Startwert;
   Orca-Mehrfarbdatei: Zeilenform flush_volumes_matrix (ANNAHME) + Spülmengen vs. Orca-Anzeige, erst dann flush_mode: matrix;
   M600 aus Orca-Datei → PAUSE/RESUME.
+- [ ] Vorschläge aus der Vormerk-Runde: (a) check_tx_frame hart sperren: Motor 0x03, 0x04, 0x07 Sub 01/03/05;
+  (b) k2_box `ending_material_purge` (Restmaterial-Fall 0x50 ausspülen statt Cut/Rückzug); (c) optional `end_print_unload`
+  (Default aus); (d) optional `KTWO_PRTOUCH_CHECK` (PRES_CHECK-Ersatz über apax); (e) Doku: FLUSH-BEFUND §5 (Tupel-None≠300),
+  SDCARD-Zeilen set_flushing_sign (3× M400), README-k2_prtouch §1 + PRTOUCH-BEFUND Z.20 (apax doch im Normalpfad).
+

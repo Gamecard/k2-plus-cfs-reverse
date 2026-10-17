@@ -1751,7 +1751,19 @@ class Motor:
         raise NotImplementedError("0x0B boot gesperrt (Bootloader)")
 
     def systemid(self, *args):
-        """TODO 0x0D systemid (Host-Tabelle) – Payload unbelegt."""
+        """GESPERRT/wirkungslos: 0x0D systemid (nur Host-Tabelle).
+
+        Befund MOTOR-KALIBRIERUNG-BEFUND-2026-10-17.md §2 (B):
+        - Host: nur Dict-Eintrag Motor_cmd['systemid'] = 0x0D (einzige
+          Ladestelle im Modul-Init), kein G-Code, keine Funktion, kein
+          Webhook -> Stock sendet 0x0D nie.
+        - FW mot2_002_081: 0x0D ist NICHT registriert (Tabelle 0x00-0x08,
+          0x0B, 0x0C, 0x0E, 0x0F, 0x11-0x16) -> ignoriert, keine Antwort.
+        - Die eigentliche Systemidentifikation (R/L-Messung,
+          system_id_RL_param_*) ist der Motorcheck beim Hochlauf (FUN_e51c,
+          Fehlerbits 9-13), nicht per Bus auslösbar; motor_R/L landen im
+          Normalbetrieb nicht im Flash (V).
+        Bleibt Stub: kein Nutzen, keine Frame-Erzeugung."""
         raise NotImplementedError("TODO 0x0D systemid: unbelegt")
 
     # --- Update-Pfad (Func 0xF0, live NIE beobachtet) ---
@@ -1828,14 +1840,46 @@ class Motor:
     # KEINER sendet Bus-Frames.
 
     def encoder_calibrate(self):
-        """TODO: `motor_encoder_calibrate` – live nie beobachtet.
-        Fremdquelle K2 (grant0013): 0x03 encoder_cal."""
+        """GESPERRT: 0x03 encoder_calibrate_official – dreht den Motor!
+
+        Befund MOTOR-KALIBRIERUNG-BEFUND-2026-10-17.md §3/§5/§12 (B = Code):
+        - Host: G-Code MOTOR_ENCODER_CALIBRATE_OFFICIAL NUM=1..10
+          [EXTRUDER=1 -> transparent], motor_send_data(addr, 0x03, 60,
+          data=b'\\x00', retries_en=False); Request F7 <addr> 04 00 03 00
+          <CRC>. Stock ruft es nie auf (nur manuell/Werk).
+        - Antwort 1 B Status: 0x0C Erfolg, 0x00 nicht gelaufen, 0x04 läuft,
+          0x08 fehlgeschlagen (Host-Texte 校准成功/没有运行校准/…).
+        - FW (Handler 0xf79c): Regel-IRQ gesperrt, protect_en = 0,
+          Phasenprüfung (schreibt phase_order_invert IMMER in den Flash),
+          Encoder-IC-Reg 0x0E <- 0x58 + EEPROM-Brand (6 s), dann open-loop
+          Dauerdrehung ~2,5 U/s, bis ~63 Umdrehungen (403225 x 62 us,
+          Rampen), Abbruch bei Encoder-Status "fertig", 6,5 s warten.
+          Dauer ~14-41 s. Danach Regler + PWM AUS (Motor stromlos).
+        - Risiko: Achs-Crash, kein Schutz/kein EN-Notstopp/kein Bus während
+          des Laufs, Encoder-EEPROM-Verschleiß, falsches phase_order_invert
+          bei blockiertem Rotor. Daher keine sendefähige Implementierung."""
         raise NotImplementedError("TODO motor_encoder_calibrate: 0x03 live nie "
                                   "beobachtet")
 
     def elec_offset_calibrate(self):
-        """TODO: `motor_elec_offset_calibrate` – live nie beobachtet.
-        Fremdquelle K2 (grant0013): 0x04 elec_offset_cal."""
+        """GESPERRT: 0x04 elec_offset_calibrate – bewegt den Motor, schreibt Flash.
+
+        Befund MOTOR-KALIBRIERUNG-BEFUND-2026-10-17.md §4-§6/§12 (B = Code):
+        - Host: MOTOR_ELEC_OFFSET_CALIBRATE NUM=1..10 [EXTRUDER=1] bzw.
+          _ALL (= NUM 1..4 nacheinander); motor_send_data(addr, 0x04, 60,
+          data=b'\\x00', retries_en=False); Request F7 <addr> 04 00 04 00
+          <CRC>. FW führt nur Payload-Byte 0 == 0x00 aus. Stock: nie.
+        - Antwort 9 B: [pass u8 (1 = 校准成功), err f32 LE (el. Grad),
+          avg f32 LE (Encoder-Counts)].
+        - FW (Handler 0xf800): protect_en = 0, Phasenprüfung (phase_order_
+          invert immer -> Flash), open-loop 1 Umdrehung vor + 1 zurück
+          (200 Schritte, je ~20 ms), Pass = bewegt UND err < elec_angle_
+          calibration_standar_deg (Default 15). Nur bei Pass: elec_offset/
+          elec_offset_err_deg, ALLE Parameter in den Flash + Kalibrier-
+          Record @0x08022B00 (Werks-Sicherung) überschrieben. Danach Regler
+          + PWM AUS, Parameter aus dem Flash neu geladen. Dauer ~10-13 s.
+        - Risiko: Bewegung ohne Schutz/Notstopp, Fehlkalibrierung an
+          belasteter Achse überschreibt die Werks-Sicherung dauerhaft."""
         raise NotImplementedError("TODO motor_elec_offset_calibrate: 0x04 live "
                                   "nie beobachtet")
 
@@ -1867,7 +1911,22 @@ class Motor:
                                   "live nie beobachtet" % (param_id,))
 
     def set_flash_param(self, param_id, value):
-        """TODO: `MOTOR_FLASH_PARAM` schreiben – 0x07 live nie beobachtet."""
+        """GESPERRT: `MOTOR_FLASH_PARAM` schreiben (0x07) – live nie beobachtet.
+
+        Befund MOTOR-KALIBRIERUNG-BEFUND-2026-10-17.md §7 (B = Code):
+        - Host: Payload [DATA] (+00 bei 3/4, +ID bei 5/6, bei 5 + Wert:
+          float 'f', u16 '<H', i16 '<h', u32/i32 '>I' BIG-ENDIAN),
+          retries_en=False. Stock nutzt 0x07 nie (Boot schreibt über 0x06).
+        - FW-Subs: 01 = Werksreset (use_default_param -> Flash, Neustart;
+          nur elec_offset/err/phase_order bleiben, u. a. amp_gain/R fallen
+          auf FW-Default), 02 = Flash-Prüfung (5 B), 03 = alle Parameter in
+          den Flash (Antwort [01] IMMER), 04 = aus Flash laden, 05 = Wert
+          (LE ab Byte 2) nur ins RAM (Regelung kurz aus/Neu-Init; Float
+          über Text mit 6 Nachkommastellen), 06 = Flash-Wert lesen.
+        - Inkonsistenzen: u32/i32 Host BE vs. FW LE (byte-verdreht); Host
+          wertet bei DATA=5 data[0] als Status 0/1, FW schickt Wert-Echo.
+        - Risiko: Werksreset/Fehlwerte dauerhaft, Regelungsunterbrechung,
+          bei latched Fehler bleibt die Regelung aus. Daher gesperrt."""
         raise NotImplementedError("TODO MOTOR_FLASH_PARAM schreiben (ID=%r): "
                                   "0x07 live nie beobachtet" % (param_id,))
 
