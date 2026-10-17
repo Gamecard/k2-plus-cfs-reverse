@@ -609,3 +609,14 @@ box 179 · boxmini 17 · cfsseq 28 · motor 134 · motor_mini 43 · auto_addr 33
 - [ ] Am Gerät (Pi): Spülbahn (Blech zwischen Abschnitten, Kreise nur am Ende, 5 s Blasen), DB-Temperaturen (PETG 250,
   PLA→PLA-Spitze 240), Prime-Speed aus DB, Preload-Sperren, N5 ([0f 01] nach Box-Reset). Bekannt: remain_material nur im
   Speicher → erster Wechsel nach Klipper-Neustart spült 90+70; Slicer-Spülmatrix nicht umgesetzt.
+
+## RE-Vormerkliste (17.10.2026, User: „die anderen Punkte merken, die machen wir auch“)
+- [ ] REA: Spül-Sonderfälle in box_wrapper (`flush_material`, `power_loss_clean`, `is_use_ending_material_flush`, `set_flushing_sign`)
+- [ ] REA: Motor-Kalibrierung verstehen (`systemid`, `encoder_calibrate`, `elec_offset_calibrate`, `set_flash_param`) – NUR Doku, nichts ausführen (schreibt Motor-Flash)
+- [ ] REA: PrTouch `start_prtouch_apax` (Düsen-FW, Modus unklar)
+- [x] 17.10. spät ERLEDIGT: CHELPER-BEFUND (c_helper.so 1.1.7.0 SHA256-gleich 1.1.3.13 → flush.py belegt),
+  SDCARD-GCODEMOVE-BEFUND (Matrix flush_para, Index = Slicer-T<n>, nur bei printing; Power-Loss EEPROM 24C16; SET_LIMITS =
+  X/Y-Positionsgrenzen, nicht Beschleunigung), REMAIN-MATERIAL-BEFUND (userdata/box/remain_material_data.json, am Gerät bestätigt)
+- [ ] Umsetzen: k2_box `remain_material_file` (atomar, Stock-Format, Startwert von Drucker übernehmbar); `flush_mode: matrix`
+  (Header der G-Code-Datei selbst lesen, TOOL=<n> durchreichen, nur printing); M600-Makro (→ PAUSE); Doku-Fix SET_LIMITS
+  in NOTIZ-cutcal.md:13/56/153 + PAUSE-RESUME-MATERIAL-BEFUND A.4/D.3

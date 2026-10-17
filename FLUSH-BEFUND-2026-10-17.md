@@ -4,6 +4,18 @@
 > Code in `pi-host/` ist **nicht** geändert. Rechen-Nachbau: `nachbau/flush.py` (Selbsttest **ok 44/44**).
 > Arbeitsdateien liegen lokal (nicht im Repo).
 
+### Nachtrag: 1.1.7.0-Abgleich (17.10.2026)
+
+Der chelper liegt jetzt auch vom Drucker vor (FW 1.1.7.0, `rootfs-live/usr/share/klipper/klippy/chelper/`). Details: `CHELPER-BEFUND-2026-10-17.md`.
+
+- **`c_helper.so` ist byte-identisch** mit der Fassung aus OTA 1.1.3.13 (SHA256 `13127750…9221`). Der live geladene Code ist also derselbe.
+- **`filament_change.o`**: Die Datei unterscheidet sich (anderer Build-Pfad, anderes LTO-Zufallssuffix). Diese Teile sind aber **byte-gleich**:
+  - `.text`, `.text.startup`, `.rodata`, `.rel.text` und `.symtab`
+  - alle Funktions-LTO-Sektionen (nach Normalisierung)
+- `get_flushing_volume` im `.so` (@`0x37d8` → calc @`0x3218`) hat denselben Befehlsfluss und denselben Literal-Pool (29/29 Wörter) wie das `.o`. Einzige Abweichung: eine LTO-Registerzuteilung (+2 Befehle).
+- Die bisherige **ANNAHME „1.1.7.0 byte-gleich“ ist damit belegt (B).** `nachbau/flush.py` bleibt unverändert, Selbsttest weiter **ok 44/44** (60/165/193/367).
+- Neu aus DWARF: `calc_flushing_volume(from, to, float extra_flush_volume)`. Der Export ruft sie mit `extra = 0.0f` auf (Literal @`0x458`).
+
 **Ziel-Binary:** `rootfs-live/usr/share/klipper/klippy/extras/box_wrapper.cpython-39.so`
 (Cython 0.29.21, armhf, Quellname `klippy/extras/box_wrapper.py`).
 
