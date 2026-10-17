@@ -11,11 +11,13 @@
 | `k2-module.cfg` | `[k2_485]` (gemeinsamer RS485-Bus, by-id-Platzhalter), `[k2_box]`, `[k2_belt mdlx]`/`[k2_belt mdly]` (gesperrt) |
 | `homing.cfg` | `[homing_override]` + Freigabe-Makro `_PI_FREIGABE` + Stall-Mode-Haken |
 | `macros.cfg` | Grundbetrieb: M106/M107, M141/M191, M900, M205, START/END_PRINT (+ PRINT_START/PRINT_END), PAUSE/RESUME/CANCEL_PRINT, T0–T15 + M8200-Kette (CFS-Wechsel über `[k2_box]`, NOTIZ-cfs.md), G29, BEDPID, NOZZLE_PID |
+| `zalign.cfg` | Dual-Z-Lichtschranken PA15/PA8: Variante L aktiv (rein lesend, `[gcode_button zalign_z/zalign_z1]`, `ZALIGN_STATUS`), Variante B `[k2_zalign]` auskommentiert + gesperrt, `ZALIGN_STOCKART` |
+| `NOTIZ-zalign.md` | A10: Stock-z_align (Config, Mitschnitt, MCU-Dekompilat), Risiko ohne Lichtschranken, Ersatz `[k2_zalign]`, Testprotokoll T0–T8 |
 | `README.md` | diese Datei |
 
 Reihenfolge in `printer.cfg`: `[mcu]`, `[mcu nozzle_mcu]`, `[k2_prtouch]`, dann die Includes, dann der Rest. Seit dem Modul-Fix (§5.3) ist die Reihenfolge der Abschnitte **egal** (Lauf I: `[k2_prtouch]` ans Ende verschoben, fehlerfrei, `statistics` aus der Standardbibliothek); `[k2_prtouch]` muss nur wegen SAVE_CONFIG (`z_offset`) in der Hauptdatei stehen.
 
-**Sicherheits-Defaults (alles gesperrt):** `[k2_prtouch] allow_move: False`, `[k2_motor] allow_write: False` + `auto_init: False`, `[k2_box] allow_write: False`, `[k2_belt mdlx/mdly] allow_write: False` + `allow_move: False`, `[k2_box] allow_move: False`, `_PI_FREIGABE allow_move: False` (`xy_stall_ok` ist nur noch Not-Sperre, Default True; X/Y-Homing braucht zusätzlich `[k2_motor] allow_write: True`, NOTIZ-stall.md) (G28 bricht ohne jede Bewegung ab – im Batch-Test nachgewiesen, §5).
+**Sicherheits-Defaults (alles gesperrt):** `[k2_prtouch] allow_move: False`, `[k2_motor] allow_write: False` + `auto_init: False`, `[k2_box] allow_write: False`, `[k2_belt mdlx/mdly] allow_write: False` + `allow_move: False`, `[k2_box] allow_move: False`, `[k2_zalign]` auskommentiert (aktiviert: `allow_move: False` + `_PI_FREIGABE` + Motor-Init), `_PI_FREIGABE allow_move: False` (`xy_stall_ok` ist nur noch Not-Sperre, Default True; X/Y-Homing braucht zusätzlich `[k2_motor] allow_write: True`, NOTIZ-stall.md) (G28 bricht ohne jede Bewegung ab – im Batch-Test nachgewiesen, §5).
 
 ## 2. Zuordnung Stock → Pi
 
@@ -47,7 +49,7 @@ Quelle: `live-logs-2026-10-16/config-aktuell/` (printer.cfg mit SAVE_CONFIG, sen
 | `[prtouch_v3]` | M `[k2_prtouch]` | Übernommen: `z_offset 0`, `speed 5`, `samples 1`, `samples_result average`, `samples_tolerance 0.5`, `samples_tolerance_retries 5`, `step_swap_pin !PC7`, `pres_swap_pin nozzle_mcu:PA15`, `pres_cs0_pin PB13/PB14`, `pres_tri_hold 4000,10000,500`, `pres_cfg_regs 60`; ergänzt (Stock-Defaults, BELEGT per Emulation): `pres_acq_tkms 0.78125`, `pres_tri_fter 5,1,0.8`, `pres_ded_tkms 128`, `step_acq_tkms 0.390625`. **E/O:** `quick_lift_speed 100`, `prth_clr_probe_pos 150,355`, `prth_msg_show`, `enable_not_linear_comp`/`high_low_temp_leveling` (Temperaturkompensation), `prth_max_chps 8`, `prth_tri_zacc 1000`, `prth_min_fans 0.6`, `bed_mesh_fall_comp_diagonal/axis` (Mesh-Kompensation), `need_steady_regional 0.8` |
 | `[bed_mesh]` | Ü | `move_check_distance` 1 → **3** (Upstream-Minimum 3.0, sonst Config-Fehler) |
 | `[printer]` | Ü | `max_accel_to_decel: 30000` gibt es in Upstream nicht mehr → `minimum_cruise_ratio: 0.0` (gleichwertig, da = max_accel) |
-| `[z_align]` (Lichtschranken PA15/PA8, `config_z_align`) | E/O | Creality-eigen; nur `[z_tilt]` |
+| `[z_align]` (Lichtschranken PA15/PA8, `config_z_align`) | Ü lesend / M (O) | `zalign.cfg` Variante L `[gcode_button]` `^!PA15`/`^!PA8` (Stock `zes_untrig 1` = Pull-up, ausgelöst = 0, FW-Dekompilat); Ausrichtung `[k2_zalign]` (Upstream-Endstops + Etappen, gesperrt, auskommentiert); `START_PRINT` holt `Z_TILT_ADJUST` nach, solange `z_tilt` nicht `applied` ist (A10a) – NOTIZ-zalign.md |
 | `[belt_mdl mdlx/mdly]` | M `[k2_belt mdlx/mdly]` | Stock-Werte 1:1 (`ch_max_dis 5`, `ch_best_n 140`, `ch_best_error 0.15`), dazu `allow_write: False`, `allow_move: False`, `stock_aliases: False` (README-k2_belt.md) |
 | `[input_shaper]` (leer) + SAVE_CONFIG `mzv 42.0 / mzv 42.4` | Ü | im SAVE_CONFIG-Block |
 | SAVE_CONFIG `[bed_mesh default]` | Ü umbenannt | als `[bed_mesh stock_referenz_2026-10-16]` – Upstream lädt es dadurch NICHT automatisch; nur Vergleich, vor dem Druck neu messen (`G29`) |
@@ -85,7 +87,7 @@ Quelle: `live-logs-2026-10-16/config-aktuell/` (printer.cfg mit SAVE_CONFIG, sen
 | `IF_NEED_HOME`, `PRINT_TEMP_SET`, `PRINT_PREPARED`, `PRINT_PREPARE_CLEAR`, `MAINTENANCE_ITEM(_PARAM)`, `MOTOR_CANCEL_PRINT` | Display-/App-Hilfen bzw. `BOX_SET_CURRENT_BOX_IDLE_MODE` |
 | `PRINT_CALIBRATION`, `ACCURATE_G28`, `BED_MESH_CALIBRATE_START_PRINT` | `CX_PRINT_LEVELING_CALIBRATION`, `ACCURATE_HOME_Z`, regionales Mesh mit `GCODE_FILE` (prtouch_v3) |
 | `FIRST_FLOOR_PAUSE(_POSITION)`, `FIRST_FLOOR_RESUME` | Erstschicht-Prüfung über Display/Kamera |
-| `ZDOWN_SWITCH_SET`, `BED_MANUAL_CAL(_START/_END)`, `Z_AXIS_CALIBRATION` | `ZDOWN_SWITCH`/`SET_G29_FLAG`/`NEXT_HOMEZ_NACCU` (`[z_align]`/prtouch_v3) |
+| `ZDOWN_SWITCH_SET`, `BED_MANUAL_CAL(_START/_END)`, `Z_AXIS_CALIBRATION` | `ZDOWN_SWITCH`/`SET_G29_FLAG`/`NEXT_HOMEZ_NACCU` (`[z_align]`/prtouch_v3) | Ersatzablauf `ZALIGN_STOCKART` (zalign.cfg, braucht Variante B) |
 | `CALIBRATE_CUT_POS` | `MOTOR_SYS_PARAM`/`MOTOR_CHECK_CUT_POS` – braucht k2_motor-G-Codes (O) |
 | `BELT_TENSION` | `BELT_MDL_*`; Ersatz-Beispiel `KTWO_BELT_TENSION` (ruft `KTWO_BELT_*`) in README-k2_belt.md – seit dem Modul-Fix gültig, aber bewusst nicht aktiv (fährt G28 X Y + spannt; erst nach Freigabe README-k2_belt.md §6) |
 | `INPUTSHAPER`, `AUTOTUNE_SHAPERS` | Creality-Makros; mit `[k2_lis2dw]` stattdessen Upstream-`SHAPER_CALIBRATE` nutzen; `CXSAVE_CONFIG` |
@@ -108,6 +110,8 @@ cp pi-host/k2_transport.py pi-host/k2_485.py pi-host/k2_box.py \
    pi-host/k2_prtouch.py pi-host/k2_belt.py  $E/
 cp pi-host/k2_motor_init.py $E/k2_motor.py          # Dateiname = Abschnitt [k2_motor]!
 mkdir -p $E/k2_nachbau && cp nachbau/*.py $E/k2_nachbau/
+# optional, nur für zalign.cfg Variante B (A10, NOTIZ-zalign.md §5 ab T4):
+# cp pi-host/k2_zalign.py $E/
 ```
 
 1. **Module** wie oben. `k2_transport.py` und `k2_nachbau/` sind keine Abschnitte, sondern Helfer.
@@ -122,13 +126,14 @@ mkdir -p $E/k2_nachbau && cp nachbau/*.py $E/k2_nachbau/
 Jeder Schritt nur, wenn der vorige bestanden ist; nach jedem Schritt `klippy.log` prüfen (SHUTDOWN, Timeouts, Config-Fehler). Hand am Not-Aus, sobald sich etwas bewegen kann. Befehlsnamen seit dem Modul-Fix `KTWO_*` (§2.3 Namensregel).
 
 0. **Vorbereitung:** Verkabelung nach PI-ERSATZ-PLAN §3 (3,3-V-UARTs, RS485 A/B gemessen, GND zuerst). Alle Sperren wie geliefert (§1).
-1. **Nur MCU-Verbindung, ohne Bewegung** (Abweichung vom Plan: k2_prtouch/k2_box/k2_motor bleiben geladen, aber gesperrt – ohne `[k2_prtouch]` gäbe es keinen Z-Endstop). Erwartet: `Klipper ready`, im Log `Loaded MCU 'mcu' … 1.1.0.48-293-g493f9a0f` und dasselbe für `nozzle_mcu`, `FIRMWARE_RESTART` sauber. Prüfen: Temperaturen (Düse, Bett, Kammer ≈ Raumtemperatur), `QUERY_ENDSTOPS` (x/y/z „open“), `QUERY_PROBE` („open“), `M106 P0 S128` / `M107` (Lüfter hörbar), `G28` → muss mit „G28 gesperrt“ abbrechen. **Abbruch** bei: kein Connect, falsche MCU-Version, Config-Fehler → UART/Baud prüfen, STOP.
+1. **Nur MCU-Verbindung, ohne Bewegung** (Abweichung vom Plan: k2_prtouch/k2_box/k2_motor bleiben geladen, aber gesperrt – ohne `[k2_prtouch]` gäbe es keinen Z-Endstop). Erwartet: `Klipper ready`, im Log `Loaded MCU 'mcu' … 1.1.0.48-293-g493f9a0f` und dasselbe für `nozzle_mcu`, `FIRMWARE_RESTART` sauber. Prüfen: Temperaturen (Düse, Bett, Kammer ≈ Raumtemperatur), `QUERY_ENDSTOPS` (x/y/z „open“), `QUERY_PROBE` („open“), `M106 P0 S128` / `M107` (Lüfter hörbar), `G28` → muss mit „G28 gesperrt“ abbrechen. `ZALIGN_STATUS` → `zalign_z: RELEASED` / `zalign_z1: RELEASED` (Bett nicht ganz unten). **Abbruch** bei: kein Connect, falsche MCU-Version, Config-Fehler → UART/Baud prüfen, STOP.
 2. **Motor-Init Trockenlauf:** `KTWO_MOTOR_INIT DRY_RUN=1` → Plan P0–P9 (167 Schritte), Strapping X 0x81/Y 0x82/Z 0x83/Z1 0x84 (MOTOR-INIT-BEFUND §10). Abweichung → Config korrigieren, STOP.
 3. **RS485-Bus + Motor-Init lesend:** `KTWO_BUS_STATUS` → `offen=True` (sonst Port/Adapter prüfen; Meldung `[k2_485] Port … nicht zu öffnen` beim Connect). Dann `KTWO_MOTOR_STATUS` (Version/Schutz/Feedback X/Y/Z/Z1 über `k2_485`, E über transparent) und `KTWO_MOTOR_INIT` mit `allow_write: False` – nur Plan, nichts gesendet. `KTWO_BOX_STATUS` (lesend) ebenso.
 4. **Motor-Init schreibend:** `allow_write: True`, danach `auto_init: True` → „All motors are normal“, Stall Z/Z1/E, `0C [0b]` 8×00, Param-Abgleich, Event `k2_motor:ready`. Abbruch bei key798–802, STATUS-Bits ≠ 0, `0C`-Fehlerbits → STOP, kein Homing.
 5. **PrTouch ohne Bewegung:** `KTWO_PRTOUCH_TEST_SWAP`, `KTWO_PRTOUCH_READ`, `QUERY_PROBE` (open), `KTWO_PRTOUCH_STATUS`; `PROBE` muss mit „allow_move“-Fehler abbrechen (k2_prtouch README A.6).
 6. **Homing X/Y:** `[k2_motor] allow_write: True`; vorher `KTWO_MOTOR_HOMING PHASE=BEGIN` im Stand + `QUERY_ENDSTOPS` (Polarität PB11/PB12 prüfen, NOTIZ-stall.md §5), dann `KTWO_MOTOR_HOMING PHASE=END`. Danach zur Laufzeit `SET_GCODE_VARIABLE MACRO=_PI_FREIGABE VARIABLE=allow_move VALUE=True`, `G28 Y`, dann `G28 X` (einzeln, Hand am Not-Aus). Erwartet nach G28 X Y: X 342,5 / Y 3,8 (im Batch-Test so). Abbruch bei Schrittverlust/Blockade.
 7. **Z mit Probe:** `[k2_prtouch] allow_move: True`; Düse ~3 mm über dem Bett, `SET_KINEMATIC_POSITION Z=10`, `PROBE` (Stopp beobachten), `PROBE_ACCURACY SAMPLES=5`, dann `G28` (Z in Bettmitte, ≤ 5 mm/s), `Z_TILT_ADJUST`, `G28 Z`, `BED_MESH_CALIBRATE PROFILE=default` (bzw. `G29`), Ergebnis gegen `stock_referenz_2026-10-16` (−0,067 … 0,226) plausibilisieren, `SAVE_CONFIG`.
+7a. **A10 Dual-Z** nach NOTIZ-zalign.md §5 (mindestens T3 vor dem ersten Druck).
 8. **Heizen/Kammer:** Düse/Bett aufheizen, ggf. `NOZZLE_PID`/`BEDPID`; `M141 S45` → PTC-Lüfter (!PB14/PB2) MUSS sofort laufen, sonst sofort `M141 S0` (§6).
 9. **Erstdruck einfarbig** (Slicer: CFS aus; `START_PRINT EXTRUDER_TEMP=… BED_TEMP=…`).
 10. Optional je Modulreife (alle über `k2_485`): Belt lesend (`KTWO_BELT_INFO`/`KTWO_BELT_TEST`), dann `allow_write`/`allow_move` laut README-k2_belt.md §6 (CALI nur ohne Riemen); CFS lesend → schreibend (`[k2_box] allow_write: True`, Wechsel-Makros).
@@ -173,6 +178,8 @@ venv/bin/python klipper-clean/klippy/parsedump.py ../lokale MCU-Dictionaries/noz
 | **F** | Auslieferung, **gefixte Module ohne Testpatches** (`klipper-clean/`), `[k2_485]` aktiv | **EXIT 0, fehlerfrei** (kein Config-/Internal error, kein Traceback außer den üblichen `.version`/`device-tree`-Hinweisen). Connect: `[k2_485] Batch-Modus: RS485-Port … wird nicht geöffnet`, `[k2_box] bereit (warte auf k2_motor:ready …)`; `[k2_belt]` findet den Bus (keine „nicht verdrahtet“-Meldung mehr) |
 | F-makros/-homing/-luefter/-druck | Test-G-Code wie B | Fehlerbild identisch zu B (nur `K2_`→`KTWO_`); EXIT 255 bei makros/homing/druck = die gewollten Sperr-Fehler (`G28 gesperrt …`, CFS-Sperre) im Batch, luefter EXIT 0 |
 | **G** | wie F + `test-485.gcode` (`KTWO_BUS_STATUS`, `KTWO_MOTOR_INIT DRY_RUN=1`, `KTWO_MOTOR_STATUS`, `KTWO_BOX_STATUS`, `KTWO_BELT_TEST`, `KTWO_PRTOUCH_STATUS`) – `[k2_485]` ohne vorhandenen Port | kein Absturz, kein Shutdown: `KTWO_BUS_STATUS` → `offen=False batch=True fehler=Batch-Modus …`; Plan P0–P9 mit Strapping 0x81–0x84 ok; `KTWO_MOTOR_STATUS` X/Y/Z/Z1 → `[k2_485] Batch-Modus …`, E → `transparent … keine Antwort`; Box `Poll-Fehler: [k2_485] …`; Belt → G-Code-Fehler `RS485-Bus nicht verfügbar …`. (Vor dem Belt-/Box-Härtungsfix führte genau das zu `Internal error` + Shutdown, und der erste Name `KTWO_485_STATUS` zu `Unknown command:"KTWO_485"` → umbenannt) |
+| A10 | `upstream-test-a10/` (`lauf-alles.sh`) | 13 Läufe, 28/28: L/B EXIT 0, Z nur über trsync(PA15), Z1 nur über trsync(PA8), 370 mm/148 Etappen/10 mm/s, Sperren ohne Z-Schritt, Konflikt L+B erkannt, Erfolgsweg mit Test-Fake |
+| RESUME-Schnitt | `upstream-test-resumecut/` | 7 Läufe, Bahnprüfung 83/83 aus MCU-Schritten: nach CFS-Abbruch Hebel nur in X und einmal angefahren, nie unter Pausen-Z, Endlage = Druckposition vor dem Wechsel, E unverändert; Sperr-Läufe ohne Bewegung (EXIT 255 gewollt) |
 | **H** | wie G, aber **ohne** `[k2_485]` | kein Absturz: `[k2_motor] RS485-Bus fehlt: Abschnitt [k2_485] (serial: <by-id-Pfad>, baud: 230400) in printer.cfg anlegen …`, Box/Belt „Abschnitt [k2_485] fehlt in printer.cfg“, `KTWO_BUS_STATUS` unbekannt (erwartet), DRY_RUN-Plan geht |
 | **I** | wie F, `[k2_prtouch]` ans Ende von printer.cfg verschoben (`cfg-I/`), `python -v` | EXIT 0, fehlerfrei; `statistics` aus `/usr/lib/python3.14/statistics.py`, `extras/statistics.py` nie geladen; nachbau-Module aus `extras/k2_nachbau/` → Reihenfolge egal |
 
@@ -225,7 +232,7 @@ RS485-Port und alles darüber (`[k2_485]` öffnet im Batch-Modus bewusst nie; Mo
 11. **`[idle_timeout]` 99999999** wie Stock: Heizungen gehen nie automatisch aus – bewusst entscheiden.
 12. **ERLEDIGT 16.10.2026 (NOTIZ-cfs.md, nur Box 1):** Alter Stand – CFS-Wechsel (`T1–T15`, `M8200`) gesperrt, bis k2_box-Wechselablauf + Cutter (`CALIBRATE_CUT_POS`, braucht k2_motor-G-Codes) stehen.
 13. **`[k2_belt]`** eingetragen, aber gesperrt; Rüttel-Zyklus (Default-`cycle_gcode`) fährt X/Y per FORCE_MOVE ±200 mm ohne Endschalterschutz – erst nach X/Y-Homing-Freigabe.
-14. **`[z_align]`-Ersatz** fehlt (nur `z_tilt`).
+14. **`[z_align]`-Ersatz:** lesend aktiv, `[k2_zalign]` als Entwurf gesperrt (NOTIZ-zalign.md), Gerätetest offen; `START_PRINT` holt `Z_TILT_ADJUST` nach Stromlos nach (A10a, NOTIZ §3.2).
 15. **ANNAHMEN:** by-id-Namen; RS485-Adapterpfad; `~/printer_data/gcodes`; Bedeutung `power` PC9; PA0 doppelt angesteuert (fan1 + temperature_fan, wie Stock) unkritisch; Düsen-PB1 doppelt (hotend_fan + extruder_fan, wie Stock) unkritisch; Stock-`PB1` im Override meinte die Düsen-MCU; `minimum_cruise_ratio 0.0` ≙ `max_accel_to_decel = max_accel`; `move_check_distance 3` statt 1 unkritisch; Upstream-Default `step_pulse_duration` 2 µs passt zu den Closed-loop-Treibern; kein `M84` am Druckende (wie Stock).
 
 ## 7. Ergänzungen 16.10.2026 (Details in den Notizen)
@@ -234,10 +241,11 @@ RS485-Port und alles darüber (`[k2_485]` öffnet im Batch-Modus bewusst nie; Mo
 |---|---|---|
 | Sensorless X/Y-Homing | `NOTIZ-stall.md`, `homing.cfg`, `k2-motor.cfg` | Stock-Frame-Folge (Stall-Mode 1/2 an X/Y, Kp ID 70 300↔100, Schutzabfrage) über `KTWO_MOTOR_HOMING PHASE=BEGIN/END`; `FORCE_MOVE stepper_y -3` wie Stock |
 | Beschleunigungssensor | `NOTIZ-accel.md`, `../README-k2_lis2dw.md` | `[k2_lis2dw]` spricht das alte Creality-Protokoll, liefert Upstream-Datenstruktur; Erstlauf im Stand (`ACCELEROMETER_DEBUG_READ REG=0x0f` → 0x44) |
-| CFS-Farbwechsel | `NOTIZ-cfs.md`, `macros.cfg`, `k2-module.cfg`, `../README-k2_box.md` §8 | T0–T15 + M8200 P/C/R/L/W/F/O als `KTWO_BOX_*`-Kette, nur Box 1, ohne Freigaben nur Plan, Fehler im Druck → PAUSE |
-| Düsenreinigung + RESUME | `NOTIZ-reinigung-resume.md`, `macros.cfg`, `homing.cfg` | `_PI_NOZZLE_CLEAN` (Silikonstreifen wie Stock `BOX_NOZZLE_CLEAN`) vor dem ersten Z-Antasten, in START_PRINT und G29; RESUME: Schacht → Aufheizen → Vorextrusion → Reinigung → Rückfahrt erst X/Y, dann Z (nie unter Pausen-Z) |
+| CFS-Farbwechsel | `NOTIZ-cfs.md`, `macros.cfg`, `k2-module.cfg`, `../README-k2_box.md` §8 | T0–T15 + M8200 P/C/R/L/W/F/O als `KTWO_BOX_*`-Kette, nur Box 1, ohne Freigaben nur Plan, Fehler im Druck → PAUSE mit Rückfahrziel = Druckposition vor dem Wechsel (NOTIZ-reinigung-resume §6a) |
+| Düsenreinigung + RESUME | `NOTIZ-reinigung-resume.md`, `macros.cfg`, `homing.cfg` | `_PI_NOZZLE_CLEAN` (Silikonstreifen wie Stock `BOX_NOZZLE_CLEAN`) vor dem ersten Z-Antasten, in START_PRINT und G29; RESUME: Schacht → Aufheizen → Vorextrusion → Reinigung → Rückfahrt erst X/Y, dann Z (nie unter Pausen-Z); nach CFS-Abbruch: PAUSE verlässt Hebel (nur X)/Schacht (X160→Y345), RESUME fährt zur Druckposition vor dem Wechsel und setzt PAUSE_STATE neu – nie in den Schneidhebel (§6a) |
 | Schneidposition kalibrieren | `NOTIZ-cutcal.md`, `cutcal.cfg`, `../README.md` §10 | `CALIBRATE_CUT_POS [SAVE=1]` → `KTWO_MOTOR_CUT_CAL` (Stock-Folge Kp 300, Stall-Mode 3, Anstöße an PB11, +0,4, Mode 2, Kp 100); Wert über SAVE_CONFIG in `[k2_box] cut_pos_x` |
 | CFS-Nachladen bei leerer Spule | `NOTIZ-runout.md`, `k2-module.cfg`, `printer.cfg` (Filamentsensor), `../README-k2_box.md` §9 | `runout_gcode: KTWO_BOX_RUNOUT`, Ersatz-Slot gleiches Material + Farbe (RFID) oder eigene Gruppe; Default aus (`runout_refill: False`), sonst PAUSE |
+| Dual-Z-Lichtschranken (17.10.2026) | `NOTIZ-zalign.md`, `zalign.cfg`, `../k2_zalign.py` | lesend `[gcode_button]`; Ausrichtung `KTWO_ZALIGN` / `ZALIGN_STOCKART` gesperrt; Testprotokoll A10; `START_PRINT` → `_PI_ZTILT_WENN_NOETIG` |
 
 Gemeinsame Batch-Prüfung aller Module mit dieser Config (Upstream 9cb9975, Live-Dictionaries): **EXIT 0**,
 MCU-Ausgabe u. a. `config_endstop pin=PC7`, `config_prtouch_pres … clk_pin=PB13 sdo_pin=PB14`,

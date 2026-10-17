@@ -67,9 +67,26 @@ mit echtem Port, `KTWO_BOX_STATUS` liefert Zustand/Hub/Temp.
   Weiter: Ursache beheben (z. B. Filament im Hub, Box-Fehler 0x0c =
   Odometer-Stillstand), Schritt bzw. ganzen Wechsel `T<n>` von Hand
   wiederholen, `KTWO_BOX_ERROR_CLEAR` (setzt auch die Box per 0x04 [00 01]
-  auf IDLE), dann `RESUME` (senkt danach den Z-Hop des Wechsels per
-  `KTWO_BOX_RESUME_FIX`). Ein Wiederholungs-`T<n>` fährt zur Startposition
-  des abgebrochenen Wechsels zurück.
+  auf IDLE), dann `RESUME`.
+  Seit 17.10.2026 (ENTWURF, offline geprüft, NOTIZ-reinigung-resume.md §6a):
+  - PAUSE bekommt von k2_box das Rückfahrziel = **Druckposition vor dem
+    Wechsel** (`PAUSE CFS_RETURN_X/Y/Z`, Z ohne Hop) statt der
+    Fehlerposition; Meldung „Fehlerposition … Rückfahrziel …“.
+  - PAUSE verlässt den Schneidbereich (X < `pre_cut_pos_x`) zuerst NUR in X
+    (Stock box.cfg:13), den Schacht nach dem Z-Hub über X160 → Y345, dann
+    Park.
+  - RESUME fährt (nach Schacht/Vorextrusion/Abstreifen) X/Y in Pausenhöhe
+    zur Druckposition, senkt Z senkrecht und setzt die Upstream-PAUSE_STATE
+    dort neu – `RESUME_BASE` fährt nicht mehr zur Fehlerposition, der Druck
+    läuft an der Stelle weiter, an der `T<n>` begann. Ohne
+    Bewegungsfreigabe/Referenz wird RESUME in diesem Fall verweigert (Druck
+    bleibt pausiert, keine Bewegung).
+  - Ein Wiederholungs-`T<n>` in der Pause fährt X/Y zur Startposition des
+    abgebrochenen Wechsels zurück, senkt Z aber nicht (das macht RESUME);
+    bricht es selbst ab, gibt es keine zweite Pause. Eine alte
+    Startposition gilt nur in derselben Pause (nicht nach CANCEL/RESUME).
+  - `KTWO_BOX_RESUME_FIX` bleibt nach `RESUME_BASE`; mit dem Pi-PAUSE-Makro
+    ist Z bereits Teil des Rückfahrziels (`RESUME_FIX CLEAR=1` aus PAUSE).
 - Ohne Druck: normaler G-Code-Fehler, Zustand aufgeräumt, keine Bewegung
   danach (der Kopf bleibt z. B. im Schacht).
 - Ohne RS485-Port: `… fehlgeschlagen: [k2_485] …` (Batch: „Batch-Modus“).
@@ -97,6 +114,8 @@ mit echtem Port, `KTWO_BOX_STATUS` liefert Zustand/Hub/Temp.
   Schacht nur über X160/Y345); `extrude_entry_pos_x` 139 aus dem Beispiel.
 - **Z-Hop 0,4 mm** wie Stock-Beispiel – bei hohen Objekten nahe Y200/X10
   bzw. auf dem Weg zum Schacht Kollisionsgefahr wie im Stock.
+- **Abbruch im Schneidbereich:** Hebelzone (X ≤ −5,5) und Y-Ausdehnung des
+  Hebels nur aus Stock-Werten abgeleitet (NOTIZ-reinigung-resume.md §6a.6).
 - **Reactor:** lange Box-Antworten laufen über `ReactorBusProxy` in einem
   Hilfs-Thread; am Gerät prüfen, dass Heizung/MCU dabei stabil bleiben.
 - **Mehrere Boxen**, WASTE-Prüfung, RFID-basierte Spülmengen: nicht umgesetzt.

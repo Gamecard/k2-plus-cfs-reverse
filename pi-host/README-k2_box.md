@@ -1,4 +1,4 @@
-> **ENTWURF – am echten Gerät UNGETESTET (Stand 16.10.2026).** Klipper-Modul [k2_box] für Upstream-Klipper; offline getestet (`python3 test_k2_box.py`, 25/25 inkl. Filamentwechsel §8 und Auto-Nachladen §9). Entwurf durch einen weiteren KI-Agenten, von uns geprüft.
+> **ENTWURF – am echten Gerät UNGETESTET (Stand 16.10.2026).** Klipper-Modul [k2_box] für Upstream-Klipper; offline getestet (`python3 test_k2_box.py`, 28/28 inkl. Filamentwechsel §8, Auto-Nachladen §9 und RESUME nach Wechsel-Abbruch §10). Entwurf durch einen weiteren KI-Agenten, von uns geprüft.
 
 # BERICHT – Klipper-Modul [k2_box] + serial485-Patch (Entwurf, 16.10.2026)
 
@@ -344,6 +344,9 @@ Neue Optionen (Stock-Namen, Defaults = box.cfg): s. `CHANGE_DEFAULTS` und
   bis `KTWO_BOX_ERROR_CLEAR`; danach senkt `KTWO_BOX_RESUME_FIX` den Z-Hop.
   Außerhalb eines Drucks → G-Code-Fehler + Aufräumen. Nie „Internal
   error“/Shutdown (alle Ausnahmen werden abgefangen).
+- Seit 17.10.2026 (§10): Abbruch im laufenden Druck → `PAUSE
+  CFS_RETURN_X/Y/Z=<Druckposition vor dem Wechsel>`; RESUME fährt dorthin
+  statt zur Fehlerposition (Schneidhebel/Schacht).
 - Box 2–4 (T4–T15) abgelehnt, solange nicht konfiguriert; Hub durch anderen
   Slot belegt → Ablehnung vor jedem Frame; Kopfsensor zeigt Filament vor
   dem Einzug → Ablehnung.
@@ -409,3 +412,31 @@ nicht nachgebaut, Z nach RESUME mitten im Wechsel. Details:
 - Nebenbei (A6): `cut_pos_x` steht nicht mehr in `k2-module.cfg` (SAVE_CONFIG-
   Konflikt); Default −7.80 aus `CHANGE_DEFAULTS` bzw. SAVE_CONFIG-Block.
 
+## 10. RESUME nach abgebrochenem Wechsel im Schneidbereich (Ergänzung 17.10.2026)
+
+> **ENTWURF – am Gerät UNGETESTET.** Offline: `test_k2_box.py` 28/28 (3 neue
+> Prüfungen), Batch gegen Upstream 9cb9975:
+> `arbeitsdateien-lokal/upstream-test-resumecut/` (7 Läufe, 83/83).
+> Belege, Ablauf, ANNAHMEN: `config-pi/NOTIZ-reinigung-resume.md` §6a.
+
+- Problem: Upstream-`PAUSE_STATE` hielt nach einem Wechsel-Abbruch die
+  Fehlerposition (z. B. X −7,80/Y200 am Schneidhebel); `RESUME_BASE` fuhr
+  gerade dorthin zurück (Hebel erneut betätigt, Druck an falscher Stelle).
+- `_fail` (Pause wird durch den Fehler ausgelöst): `PAUSE CFS_RETURN_X/Y/Z`
+  = `start_pos` der Kette (vor dem Z-Hop) bzw. Position vor einem
+  Einzelschritt ohne Kette (`_step_start`); kein Ziel, wenn der Kopf noch
+  dort steht oder die Kette in einer Pause begann. `pending_resume_z` nur
+  noch, wenn die Pause durch den Fehler entsteht.
+- `KTWO_BOX_RESUME_FIX CLEAR=1` (aus dem PAUSE-Makro): Z-Korrektur verwerfen
+  (Z steckt im Rückfahrziel; keine Altlast einer per CANCEL beendeten Pause).
+- `gcode_leave_cut_zone(c, pos)`: Kopf bei X < `pre_cut_pos_x` → `G0 X10`
+  + `M400` vor jeder Schachtfahrt (`_go_extrude_pos`), Stock box.cfg:13.
+- `cmd_pre_opt`: `paused_at_start`; `_keep_start_pos` nur für ein `T<n>` in
+  derselben Pause (Fix: sonst Rückfahrt zur Position eines früheren
+  Wechsels). `cmd_end_opt` in einer Pause: Z nicht unter die Pausenhöhe.
+- Makros (`macros.cfg`): PAUSE übernimmt das Ziel (`pause_rebase`), parkt
+  vom Hebel nur über X, aus dem Schacht über X160 → Y345; RESUME sperrt vor
+  jeder Bewegung (Ziel am Hebel, fehlende Freigabe bei CFS-Abbruch), fährt
+  vom Hebel nur in X, und `_PI_RESUME_REBASE` setzt `PAUSE_STATE` an der
+  Druckposition neu (`RESTORE_GCODE_STATE` + `SAVE_GCODE_STATE`, ohne Fahrt)
+  → `RESUME_BASE` = Nullfahrt, G-Code-E wie vor dem Wechsel.

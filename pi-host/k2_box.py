@@ -109,7 +109,15 @@ Glied der Makrokette (config-pi/macros.cfg: T0–T15, M8200):
   ``KTWO_BOX_WASTE`` (= M8200 W, hier nur Hinweis),
   ``KTWO_BOX_END_OPT [RETURN=0|1]`` (= M8200 O), ``KTWO_BOX_WAIT``
   (Box-Zustand abwarten, Stock BOX_MODE_WAIT), ``KTWO_BOX_ERROR_CLEAR``,
-  ``KTWO_BOX_RESUME_FIX`` (aus RESUME, Z nach Abbruch im Wechsel).
+  ``KTWO_BOX_RESUME_FIX [CLEAR=1]`` (aus RESUME, Z nach Abbruch im
+  Wechsel; CLEAR=1 aus PAUSE = Z steckt im Rückfahrziel, s. unten).
+
+Abbruch im laufenden Druck (17.10.2026, config-pi/NOTIZ-reinigung-resume.md
+§6a): ``PAUSE CFS_RETURN_X/Y/Z=<Druckposition vor dem Wechsel>`` statt der
+Fehlerposition (z. B. am Schneidhebel X -7,8 / Y200 oder im Schacht) – das
+PAUSE-Makro merkt sie als Rückfahrziel, RESUME fährt dorthin und setzt die
+Upstream-PAUSE_STATE darauf (RESUME_BASE = Nullfahrt). Fahrten in den Schacht
+verlassen den Schneidbereich (X < pre_cut_pos_x) zuerst nur in X.
 
 Auto-Nachladen bei Runout (A7, 17.10.2026 – Belege/ANNAHMEN in
 config-pi/NOTIZ-runout.md, README-k2_box.md §9):
@@ -358,6 +366,22 @@ def gcode_go_extrude_pos(c):
             "G0 X%s F%s" % (_n(c["extrude_entry_pos_x"]), f),
             "G0 Y%s F%s" % (_n(c["extrude_pos_y"]), f),
             "G0 X%s F%s" % (_n(c["extrude_pos_x"]), f)]
+
+
+def gcode_leave_cut_zone(c, pos):
+    """Kopf im Schneidbereich (X < pre_cut_pos_x, Hebel-Anschlag links, z. B.
+    nach einem abgebrochenen Schnitt): zuerst NUR X auf pre_cut_pos_x, keine
+    Y-Bewegung in Hebelnähe. Beleg Stock box.cfg:13 ``pre_cut_pos_x: 10
+    #预撞刀的位置，保证垂直撞刀`` (Vor-Schneidposition, Hebel senkrecht
+    anfahren) und Rückweg des Schnitts ``G0 X10`` + ``M400`` (gcode_cut,
+    live „cut to return OK“); erst danach Y (T0-Beispiel 6.: ``G0 Y345`` bei
+    X10). Das M400 hält dort an: ohne Halt zöge der Input-Shaper die folgende
+    Y-Fahrt schon vor X10 an (Batch resumecut: 0,03 mm Y bei X < 9,4).
+    Sonst [] (pos None = unbekannt -> nichts)."""
+    if pos is None or float(pos[0]) >= float(c["pre_cut_pos_x"]) - 0.01:
+        return []
+    return ["G0 X%s F%s" % (_n(c["pre_cut_pos_x"]), _n(c["travel_velocity"])),
+            "M400"]
 
 
 def gcode_safe_pos(c):
@@ -1460,7 +1484,12 @@ class PrinterK2Box:
         self.chain = self._new_chain()
         self.chain_error = ""
         self.pending_resume_z = None
-        self._keep_start_pos = None  # Startposition eines abgebrochenen Wechsels
+        # Startposition eines im Druck abgebrochenen Wechsels – nur für ein
+        # Wiederholungs-T<n> IN DERSELBEN PAUSE (s. cmd_pre_opt).
+        self._keep_start_pos = None
+        # Position vor einem Einzelschritt im laufenden Druck ohne Kette
+        # (z. B. M8200 C ohne P) -> Rückfahrziel bei dessen Abbruch.
+        self._step_start = None
         # Auto-Nachladen bei Runout (A7): Laufzeit-Schalter (Start = Config
         # runout_refill, Stock BOX_ENABLE_AUTO_REFILL), Gleich-Material-Liste
         # (Stock BOX_UPDATE_SAME_MATERIAL_LIST, hier manuell), letzte Meldung.
@@ -1493,7 +1522,8 @@ class PrinterK2Box:
                 ("KTWO_BOX_ERROR_CLEAR", self.cmd_error_clear,
                  "Wechsel-Fehler quittieren (+ Box 0x04 IDLE mit allow_write)"),
                 ("KTWO_BOX_RESUME_FIX", self.cmd_resume_fix,
-                 "Nach RESUME: Z auf Höhe vor dem abgebrochenen Wechsel"),
+                 "Nach RESUME: Z auf Höhe vor dem abgebrochenen Wechsel "
+                 "[CLEAR=1] (CLEAR aus PAUSE: Z steckt im Rückfahrziel)"),
                 ("KTWO_BOX_RUNOUT", self.cmd_runout,
                  "Runout: aus der CFS nachladen (= Stock BOX_CHECK_MATERIAL_"
                  "REFILL) [SLOT=A..D] [TEMP=] [DRY_RUN=1]"),
@@ -1795,6 +1825,7 @@ class PrinterK2Box:
     def _new_chain():
         return {"active": False, "skip": False, "skip_reason": "",
                 "tnn": "", "start_pos": None, "hop": 0.0,
+                "paused_at_start": False,
                 "state_saved": False, "sensor_was_enabled": None,
                 "orig_target": None, "temp_changed": False}
 
@@ -1996,8 +2027,14 @@ class PrinterK2Box:
         if pos is not None and abs(pos[0] - c["extrude_pos_x"]) < 0.5 \
                 and abs(pos[1] - c["extrude_pos_y"]) < 0.5:
             return False
-        return self._move(gcmd, "Abfallschacht (BOX_GO_TO_EXTRUDE_POS)",
-                          gcode_go_extrude_pos(c))
+        lines = gcode_go_extrude_pos(c)
+        # Kopf noch am Schneidhebel (abgebrochener Schnitt, Schritt von Hand
+        # wiederholt): erst nur X heraus, sonst zöge "G0 Y345" den Kopf
+        # seitlich am Hebel entlang.
+        lead = gcode_leave_cut_zone(c, pos)
+        if lead:
+            lines = lines[:1] + lead + lines[1:]
+        return self._move(gcmd, "Abfallschacht (BOX_GO_TO_EXTRUDE_POS)", lines)
 
     @staticmethod
     def _exc_text(exc):
@@ -2018,25 +2055,68 @@ class PrinterK2Box:
                 pass
         self.chain = self._new_chain()
 
+    def _resume_target(self):
+        """Rückfahrziel für RESUME nach einem Wechsel-Fehler im LAUFENDEN
+        Druck: die Druckposition, an der die Kette begann (PRE_OPT, vor dem
+        Z-Hop) bzw. vor dem fehlgeschlagenen Einzelschritt (ohne Kette, z. B.
+        M8200 C ohne P). Upstream-PAUSE_STATE hielte sonst die Fehlerposition
+        (am Schneidhebel, im Schacht) – RESUME_BASE führe gerade dorthin und
+        der Druck ginge dort weiter. None = kein eigenes Ziel nötig: Kette in
+        einer Pause gestartet (PAUSE_STATE ist dann schon die Druckposition),
+        Position unbekannt, oder Kopf steht noch dort (±0,01 mm)."""
+        ch = self.chain
+        if ch.get("active"):
+            sp = None if ch.get("paused_at_start") else ch.get("start_pos")
+        else:
+            sp = self._step_start
+        if sp is None:
+            return None
+        sp = [float(v) for v in sp[:3]]
+        pos = self._gcode_pos()
+        if pos is not None and max(abs(pos[i] - sp[i]) for i in range(3)) < 0.01:
+            return None
+        return sp
+
     def _fail(self, gcmd, name, text):
         """Fehler im Wechsel: im Druck PAUSE (kein Shutdown, kein Abbruch),
-        Folgeschritte überspringen; sonst Aufräumen + G-Code-Fehler."""
+        Folgeschritte überspringen; sonst Aufräumen + G-Code-Fehler.
+
+        Löst DIESER Fehler die Pause aus (Druck lief), bekommt PAUSE das
+        Rückfahrziel ``CFS_RETURN_X/Y/Z`` (= _resume_target, Z ohne Hop):
+        das PAUSE-Makro (macros.cfg) merkt es statt der Fehlerposition und
+        quittiert mit ``KTWO_BOX_RESUME_FIX CLEAR=1`` (Z ist Teil des
+        Ziels); ohne dieses Makro (Upstream-PAUSE ignoriert die Parameter)
+        bleibt der alte Z-Fallback pending_resume_z. In einer schon
+        bestehenden Pause (Wiederholung von Hand, Runout-Kette) weder Ziel
+        noch Z-Fallback – PAUSE_STATE ist dort bereits die Druckposition."""
         msg = "[k2_box] %s fehlgeschlagen: %s" % (name, text)
         if self._print_active() and self.cfg.get("pause_on_failure"):
             if not self.chain_error:
                 self.chain_error = msg
             ch = self.chain
+            was_paused = self._is_paused()
             if ch.get("start_pos") is not None:
                 self._keep_start_pos = list(ch["start_pos"])
-                if ch.get("hop"):
-                    self.pending_resume_z = float(ch["start_pos"][2])
+            target = None if was_paused else self._resume_target()
+            if not was_paused and ch.get("hop") and ch.get("active") \
+                    and ch.get("start_pos") is not None:
+                self.pending_resume_z = float(ch["start_pos"][2])
+            hint = ""
+            if target is not None:
+                hint = (" Rückfahrziel für RESUME = Druckposition vor dem "
+                        "Wechsel X%s Y%s Z%s (nicht die Fehlerposition)."
+                        % tuple(_n(v) for v in target))
             self._respond_error(
                 "%s – Druck wird PAUSIERT (kein Abbruch). Ursache beheben, "
                 "Schritt bzw. Wechsel (T<n>) von Hand wiederholen, dann "
-                "KTWO_BOX_ERROR_CLEAR und RESUME." % (msg,))
-            if not self._is_paused():
+                "KTWO_BOX_ERROR_CLEAR und RESUME.%s" % (msg, hint))
+            if not was_paused:
+                line = "PAUSE"
+                if target is not None:
+                    line += (" CFS_RETURN_X=%s CFS_RETURN_Y=%s CFS_RETURN_Z=%s"
+                             % tuple(_n(v) for v in target))
                 try:
-                    self._script(["PAUSE"])
+                    self._script([line])
                 except Exception as exc:
                     self._respond_error("[k2_box] PAUSE fehlgeschlagen: %s"
                                         % (exc,))
@@ -2059,10 +2139,17 @@ class PrinterK2Box:
                 "Filamentwechsel im Druck nicht freigegeben ([k2_box] "
                 "allow_write=%s, allow_move=%s) – nichts ausgeführt" % (
                     self.cfg.get("allow_write"), self.cfg.get("allow_move"))))
+        # Einzelschritt ohne Kette im laufenden Druck: Position merken
+        # (Rückfahrziel, falls der Schritt abbricht – s. _resume_target).
+        self._step_start = (self._gcode_pos() if not ch.get("active")
+                            and self._print_active()
+                            and not self._is_paused() else None)
         try:
             return body(gcmd)
         except Exception as exc:
             return self._fail(gcmd, name, self._exc_text(exc))
+        finally:
+            self._step_start = None
 
     # -- G-Codes ---------------------------------------------------------
     def cmd_pre_opt(self, gcmd):
@@ -2101,8 +2188,17 @@ class PrinterK2Box:
             if "enabled" in sens:
                 ch["sensor_was_enabled"] = bool(sens["enabled"])
                 self._set_head_sensor(False)
-            ch["start_pos"] = (list(self._keep_start_pos)
-                               if self._keep_start_pos else self._gcode_pos())
+            # Startposition: Wiederholungs-T<n> IN der Pause nach einem
+            # Abbruch -> Startposition des abgebrochenen Wechsels; sonst (Druck
+            # läuft, kein Druck) die aktuelle Position und eine alte Start-
+            # position verwerfen (Fix 17.10.: nach CANCEL/RESUME hätte END_OPT
+            # sonst zur Position eines früheren Wechsels zurückgefahren).
+            ch["paused_at_start"] = self._is_paused()
+            if ch["paused_at_start"] and self._keep_start_pos:
+                ch["start_pos"] = list(self._keep_start_pos)
+            else:
+                self._keep_start_pos = None
+                ch["start_pos"] = self._gcode_pos()
             self._script(["SAVE_GCODE_STATE NAME=%s" % CHAIN_STATE_NAME])
             ch["state_saved"] = True
             if hop > 0:
@@ -2334,11 +2430,23 @@ class PrinterK2Box:
                     self._move(gcmd, "Schacht verlassen", gcode_safe_pos(c))
                 sp = ch.get("start_pos")
                 if ret and sp is not None:
-                    self._move(gcmd, "Rückfahrt zur Startposition", [
-                        "G90",
-                        "G0 X%s Y%s F%s" % (_n(sp[0]), _n(sp[1]),
-                                            _n(c["travel_velocity"])),
-                        "G0 Z%s F%s" % (_n(sp[2]), _n(c["z_velocity"]))])
+                    lines = ["G90", "G0 X%s Y%s F%s" % (
+                        _n(sp[0]), _n(sp[1]), _n(c["travel_velocity"]))]
+                    cur = self._gcode_pos()
+                    if self._is_paused() and cur is not None \
+                            and float(sp[2]) < cur[2] + 0.001:
+                        # In der Pause senkt nur RESUME (X/Y in Pausenhöhe,
+                        # dann Z senkrecht) – sonst stünde die Düse auf
+                        # Druckhöhe über dem Objekt und RESUME führe von dort
+                        # quer zum Schacht.
+                        gcmd.respond_info(
+                            "[k2_box] END_OPT: Druck pausiert – Z bleibt auf "
+                            "%s (Start-Z %s senkt RESUME)" % (_n(cur[2]),
+                                                             _n(sp[2])))
+                    else:
+                        lines.append("G0 Z%s F%s" % (_n(sp[2]),
+                                                     _n(c["z_velocity"])))
+                    self._move(gcmd, "Rückfahrt zur Startposition", lines)
                 if ch.get("temp_changed") and ch.get("orig_target") is not None:
                     self._move(gcmd, "Zieltemperatur zurück",
                                ["M104 S%s" % _n(ch["orig_target"])], wrap=False)
@@ -2373,6 +2481,18 @@ class PrinterK2Box:
         gcmd.respond_info(msg)
 
     def cmd_resume_fix(self, gcmd):
+        # CLEAR=1 (aus dem PAUSE-Makro bei JEDER neuen Pause): ein Rückfahrziel
+        # mit Z (PAUSE CFS_RETURN_Z) ersetzt die Z-Korrektur; zugleich keine
+        # Altlast aus einer per CANCEL beendeten Pause (sonst führe ein
+        # späteres RESUME auf ein fremdes Z).
+        if gcmd.get_int("CLEAR", 0):
+            if self.pending_resume_z is not None:
+                gcmd.respond_info("[k2_box] RESUME_FIX: Z-Korrektur auf %s "
+                                  "verworfen (Rückfahrziel der Pause enthält "
+                                  "Z bzw. neue Pause)"
+                                  % (_n(self.pending_resume_z),))
+            self.pending_resume_z = None
+            return
         z = self.pending_resume_z
         if z is None:
             return

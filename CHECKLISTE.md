@@ -131,9 +131,21 @@ Audit und Änderungsbegründungen: `<projekt>/AUDIT-UND-AENDERUNGEN.md`.
   (Testordner ~/k2-test, NICHT installiert; Klipper-Checkout unverändert)
 - [ ] Pi am Drucker: Lower-Board-Verbindung (UART Main/Düse + USB-RS485), by-id-Namen ermitteln, Module nach
   config-pi/README §3 installieren, Inbetriebnahme §4 (erst ohne Bewegung)
-- [ ] A10 z_align-Vergleich am Gerät (Dual-Z ohne Lichtschranken stabil?)
-- [ ] RESUME nach abgebrochenem CFS-Wechsel im Schneidbereich: Upstream-RESUME_BASE fährt gerade zur Fehlerposition
-  zurück und könnte den Schneidhebel erneut betätigen (bisher nur Meldung) – am Pi prüfen/absichern
+- [~] A10 z_align-Vergleich am Gerät (Dual-Z ohne Lichtschranken stabil?) – OFFLINE VORBEREITET 17.10.2026:
+  Analyse + Testprotokoll T0–T8: pi-host/config-pi/NOTIZ-zalign.md. zalign.cfg Variante L aktiv (lesend,
+  [gcode_button] ^!PA15/^!PA8, ZALIGN_STATUS; buttons_* im Main-Dict 130/140 nachgeprüft); Variante B [k2_zalign]
+  (pi-host/k2_zalign.py) auskommentiert + gesperrt. Batch upstream-test-a10 28/28, test_k2_zalign 83/83.
+  Am Gerät: T1 lesen + Zuordnung links/rechts, T3 z_tilt-only (≥3 Kaltstarts), T4–T7 Variante B + Z-max, T8 Entscheidung.
+- [x] A10a START_PRINT holte nach Stromlos kein Z_TILT_ADJUST nach, lud aber das Mesh – BEHOBEN 17.10.2026:
+  `_PI_ZTILT_WENN_NOETIG` (macros.cfg) vor dem maßgeblichen G28 Z, nur wenn z_tilt nicht applied; a45-Batch 0 Fehler.
+- [x] RESUME nach abgebrochenem CFS-Wechsel im Schneidbereich – OFFLINE GELÖST 17.10.2026 (NOTIZ-reinigung-resume §6a,
+  Batch upstream-test-resumecut 83/83): PAUSE CFS_RETURN = Druckposition vor dem Wechsel, Schneidbereich nur in X,
+  Schacht über X160→Y345, RESUME setzt PAUSE_STATE neu (_PI_RESUME_REBASE), Ziel am Hebel/ohne Freigabe → RESUME gesperrt.
+  Nebenbei behoben: pending_resume_z bei Kette in Pause, Z-Korrektur nach CANCEL, _keep_start_pos nach CANCEL/RESUME,
+  END_OPT senkte Z in der Pause. Abgebrochener Wechsel wird NICHT automatisch nachgeholt (Stock resume_tnn):
+  in der Pause T<n>, dann KTWO_BOX_ERROR_CLEAR + RESUME.
+- [ ] Am Gerät: CFS-Abbruch im Schacht provozieren (Box stromlos während T1), Park- und RESUME-Bahn beobachten;
+  Hebelfall nur außerhalb eines Drucks mit KTWO_BOX_CUT
 - [ ] Am Pi zu prüfen: Positionen Reinigung/Schacht wegen FORCE_MOVE-Versatz einzeln langsam abfahren; Vorextrusion
   460 mm/min/180 °C; Stall-Pin PB11 in Mode 3; RESUME direkt aus runout_gcode
   Zurückgestellt: Motor-Kalibrierfunktionen aus dessen motor_control.py (0x03 Encoder, 0x04 Elektrik-Offset,

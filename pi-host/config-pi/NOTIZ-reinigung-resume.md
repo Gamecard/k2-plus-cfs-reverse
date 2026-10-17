@@ -7,6 +7,12 @@
 > grün. `config-pi/README.md` ist hier bewusst nicht geändert (dort steht in
 > §2.2/§6 Punkt 5 noch „Düsenreinigung fehlt“ – gilt seit diesem Stand nicht
 > mehr). Alles mit **ANNAHME** ist nicht belegt.
+>
+> **Ergänzung 17.10.2026 (§6a):** RESUME nach einem im Druck abgebrochenen
+> CFS-Wechsel (Schneidhebel/Schacht) – Rückfahrziel = Druckposition vor dem
+> Wechsel, Schneidbereich nur in X, PAUSE_STATE-Neusetzung. Offline geprüft:
+> `arbeitsdateien-lokal/upstream-test-resumecut/` (7 Läufe, 83 Prüfungen,
+> 0 Fehler), a45-Batch weiter 0 Fehler, `test_k2_box.py` 28/28.
 
 ## 1. Was wo passiert
 
@@ -17,9 +23,10 @@
 | `macros.cfg` `_PI_CLEAN_PATH` | **neu**: dieselbe Bahn als reiner G-Code (`PART=GO\|WIPE\|LEAVE`), Werte aus `[k2_box]` |
 | `macros.cfg` `START_PRINT` | Reinigung vor dem zweiten `G28 Z`; am Ende über dem Schacht auf Drucktemperatur, dann abstreifen |
 | `macros.cfg` `G29` | Reinigung zwischen `Z_TILT_ADJUST` und dem letzten `G28 Z` |
-| `macros.cfg` `PAUSE` | merkt zusätzlich die Pausenposition (`pause_x/y/z`) |
+| `macros.cfg` `PAUSE` | merkt zusätzlich die Pausenposition (`pause_x/y/z`); seit 17.10. `CFS_RETURN_X/Y/Z` (Rückfahrziel aus k2_box, `pause_rebase`), verlässt Schneidbereich (nur X) bzw. Schacht (X160 → Y345) vor dem Parken (§6a) |
 | `macros.cfg` `RESUME` | ruft `_PI_RESUME_PREPARE` (nur wenn pausiert), Lüfter zurück, dann `RESUME_BASE` + `KTWO_BOX_RESUME_FIX` |
 | `macros.cfg` `_PI_RESUME_PREPARE/_PRIME/_RETURN` | **neu**: Schacht → `M109` → Vorextrusion → Abkühlen → Abstreifen → Schacht verlassen → Rückfahrt (X/Y in Pausenhöhe, dann Z senkrecht) |
+| `macros.cfg` `_PI_RESUME_REBASE` | **neu 17.10.**: nach CFS-Abbruch PAUSE_STATE an der erreichten Druckposition neu speichern (§6a) |
 | `homing.cfg` `[homing_override]` | `_PI_NOZZLE_CLEAN WHY=G28` vor dem ersten Z-Antasten (nur wenn Z noch nicht referenziert) |
 
 ## 2. A4 – Reinigung vor dem Z-Antasten
@@ -143,10 +150,11 @@ Pausen-Z, (2) X/Y in dieser Höhe (Pausenhöhe = Pausen-Z + `z_safe`, z. B.
 Nullfahrt und stellt Modus/E-Basis her (Batch: G-Code-E nach RESUME = vor
 PAUSE, E-Basis +79 = 82 − 3). Die Pausenposition merkt sich `PAUSE`
 (`gcode_move.gcode_position` beim Rendern = Position von `PAUSE_BASE`).
-Sonderfälle (Pause aus einem abgebrochenen CFS-Wechsel): Pausenposition im
-Schacht (Y > `safe_pos_y`) → Einfahrt wie `KTWO_BOX_GO_EXTRUDE_POS`
-(Y345 → X139 → Y → X); im Schneidbereich (X < `pre_cut_pos_x`) → keine eigene
-Fahrt, nur Meldung (s. §6).
+Sonderfälle: Pausenposition im Schacht (Y > `safe_pos_y`) → Einfahrt wie
+`KTWO_BOX_GO_EXTRUDE_POS` (Y345 → X139 → Y → X). Pause aus einem im Druck
+abgebrochenen CFS-Wechsel → seit 17.10. ist die „Pausenposition“ die
+Druckposition VOR dem Wechsel, Schneidbereich nur in X, PAUSE_STATE wird
+danach neu gesetzt (§6a); Ziel am Schneidhebel → RESUME verweigert.
 
 ### 4.3 Ablauf `RESUME` (nur wenn pausiert)
 
@@ -154,7 +162,11 @@ Fahrt, nur Meldung (s. §6).
 2. `_PI_RESUME_PREPARE` – Voraussetzungen: X/Y/Z referenziert,
    `_PI_FREIGABE allow_move`, `[k2_box]` mit `allow_move`, Pausenposition
    bekannt. Sonst nur `M109 S<Pausentemperatur>` + Meldung, Rückweg über
-   `RESUME_BASE` wie bisher.
+   `RESUME_BASE` wie bisher – **außer** (seit 17.10., §6a) die Pause stammt
+   aus einem abgebrochenen CFS-Wechsel (`pause_rebase`) oder der Kopf steht
+   im Schneidbereich: dann `RESUME gesperrt …` ohne jede Bewegung. Ziel am
+   Schneidhebel (X ≤ `check_cut_pos_x_max`) → immer gesperrt.
+   0. (17.10.) Kopf im Schneidbereich → zuerst `G1 X<pre_cut_pos_x>` + `M400`.
    1. `_PI_NOZZLE_CLEAN ONLY=GO` – in den Abfallschacht (im Druck/Pause
       VIA=GCODE, s. §2.2), Tropfen beim Aufheizen fallen dort hinein.
    2. `M109 S<hotend_temp>` (aus PAUSE).
@@ -164,7 +176,9 @@ Fahrt, nur Meldung (s. §6).
       `G1 E{pause_extrude + resume_prime_extra} F{resume_prime_speed}`
       (= 82 mm mit 460 mm/min), `M106 P0 S127`, `G4 P3000`.
    4. `_PI_NOZZLE_CLEAN` – Abstreifen + Schacht verlassen.
-   5. `_PI_RESUME_RETURN` – §4.2.
+   5. `_PI_RESUME_RETURN` – §4.2 (bricht ab, wenn ein CFS-Schritt der
+      Vorbereitung `chain_error` gesetzt hat).
+   6. (17.10.) nur bei `pause_rebase`: `_PI_RESUME_REBASE` (§6a).
 3. Lüfter wie vor der Pause (fan0 sonst `M107 P0`, damit der Abkühl-Lüfter
    aus ist), `extruder_fan` an.
 4. `RESUME_BASE {rawparams}`, `KTWO_BOX_RESUME_FIX` (Z-Hop nach CFS-Abbruch).
@@ -211,11 +225,9 @@ paused“) + `KTWO_BOX_RESUME_FIX` – keine Lüfter-/Extruderaktion.
   reinigen ohnehin noch einmal bei 140 °C vor dem maßgeblichen `G28 Z`).
 - **PAUSE parkt weiter bei X max−10 / Y Mitte** (unverändert, Stock parkt am
   Schacht/X160 Y345). RESUME heizt deshalb erst im Schacht wieder auf.
-- **Pause aus einem abgebrochenen CFS-Wechsel:** Upstream-`PAUSE_STATE` hält
-  die Fehlerposition (Schacht, selten Schneidhebel). `RESUME_BASE` fährt
-  dorthin zurück (vorbestehendes Verhalten, nicht neu); im Schneidbereich
-  könnte die gerade Rückfahrt den Hebel erneut betätigen → am Gerät prüfen,
-  ggf. in k2_box lösen (Start- statt Fehlerposition als Rückfahrziel).
+- ~~**Pause aus einem abgebrochenen CFS-Wechsel:** Upstream-`PAUSE_STATE`
+  hält die Fehlerposition … `RESUME_BASE` fährt dorthin zurück~~ –
+  **gelöst 17.10.2026 (offline), §6a.** Am Gerät bleibt zu prüfen: §6a.6.
 - **Wegwahl BOX/GCODE** spiegelt `k2_box._print_active()` (Stand 16.10. spät:
   print_stats printing/paused ODER `pause_resume.is_paused`). Ändert k2_box
   das erneut, muss `_PI_NOZZLE_CLEAN` mitgezogen werden (sonst pausiert k2_box
@@ -224,3 +236,137 @@ paused“) + `KTWO_BOX_RESUME_FIX` – keine Lüfter-/Extruderaktion.
   `FORCE_MOVE stepper_y -3` (NOTIZ-stall.md §4) am Gerät erst langsam mit
   `KTWO_BOX_GO_EXTRUDE_POS`/`KTWO_BOX_WIPE`/`KTWO_BOX_SAFE_POS` einzeln prüfen
   (NOTIZ-cfs.md §2 Schritt 2), dann `_PI_NOZZLE_CLEAN`, dann G28.
+
+## 6a. RESUME nach abgebrochenem CFS-Wechsel im Schneidbereich (17.10.2026)
+
+> **ENTWURF – am Gerät UNGETESTET.** Offline: Batch
+> `arbeitsdateien-lokal/upstream-test-resumecut/` gegen Upstream 9cb9975
+> (`ERGEBNIS.txt`: 7 Läufe, Bahnprüfung aus den dekodierten MCU-Schritten
+> 83/83), `pi-host/test_k2_box.py` 28/28 (3 neue Prüfungen), a45-Batch
+> weiter 0 Fehler (eine Render-Erwartung bewusst geändert, s. 6a.5).
+> Alles weiter gesperrt ausgeliefert.
+
+### 6a.1 Problem
+
+Bricht ein Wechsel im laufenden Druck ab, pausiert k2_box (`_fail` →
+`PAUSE`). Upstream-`PAUSE_BASE` speichert dabei `PAUSE_STATE` an der
+**Fehlerposition** (z. B. am Schneidhebel X −7,80 / Y200, oder im Schacht
+X133/Y378, jeweils Druck-Z + Hop 0,4). `RESUME_BASE` = `RESTORE_GCODE_STATE
+NAME=PAUSE_STATE MOVE=1` fährt **gerade** (X/Y/Z zugleich) dorthin zurück
+(Upstream `pause_resume.py` `cmd_RESUME`, `gcode_move.py`
+`cmd_RESTORE_GCODE_STATE`) → schräg in den Hebel / gegen den Rahmen, und der
+Druck ginge danach an der Fehlerposition weiter (der nächste Slicer-Befehl
+erwartet aber die Druckposition vor `T<n>`). Zusätzlich parkte PAUSE schräg
+aus Hebel/Schacht heraus (`G1 X342,5 Y200`).
+
+### 6a.2 Stock-Belege (Maßstab)
+
+| Fundstelle | Inhalt |
+|---|---|
+| `live-logs-2026-10-16/config-aktuell/box.cfg:13` | `pre_cut_pos_x: 10 #预撞刀的位置，保证垂直撞刀` – Vor-Schneidposition, „Hebel senkrecht anfahren“ → am Hebel nur X-Bewegung |
+| `…/box.cfg:226-237` (T0-Beispiel 3.–6.1) | `G0 X10 Y200` → `M8200 C` (Schnitt) → „6. zuerst Y“ `G0 Y345` (bei X10) → `G0 X139` („此位置直行无碰撞风险“, gerade ohne Kollisionsrisiko) |
+| `live-logs-2026-10-15/klippy.log.2026-10-12:13144/13156` | `[box] cut sensor detected` → 3 s → `[box] cut to return OK` (Schnitt endet wieder an der Vor-Schneidposition, k2_box `gcode_cut`: `G0 X10` + `M400`) |
+| `…/box.cfg:39-40` | `check_cut_pos_x_max: -5.5`, `check_cut_pos_x_min: -9.5` – Bereich des Schneidanschlags (Kalibrierung zählt erst dort Treffer, NOTIZ-cutcal §1) |
+| `…/box.cfg:268-270` (T0-Beispiel 11.) | Schacht verlassen `G0 X160` / `G0 Y345` |
+| `…/box.cfg:273-274` (T0-Beispiel 13.) | „Z wiederherstellen (oder zurück zum Modell, **dann** Z)“ |
+| `…/gcode_macro.cfg:759-775` | Stock-PAUSE: `M400`, Rückzug, Z-Hub, dann `BOX_GO_TO_EXTRUDE_POS` / `BOX_NOZZLE_CLEAN` / `BOX_MOVE_TO_SAFE_POS` (nicht schräg zum Parkpunkt) |
+| `…/gcode_macro.cfg:870-881` | Stock-RESUME: `RESUME_EXTERNAL_PROCESS` → `BOX_ERROR_RESUME_PROCESS` → `RESUME_EXTERNAL` → `RESUME_BASE` |
+| `box_wrapper.cpython-39.so` (strings) | `save_resume_tnn`, `clear_resume_tnn`, `resume_flag`, `[error_resume_process] state is not paused` / `resume_tnn is None` / `filament sensor is detected` → Stock merkt sich die TNN des abgebrochenen Wechsels und holt ihn beim RESUME nach (**ANNAHME** nach Strings, Ablauf nicht dekompiliert) |
+| `klippy.log.2026-10-12:51987-51988`, `klippy.log.2026-10-05:66249`, `klippy.log.2026-10-12:88007` | `error: empty_print, tnn: T1A` → `set resume_flag`; RESUME: `[error_resume_process] resume_tnn is None` bzw. `filament sensor is detected` – **kein** Log eines Fehler-Resume mit Rückfahrt aus dem Schneidbereich → Stock-Rückfahrziel nach Box-Fehler **unbelegt** |
+
+### 6a.3 Lösung (gewählt: Startposition als Rückfahrziel + Schneidbereich nur in X)
+
+1. **k2_box `_fail`** (Fehler im laufenden Druck, Pause wird DADURCH
+   ausgelöst): `PAUSE CFS_RETURN_X/Y/Z=<Druckposition vor dem Wechsel>` –
+   `start_pos` aus `PRE_OPT` (vor dem Z-Hop) bzw. die Position vor einem
+   Einzelschritt ohne Kette (z. B. `M8200 C` ohne `P`, `_step_start`).
+   Kein Ziel, wenn der Kopf noch dort steht (±0,01) oder die Kette in einer
+   Pause begann (Wiederholung von Hand, Runout-Kette: dort ist PAUSE_STATE
+   schon die Druckposition) – dann auch kein `pending_resume_z` mehr (Fix:
+   früher Z-Korrektur auf Park-Z).
+2. **PAUSE-Makro**: übernimmt `CFS_RETURN_*` als `pause_x/y/z`,
+   `pause_rebase: True`, Meldung „Fehlerposition … Rückfahrziel …“, ruft
+   `KTWO_BOX_RESUME_FIX CLEAR=1` (Z steckt im Ziel; zugleich keine Z-Altlast
+   aus einer per CANCEL beendeten Pause). Parken: Kopf im Schneidbereich
+   (X < `pre_cut_pos_x`) → zuerst `G90` + `G1 X10` (nur X, vor Rückzug und
+   Z-Hub); Kopf im Schacht (Y > `safe_pos_y`) → nach dem Z-Hub `G1 X160`,
+   `G1 Y345`; dann wie bisher `X max−10 / Y Mitte`.
+3. **RESUME** (`_PI_RESUME_PREPARE`) – Sperren VOR jeder Bewegung (auch vor
+   `M109`): Ziel X ≤ `check_cut_pos_x_max` → `RESUME gesperrt` (RESUME_BASE
+   führe in den Hebel); `pause_rebase` oder Kopf im Schneidbereich ohne
+   Bewegungsfreigabe/Referenz → `RESUME gesperrt` (Druck bleibt pausiert).
+   Kopf im Schneidbereich → zuerst `G1 X10` + `M400`. Dann Schacht → Heizen →
+   Vorextrusion → Abstreifen → raus → `_PI_RESUME_RETURN` (X/Y in Pausenhöhe,
+   Z senkrecht; Ziel im Schneidbereich an der Bettkante → X/Y bis X10, hinein
+   nur X; offener `chain_error` → Abbruch vor der Rückfahrt) →
+   `_PI_RESUME_REBASE`: Kopf an `pause_x/y/z` (±0,01, sonst Abbruch ohne
+   RESUME_BASE) → `RESTORE_GCODE_STATE NAME=PAUSE_STATE` (Modus, Basis,
+   E-Basis + e_diff) + `SAVE_GCODE_STATE NAME=PAUSE_STATE` an der
+   Druckposition → `RESUME_BASE` = Nullfahrt, G-Code-E = E vor dem Wechsel.
+4. **Fahrten in den Schacht** (`KTWO_BOX_GO_EXTRUDE_POS`, `_PI_CLEAN_PATH
+   PART=GO`): vom Schneidhebel aus erst `G0 X10` + `M400`, dann `Y345`
+   (k2_box `gcode_leave_cut_zone`) – deckt den von Hand wiederholten
+   Einzelschritt ab.
+5. **END_OPT in einer Pause** (Wiederholungs-`T<n>`): Rückfahrt X/Y zur
+   Startposition, Z aber NICHT unter die Pausenhöhe (sonst stünde die Düse
+   auf Druckhöhe über dem Objekt und RESUME führe von dort quer zum Schacht);
+   RESUME senkt. **Fix:** eine alte Startposition (`_keep_start_pos`) gilt
+   nur noch für ein `T<n>` in derselben Pause – nach CANCEL/RESUME fuhr
+   `END_OPT` sonst zur Position eines früheren Wechsels.
+
+Unverändert: `chain_error`-Sperre (RESUME gesperrt bis
+`KTWO_BOX_ERROR_CLEAR`), Wegwahl `_print_active()`/`VIA=GCODE` (§2.2),
+`KTWO_BOX_RESUME_FIX` nach `RESUME_BASE` (mit unserem PAUSE-Makro jetzt
+Nullfahrt bzw. nichts; Fallback für fremde PAUSE-Makros: Z-Korrektur wie
+bisher). Verworfen: „RESUME fährt erst aus dem Schneidbereich, dann zur
+Fehlerposition“ – die Fehlerposition ist kein sinnvolles Ziel (Druck ginge
+dort weiter); sie bleibt nur in PAUSE_STATE bis zum Rebase.
+
+### 6a.4 Nachweis (offline)
+
+Batch `upstream-test-resumecut` (`LIESMICH.txt`, `ERGEBNIS.txt`), Fake-Bus
+(Motoren für das Homing, CFS antwortet nicht) + TEST-Hook (Host-Druck,
+Abbruch AM Anschlag): `lauf-schnitt` – Anschlag X −7,800 bei Z10,4, X < 9,4
+nur bei Y200 (±1 Schritt), genau ein Besuch im Schneidbereich, hinaus nur in
+X (Y/Z konstant), dann Z-Hub, Park, RESUME Schacht → Vorextrusion 82 mm →
+Abstreifen → X/Y in Z50 → Z senkrecht auf 10, nie unter Z10, Endlage
+X110/Y120/Z10 = Druckposition vor `T1`, G-Code-E = 1 wie vor `T1`, danach
+nur der Druckweg X110 → X120 (RESUME_BASE ohne Fahrt); `lauf-schacht` –
+Abbruch bei X133/Y378: Z-Hub vor dem Ausstieg, X160 → Y345 → Park, sonst wie
+oben; `lauf-normal` – unverändert (kein Rebase, Endlage = PAUSE_STATE);
+`lauf-wiederholung` – Abbruch eines `T1` IN der Pause: keine zweite Pause,
+RESUME fährt erst nur X vom Hebel, Endlage = Druckposition; `lauf-sperre` /
+`lauf-gesperrt` – RESUME verweigert, keine Bewegung, Druck bleibt pausiert.
+Kein Internal error/Shutdown. `test_k2_box.py`: `_fail`-Ziel, Wiederholung,
+Altlast `_keep_start_pos`, Einzelschritt, Schacht vom Hebel, `RESUME_FIX
+CLEAR`, Render aller neuen Makrozweige.
+
+### 6a.5 Geänderte Erwartung im a45-Batch (begründet)
+
+`render-a45.py` „RETURN Pause im Schneidbereich: keine Fahrt, Meldung“ →
+jetzt „Fehler statt Fahrt“: das alte Verhalten ließ RESUME_BASE danach
+gerade in den Hebel fahren (genau der behobene Fehler). Alle übrigen
+a45-Prüfungen unverändert grün (Bahn + Render 0 Fehler).
+
+### 6a.6 ANNAHMEN / am Gerät prüfen
+
+- **Hebelzone:** Der Hebel wird erst links von X ≈ −5 betätigt (Kalibrierstart
+  `pre_cut_cal_pos_x` −5, Treffer ab −5,5); „Schneidbereich“ = X < 10 ist
+  bewusst weiter gefasst. Verweigert wird nur ein Ziel X ≤ −5,5.
+- **Druckpositionen** liegen nie links von X 0 (Bett) – ein Ziel in 0…10
+  (Bettkante) wird nur in X angefahren.
+- **Y-Ausdehnung des Hebels:** nur bei Y200 (`cut_pos_y`) belegt; ob eine
+  Y-Bewegung bei X < 10 abseits Y200 gefahrlos ist, ist unbelegt – deshalb
+  dort generell keine Y-Bewegung.
+- **Abbruch mitten in der Schneidfahrt** ist selten (der Schnitt läuft als
+  ein Script inkl. Rückweg); realistisch sind Abbrüche danach (Schacht).
+  Der Batch erzwingt den Hebelfall per TEST-Hook.
+- **SET_GCODE_OFFSET während einer CFS-Pause:** PAUSE_STATE-Basis gilt wie
+  bei Upstream-RESUME; die Korrektur erfolgt mit dem nächsten Druckbefehl
+  statt in RESUME_BASE (Rebase ohne Fahrt).
+- **Stock-Gleichwertigkeit:** Stock holt den Wechsel beim RESUME evtl. selbst
+  nach (`resume_tnn`); hier weiter von Hand (`T<n>` in der Pause), dann
+  `KTWO_BOX_ERROR_CLEAR` + `RESUME` (NOTIZ-cfs.md §3).
+- **Am Gerät (Hand am Not-Aus):** Abbruch im Schacht provozieren (z. B. Box
+  stromlos während `T1`), Parkweg und RESUME-Bahn beobachten; Hebelfall nur
+  mit `KTWO_BOX_CUT` außerhalb eines Drucks + manuellem `G1 X10` prüfen.

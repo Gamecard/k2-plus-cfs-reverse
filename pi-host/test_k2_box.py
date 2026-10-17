@@ -82,7 +82,7 @@ except Exception:
     REF_BUILD = None
     _HAVE_S485 = False
 
-UID12 = [0xB0, 0x5D, 0x3B, 0x8A, 0x0C, 0x93, 0x30, 0x10, 0x4C, 0x37, 0x36, 0x31]
+UID12 = [0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8, 0xA9, 0xAA, 0xAB]  # Platzhalter (Repo-Anonymisierung), Fake-Box
 SN19 = b"10000000000X000TEST"  # 19 Zeichen wie echte SN (Beleg box-Selbsttest)
 
 
@@ -1252,12 +1252,15 @@ def test_wechsel_fehler_im_druck():
     bus.trace = []
     run_chain(mod, "T1A")
     sc = printer.gcode.scripts
-    assert "PAUSE" in sc, sc
+    # seit 17.10.2026: PAUSE trägt das Rückfahrziel = Druckposition vor dem
+    # Wechsel (200/200/20, Z ohne Hop) – Fehlerposition ist der Schacht
+    want = "PAUSE CFS_RETURN_X=200 CFS_RETURN_Y=200 CFS_RETURN_Z=20"
+    assert want in sc and "PAUSE" not in sc, sc
     st = mod.get_status()
     assert "0x0c" in st["chain_error"] and not st["chain_active"], st
     assert st["pending_resume_z"] == 20.0, st
     assert any(m.startswith("!!") and "PAUSIERT" in m for m in printer.gcode.raw)
-    i_pause = sc.index("PAUSE")
+    i_pause = sc.index(want)
     assert not [l for l in sc[i_pause:] if l.startswith(("G0", "G1"))], sc[i_pause:]
     assert printer.sensor.enabled and "RESTORE_GCODE_STATE NAME=_ktwo_box_chain" \
         in sc[i_pause:]
@@ -1323,6 +1326,362 @@ def test_wechsel_fehler_ohne_druck():
     else:
         raise AssertionError("ohne Bus hätte G-Code-Fehler kommen müssen")
     return "ohne Druck: G-Code-Fehler + Aufräumen; Box 2/Hub belegt/kein Bus abgelehnt"
+
+
+# =====================================================================
+# RESUME nach abgebrochenem CFS-Wechsel im Schneidbereich (17.10.2026,
+# config-pi/NOTIZ-reinigung-resume.md §6a, Batch upstream-test-resumecut)
+# =====================================================================
+
+def _hull_t1b_ok(**over):
+    """Hülle wie test_wechsel_kette_voll: Slot A geladen, T1B läuft durch."""
+    bus, printer, mod = build_hull(allow_write="True", **over)
+    bus.hub_mask, bus.head = 0x01, True
+    bus.head_at_mm = 300.0
+    bus.need_extruder_for_mode7 = True
+    return bus, printer, mod
+
+
+def _set_pos(printer, x, y, z):
+    printer.pos[:3] = [float(x), float(y), float(z)]
+    printer._refresh()
+
+
+def test_resume_ziel_nach_abbruch():
+    # 1) Baustein: Schneidbereich nur in X verlassen (box.cfg:13 pre_cut_pos_x)
+    c = dict(K.CHANGE_DEFAULTS)
+    assert K.gcode_leave_cut_zone(c, [10.0, 200.0, 5.0]) == []
+    assert K.gcode_leave_cut_zone(c, [9.98, 200.0, 5.0]) == ["G0 X10 F12000", "M400"]
+    assert K.gcode_leave_cut_zone(c, [-7.8, 200.0, 5.0]) == ["G0 X10 F12000", "M400"]
+    assert K.gcode_leave_cut_zone(c, None) == []
+    # 2) T-Kette im Druck, Schnitt bricht AM ANSCHLAG ab (nach G0 X-7.8,
+    #    vor dem Rückweg G0 X10) -> PAUSE mit Rückfahrziel Druckposition
+    bus, printer, mod = _hull_t1b_ok()
+    printer.set_printing(True)
+    _set_pos(printer, 110, 120, 10)
+    printer.fail_on = "G4 P"
+    run_chain(mod, "T1B")
+    sc = printer.gcode.scripts
+    assert [round(v, 3) for v in printer.pos[:3]] == [-7.8, 200.0, 10.4], \
+        printer.pos
+    want = "PAUSE CFS_RETURN_X=110 CFS_RETURN_Y=120 CFS_RETURN_Z=10"
+    assert want in sc and "PAUSE" not in sc, sc
+    i = sc.index(want)
+    assert not [l for l in sc[i:] if l.startswith(("G0", "G1"))], sc[i:]
+    st = mod.get_status()
+    assert "CUT fehlgeschlagen" in st["chain_error"] and not st["chain_active"]
+    assert st["pending_resume_z"] == 10.0, st   # Fallback ohne PAUSE-Makro
+    assert any("Rückfahrziel für RESUME = Druckposition vor dem Wechsel "
+               "X110 Y120 Z10" in m for m in printer.gcode.raw), printer.gcode.raw
+    assert printer.accel == 20000.0 and printer.sensor.enabled
+    assert mod._keep_start_pos == [110.0, 120.0, 10.0]
+    # 3) Wiederholung IN DER PAUSE bricht erneut am Hebel ab: kein zweites
+    #    PAUSE, kein neues Ziel/Z, Startposition = die des 1. Wechsels
+    assert printer.paused
+    mod.cmd_error_clear(FakeGcmd({}))
+    n = len(sc)
+    run_chain(mod, "T1B")
+    assert not [l for l in sc[n:] if l.startswith("PAUSE")], sc[n:]
+    assert sc[n:].count("G0 X10 Y200 F12000") == 1   # vom Hebel nur in X weg
+    assert mod.get_status()["pending_resume_z"] == 10.0
+    assert mod._keep_start_pos == [110.0, 120.0, 10.0]
+    # 4) erfolgreiche Wiederholung in der Pause: END_OPT fährt X/Y zur
+    #    Startposition, senkt Z aber NICHT (das macht RESUME)
+    printer.fail_on = None
+    mod.cmd_error_clear(FakeGcmd({}))
+    bus.trace = []
+    infos = run_chain(mod, "T1B")
+    t = bus.trace
+    i1 = _idx(t, _g("G0 X10 Y200 F12000"))
+    assert not [e for e in t[:i1] if e[0] == "gcode" and e[1].startswith(("G0", "G1"))
+                and "Y" in e[1] and "Z" not in e[1]], t[:i1]
+    i2 = _idx(t, _g("G0 X110 Y120 F12000"), i1)
+    assert not [e for e in t[i2:] if e[0] == "gcode" and e[1].startswith("G0 Z")], t[i2:]
+    assert round(printer.pos[2], 3) > 10.0 and printer.pos[:2] == [110.0, 120.0]
+    assert any("Z bleibt" in m for m in infos), infos
+    st = mod.get_status()
+    assert st["loaded_tnn"] == "T1B" and st["chain_error"] == "" \
+        and mod._keep_start_pos is None, st
+    # 5) Startposition eines früheren Abbruchs veraltet nicht: nach CANCEL
+    #    (keine Pause mehr) nimmt ein neuer Wechsel die AKTUELLE Position
+    bus, printer, mod = _hull_t1b_ok()
+    printer.set_printing(True)
+    _set_pos(printer, 110, 120, 10)
+    printer.fail_on = "G4 P"
+    run_chain(mod, "T1B")
+    assert mod._keep_start_pos == [110.0, 120.0, 10.0]
+    printer.paused, printer.fail_on = False, None      # CANCEL + neuer Druck
+    printer.set_printing(True)
+    mod.cmd_error_clear(FakeGcmd({}))
+    _set_pos(printer, 50, 60, 5)
+    bus.trace = []
+    run_chain(mod, "T1B")
+    t = bus.trace
+    i3 = _idx(t, _g("G0 X50 Y60 F12000"))
+    _idx(t, _g("G0 Z5 F600"), i3)
+    assert not [e for e in t if e[0] == "gcode" and e[1].startswith("G0 X110 Y120")]
+    assert [round(v, 3) for v in printer.pos[:3]] == [50.0, 60.0, 5.0]
+    # 6) Einzelschritt (M8200 C ohne P) im Druck: Ziel = Position davor
+    bus, printer, mod = _hull_t1b_ok()
+    printer.set_printing(True)
+    _set_pos(printer, 80, 90, 7)
+    printer.fail_on = "G4 P"
+    mod.cmd_cut(FakeGcmd({}))
+    assert "PAUSE CFS_RETURN_X=80 CFS_RETURN_Y=90 CFS_RETURN_Z=7" \
+        in printer.gcode.scripts, printer.gcode.scripts
+    assert mod.get_status()["pending_resume_z"] is None and mod._step_start is None
+    # 7) Fehler OHNE Bewegung (Druck ohne Freigabe): PAUSE ohne Ziel
+    bus, printer, mod = build_hull(allow_write="False", allow_move="True")
+    printer.set_printing(True)
+    run_chain(mod, "T1B")
+    assert "PAUSE" in printer.gcode.scripts and not [
+        l for l in printer.gcode.scripts if l.startswith("PAUSE ")]
+    return ("Hebel-Abbruch im Druck -> PAUSE CFS_RETURN=Druckpos (Z ohne Hop); "
+            "Wiederholung in der Pause ohne neue Pause, END_OPT ohne Z-Senkung; "
+            "alte Startposition verworfen; Einzelschritt; ohne Bewegung kein Ziel")
+
+
+def test_schacht_aus_schneidbereich_und_resume_fix():
+    # Kopf am Hebel (abgebrochener Schnitt außerhalb/innerhalb einer Pause,
+    # Schritt von Hand wiederholt): erst NUR X auf pre_cut_pos_x, dann Y345
+    bus, printer, mod = build_hull(allow_write="False", allow_move="True")
+    _set_pos(printer, -7.8, 200, 20)
+    bus.trace = []
+    mod.cmd_go_extrude_pos(FakeGcmd({}))
+    moves = [e[1] for e in bus.trace if e[0] == "gcode"
+             and e[1].startswith(("G0", "G1", "M400"))]
+    assert moves == ["G0 X10 F12000", "M400", "G0 Y345 F12000", "G0 X139 F12000",
+                     "G0 Y378 F12000", "G0 X133 F12000"], moves
+    # außerhalb des Schneidbereichs unverändert (Stock T0-Beispiel 6.)
+    _set_pos(printer, 10, 200, 20)
+    bus.trace = []
+    mod.cmd_go_extrude_pos(FakeGcmd({}))
+    moves = [e[1] for e in bus.trace if e[0] == "gcode"
+             and e[1].startswith(("G0", "G1"))]
+    assert moves[0] == "G0 Y345 F12000", moves
+    # RESUME_FIX CLEAR=1 (aus PAUSE): verwirft die Z-Korrektur ohne Fahrt
+    mod.pending_resume_z = 12.0
+    n = len(printer.gcode.scripts)
+    g = FakeGcmd({"CLEAR": "1"})
+    mod.cmd_resume_fix(g)
+    assert mod.get_status()["pending_resume_z"] is None
+    assert any("verworfen" in m for m in g.infos), g.infos
+    g = FakeGcmd({"CLEAR": "1"})
+    mod.cmd_resume_fix(g)
+    assert g.infos == [] and printer.gcode.scripts[n:] == []
+    mod.cmd_resume_fix(FakeGcmd({}))           # nichts offen -> nichts
+    assert printer.gcode.scripts[n:] == []
+    return "Schacht-Einfahrt vom Hebel: X10 vor Y345; RESUME_FIX CLEAR=1 ohne Fahrt"
+
+
+def _render_env():
+    import jinja2
+    path = os.path.join(_HERE, "config-pi", "macros.cfg")
+    macros = _macro_sources(path)
+    kcfg = {}
+    sec = open(os.path.join(_HERE, "config-pi", "k2-module.cfg"),
+               encoding="utf-8").read()
+    a = sec.index("[k2_box]")
+    for ln in sec[a:sec.index("\n[", a + 1)].splitlines()[1:]:
+        if ":" in ln and not ln.startswith("#"):
+            k, v = ln.split(":", 1)
+            kcfg[k.strip().lower()] = v.strip()
+
+    def pyval(v):
+        if v in ("True", "False"):
+            return v == "True"
+        try:
+            return float(v) if "." in v else int(v)
+        except ValueError:
+            return v
+    param = {k: pyval(v) for k, v in macros["_PI_PARAM"][1].items()}
+    return jinja2.Environment("{%", "%}", "{", "}"), macros, kcfg, param
+
+
+class _RenderRaise(Exception):
+    pass
+
+
+def _rprinter(param, kcfg, **upd):
+    pr = {
+        "gcode_macro _PI_PARAM": dict(param, hotend_temp=220, pause_x=110.0,
+                                      pause_y=120.0, pause_z=10.0,
+                                      pause_pos_valid=True),
+        "gcode_macro _PI_FREIGABE": {"allow_move": True},
+        "k2_box": {"allow_move": True, "allow_write": True,
+                   "change_enabled": True, "chain_active": False,
+                   "chain_error": ""},
+        "toolhead": {"homed_axes": "xyz", "max_accel": 20000.0,
+                     "position": {"x": 342.5, "y": 200.0, "z": 50.0},
+                     "axis_maximum": {"x": 352.5, "y": 400.0}},
+        "gcode_move": {"gcode_position": {"x": 342.5, "y": 200.0, "z": 50.0,
+                                          "e": 0.0}},
+        "pause_resume": {"is_paused": True},
+        "print_stats": {"state": "printing"},
+        "extruder": {"temperature": 220.0, "target": 220.0, "can_extrude": True},
+        "configfile": {"config": {"k2_box": dict(kcfg)},
+                       "settings": {"extruder": {"min_extrude_temp": 170.0}}},
+        "output_pin fan0": {"value": 0.0}, "output_pin fan2": {"value": 0.0},
+    }
+    for key, val in upd.items():
+        pr[key].update(val)
+    return pr
+
+
+def _render(env, macros, name, printer, params=None):
+    msgs = []
+
+    def _info(m):
+        msgs.append(m)
+        return ""
+
+    def _err(m):
+        raise _RenderRaise(m)
+    out = env.from_string(macros[name][0]).render(
+        params=dict(params or {}), rawparams="", printer=printer,
+        action_respond_info=_info, action_raise_error=_err)
+    return [l.strip() for l in out.split("\n")
+            if l.strip() and not l.strip().startswith("#")], msgs
+
+
+def test_makros_resume_schneidbereich():
+    try:
+        env, macros, kcfg, param = _render_env()
+    except ImportError:
+        return "SKIP (jinja2 fehlt)"
+    for n in ("PAUSE", "_PI_RESUME_PREPARE", "_PI_RESUME_RETURN",
+              "_PI_RESUME_REBASE", "_PI_CLEAN_PATH"):
+        assert n in macros, n
+    assert param.get("pause_rebase") is False, param
+    R = lambda name, pr, params=None: _render(env, macros, name, pr, params)  # noqa: E731
+    pos = lambda x, y, z: {"gcode_position": {"x": x, "y": y, "z": z, "e": 0.0}}  # noqa: E731
+    tpos = lambda x, y, z: {"position": {"x": x, "y": y, "z": z}}  # noqa: E731
+
+    def raises(name, pr, txt, params=None):
+        try:
+            lines, _m = R(name, pr, params)
+        except _RenderRaise as exc:
+            assert all(t in str(exc) for t in txt), exc
+            return str(exc)
+        raise AssertionError("%s hätte verweigern müssen: %s" % (name, lines))
+
+    # --- PAUSE normal: Ziel = Position, kein Rebase, Altlast-Z weg -------
+    pr = _rprinter(param, kcfg, gcode_move=pos(110.0, 120.0, 10.0),
+                   toolhead=tpos(110.0, 120.0, 10.0),
+                   pause_resume={"is_paused": False})
+    lines, msgs = R("PAUSE", pr)
+    i = lines.index("PAUSE_BASE")
+    assert lines[i + 1:i + 7] == [
+        "SET_GCODE_VARIABLE MACRO=_PI_PARAM VARIABLE=pause_x VALUE=110.0",
+        "SET_GCODE_VARIABLE MACRO=_PI_PARAM VARIABLE=pause_y VALUE=120.0",
+        "SET_GCODE_VARIABLE MACRO=_PI_PARAM VARIABLE=pause_z VALUE=10.0",
+        "SET_GCODE_VARIABLE MACRO=_PI_PARAM VARIABLE=pause_pos_valid VALUE=True",
+        "SET_GCODE_VARIABLE MACRO=_PI_PARAM VARIABLE=pause_rebase VALUE=False",
+        "KTWO_BOX_RESUME_FIX CLEAR=1"], lines
+    mv = [l for l in lines if l.startswith("G1 ")]
+    assert mv[0] == "G1 E-1.0 F180" and "G1 X10.0 F12000.0" not in lines \
+        and "G1 Y345.0 F12000.0" not in lines and msgs == [], (lines, msgs)
+    # --- PAUSE nach Abbruch AM HEBEL (k2_box: CFS_RETURN = Druckposition) --
+    pr = _rprinter(param, kcfg, gcode_move=pos(-7.8, 200.0, 10.4),
+                   toolhead=tpos(-7.8, 200.0, 10.4),
+                   pause_resume={"is_paused": False})
+    cfs = {"CFS_RETURN_X": "110", "CFS_RETURN_Y": "120", "CFS_RETURN_Z": "10"}
+    lines, msgs = R("PAUSE", pr, cfs)
+    i = lines.index("PAUSE_BASE")
+    assert lines[i + 1:i + 7] == [
+        "SET_GCODE_VARIABLE MACRO=_PI_PARAM VARIABLE=pause_x VALUE=110.0",
+        "SET_GCODE_VARIABLE MACRO=_PI_PARAM VARIABLE=pause_y VALUE=120.0",
+        "SET_GCODE_VARIABLE MACRO=_PI_PARAM VARIABLE=pause_z VALUE=10.0",
+        "SET_GCODE_VARIABLE MACRO=_PI_PARAM VARIABLE=pause_pos_valid VALUE=True",
+        "SET_GCODE_VARIABLE MACRO=_PI_PARAM VARIABLE=pause_rebase VALUE=True",
+        "KTWO_BOX_RESUME_FIX CLEAR=1"], lines
+    assert msgs and "Fehlerposition X-7.80 Y200.00 Z10.40" in msgs[0] \
+        and "X110.00 Y120.00 Z10.00" in msgs[0], msgs
+    mv = [l for l in lines[i:] if l.startswith(("G1 ", "G90", "G91"))]
+    assert mv[:3] == ["G90", "G1 X10.0 F12000.0", "G91"], mv   # erst nur X raus
+    assert lines.index("G1 X10.0 F12000.0") < lines.index("G1 Z39.6 F600") \
+        < lines.index("G1 X342.5 Y200.0 F6000"), lines
+    # --- PAUSE nach Abbruch IM SCHACHT: Z-Hub, X160, Y345, dann Park -------
+    pr = _rprinter(param, kcfg, gcode_move=pos(133.0, 378.0, 10.4),
+                   toolhead=tpos(133.0, 378.0, 10.4),
+                   pause_resume={"is_paused": False})
+    lines, _m = R("PAUSE", pr, cfs)
+    mv = [l for l in lines if l.startswith("G1 ") and "E" not in l]
+    assert mv == ["G1 Z39.6 F600", "G1 X160.0 F12000.0", "G1 Y345.0 F12000.0",
+                  "G1 X342.5 Y200.0 F6000"], mv
+    # --- PREPARE: Rebase nach der Rückfahrt -------------------------------
+    pr = _rprinter(param, kcfg)
+    pr["gcode_macro _PI_PARAM"]["pause_rebase"] = True
+    lines, _m = R("_PI_RESUME_PREPARE", pr)
+    assert lines == ["SAVE_GCODE_STATE NAME=_pi_resume_prep",
+                     "_PI_NOZZLE_CLEAN ONLY=GO WHY=RESUME", "M109 S220",
+                     "_PI_RESUME_PRIME", "_PI_NOZZLE_CLEAN WHY=RESUME",
+                     "_PI_RESUME_RETURN",
+                     "RESTORE_GCODE_STATE NAME=_pi_resume_prep",
+                     "_PI_RESUME_REBASE"], lines
+    # ohne Bewegungsfreigabe: verweigert (RESUME_BASE führe zur Fehlerpos.)
+    pr["gcode_macro _PI_FREIGABE"]["allow_move"] = False
+    raises("_PI_RESUME_PREPARE", pr, ["RESUME gesperrt", "abgebrochenem CFS",
+                                      "_PI_FREIGABE allow_move=False"])
+    pr = _rprinter(param, kcfg)
+    pr["gcode_macro _PI_PARAM"]["pause_rebase"] = True
+    pr["k2_box"]["allow_move"] = False
+    raises("_PI_RESUME_PREPARE", pr, ["RESUME gesperrt", "[k2_box] allow_move"])
+    # Kopf am Hebel (Abbruch in einer Pause): erst nur X, dann Schacht
+    pr = _rprinter(param, kcfg, gcode_move=pos(-7.8, 200.0, 50.4))
+    lines, msgs = R("_PI_RESUME_PREPARE", pr)
+    assert lines[:5] == ["SAVE_GCODE_STATE NAME=_pi_resume_prep", "G90",
+                         "G1 X10.0 F12000.0", "M400",
+                         "_PI_NOZZLE_CLEAN ONLY=GO WHY=RESUME"], lines
+    assert "_PI_RESUME_REBASE" not in lines and "Schneidbereich" in msgs[0]
+    pr["k2_box"]["allow_move"] = False
+    raises("_PI_RESUME_PREPARE", pr, ["RESUME gesperrt", "Schneidbereich X-7.80"])
+    # Ziel am Hebel: immer verweigert, vor jeder Zeile
+    pr = _rprinter(param, kcfg)
+    pr["gcode_macro _PI_PARAM"].update(pause_x=-7.8, pause_y=200.0)
+    raises("_PI_RESUME_PREPARE", pr, ["RESUME gesperrt", "Schneidhebel"])
+    # nicht referenziert: alter Pfad (nur M109), kein Fehlalarm X0 < 10
+    pr = _rprinter(param, kcfg, gcode_move=pos(0.0, 0.0, 0.0),
+                   toolhead={"homed_axes": ""})
+    lines, msgs = R("_PI_RESUME_PREPARE", pr)
+    assert lines == ["M109 S220"] and "nicht referenziert" in msgs[0], (lines, msgs)
+    # --- RETURN -----------------------------------------------------------
+    pr = _rprinter(param, kcfg, gcode_move=pos(160.0, 345.0, 50.0))
+    pr["gcode_macro _PI_PARAM"]["pause_rebase"] = True
+    lines, msgs = R("_PI_RESUME_RETURN", pr)
+    assert lines == ["G90", "G0 X110.0 Y120.0 F12000.0", "G1 Z10.0 F600.0"] \
+        and "vor dem abgebrochenen CFS-Wechsel" in msgs[0], (lines, msgs)
+    pr["gcode_macro _PI_PARAM"].update(pause_x=5.0)          # Bettkante
+    lines, _m = R("_PI_RESUME_RETURN", pr)
+    assert lines == ["G90", "G0 X10.0 Y120.0 F12000.0", "G0 X5.0 F12000.0",
+                     "G1 Z10.0 F600.0"], lines
+    pr = _rprinter(param, kcfg, gcode_move=pos(-7.8, 200.0, 50.0))
+    lines, _m = R("_PI_RESUME_RETURN", pr)
+    assert lines == ["G90", "G0 X10.0 F12000.0", "M400",
+                     "G0 X110.0 Y120.0 F12000.0", "G1 Z10.0 F600.0"], lines
+    pr["k2_box"]["chain_error"] = "[k2_box] GO_EXTRUDE_POS fehlgeschlagen: x"
+    raises("_PI_RESUME_RETURN", pr, ["vor der Rückfahrt", "GO_EXTRUDE_POS"])
+    # --- REBASE -----------------------------------------------------------
+    pr = _rprinter(param, kcfg, gcode_move=pos(110.0, 120.0, 10.0))
+    lines, msgs = R("_PI_RESUME_REBASE", pr)
+    assert lines == ["RESTORE_GCODE_STATE NAME=PAUSE_STATE",
+                     "SAVE_GCODE_STATE NAME=PAUSE_STATE",
+                     "SET_GCODE_VARIABLE MACRO=_PI_PARAM VARIABLE=pause_rebase "
+                     "VALUE=False"], lines
+    pr = _rprinter(param, kcfg, gcode_move=pos(110.0, 120.5, 10.0))
+    raises("_PI_RESUME_REBASE", pr, ["nicht an der Druckposition",
+                                     "PAUSE_STATE unverändert"])
+    # --- _PI_CLEAN_PATH GO vom Hebel == k2_box _go_extrude_pos -------------
+    pr = _rprinter(param, kcfg, gcode_move=pos(-7.8, 200.0, 20.0))
+    lines, _m = R("_PI_CLEAN_PATH", pr, {"PART": "GO"})
+    c = dict(K.CHANGE_DEFAULTS)
+    exp = K.gcode_go_extrude_pos(c)
+    exp = exp[:1] + K.gcode_leave_cut_zone(c, [-7.8, 200.0]) + exp[1:]
+    norm = lambda l: [(w[0], float(w[1:])) if w[0] in "XYF" and len(w) > 1  # noqa: E731
+                      else w for w in l.split()]
+    assert [norm(l) for l in lines] == [norm(l) for l in exp], (lines, exp)
+    return ("PAUSE (normal/Hebel/Schacht), PREPARE (Rebase, Sperren, Hebel), "
+            "RETURN (Ziel Bettkante, vom Hebel, chain_error), REBASE, CLEAN_PATH")
 
 
 def test_reactor_bus_proxy():
@@ -1825,6 +2184,12 @@ TESTS = [
     ("Wechsel-Sperren (allow_write/allow_move/Druck)", test_wechsel_sperren),
     ("Wechsel-Fehler im Druck -> Pause", test_wechsel_fehler_im_druck),
     ("Wechsel-Fehler ohne Druck -> G-Code-Fehler", test_wechsel_fehler_ohne_druck),
+    ("RESUME-Ziel nach Abbruch am Schneidhebel (PAUSE CFS_RETURN)",
+     test_resume_ziel_nach_abbruch),
+    ("Schacht vom Hebel nur über X + RESUME_FIX CLEAR",
+     test_schacht_aus_schneidbereich_und_resume_fix),
+    ("Makros PAUSE/RESUME nach CFS-Abbruch (Schneidbereich/Schacht)",
+     test_makros_resume_schneidbereich),
     ("ReactorBusProxy (kein Reactor-Blockieren)", test_reactor_bus_proxy),
     ("Makros T0-T15/M8200/RESUME (macros.cfg)", test_makros_cfg),
     ("Runout: Slot-Wahl-Regel + Optionen", test_runout_slotwahl),
