@@ -1,5 +1,7 @@
 > **Nachtrag 17.10.2026 (PRTOUCH-MCU-BEFUND-2026-10-17 §7): Absicherung umgesetzt** – Config-Prüfung der Antast-Parameter, `arm_settle_s` an die Totzeit gekoppelt, Mindest-Antastgeschwindigkeit (ANNAHME), erweiterter Ruhetest (Tickabstand, −1/24 Bit, gefilterter Kanal), Blocklesen `idx += n`, Endstop-Pin jetzt **`^!PC7`** (Pull-Up wie Stock). Details Abschnitt **A.8**. Weiterhin gesperrt (`allow_move: False`). Offline-Tests 248/248 + Review-Test; Batch gegen Upstream lauf-F EXIT 0.
 
+> **Nachtrag 17.10.2026 (2): Rückfallweg `mode: steps` repariert** – gleiche Reihenfolge und Absicherung wie der Probe-Weg über **gemeinsamen Code** (`K2PrtouchProbeCore.arm/disarm/preflight`): Signalweg → scharf → Totzeit → Ruhetest → kein Kontakt → Schritte → Entschärfen im `finally` → Anheben. Mindestgeschwindigkeit jetzt auch für `probe_speed` (ANNAHME). Host-Kontaktkriterium gegen die MCU-Logik geprüft: Abschnitt **B.2**. Offline-Tests 280/280 + Review-Test.
+
 > **ENTWURF – Stand 16.10.2026 abends.** Sensor-Lesepfad und Swap-Leitung am Gerät GETESTET (ohne Bewegung, PRTOUCH-LESETEST-BEFUND-2026-10-16.md, Fingerdruck-Test 19/19). **Hauptweg ist jetzt eine normale Upstream-Klipper-Probe** auf `!PC7` (wie Stock). Antasten mit Bewegung ist weiterhin **UNGETESTET**. Offline-Tests: 138/138 + Review-Test (davon 21 gegen die echten Upstream-Dateien `probe.py`/`homing.py`/`manual_probe.py`/`gcode.py`/`pins.py`). Vor der ersten echten Fahrt: Abschnitt A.5 (ANNAHMEN P1–P6) und A.6 (Erstlauf) beachten, erst mit `allow_move: False`.
 
 # [k2_prtouch] – Kraftsensor-Düse des K2 Plus unter Upstream-Klipper
@@ -280,6 +282,18 @@ A.8, inkl. Negativfällen und 6 gegen die echten Upstream-Dateien). Dafür gibt
 es im Test einen Nachbau von Düsen-Encoder (0x08006524, 41-Byte-Grenze) und
 64er-Schieberegister (`_McuRegister`).
 
+Stand 17.10.2026 (2): **280/280** + Review-Test. Neu (32, „steps“): Rückfall-Fakes
+mit Arm-Zustand (Register erst nach `start_prtouch_pres` gefüllt, Swap-Leitung,
+`tri_chxs`); Reihenfolge Stillstand → Signalweg → cont → start_pres → start_step →
+Totzeit → Ruhetest → `tri_chxs` → Schritte → stop_step → stop_pres → Lift;
+Register-leer-Fall (alter Weg scheitert, neuer nicht; Start wirkungslos →
+`rest_error`); Entschärfen bei Signalweg-/ack-/Ruhetest-Fehler, Kontakt vor der
+Fahrt, Ausnahme im Schritt, `KeyboardInterrupt`, Notgrenze, max_travel,
+Entschärf-/Lift-Fehler; `mcu_contact`; `allow_move: False`/DRY_RUN nur Vorabprüfung;
+Mindestgeschwindigkeit (Config + Laufzeit); can_brk-Wiederholung schaltet neu
+scharf; `read_status` sendet `[oid, 2, 0, 0, 0]`. Die bisherigen Tests (a)–(g)
+laufen unverändert über den neuen Ablauf.
+
 ### A.8 Absicherung nach PRTOUCH-MCU-BEFUND-2026-10-17 (Code 17.10.2026)
 
 Kennzeichnung wie im Befund: **B** = im MCU-Image belegt (Adresse Düse noz0_130,
@@ -319,7 +333,10 @@ Sample bei 5 mm/s; Rampe ∝ Geschwindigkeit → theoretisch ≈ 0,8 mm/s, mit F
 Reserve 2,5 mm/s (= Upstream-Default `second_homing_speed` bei `homing_speed` 5).
 Gilt für `speed`, `PROBE_SPEED=`, `homing_speed`/`second_homing_speed`.
 Schwellen, deren Minimum über 5 mm/s läge (z. B. `pres_tri_hold` 9000, …, 1000),
-werden abgelehnt; bei `cfg_regs` 56 (PGA 64) ist nur noch 5 mm/s zulässig. `mode: steps` ausgenommen (dort stoppt der Host, nicht die MCU).
+werden abgelehnt; bei `cfg_regs` 56 (PGA 64) ist nur noch 5 mm/s zulässig. Seit
+17.10.2026 (2) gilt die Grenze auch in `mode: steps` für `probe_speed` (Config und
+Laufzeit): die Düse ist dort ebenfalls scharf, und nur ihre eigene Auslösung friert
+den Puffer am Kontakt ein (B.2) – notwendig, aber nicht hinreichend (B.2 Punkt 5).
 
 **4. Ruhetest erweitert** (`check_rest_ok`): Rohwerte `is_src=1`: mind. 32 gültige
 Samples (ANNAHME), `dif ≤ rest_max_dif`, **kein −1** (F: Sensor ab → MCU liest nach
@@ -357,11 +374,13 @@ abgerissene Leitung erkennt der Signalweg-Test vor **jeder** Fahrt. Restrisiko
 (ANNAHME): Leitungsbruch bzw. Düsen-MCU-Reset **während** einer Fahrt würde mit
 Pull-Up nicht als Kontakt gelesen – wie bei Stock.
 
-**Hinweis Rückfallweg (`mode: steps`):** Der Ruhetest läuft dort VOR
-`start_prtouch_pres`. Ein nie gestartetes Register ist leer und fällt jetzt
-richtig durch (vorher „ok“ mit Nullpunkt 0 → Notgrenzen-Abbruch nach dem ersten
-Schritt). Der Rückfallweg bleibt damit ohne vorheriges Scharfschalten
-unbenutzbar – nicht Teil dieser Änderung.
+**Hinweis Rückfallweg (`mode: steps`):** ~~Der Ruhetest läuft dort VOR
+`start_prtouch_pres`~~ – **behoben 17.10.2026 (2)**, s. B.1. Ursache war
+`K2PrtouchController.probe_point` (alt `k2_prtouch.py:1873-1890` →
+`check_sensor_rest` :1827, liest `read_rest_pres`) **vor** `start_sampling`
+(:1923-1926): ein nie gestartetes Register ist leer (Tick 0 + Wert 0, B Memset)
+→ Ruhetest immer `rest_error`. Außerdem wurde ohne Totzeit, ohne gefilterten
+Kanal, ohne ack-Prüfung und ohne Entschärfen im `finally` gefahren.
 
 ### Tests gegen echte Upstream-Dateien
 
@@ -369,11 +388,85 @@ unbenutzbar – nicht Teil dieser Änderung.
 
 ## B. Rückfall: zeitgesteuerte Schrittfahrt (`mode: steps` / `KTWO_PRTOUCH_PROBE_STEPS`)
 
-Der bisherige Weg (`K2PrtouchController.probe_point`) bleibt unverändert
-erhalten. `KTWO_PRTOUCH_PROBE_STEPS` (früher `K2_PRTOUCH_PROBE`) gibt es in beiden
+`K2PrtouchController.probe_point` (Host stoppt nach jedem kurzen Schritt).
+`KTWO_PRTOUCH_PROBE_STEPS` (früher `K2_PRTOUCH_PROBE`) gibt es in beiden
 Modi; `KTWO_PRTOUCH_HOME_Z` und `KTWO_PRTOUCH_MESH` nur bei `mode: steps` (dann ohne
-`probe`-Objekt, kein `probe:z_virtual_endstop`). Der folgende Altbericht
-beschreibt diesen Rückfallweg; durch A überholte Punkte sind markiert.
+`probe`-Objekt, kein `probe:z_virtual_endstop`). Der Altbericht weiter unten
+beschreibt den Weg vor dem 17.10.2026; durch A/B.1 überholte Punkte sind markiert.
+**Antasten mit Bewegung ist auch hier UNGETESTET.**
+
+### B.1 Ablauf seit 17.10.2026 (2) – gemeinsamer Code mit dem Probe-Weg
+
+Der Controller benutzt intern einen `K2PrtouchProbeCore` (`_make_core`), also
+**dieselben** Methoden `arm()`, `disarm()`, `preflight()` wie `run_probe`. Je Punkt:
+
+1. Temperatur-Hinweis (S5). Ohne `allow_move: True` oder mit `DRY_RUN=1`: **nur
+   `preflight()`** (scharf → Ruhetest → entschärft), keine Bewegung, Status
+   `dry_run` mit Ruhewerten – vorher meldete der Trockenlauf einen Ruhetest auf
+   dem leeren Register.
+2. Config-Grenzen doppelt: `step_mm ≤ 0,05`, `probe_speed` ≤ 5 **und ≥
+   Mindestgeschwindigkeit** (A.8 Punkt 3, ANNAHME) – sonst `config_error` ohne
+   MCU-Befehl.
+3. XY-Fahrt (nur mit Freigabe), `wait_moves` (Stillstand).
+4. `arm()`: Signalweg-Test `sta_swap` 0/1 mit Rücklesen über `stop_prtouch_step`
+   (expar0 = PC7, exakt Stock-TEST_SWAP; nur **vor** start zulässig, P4) →
+   `cont_prtouch_step` → `start_prtouch_pres` (ack `err ≠ 0` → Abbruch) →
+   `start_prtouch_step` (ack) → `arm_settle_s` (≥ Totzeit, A.8 Punkt 2) →
+   Ruhetest roh + gefiltert + Ticks (A.8 Punkt 4) → **kein Kontakt**. Weil es in
+   `mode: steps` keinen Endstop auf PC7 gibt und `stop_prtouch_step` die
+   step-Aufzeichnung beenden würde, prüft der Rückfallweg „kein Kontakt“ über den
+   Düsen-Status `read_prtouch_pres [oid, 2, 0, 0, 0]` → `tri_chxs = 0`
+   (`KlippyPresMcu.read_status`; B: Status ohne Daten 0x08004060, `tri_chxs` ab
+   Auslösung stehend, gleiche Stelle wie PA15 → 0, 0x08008192; **ANNAHME:** die
+   Statusabfrage hat während laufender Abtastung keine Nebenwirkung).
+   Nullpunkt der Notgrenze = Median der Ruhe-Rohwerte (bei `rest_check: False`
+   aus einem eigenen Lesen des jetzt gefüllten Registers).
+5. Schleife: `step_mm` abwärts + M400 → `read_pres` (roh, Blocklesen `idx += n`) →
+   `read_step` (`idx += n`) → `tri_chxs` → Notgrenze → Host-Kontaktkriterium (B.2).
+   Kontakt → `ok` (Ergebnis enthält `mcu_triggered`). `tri_chxs ≠ 0` ohne
+   Host-Kontakt → `mcu_contact` (kein Z-Wert, Abbruch – Kriterium prüfen).
+6. **`finally`: `disarm()`** (`stop_prtouch_step` → `stop_prtouch_pres sta_swap=1`,
+   beide werden immer versucht) – bei jedem Ausgang inkl. Ausnahme und
+   `KeyboardInterrupt`; Entschärf-Fehler → `disarm_error`.
+7. Erst danach Anheben `z_lift_mm` (wenn Z bewegt wurde). `can_brk False` →
+   genau eine versetzte Wiederholung, die **neu** scharf schaltet.
+
+Status: `ok`, `dry_run`, `swap_error`, `start_error`, `rest_error`,
+`contact_before_move`, `config_error`, `denied`, `move_error`, `emergency`,
+`max_travel`, `timeout`, `mcu_contact`, `error`, `disarm_error`, `lift_error`.
+`KTWO_PRTOUCH_READ` macht in `mode: steps` jetzt ebenfalls die Vorabprüfung
+(`ctl.preflight()`); `check_sensor_rest` ist entfernt. `allow_move` bleibt
+Default False. Config-Prüfung (A.8 Punkt 1) und `arm_settle_s`-Kopplung galten
+schon vorher für beide Modi; die `^!`-Pflicht für `step_swap_pin` bleibt auf
+`mode: probe` beschränkt (kein Endstop im Rückfallweg).
+
+### B.2 Host-Kontaktkriterium vs. MCU-Logik (PRTOUCH-MCU-BEFUND §3.3/§3.5/§4.3)
+
+Host (`detect_contact`, nur noch `mode: steps`, Befund §5 Tabelle Nr. 8): Rohwerte
+`is_src=1`, Nullpunkt = Median der ersten 32 Samples **des jeweiligen Fensters**,
+Kontakt = `rest_min_consec` (2) aufeinanderfolgende Samples mit |roh − Nullpunkt| >
+`contact_thresh` (3000), `best_indx` = erstes davon. Düse (B): Hochpass gegen das
+Mittel von vor 48–63 Samples (37–49 ms), Ausreißer- und IIR-Filter, Auslösung bei
+3 nicht fallenden Samples ≥ 4000/4500/5000 (Stock) und allen älteren ≤ L[2],
+richtungsunabhängig; danach Puffer eingefroren (Düse und Main, §4.3).
+
+| # | Punkt | Bewertung |
+|---|---|---|
+| 1 | Betrag, Vorzeichen egal | passt (B: Düse negiert je nach Richtung) |
+| 2 | Bezug: Fenster-Median (≈ 25–50 ms alt) vs. Hochpass (37–49 ms alt) | ähnliche Zeitkonstante, grob vergleichbar (F); Host ohne Ausreißer-/Tiefpassfilter |
+| 3 | Schwelle 3000 roh < Düse 4000–5000 gefiltert | Host löst eher aus als die Düse; Ruhe live 756–1 292 dif → Abstand ~4× (**ANNAHME**, keine Fehlauslösung) |
+| 4 | 2 Samples ohne Steigungsbedingung vs. 3 steigende | Host nimmt 2-Sample-Spitzen als Kontakt, die Düse nie (B Modell §3.5) → mögliche Frühauslösung durch Störspitzen (**ANNAHME**: selten; Richtung fail-safe = zu hoch, kein Crash) |
+| 5 | **Treppen-Effekt (F):** Schritt 0,02 mm, dann Stillstand bis M400 + Lesen | Fenster (50 ms) liegt oft großteils NACH dem Schritt; der Fenster-Median ist dann schon belastet → nur ein Kraftsprung **je Schritt** > 3000 im Fenster zählt. Die Düse passt ihren Hochpass in den Pausen ebenso an (≈ 50 ms) und löst nur bei Sprüngen ≥ 5000 aus. Grobe Schätzung aus live 5 mm/s (≥ ~500 Counts/Sample, 0,0039 mm/Sample): **~2 500 Counts je 0,02-mm-Schritt** – also um die Schwelle. Kleinere Sprünge → weder Host noch Düse erkennen den Kontakt; dann stoppt erst die Notgrenze (fester Ruhe-Nullpunkt, 15 000) → `emergency` ohne Messwert (fail-safe, aber unbrauchbar). **ANNAHME – am Gerät messen**, ggf. `step_mm` 0,05 oder `contact_thresh` anpassen. |
+| 6 | Eingefrorener Puffer | Löst die Düse aus, endet das Fenster am Auslösesample (B §4.3) → Host-Auswertung auf demselben Puffer wie Stock; `mcu_triggered`/`mcu_contact` machen Abweichungen sichtbar |
+| 7 | `best_indx`/`can_brk` | Stocks `best_indx` (53–60) stammt aus Stocks eigener Auswertung; Host-`best_indx` (erstes > 3000) ist nicht dasselbe → can_brk-Schranken 53/42/0,040 im Rückfallweg **ANNAHME** |
+| 8 | Notgrenze 15 000 | nur Host (MCU hat keine, B §3.3); Drift über lange Fahrten kann sie früher auslösen (fail-safe) |
+
+Fazit: Das Kriterium ist mit der MCU-Logik **verträglich** (gleiche Richtung, ähnlicher
+Bezug, empfindlichere Schwelle), aber nicht gleich; Punkte 3–5 und 7 sind ANNAHMEN.
+Gerätetest Rückfallweg (nach dem Probe-Weg, allow_move erst danach): `KTWO_PRTOUCH_READ`,
+`KTWO_PRTOUCH_PROBE_STEPS DRY_RUN=1`, dann über leerem Bett mit kleinem
+`max_travel_mm` – im Ergebnis `mcu_triggered`, `best_indx`, `zoft` notieren und
+klippy.log auf `emergency`/`mcu_contact` prüfen.
 
 ---
 
@@ -425,7 +518,8 @@ printer.cfg [k2_prtouch]
 - Einmalig (register_config_callback, vor connect):
   `config_prtouch_pres` auf `nozzle_mcu` (idx, swp PA15, clk/sdo –
   s. ANNAHMEN), `config_prtouch_step` auf `mcu` (X/Y/Z-OIDs, swp !PC7).
-- Pro Antastung: `TEST_SWAP` + Ruhetest → `start_prtouch_step` (`aqc_tick`)
+- *(ÜBERHOLT 17.10.2026 – Reihenfolge jetzt B.1: scharf schalten VOR dem Ruhetest)*
+  Pro Antastung: `TEST_SWAP` + Ruhetest → `start_prtouch_step` (`aqc_tick`)
   + `start_prtouch_pres` (`cfg_regs=60`, `acq_tick=93750`, `ned_*`,
   `holds 4000/10000/500`, `lmt_dead`) → Schleife aus
   `move_down(step_mm) + wait_moves + read_pres/step + decode + detect` →
@@ -455,7 +549,7 @@ printer.cfg [k2_prtouch]
 - **S3 Freigabe:** `allow_move` Default False → nur Swap/Ruhe/Lesen/Plan,
   keine Z-Bewegung. `KTWO_PRTOUCH_PROBE_STEPS DRY_RUN=1` ebenfalls bewegungslos.
   Test (d).
-- **S4 Vorabtests:** `TEST_SWAP`-Äquivalent (beide MCU-Seiten müssen
+- **S4 Vorabtests** *(seit 17.10.2026 nach dem Scharfschalten, B.1)*: `TEST_SWAP`-Äquivalent (beide MCU-Seiten müssen
   antworten; Fehlertext wie Stock `PR_ERR_CODE_SWAP_PIN_DETECTI`) +
   Ruhetest (`dif ≤ rest_max_dif` Default 3000, analog PRES_CHECK).
   Abbruch VOR Bewegung. Test (e).

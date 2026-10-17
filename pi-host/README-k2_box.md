@@ -519,3 +519,12 @@ sonst `go_to_extrude_pos` → `box_retrude_material` → `box_extrude_material`
 - Neue Option `resume_redo_change` (Default False, `k2-module.cfg`), neuer
   Befehl `KTWO_BOX_RESUME_CHECK`, `KTWO_BOX_ERROR_CLEAR HEAD_LOADED=1`,
   `KTWO_BOX_PRE_OPT … SOURCE=`.
+- **Temperatur (Fix 17.10.2026 spät, NOTIZ §6a.10):** hatte der abgebrochene
+  Wechsel schon auf die Wechsel-Temperatur geheizt (`M109 max(Ziel, 220)`),
+  übergibt `_fail` der neuen Pause `CFS_TEMP=<Druckziel vor dem Aufheizen>`;
+  das PAUSE-Makro merkt es als `hotend_temp` (statt `extruder.target`), RESUME
+  heizt darauf. Kein `CFS_TEMP` bei Abbruch vor dem Heizen, Druckziel
+  ≥ Wechsel-Temperatur oder Ziel vorher 0/unbekannt (dann wie bisher
+  aktuelles Ziel + Meldung). Abbruch einer Wiederholung IN der Pause: keine
+  neue PAUSE (`hotend_temp` der ersten bleibt), Düse zurück auf das Ziel vor
+  diesem Wechsel (Pausentemperatur).

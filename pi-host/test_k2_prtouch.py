@@ -66,7 +66,11 @@ def det_noise(i, amp):
 class FakeToolhead:
     """Simuliert Z (+XY), zeichnet alle Bewegungen auf."""
 
-    def __init__(self, z_start=0.2, x=100.0, y=100.0, temps=(140.0, 50.0)):
+    def __init__(self, z_start=0.2, x=100.0, y=100.0, temps=(140.0, 50.0),
+                 events=None):
+        self.events = events if events is not None else []
+        self.fail_down_at = None  # n-ter Abwärtsschritt wirft (Fehlertest)
+        self.fail_lift = False
         self.z = float(z_start)
         self.x = float(x)
         self.y = float(y)
@@ -83,21 +87,31 @@ class FakeToolhead:
         return (float(self.x), float(self.y))
 
     def move_down(self, step_mm, speed):
+        if (self.fail_down_at is not None
+                and len(self.down_steps()) + 1 >= self.fail_down_at):
+            self.events.append("down_fail")
+            raise RuntimeError("Toolhead-Fehler (Test)")
+        self.events.append("down")
         self.moves.append(("down", float(step_mm), float(speed)))
         self.z -= float(step_mm)
         if self.z < self.min_z:
             self.min_z = float(self.z)
 
     def move_to_xy(self, x, y, speed):
+        self.events.append("xy")
         self.moves.append(("xy", (float(x), float(y)), float(speed)))
         self.x, self.y = float(x), float(y)
 
     def lift(self, dz_mm, speed):
+        if self.fail_lift:
+            raise RuntimeError("Lift-Fehler (Test)")
+        self.events.append("lift")
         self.moves.append(("lift", float(dz_mm), float(speed)))
         self.z += float(dz_mm)
 
     def wait_moves(self):
         self.waits += 1
+        self.events.append("wait")
 
     def get_temps(self):
         return self.temps
@@ -110,11 +124,25 @@ class FakeToolhead:
 
 
 class FakePres:
-    """Düsen-MCU: Kraftkurve mit Kontakt bei z_true."""
+    """Düsen-MCU: Kraftkurve mit Kontakt bei z_true.
+
+    Seit 17.10.2026 mit Arm-Zustand wie die echte Düse: Register erst nach
+    start_prtouch_pres gefüllt (vorher Tick 0 + Wert 0 = leer, B Memset),
+    Swap-Leitung (set_swap -> Pegel, den FakeStep.read_swap liest),
+    Status tri_chxs (read_status), disarm."""
 
     def __init__(self, tool, cfg, z_true=0.0, baseline=-1450000,
                  noise_amp=300, swap_ok=True, rest_noisy=False,
-                 emergency_always=False, spike=-9000, tick_base=10000000):
+                 emergency_always=False, spike=-9000, tick_base=10000000,
+                 events=None):
+        self.events = events if events is not None else []
+        self.armed = False
+        self.level = 1          # PA15/PC7
+        self.ack_err = 0        # start_prtouch_pres ack err
+        self.never_fills = False  # start wirkungslos -> Register bleibt leer
+        self.mcu_trigger = True   # Düse löst bei Kontakt selbst aus
+        self.trigger_on_arm = False
+        self.fail_disarm = False
         self.tool = tool
         self.cfg = cfg
         self.z_true = float(z_true)
@@ -135,8 +163,52 @@ class FakePres:
         return {"py_ver": 78, "pres_ver": 71, "step_ver": 71,
                 "swap_ok": True}
 
+    def set_swap(self, level):
+        self.events.append("swap%d" % int(level))
+        if self.swap_ok:  # defekte Leitung: Main liest immer 1
+            self.level = int(level)
+        return {"err": 0, "expar0": 0, "expar1": 71}
+
     def start_sampling(self):
+        self.events.append("start_pres")
         self.starts += 1
+        if self.ack_err:
+            return {"err": self.ack_err, "expar0": 0, "expar1": 0}
+        self.armed = True
+        return {"err": 0, "expar0": 64, "expar1": 0}
+
+    def disarm(self):
+        self.events.append("stop_pres1")
+        self.armed = False
+        self.level = 1
+        if self.fail_disarm:
+            raise RuntimeError("Timeout stop_prtouch_pres (Test)")
+        return {"err": 0, "expar0": 0, "expar1": 71}
+
+    def _contact(self):
+        return float(self.tool.get_z()) <= self.z_true + 1e-12
+
+    def read_status(self):
+        self.events.append("status")
+        tri = self.armed and (self.trigger_on_arm
+                              or (self.mcu_trigger and self._contact()))
+        return {"tri_chxs": 1 if tri else 0, "buf_len": 64, "idx": 0,
+                "len": 0}
+
+    def _filled(self):
+        return self.armed and not self.never_fills
+
+    @staticmethod
+    def _empty():
+        return struct.pack("<64I", *([0] * 64)), struct.pack("<64i",
+                                                             *([0] * 64))
+
+    def read_pres_filtered(self):
+        self.events.append("read_ftr")
+        if not self._filled():
+            return self._empty()
+        return self._ticks(), struct.pack(
+            "<64i", *[det_noise(3 * i + 1, 300) for i in range(64)])
 
     def stop_sampling(self, ok=True):
         self.stops.append(bool(ok))
@@ -165,15 +237,17 @@ class FakePres:
         return self._ticks(), self._ruhe_datas(noisy=self.rest_noisy)
 
     def read_pres(self):
+        self.events.append("read_pres")
+        if not self._filled():
+            return self._empty()  # nie gestartetes Register (Altfehler)
         self.reads += 1
-        if self.emergency_always:
-            # Ruhe für baseline0 war ok (read_rest), hier Notfall:
+        if self.emergency_always and self.tool.down_steps():
+            # Ruhe für baseline0 war ok (Ruhetest), hier Notfall:
             out = [self.baseline + 50000 + det_noise(i, 100)
                    for i in range(64)]
             return self._ticks(), struct.pack("<64i", *out)
-        z = float(self.tool.get_z())
-        if z > self.z_true + 1e-12:
-            return self._ticks(), self._ruhe_datas(noisy=False)
+        if not self._contact():
+            return self._ticks(), self._ruhe_datas(noisy=self.rest_noisy)
         # Kontakt: erste 60 Ruhe, letzte 4 Spike (wie live FTR-Spitze):
         out = []
         for i in range(64):
@@ -188,7 +262,11 @@ class FakePres:
 class FakeStep:
     """Main-MCU: Schrittzähler → counts, relativ zum Trigger."""
 
-    def __init__(self, tool, cfg, swap_ok=True, tick_base=20000000):
+    def __init__(self, tool, cfg, swap_ok=True, tick_base=20000000,
+                 pres=None, events=None):
+        self.pres = pres
+        self.events = events if events is not None else []
+        self.fail_disarm = False
         self.tool = tool
         self.cfg = cfg
         self.swap_ok = bool(swap_ok)
@@ -203,13 +281,32 @@ class FakeStep:
         return {"py_ver": 78, "pres_ver": 71, "step_ver": 71,
                 "swap_ok": True}
 
+    def read_swap(self):
+        # stop_prtouch_step: expar0 = PC7-Pegel (B 0x08004244)
+        self.events.append("read_swap")
+        return {"err": 0, "expar0": self.pres.level if self.pres else 1,
+                "expar1": 71}
+
+    def cont_step(self):
+        self.events.append("cont")
+        return {"cnt_x": 0, "cnt_y": 0, "cnt_z": 0}
+
     def start_sampling(self):
+        self.events.append("start_step")
         self.starts += 1
+        return {"err": 0, "expar0": 0, "expar1": 0}
+
+    def disarm(self):
+        self.events.append("stop_step")
+        if self.fail_disarm:
+            raise RuntimeError("Timeout stop_prtouch_step (Test)")
+        return {"err": 0, "expar0": 1, "expar1": 71}
 
     def stop_sampling(self, ok=True):
         self.stops.append(bool(ok))
 
     def read_step(self):
+        self.events.append("read_step")
         self.reads += 1
         speed = float(self.cfg["probe_speed"])
         stepd = float(self.cfg["step_dist_mm"])
@@ -236,21 +333,32 @@ def make_ctl(z_start=0.2, z_true=0.0, cfg_over=None, fake_over=None):
             "max_travel_mm": 5.0, "packing": "struct"}  # Fakes liefern feste Breite
     base.update(cfg_over)
     cfg = K.parse_options(base)
+    events = []
     tool = FakeToolhead(z_start=z_start,
-                        temps=fake_over.get("temps", (140.0, 50.0)))
-    pres = FakePres(tool, cfg, z_true=z_true,
+                        temps=fake_over.get("temps", (140.0, 50.0)),
+                        events=events)
+    pres = FakePres(tool, cfg, z_true=z_true, events=events,
+                    spike=fake_over.get("spike", -9000),
                     baseline=fake_over.get("baseline", -1450000),
                     noise_amp=fake_over.get("noise_amp", 300),
                     swap_ok=fake_over.get("swap_ok", True),
                     rest_noisy=fake_over.get("rest_noisy", False),
                     emergency_always=fake_over.get("emergency_always",
                                                    False))
-    step = FakeStep(tool, cfg,
+    step = FakeStep(tool, cfg, pres=pres, events=events,
                     swap_ok=fake_over.get("step_swap_ok",
                                           fake_over.get("swap_ok", True)))
     log = DummyLog()
+    pauses = []
+
+    def _pause(sec):
+        events.append("pause")
+        pauses.append(float(sec))
+
     ctl = K.K2PrtouchController(cfg, pres, step, tool,
-                                pause=lambda s: None, logger=log)
+                                pause=_pause, logger=log)
+    ctl._test_events = events
+    ctl._test_pauses = pauses
     return cfg, tool, pres, step, ctl, log
 
 
@@ -1667,8 +1775,12 @@ def test_1017_min_speed():
     check("(1017-3) speed 2.5 erlaubt", not _raises({"speed": "2.5"}))
     check("(1017-3) probe_speed 2 (speed fällt zurück) abgelehnt",
           _raises({"probe_speed": "2"}, "zu langsam"))
-    check("(1017-3) mode steps: probe_speed 2 erlaubt (Host stoppt, nicht MCU)",
-          not _raises({"mode": "steps", "probe_speed": "2"}))
+    # Seit 17.10.2026 (CHECKLISTE mode steps): Düse ist auch im Rückfallweg
+    # scharf -> dieselbe Mindestgeschwindigkeit (ANNAHME-Grenze) für probe_speed.
+    check("(1017-3) mode steps: probe_speed 2 abgelehnt (Düse scharf, Rampe)",
+          _raises({"mode": "steps", "probe_speed": "2"}, "zu langsam"))
+    check("(1017-3) mode steps: probe_speed 2.5 erlaubt",
+          not _raises({"mode": "steps", "probe_speed": "2.5"}))
     c = K.parse_options({"pres_tri_hold": "8000, 10000, 1000"})
     check("(1017-3) Schwellen 8000/1000 -> Minimum 5,0 mm/s",
           abs(c["speed_min"] - 5.0) < 1e-9
@@ -2055,6 +2167,245 @@ def test_1017_upstream():
           ok and env4["rec"]["probing"] == [])
 
 
+# =====================================================================
+# 17.10.2026: Rückfallweg mode steps – Reihenfolge wie der Probe-Weg
+# (CHECKLISTE „Ruhetest liest vor start_prtouch_pres“, README A.8/B.1)
+# =====================================================================
+
+STEPS_ARM = ["wait", "swap0", "read_swap", "swap1", "read_swap", "cont",
+             "start_pres", "start_step", "pause", "read_pres", "read_ftr",
+             "status"]
+
+
+def _idx(ev, name, last=False):
+    if name not in ev:
+        return -1
+    return len(ev) - 1 - ev[::-1].index(name) if last else ev.index(name)
+
+
+def test_1017_steps_order():
+    cfg, tool, pres, step, ctl, log = make_ctl(z_start=0.2, z_true=0.0)
+    res = ctl.probe_point()
+    ev = ctl._test_events
+    check("(steps) Antastung ok", res.get("status") == "ok", str(res)[:200])
+    check("(steps) Reihenfolge Stillstand → Signalweg → cont → start_pres → "
+          "start_step → Totzeit → Ruhetest roh+gefiltert → tri_chxs",
+          ev[:len(STEPS_ARM)] == STEPS_ARM, str(ev[:14]))
+    check("(steps) erster Schritt erst NACH Ruhetest/Kontaktprüfung",
+          _idx(ev, "down") > _idx(ev, "status") > _idx(ev, "read_ftr")
+          > _idx(ev, "start_pres"), str(ev[:16]))
+    check("(steps) Ende: stop_step → stop_pres sta_swap=1 → Lift",
+          ev[-4:] == ["stop_step", "stop_pres1", "lift", "wait"],
+          str(ev[-6:]))
+    check("(steps) genau 1× scharf, 1× entschärft, Totzeit = arm_settle_s",
+          ev.count("start_pres") == 1 and ev.count("stop_pres1") == 1
+          and ctl._test_pauses == [cfg["arm_settle_s"]]
+          and not ctl.core.armed, str(ctl._test_pauses))
+    check("(steps) je Schritt M400 + Lesen + tri_chxs",
+          ev.count("down") == ev.count("read_step") == res["steps"]
+          and ev.count("status") == res["steps"] + 1)
+    check("(steps) Düse hat mit ausgelöst (mcu_triggered im Ergebnis)",
+          res.get("mcu_triggered") is True)
+    check("(steps) Nullpunkt = Median des Ruhetests nach dem Scharfschalten",
+          abs(res["rest"]["median"] - (-1450000)) <= 300, str(res["rest"]))
+    # preflight (KTWO_PRTOUCH_READ / DRY_RUN) – gleicher Arm-Code, entschärft
+    cfg2, tool2, pres2, _, ctl2, _ = make_ctl(z_start=0.2, z_true=0.0)
+    info = ctl2.preflight()
+    ev2 = ctl2._test_events
+    check("(steps) preflight: scharf → Ruhe → entschärft, keine Bewegung",
+          ev2 == STEPS_ARM + ["stop_step", "stop_pres1"]
+          and not tool2.moves and info["rest"]["len"] == 64, str(ev2))
+
+
+def test_1017_steps_register_empty():
+    """Altfehler: Ruhetest VOR start_prtouch_pres liest ein leeres Register."""
+    cfg, tool, pres, step, ctl, log = make_ctl(z_start=0.2, z_true=0.0)
+    t, d = pres.read_pres()  # unscharf, wie der alte check_sensor_rest
+    tk, dd = K.drop_empty(K.decode_ticks(t, cfg), K.decode_pres_datas(d, cfg))
+    ok, info = K.check_rest_ok(dd, cfg, ticks=tk)
+    check("(steps-leer) unscharf gelesen: Register leer -> Ruhetest scheitert "
+          "(deshalb war mode steps unbenutzbar)",
+          not ok and len(dd) == 0, str(info["errors"]))
+    check("(steps-leer) alter Weg check_sensor_rest entfernt",
+          not hasattr(ctl, "check_sensor_rest"))
+    del ctl._test_events[:]
+    r = ctl.probe_point()
+    check("(steps-leer) neuer Weg: ok, Ruhetest erst nach start_pres",
+          r.get("status") == "ok" and _idx(ctl._test_events, "read_pres")
+          > _idx(ctl._test_events, "start_pres"), str(r)[:160])
+    # Start wirkungslos (ack 0, Register bleibt leer) -> Abbruch vor Fahrt
+    cfg2, tool2, pres2, _, ctl2, _ = make_ctl(z_start=0.2, z_true=0.0)
+    pres2.never_fills = True
+    r2 = ctl2.probe_point()
+    ev2 = ctl2._test_events
+    check("(steps-leer) Register nach start leer -> rest_error, keine Fahrt",
+          r2.get("status") == "rest_error"
+          and "gültige Rohwerte" in r2.get("error", "")
+          and not tool2.moves, str(r2)[:200])
+    check("(steps-leer) trotzdem entschärft",
+          ev2[-2:] == ["stop_step", "stop_pres1"] and not ctl2.core.armed,
+          str(ev2[-4:]))
+
+
+def test_1017_steps_errors():
+    # (1) Signalweg defekt -> swap_error, nie scharf, entschärft
+    cfg, tool, pres, step, ctl, _ = make_ctl(fake_over={"swap_ok": False})
+    r = ctl.probe_point()
+    ev = ctl._test_events
+    check("(steps-err) Signalweg defekt -> swap_error, kein start, keine Fahrt",
+          r.get("status") == "swap_error" and "start_pres" not in ev
+          and not tool.moves and ev[-2:] == ["stop_step", "stop_pres1"],
+          str(r)[:160])
+    # (2) ack err != 0 -> start_error
+    cfg, tool, pres, step, ctl, _ = make_ctl()
+    pres.ack_err = 3
+    r = ctl.probe_point()
+    ev = ctl._test_events
+    check("(steps-err) ack err=3 -> start_error, kein Ruhetest, keine Fahrt, "
+          "entschärft", r.get("status") == "start_error"
+          and "err=3" in r.get("error", "") and "read_pres" not in ev
+          and not tool.moves and ev[-2:] == ["stop_step", "stop_pres1"],
+          str(r)[:160])
+    # (3) Düse meldet schon beim Scharfschalten Kontakt (tri_chxs)
+    cfg, tool, pres, step, ctl, _ = make_ctl()
+    pres.trigger_on_arm = True
+    r = ctl.probe_point()
+    check("(steps-err) tri_chxs vor der Fahrt -> contact_before_move, "
+          "keine Fahrt, entschärft",
+          r.get("status") == "contact_before_move" and not tool.moves
+          and ctl._test_events[-2:] == ["stop_step", "stop_pres1"],
+          str(r)[:160])
+    # (4) Ausnahme während der Fahrt -> entschärft VOR dem Anheben
+    cfg, tool, pres, step, ctl, _ = make_ctl(z_start=0.2, z_true=0.0)
+    tool.fail_down_at = 3
+    r = ctl.probe_point()
+    ev = ctl._test_events
+    check("(steps-err) Ausnahme im 3. Schritt -> error, entschärft, dann Lift",
+          r.get("status") == "error" and ev.count("down") == 2
+          and _idx(ev, "lift") > _idx(ev, "stop_pres1")
+          > _idx(ev, "stop_step") > _idx(ev, "down_fail"), str(ev[-6:]))
+    # (5) Notgrenze -> entschärft vor Lift
+    cfg, tool, pres, step, ctl, _ = make_ctl(
+        fake_over={"emergency_always": True})
+    r = ctl.probe_point()
+    ev = ctl._test_events
+    check("(steps-err) Notgrenze -> emergency, 1 Schritt, entschärft, Lift",
+          r.get("status") == "emergency" and r.get("steps") == 1
+          and ev[-4:] == ["stop_step", "stop_pres1", "lift", "wait"],
+          str(r)[:160])
+    # (6) max_travel -> entschärft vor Lift, Weg begrenzt
+    cfg, tool, pres, step, ctl, _ = make_ctl(z_start=0.5, z_true=0.0,
+                                             cfg_over={"max_travel_mm": 0.1})
+    r = ctl.probe_point()
+    ev = ctl._test_events
+    check("(steps-err) max_travel -> entschärft, Lift, Weg <= 0,1 mm",
+          r.get("status") == "max_travel" and tool.total_down() <= 0.1 + 1e-9
+          and ev[-4:] == ["stop_step", "stop_pres1", "lift", "wait"],
+          str(r)[:160])
+    # (7) Entschärfen schlägt fehl (step) -> disarm_error, pres trotzdem
+    cfg, tool, pres, step, ctl, _ = make_ctl(z_start=0.2, z_true=0.0)
+    step.fail_disarm = True
+    r = ctl.probe_point()
+    ev = ctl._test_events
+    check("(steps-err) stop_step-Fehler -> disarm_error, stop_pres gesendet, "
+          "angehoben", r.get("status") == "disarm_error"
+          and "Entschärfen" in r.get("error", "") and "stop_pres1" in ev
+          and ev[-2:] == ["lift", "wait"], str(r)[:200])
+    # (8) BaseException (z.B. KeyboardInterrupt) -> entschärft + weiter
+    cfg, tool, pres, step, ctl, _ = make_ctl(z_start=0.2, z_true=0.0)
+
+    def _boom(step_mm, speed):
+        raise KeyboardInterrupt()
+    tool.move_down = _boom
+    try:
+        ctl.probe_point()
+        ok = False
+    except KeyboardInterrupt:
+        ok = True
+    check("(steps-err) KeyboardInterrupt -> weitergereicht, entschärft",
+          ok and ctl._test_events[-2:] == ["stop_step", "stop_pres1"]
+          and not ctl.core.armed, str(ctl._test_events[-4:]))
+    # (9) Düse löst aus, Host-Kriterium (3000) nicht -> mcu_contact, kein Z
+    cfg, tool, pres, step, ctl, _ = make_ctl(z_start=0.2, z_true=0.0,
+                                             fake_over={"spike": -2000})
+    r = ctl.probe_point()
+    ev = ctl._test_events
+    check("(steps-err) tri_chxs ohne Host-Kontakt -> mcu_contact, kein z, "
+          "entschärft + Lift", r.get("status") == "mcu_contact"
+          and "z" not in r and ev[-4:] == ["stop_step", "stop_pres1",
+                                            "lift", "wait"], str(r)[:200])
+    # (10) Lift-Fehler nach Kontakt -> lift_error
+    cfg, tool, pres, step, ctl, _ = make_ctl(z_start=0.2, z_true=0.0)
+    tool.fail_lift = True
+    r = ctl.probe_point()
+    check("(steps-err) Lift-Fehler -> lift_error, entschärft",
+          r.get("status") == "lift_error" and not ctl.core.armed
+          and "stop_pres1" in ctl._test_events, str(r)[:160])
+
+
+def test_1017_steps_guards():
+    # allow_move False -> nur Vorabprüfung (scharf -> Ruhe -> entschärft)
+    cfg, tool, pres, step, ctl, _ = make_ctl(cfg_over={"allow_move": False})
+    r = ctl.probe_point(100.0, 100.0)
+    ev = ctl._test_events
+    check("(steps-guard) allow_move False -> dry_run, 0 Bewegungen, "
+          "MCU entschärft", r.get("status") == "dry_run" and not tool.moves
+          and "down" not in ev and "xy" not in ev
+          and ev[-2:] == ["stop_step", "stop_pres1"]
+          and abs(r.get("baseline", 0) + 1450000) <= 300, str(r)[:160])
+    # DRY_RUN mit kaputtem Sensor meldet den Fehler statt „ok“
+    cfg, tool, pres, step, ctl, _ = make_ctl(fake_over={"rest_noisy": True})
+    r = ctl.probe_point(dry_run=True)
+    check("(steps-guard) DRY_RUN mit unruhigem Sensor -> rest_error",
+          r.get("status") == "rest_error" and not tool.moves, str(r)[:160])
+    # Mindestgeschwindigkeit doppelt (Laufzeit, falls cfg verändert)
+    cfg, tool, pres, step, ctl, _ = make_ctl()
+    ctl.cfg["probe_speed"] = 2.0
+    r = ctl.probe_point(100.0, 100.0)
+    check("(steps-guard) probe_speed 2 zur Laufzeit -> config_error, "
+          "kein MCU-Befehl, keine Bewegung",
+          r.get("status") == "config_error" and "zu langsam" in r["error"]
+          and not tool.moves and not ctl._test_events, str(r)[:160])
+    ctl.cfg["probe_speed"] = 5.5
+    r = ctl.probe_point()
+    check("(steps-guard) probe_speed 5,5 -> config_error",
+          r.get("status") == "config_error" and not tool.moves)
+    # Config: arm_settle_s/Antast-Parameter gelten auch in mode steps
+    check("(steps-guard) mode steps: arm_settle_s 0.1 / min_hold==max_hold "
+          "abgelehnt", _raises({"mode": "steps", "arm_settle_s": "0.1"},
+                               "zu kurz")
+          and _raises({"mode": "steps", "pres_tri_hold": "4000,4000,500"},
+                      "Stream"))
+    # can_brk False -> zweiter Versuch schaltet NACH dem Entschärfen neu scharf
+    calls = []
+    orig = K.check_can_brk
+
+    def _fake_can(b, s_, z, c):
+        calls.append(1)
+        return (len(calls) > 1), "Test"
+    K.check_can_brk = _fake_can
+    try:
+        cfg, tool, pres, step, ctl, _ = make_ctl(z_start=0.2, z_true=0.0)
+        r = ctl.probe_point(100.0, 100.0)
+    finally:
+        K.check_can_brk = orig
+    ev = ctl._test_events
+    starts = [i for i, e in enumerate(ev) if e == "start_pres"]
+    stops = [i for i, e in enumerate(ev) if e == "stop_pres1"]
+    check("(steps-guard) can_brk-Wiederholung: 2× scharf/entschärft, "
+          "zweites start_pres nach erstem stop_pres",
+          r.get("retried") and r.get("status") == "ok" and len(starts) == 2
+          and len(stops) == 2 and stops[0] < starts[1], str(ev.count("down")))
+    # Adapter: Status-Abfrage wie Stock read_prtouch_pres [oid, 2, 0, 0, 0]
+    kp = K.KlippyPresMcu(None, None, K.parse_options({}), 4, {})
+    kp._q_read = _Q("read", lambda d: {"tri_chxs": 1, "buf_len": 64,
+                                       "idx": 0, "len": 0})
+    st = kp.read_status()
+    check("(steps-guard) KlippyPresMcu.read_status sendet [oid,2,0,0,0]",
+          kp._q_read.sent == [[4, 2, 0, 0, 0]] and st["tri_chxs"] == 1,
+          str(kp._q_read.sent))
+
+
 def main():
     test_live_ring_read()
     test_swap_mechanism()
@@ -2085,6 +2436,10 @@ def main():
     test_1017_ring_blocks()
     test_1017_pc7_pull()
     test_1017_upstream()
+    test_1017_steps_order()
+    test_1017_steps_register_empty()
+    test_1017_steps_errors()
+    test_1017_steps_guards()
     print("\n%d bestanden, %d fehlgeschlagen" % (len(PASS), len(FAIL)))
     if FAIL:
         print("FEHLER:", FAIL)

@@ -119,7 +119,11 @@ Abbruch im laufenden Druck (17.10.2026, config-pi/NOTIZ-reinigung-resume.md
 Fehlerposition (z. B. am Schneidhebel X -7,8 / Y200 oder im Schacht) – das
 PAUSE-Makro merkt sie als Rückfahrziel, RESUME fährt dorthin und setzt die
 Upstream-PAUSE_STATE darauf (RESUME_BASE = Nullfahrt). Fahrten in den Schacht
-verlassen den Schneidbereich (X < pre_cut_pos_x) zuerst nur in X.
+verlassen den Schneidbereich (X < pre_cut_pos_x) zuerst nur in X. Hatte der
+Wechsel schon auf die Wechsel-Temperatur geheizt (M109, max(Ziel, 220)),
+bekommt PAUSE zusätzlich ``CFS_TEMP=<Druck-Zieltemperatur vor dem Wechsel>``
+– das Makro merkt sie statt des aktuellen Ziels als hotend_temp, RESUME
+heizt also wieder auf die Drucktemperatur (Fix 17.10.2026 spät).
 
 RESUME nach abgebrochenem Wechsel (17.10.2026 spät, BOOTLOADER-HOST-BEFUND
 §5, config-pi/NOTIZ-reinigung-resume.md §6a.7, README-k2_box.md §11):
@@ -1516,6 +1520,9 @@ class PrinterK2Box:
         # Position vor einem Einzelschritt im laufenden Druck ohne Kette
         # (z. B. M8200 C ohne P) -> Rückfahrziel bei dessen Abbruch.
         self._step_start = None
+        # Extruder-Ziel vor einem solchen Einzelschritt (PAUSE CFS_TEMP, s.
+        # _pause_temp); in der Kette übernimmt das chain["orig_target"].
+        self._step_target = None
         # Abgebrochener Wechsel im Druck (_fail, Pausenpfad): RESUME prüft
         # dann den Kopfsensor (cmd_resume_check) – leer = gesperrt bzw.
         # Nachholen (resume_redo_change). Dict step/tnn/source oder None.
@@ -2007,14 +2014,25 @@ class PrinterK2Box:
             t = max(target, float(self.cfg["tn_extrude_temp"]))
         return float(t)
 
+    def _extruder_target(self):
+        """Aktuelles Extruder-Ziel in °C, None = nicht lesbar."""
+        st = self._obj_status("extruder")
+        if "target" not in st:
+            return None
+        try:
+            return float(st.get("target") or 0.0)
+        except Exception:
+            return None
+
     def _heat(self, gcmd, temp):
+        # orig_target = Ziel VOR dem ersten Heizen der Kette (vor M109, damit
+        # es auch bei einem Abbruch während M109 stimmt – M109 setzt das Ziel
+        # vor dem Warten). END_OPT stellt es wieder her, _fail gibt es an
+        # PAUSE (CFS_TEMP, s. _pause_temp). Nicht lesbar -> 0.0 (= unbekannt).
         ch = self.chain
         if ch.get("active") and ch.get("orig_target") is None:
-            try:
-                ch["orig_target"] = float(
-                    self._obj_status("extruder").get("target") or 0.0)
-            except Exception:
-                ch["orig_target"] = 0.0
+            t = self._extruder_target()
+            ch["orig_target"] = 0.0 if t is None else t
         if self._move(gcmd, "Heizen", ["M109 S%s" % _n(temp)], wrap=False):
             if ch.get("active"):
                 ch["temp_changed"] = True
@@ -2124,6 +2142,40 @@ class PrinterK2Box:
             return None
         return sp
 
+    def _pause_temp(self):
+        """Druck-Zieltemperatur für ``PAUSE CFS_TEMP`` nach einem Abbruch
+        im LAUFENDEN Druck -> (temp, hinweis).
+
+        Hintergrund: das PAUSE-Makro merkt ``printer.extruder.target`` als
+        hotend_temp (wie Stock PAUSE, config/F008/gcode_macro.cfg:738) und
+        RESUME heizt darauf (macros.cfg _PI_RESUME_PREPARE M109, Stock RESUME
+        gcode_macro.cfg:836-842). Hat der Wechsel schon geheizt (_heat ->
+        M109 Wechsel-Temperatur max(Ziel, tn_extrude_temp)), wäre das die
+        Wechsel- statt der Drucktemperatur. temp = Ziel vor dem ersten
+        Heizen (Kette: orig_target; Einzelschritt: _step_target), None =
+        kein CFS_TEMP nötig/möglich:
+        - noch nicht geheizt bzw. Ziel unverändert (±0,01 °C) -> PAUSE merkt
+          ohnehin das richtige Ziel;
+        - Ziel vor dem Wechsel 0/nicht lesbar -> UNBEKANNT: PAUSE merkt wie
+          bisher das aktuelle Ziel (lieber auf Wechsel-Temperatur als kalt
+          weiterdrucken), hinweis erklärt das."""
+        ch = self.chain
+        orig = ch.get("orig_target") if ch.get("active") else self._step_target
+        if orig is None:
+            return None, ""
+        cur = self._extruder_target()
+        if orig <= 0.0:
+            if cur is not None and cur > 0.0:
+                return None, (
+                    " Druck-Zieltemperatur vor dem Wechsel unbekannt (0) – "
+                    "RESUME heizt auf das aktuelle Ziel %s °C; ggf. vor "
+                    "RESUME SET_GCODE_VARIABLE MACRO=_PI_PARAM "
+                    "VARIABLE=hotend_temp VALUE=<°C>." % (_n(cur),))
+            return None, ""
+        if cur is not None and abs(cur - orig) < 0.01:
+            return None, ""
+        return float(orig), ""
+
     @staticmethod
     def _tool_of(tnn):
         """'T1B' -> 'T1' (Werkzeugnummer wie macros.cfg T0..T15)."""
@@ -2175,7 +2227,13 @@ class PrinterK2Box:
         Ziels); ohne dieses Makro (Upstream-PAUSE ignoriert die Parameter)
         bleibt der alte Z-Fallback pending_resume_z. In einer schon
         bestehenden Pause (Wiederholung von Hand, Runout-Kette) weder Ziel
-        noch Z-Fallback – PAUSE_STATE ist dort bereits die Druckposition."""
+        noch Z-Fallback – PAUSE_STATE ist dort bereits die Druckposition.
+
+        Temperatur (Fix 17.10.2026 spät): hatte der Wechsel schon geheizt,
+        bekommt die NEUE Pause ``CFS_TEMP=<Ziel vor dem Wechsel>``
+        (_pause_temp) – das PAUSE-Makro merkt es als hotend_temp statt der
+        Wechsel-Temperatur. In einer bestehenden Pause kein CFS_TEMP:
+        hotend_temp stammt dort schon aus der ersten Pause."""
         msg = "[k2_box] %s fehlgeschlagen: %s" % (name, text)
         if self._print_active() and self.cfg.get("pause_on_failure"):
             if not self.chain_error:
@@ -2190,11 +2248,36 @@ class PrinterK2Box:
             if not was_paused and ch.get("hop") and ch.get("active") \
                     and ch.get("start_pos") is not None:
                 self.pending_resume_z = float(ch["start_pos"][2])
+            # Drucktemperatur vor dem Wechsel (nur für eine NEUE Pause: in
+            # einer bestehenden hat PAUSE hotend_temp schon gemerkt – ein
+            # Wiederholungs-T<n> heizt von der Pausentemperatur aus)
+            temp, temp_hint = (None, "") if was_paused else self._pause_temp()
             hint = ""
             if target is not None:
                 hint = (" Rückfahrziel für RESUME = Druckposition vor dem "
                         "Wechsel X%s Y%s Z%s (nicht die Fehlerposition)."
                         % tuple(_n(v) for v in target))
+            if temp is not None:
+                hint += (" RESUME heizt auf die Drucktemperatur vor dem "
+                         "Wechsel %s °C (nicht die Wechsel-Temperatur %s °C)."
+                         % (_n(temp), _n(self._extruder_target() or 0.0)))
+            hint += temp_hint
+            if was_paused and ch.get("active") and ch.get("temp_changed") \
+                    and ch.get("orig_target") is not None:
+                # Abbruch IN einer Pause (Wiederholung von Hand, Nachholen im
+                # RESUME, Runout-Kette): Düse zurück auf das Ziel vor diesem
+                # Wechsel (= Pausentemperatur, macros.cfg PAUSE M104 S140) wie
+                # END_OPT im Erfolgsfall – sonst stünde sie die ganze Pause
+                # auf Wechsel-Temperatur. RESUME heizt aus hotend_temp.
+                try:
+                    if self._move(gcmd, "Zieltemperatur zurück (Abbruch in "
+                                  "der Pause)", ["M104 S%s" % _n(
+                                      ch["orig_target"])], wrap=False):
+                        ch["temp_changed"] = False
+                        hint += (" Düse zurück auf %s °C (Ziel vor diesem "
+                                 "Wechsel)." % (_n(ch["orig_target"]),))
+                except Exception as exc:
+                    hint += " Zieltemperatur zurück fehlgeschlagen: %s." % (exc,)
             # Reihenfolge (Fix 17.10. spät): ein T<n> bei offenem Fehler lehnt
             # PRE_OPT ab -> erst quittieren, dann wiederholen. RESUME prüft
             # danach den Kopfsensor (leer = gesperrt, cmd_resume_check).
@@ -2208,6 +2291,8 @@ class PrinterK2Box:
                 if target is not None:
                     line += (" CFS_RETURN_X=%s CFS_RETURN_Y=%s CFS_RETURN_Z=%s"
                              % tuple(_n(v) for v in target))
+                if temp is not None:
+                    line += " CFS_TEMP=%s" % (_n(temp),)
                 # PAUSE-Makro ruft KTWO_BOX_RESUME_FIX CLEAR=1: diese Pause
                 # stammt aus _fail -> den gerade gemerkten Abbruch behalten
                 self._pause_from_fail = True
@@ -2238,16 +2323,19 @@ class PrinterK2Box:
                 "allow_write=%s, allow_move=%s) – nichts ausgeführt" % (
                     self.cfg.get("allow_write"), self.cfg.get("allow_move"))))
         # Einzelschritt ohne Kette im laufenden Druck: Position merken
-        # (Rückfahrziel, falls der Schritt abbricht – s. _resume_target).
-        self._step_start = (self._gcode_pos() if not ch.get("active")
-                            and self._print_active()
-                            and not self._is_paused() else None)
+        # (Rückfahrziel, falls der Schritt abbricht – s. _resume_target),
+        # ebenso das Extruder-Ziel (Drucktemperatur für PAUSE CFS_TEMP).
+        single = (not ch.get("active") and self._print_active()
+                  and not self._is_paused())
+        self._step_start = self._gcode_pos() if single else None
+        self._step_target = self._extruder_target() if single else None
         try:
             return body(gcmd)
         except Exception as exc:
             return self._fail(gcmd, name, self._exc_text(exc))
         finally:
             self._step_start = None
+            self._step_target = None
 
     # -- G-Codes ---------------------------------------------------------
     def cmd_pre_opt(self, gcmd):

@@ -1700,7 +1700,7 @@ def test_makros_resume_schneidbereich():
 # §6a.7, README-k2_box.md §11, Batch upstream-test-resumecut)
 # =====================================================================
 
-def _hull_abort_leer(source="T", **over):
+def _hull_abort_leer(source="T", target=0.0, **over):
     """Druck mit T1B (Hub B, Kopf voll) -> T0 (= T1A): Schnitt + Rückzug B
     laufen (Kopf danach LEER), Einzug A bricht mit 0x0c ab -> _fail ->
     PAUSE. "PAUSE" ruft wie das Makro KTWO_BOX_RESUME_FIX CLEAR=1."""
@@ -1715,6 +1715,7 @@ def _hull_abort_leer(source="T", **over):
         mod.cmd_resume_fix(FakeGcmd({"CLEAR": "1"}))
     printer.gcode.commands["PAUSE"] = fake_pause
     printer.set_printing(True)
+    printer.target = float(target)          # Druck-Zieltemperatur (M104)
     _set_pos(printer, 110, 120, 10)
     run_chain(mod, "T1A", source=source)
     return bus, printer, mod
@@ -1822,6 +1823,153 @@ def test_resume_kopf_sensor_fehlt():
     return "Sensor fehlt/leer konfiguriert -> gesperrt, HEAD_LOADED=1 gibt frei"
 
 
+# =====================================================================
+# PAUSE-Temperatur nach abgebrochenem Wechsel (17.10.2026 spät, CHECKLISTE
+# "PAUSE merkt nach Kettenabbruch hotend_temp = Wechsel-Temperatur",
+# NOTIZ-reinigung-resume.md §6a.10, README-k2_box.md §11)
+# =====================================================================
+
+def _pause_lines(sc):
+    return [l for l in sc if l.split()[0] == "PAUSE"]
+
+
+def test_pause_temp_nach_abbruch():
+    # 1) Druck mit 200 °C, Wechsel heizt (RETRUDE/EXTRUDE: M109 S220) und
+    #    bricht im Einzug ab -> PAUSE bekommt CFS_TEMP=200 (Ziel VOR dem
+    #    Aufheizen), nicht 220
+    bus, printer, mod = _hull_abort_leer(target=200.0)
+    sc = printer.gcode.scripts
+    assert "M109 S220" in sc and printer.target == 220.0, sc
+    assert _pause_lines(sc) == ["PAUSE CFS_RETURN_X=110 CFS_RETURN_Y=120 "
+                                "CFS_RETURN_Z=10 CFS_TEMP=200"], _pause_lines(sc)
+    assert any("Drucktemperatur vor dem Wechsel 200 °C (nicht die Wechsel-"
+               "Temperatur 220 °C)" in m for m in printer.gcode.raw), \
+        printer.gcode.raw
+    # 2) mehrere Abbrüche: Wiederholung IN der Pause (PAUSE-Makro hat auf
+    #    140 °C gesenkt) heizt erneut und bricht wieder ab -> keine zweite
+    #    PAUSE, kein CFS_TEMP (hotend_temp stammt aus der ersten Pause)
+    printer.target = 140.0                   # = macros.cfg PAUSE M104 S140
+    mod.cmd_error_clear(FakeGcmd({}))
+    n = len(sc)
+    run_chain(mod, "T1A")
+    assert "EXTRUDE fehlgeschlagen" in mod.get_status()["chain_error"]
+    assert "M109 S220" in sc[n:] and _pause_lines(sc[n:]) == [], sc[n:]
+    assert mod.chain["orig_target"] is None    # Kette aufgeräumt
+    # ... und die Düse steht nicht die ganze Pause auf Wechsel-Temperatur:
+    # zurück auf das Ziel vor diesem Wechsel (Pausentemperatur 140)
+    i = sc.index("M109 S220", n)
+    assert sc[i:].count("M104 S140") == 1 and printer.target == 140.0, sc[i:]
+    assert any("Düse zurück auf 140 °C" in m for m in printer.gcode.raw)
+    # 3) manueller T<n> in der Pause (Erfolg): END_OPT stellt das Ziel VOR
+    #    diesem Wechsel her = Pausentemperatur 140, NICHT die Drucktemperatur
+    #    (die heizt erst RESUME aus hotend_temp)
+    printer.target = 140.0
+    mod.cmd_error_clear(FakeGcmd({}))
+    bus.fail_after_mm = None
+    bus.head_at_mm = bus.odo + 100.0
+    n = len(sc)
+    run_chain(mod, "T1A")
+    assert mod.get_status()["chain_error"] == "" and printer.paused
+    assert "M109 S220" in sc[n:] and sc[n:].count("M104 S140") == 1 \
+        and printer.target == 140.0 and _pause_lines(sc[n:]) == [], sc[n:]
+    # 4) Abbruch VOR dem Aufheizen (Schnitt am Hebel): Ziel unverändert ->
+    #    PAUSE ohne CFS_TEMP (merkt ohnehin das Druckziel)
+    bus, printer, mod = _hull_t1b_ok()
+    printer.set_printing(True)
+    printer.target = 200.0
+    _set_pos(printer, 110, 120, 10)
+    printer.fail_on = "G4 P"
+    run_chain(mod, "T1B")
+    sc = printer.gcode.scripts
+    assert "M109 S220" not in sc and _pause_lines(sc) == [
+        "PAUSE CFS_RETURN_X=110 CFS_RETURN_Y=120 CFS_RETURN_Z=10"], sc
+    # 5) Druckziel schon >= Wechsel-Temperatur (235): Kette heizt auf 235,
+    #    Ziel unverändert -> kein CFS_TEMP
+    bus, printer, mod = _hull_abort_leer(target=235.0)
+    sc = printer.gcode.scripts
+    assert "M109 S235" in sc and _pause_lines(sc) == [
+        "PAUSE CFS_RETURN_X=110 CFS_RETURN_Y=120 CFS_RETURN_Z=10"], sc
+    # 6) Ziel vor dem Wechsel 0 (unbekannt/aus): kein CFS_TEMP -> PAUSE
+    #    merkt wie bisher das aktuelle Ziel 220 (nicht kalt weiterdrucken),
+    #    Meldung erklärt es
+    bus, printer, mod = _hull_abort_leer(target=0.0)
+    sc = printer.gcode.scripts
+    assert _pause_lines(sc) == ["PAUSE CFS_RETURN_X=110 CFS_RETURN_Y=120 "
+                                "CFS_RETURN_Z=10"], sc
+    assert any("vor dem Wechsel unbekannt (0)" in m and "220 °C" in m
+               for m in printer.gcode.raw), printer.gcode.raw
+    # 7) Einzelschritt ohne Kette im Druck (KTWO_BOX_EXTRUDE von Hand):
+    #    Ziel vor dem Schritt -> CFS_TEMP; danach kein Merker-Rest
+    bus, printer, mod = build_hull(allow_write="True")
+    bus.fail_after_mm = 100.0
+    printer.set_printing(True)
+    printer.target = 205.0
+    _set_pos(printer, 80, 90, 7)
+    mod.cmd_extrude(FakeGcmd({"TNN": "T1A"}))
+    sc = printer.gcode.scripts
+    pl = _pause_lines(sc)
+    assert len(pl) == 1 and pl[0].startswith("PAUSE CFS_RETURN_X=80 ") \
+        and pl[0].endswith(" CFS_TEMP=205"), sc
+    assert mod._step_target is None and mod._step_start is None
+    # 8) ohne Druck: Fehler -> G-Code-Fehler, keine PAUSE (unverändert)
+    bus, printer, mod = build_hull(allow_write="True")
+    bus.fail_after_mm = 100.0
+    printer.target = 200.0
+    try:
+        mod.cmd_extrude(FakeGcmd({"TNN": "T1A"}))
+    except ValueError:
+        pass
+    assert _pause_lines(printer.gcode.scripts) == []
+    return ("Abbruch nach M109 S220 bei 200 °C -> PAUSE CFS_TEMP=200; "
+            "Wiederholung in der Pause ohne PAUSE/CFS_TEMP, Erfolg -> M104 S140; "
+            "vor dem Heizen / Ziel 235 / Ziel 0 -> kein CFS_TEMP; Einzelschritt")
+
+
+def test_makros_pause_temp():
+    try:
+        env, macros, kcfg, param = _render_env()
+    except ImportError:
+        return "SKIP (jinja2 fehlt)"
+    R = lambda name, pr, params=None: _render(env, macros, name, pr, params)  # noqa: E731
+    pos = {"gcode_position": {"x": 133.0, "y": 378.0, "z": 10.4, "e": 0.0}}
+    tpos = {"position": {"x": 133.0, "y": 378.0, "z": 10.4}}
+    key = "SET_GCODE_VARIABLE MACRO=_PI_PARAM VARIABLE=hotend_temp VALUE="
+    cfs = {"CFS_RETURN_X": "110", "CFS_RETURN_Y": "120", "CFS_RETURN_Z": "10"}
+
+    def pause(params, target=220.0):
+        pr = _rprinter(param, kcfg, gcode_move=pos, toolhead=tpos,
+                       pause_resume={"is_paused": False},
+                       extruder={"target": target})
+        lines, msgs = R("PAUSE", pr, params)
+        return [l for l in lines if l.startswith(key)], lines, msgs
+    # mit CFS_TEMP: merkt 200 statt Wechsel-Ziel 220, Meldung
+    ht, lines, msgs = pause(dict(cfs, CFS_TEMP="200"))
+    assert ht == [key + "200.0"], ht
+    assert any("Drucktemperatur vor dem Wechsel 200.0 °C" in m
+               and "220.0 °C" in m for m in msgs), msgs
+    assert "M104 S140" in lines, lines         # Pausentemperatur wie bisher
+    # ohne CFS_TEMP (normale Pause / Abbruch vor dem Heizen): aktuelles Ziel
+    ht, _l, msgs = pause(cfs)
+    assert ht == [key + "220.0"] and not [m for m in msgs if "Drucktemp" in m]
+    ht, _l, _m = pause({}, target=205.0)
+    assert ht == [key + "205.0"], ht
+    # CFS_TEMP 0 / ungültig -> aktuelles Ziel (nie hotend_temp 0 = kalt)
+    for bad in ("0", "-5", "abc"):
+        ht, _l, msgs = pause(dict(cfs, CFS_TEMP=bad))
+        assert ht == [key + "220.0"], (bad, ht)
+    # schon pausiert: PAUSE tut nichts (hotend_temp der ersten Pause bleibt)
+    pr = _rprinter(param, kcfg, pause_resume={"is_paused": True})
+    lines, _m = R("PAUSE", pr, dict(cfs, CFS_TEMP="200"))
+    assert lines == [], lines
+    # RESUME-Vorbereitung heizt auf hotend_temp (= 200 nach CFS_TEMP)
+    pr = _rprinter(param, kcfg)
+    pr["gcode_macro _PI_PARAM"]["hotend_temp"] = 200.0
+    lines, _m = R("_PI_RESUME_PREPARE", pr)
+    assert "M109 S200" in lines and "M109 S220" not in lines, lines
+    return ("PAUSE CFS_TEMP=200 -> hotend_temp 200 (sonst/0/ungültig "
+            "aktuelles Ziel), in der Pause nichts, PREPARE M109 S200")
+
+
 def test_resume_abbruch_merker():
     bus, printer, mod = _hull_abort_leer()
     # PAUSE aus _fail ruft RESUME_FIX CLEAR=1 -> Merker bleibt
@@ -1918,6 +2066,10 @@ def test_resume_nachholen():
     st = mod.get_status()
     assert "EXTRUDE fehlgeschlagen" in st["chain_error"] \
         and mod.aborted["source"] == "T" and mod.aborted["tnn"] == "T1A", st
+    # Düse nach dem gescheiterten Nachholen zurück auf das Ziel davor (hier
+    # 220 aus der Fake-Pause; real die Pausentemperatur 140)
+    i = sc.index("M109 S235")
+    assert sc[i:].count("M104 S220") == 1 and printer.target == 220.0, sc[i:]
     return ("Nachholen: PRE_OPT Z_HOP=0 -> Schacht/M109 235 -> Rückzug A "
             "(E-10 heiß) -> Einzug A -> E30/mode7/PRINT -> Spülen -> raus, "
             "kein Schnitt/Z/Rückfahrt; Fehler -> gesperrt + pausiert")
@@ -2513,6 +2665,9 @@ TESTS = [
     ("RESUME nach Abbruch: Nachholen nur mit allen Freigaben",
      test_resume_nachholen_sperren),
     ("Makros RESUME: Kopfprüfung vor PREPARE", test_makros_resume_kopfpruefung),
+    ("PAUSE-Temperatur nach Abbruch (CFS_TEMP = Druckziel)",
+     test_pause_temp_nach_abbruch),
+    ("Makros PAUSE CFS_TEMP / RESUME-Heizen", test_makros_pause_temp),
     ("ReactorBusProxy (kein Reactor-Blockieren)", test_reactor_bus_proxy),
     ("Makros T0-T15/M8200/RESUME (macros.cfg)", test_makros_cfg),
     ("Runout: Slot-Wahl-Regel + Optionen", test_runout_slotwahl),

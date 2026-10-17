@@ -863,7 +863,13 @@ def parse_options(opts):
         cfg["step_swap_pull"] = CREALITY_PULL.get(sw["pullup"], "?")
     else:
         # mode steps: kein Endstop auf PC7, nur config_prtouch_step (setzt
-        # immer Pull-Up, B 0x08004910).
+        # immer Pull-Up, B 0x08004910). Mindestgeschwindigkeit seit
+        # 17.10.2026 auch hier (probe_speed): die Düse ist auch im Rückfall-
+        # weg scharf und friert ihren Puffer erst bei eigener Auslösung ein;
+        # deren Anstiegsdetektor braucht dieselbe Kraftrampe (ANNAHME-Grenze).
+        err = check_probe_speed(cfg["probe_speed"], cfg)
+        if err:
+            raise ValueError("probe_speed: %s" % err)
         cfg["step_swap_pull"] = "Pull-Up (nur config_prtouch_step)"
     rate, pga = cs1237_rate_pga(cfg["cfg_regs"])
     cfg["pres_rate_hz"] = rate
@@ -1229,6 +1235,8 @@ def check_rest_ok(datas, cfg, ticks=None, filt=None):
         info = rest_info(vals)
     else:
         info = {"min": 0, "max": 0, "avg": 0.0, "dif": 0, "len": 0}
+    # Median = Nullpunkt der Notgrenze im Rückfallweg (mode steps).
+    info["median"] = median_int(vals) if vals else None
     if len(vals) < REST_MIN_SAMPLES:
         errors.append("nur %d gültige Rohwerte (< %d) – Sampling nicht "
                       "gestartet/Puffer leer?" % (len(vals), REST_MIN_SAMPLES))
@@ -1384,7 +1392,8 @@ class PrtouchMcuOps:
         raise NotImplementedError
 
     def read_rest_pres(self):
-        """Ruhefenster ohne Fahrt (für check_sensor_rest)."""
+        """Ruhefenster ohne Fahrt (alt; seit 17.10.2026 ungenutzt – ein
+        Lesen VOR start_prtouch_pres liefert ein leeres Register)."""
         return self.read_pres()
 
 
@@ -1505,6 +1514,24 @@ class KlippyPresMcu(PrtouchMcuOps):
         """is_src=0: gefilterte Werte – genau das, was die Düse gegen
         min_hold vergleicht (MCU-Befund §3.2, 0x08003F92)."""
         return self._read_ring(0)
+
+    def read_status(self):
+        """read_prtouch_pres [oid, 2, 0, 0, 0] -> dict(tri_chxs, …).
+
+        B (MCU-Befund §2, 0x08004060-0x0800407A): is_src >= 2 = nur Status,
+        Antwort ohne Daten; tri_chxs = Auslösebits. B §3.2/§3.3: tri_chxs
+        wird je Sample auf 0 gesetzt und bei Auslösung gesetzt; danach
+        acq_tick := 0 (Puffer eingefroren) -> bleibt bis zum nächsten start
+        stehen. Gleiche Stelle zieht PA15 (-> PC7) auf 0 (0x08008192).
+        ANNAHME: die Statusabfrage hat während laufender Abtastung keine
+        Nebenwirkung (Handler liest nur; Stock fragt sie nur nach stop).
+        Rückfallweg (mode steps): Ersatz für die PC7-Abfrage im scharfen
+        Zustand und zusätzliches MCU-Kontaktsignal je Schritt."""
+        st = self._q_read.send([self.oid, 2, 0, 0, 0])
+        get = st.get if hasattr(st, "get") else (lambda k, d=None: d)
+        return {"tri_chxs": int(get("tri_chxs", 0) or 0),
+                "buf_len": get("buf_len"), "idx": get("idx"),
+                "len": get("len")}
 
     def stop_sampling(self, ok=True):
         # BELEGT 16.10.2026: sta_swap=1 = Leitung high (Ruhe, PC7=1);
@@ -1708,6 +1735,8 @@ class K2PrtouchController:
         self.log = logger if logger is not None else self._print_log()
         self.last_result = None
         self.waits = 0
+        # Gemeinsamer Arm/Ruhetest/Disarm-Code mit dem Probe-Hauptweg.
+        self.core = self._make_core()
 
     class _print_log:
         def info(self, msg):
@@ -1756,12 +1785,14 @@ class K2PrtouchController:
                      "(alle ANNAHME, s. BERICHT)" % (
                          c["contact_thresh"], c["emergency_thresh"],
                          c["rest_max_dif"]))
-        lines.append("Ablauf pro Punkt: TEST_SWAP → Ruhetest → "
-                     "start_pres/step → Schritte %.3fmm@%.1fmm/s + M400 + "
-                     "read/detect → bei Kontakt Stopp + Lift → "
-                     "Z = Pos + zoft → can_brk, ggf. 1× versetzt (%.2f,%.2f)"
-                     % (c["step_mm"], c["probe_speed"], c["retry_dx"],
-                        c["retry_dy"]))
+        lines.append("Ablauf pro Punkt: Signalweg-Test → cont_step → "
+                     "start_pres/start_step (ack) → %.3fs Totzeit → Ruhetest "
+                     "(roh+gefiltert) → tri_chxs=0 → Schritte %.3fmm@%.1fmm/s "
+                     "+ M400 + read/detect → stop_step/stop_pres (immer) → "
+                     "Lift → Z = Pos + zoft → can_brk, ggf. 1× versetzt "
+                     "(%.2f,%.2f)"
+                     % (c["arm_settle_s"], c["step_mm"], c["probe_speed"],
+                        c["retry_dx"], c["retry_dy"]))
         return "\n".join(lines)
 
     def test_swap(self):
@@ -1817,23 +1848,51 @@ class K2PrtouchController:
                        self.cfg["step_swap_pin"]))
         return {"pres": p, "step": s}
 
-    def check_sensor_rest(self):
-        """Ruhetest vor Bewegung (S4). Gibt (info, datas) oder wirft.
+    # --- Scharf schalten (gemeinsamer Code mit dem Probe-Hauptweg) -------
+    def _pc7_unarmed(self):
+        """PC7 lesen VOR dem Scharfschalten (Signalweg-Test): stop_prtouch_
+        step, ack expar0 = PC7-Rohpegel (B MCU-Befund §2, 0x08004244) –
+        exakt der Stock-TEST_SWAP-Ablauf. True = ausgelöst (Pegel 0).
+        Nur VOR start_prtouch_step zulässig (würde die step-Aufzeichnung
+        beenden)."""
+        r = self.step.read_swap()
+        return int(r.get("expar0", 1)) == 0
 
-        Seit 17.10.2026 inkl. Tickabstand, -1/24-Bit, nicht konstant
-        (check_rest_ok). Hinweis Rückfallweg: hier wird VOR start_prtouch_pres
-        gelesen – ein nie gestartetes Register ist leer und fällt jetzt
-        (richtig) durch, statt mit Nullpunkt 0 „ok“ zu melden."""
-        t_b, d_b = self.pres.read_rest_pres()
-        ticks = decode_ticks(t_b, self.cfg)
-        datas = decode_pres_datas(d_b, self.cfg)
-        ticks, datas = drop_empty(ticks, datas)
-        ok, info = check_rest_ok(datas, self.cfg, ticks=ticks)
-        if not ok:
-            raise K2PrtouchError(
-                "Sensor-Ruhetest fehlgeschlagen (analog PRES_CHECK): %s – "
-                "keine Bewegung." % "; ".join(info["errors"]))
-        return info, datas
+    def _armed_triggered(self):
+        """Kontakt im scharfen Zustand? -> Status tri_chxs der Düse
+        (read_status, B §2/§3.3; ANNAHME: ohne Nebenwirkung). Ersetzt im
+        Rückfallweg die Endstop-Abfrage des Probe-Wegs (kein Endstop auf
+        PC7 in mode steps)."""
+        st = self.pres.read_status()
+        return int(st.get("tri_chxs", 0) or 0) != 0
+
+    def _make_core(self):
+        """K2PrtouchProbeCore für Arm/Ruhetest/Disarm – derselbe Code wie im
+        Probe-Hauptweg (arm(): Signalweg-Test -> cont_prtouch_step ->
+        start_prtouch_pres [ack] -> start_prtouch_step [ack] -> arm_settle_s
+        (>= Totzeit) -> Ruhetest roh+gefiltert+Ticks -> kein Kontakt;
+        disarm(): stop_prtouch_step -> stop_prtouch_pres sta_swap=1).
+        Ohne descend/get_params: die Fahrt macht probe_point selbst."""
+        core = K2PrtouchProbeCore(
+            self.cfg, None, None, self._pc7_unarmed, self.tool.wait_moves,
+            self.pause, error=K2PrtouchError, logger=None,
+            query_triggered_armed=self._armed_triggered)
+        core.attach(self.pres, self.step)
+        return core
+
+    def preflight(self):
+        """Vorabprüfung OHNE Bewegung (KTWO_PRTOUCH_READ, DRY_RUN,
+        allow_move: False): scharf schalten -> Totzeit -> Ruhetest -> kein
+        Kontakt -> IMMER entschärfen (K2PrtouchProbeCore.preflight).
+        Ersetzt den alten check_sensor_rest, der VOR start_prtouch_pres las:
+        ein nie gestartetes Register ist leer (Altfehler README A.8)."""
+        return self.core.preflight()
+
+    @staticmethod
+    def _arm_status(phase):
+        return {"swap": "swap_error", "start": "start_error",
+                "settle": "start_error", "rest": "rest_error",
+                "pc7": "contact_before_move"}.get(phase, "arm_error")
 
     def check_temps(self):
         """Temperatur-Empfehlung (S5): nur Warnungen, nie Abbruch/Heizen."""
@@ -1856,10 +1915,20 @@ class K2PrtouchController:
 
     # --- Hauptablauf ---------------------------------------------------
     def probe_point(self, x=None, y=None, dry_run=False, _is_retry=False):
-        """Eine Antastung. Gibt dict(status, z, zoft, details...).
+        """Eine Antastung (Rückfallweg). Gibt dict(status, z, zoft, ...).
 
-        status: ok / dry_run / swap_error / rest_error / emergency /
-                max_travel / timeout / no_contact / temp_warn_ok.
+        Reihenfolge (seit 17.10.2026 wie der Probe-Hauptweg, gemeinsamer
+        Code K2PrtouchProbeCore.arm/disarm):
+          Temperatur-Hinweis -> [allow_move/DRY_RUN: nur preflight, Ende]
+          -> Config-Grenzen (step_mm, Geschwindigkeit max 5 / min
+          min_probe_speed) -> XY -> wait_moves (Stillstand) -> arm()
+          (Signalweg, cont/start_pres/start_step mit ack, arm_settle_s,
+          Ruhetest roh+gefiltert, tri_chxs = 0) -> Schritte (step_mm + M400
+          + Lesen + Auswertung) -> finally disarm() -> Anheben.
+        status: ok / dry_run / swap_error / start_error / rest_error /
+                contact_before_move / config_error / denied / move_error /
+                emergency / max_travel / timeout / mcu_contact / error /
+                disarm_error / lift_error.
         Bei ok: z = A + zoft (A = Z bei Kontakt/tiefster Punkt).
         """
         c = self.cfg
@@ -1870,28 +1939,20 @@ class K2PrtouchController:
                 self.log.info("[k2_prtouch] Warnung: %s" % w)
             except Exception:
                 pass
-        # S4: Swap + Ruhe VOR jeder Bewegung.
-        try:
-            swap = self.test_swap()
-        except K2PrtouchError as exc:
-            return {"status": "swap_error", "error": str(exc),
-                    "warnings": warns}
-        except Exception as exc:
-            return {"status": "swap_error",
-                    "error": "Swap-Test: %s" % exc, "warnings": warns}
-        try:
-            rest_info_d, rest_datas = self.check_sensor_rest()
-            baseline0 = median_int(rest_datas)
-        except K2PrtouchError as exc:
-            return {"status": "rest_error", "error": str(exc),
-                    "warnings": warns}
-        except Exception as exc:
-            return {"status": "rest_error",
-                    "error": "Ruhetest: %s" % exc, "warnings": warns}
 
+        # S3: ohne Freigabe/DRY_RUN nur Vorabprüfung (scharf -> Ruhe ->
+        # entschärft), keine Bewegung.
         if dry_run or not c.get("allow_move"):
-            return {"status": "dry_run", "warnings": warns, "swap": swap,
-                    "rest": rest_info_d, "baseline": baseline0,
+            try:
+                info = self.preflight()
+            except Exception as exc:
+                return {"status": self._arm_status(self.core.arm_phase),
+                        "error": str(exc), "warnings": warns,
+                        "disarms": self.core.disarm_count}
+            rest = info.get("rest") or {}
+            return {"status": "dry_run", "warnings": warns,
+                    "swap": info.get("swap"), "rest": rest,
+                    "baseline": rest.get("median"),
                     "plan": self.describe_plan()}
 
         step_mm = float(c["step_mm"])
@@ -1901,10 +1962,10 @@ class K2PrtouchController:
             return {"status": "config_error",
                     "error": "step_mm %.4f verletzt Maximum %.2f (S1)"
                              % (step_mm, STEP_MM_MAX), "warnings": warns}
-        if speed <= 0 or speed > SPEED_MAX + 1e-12:
+        err = check_probe_speed(speed, c)  # zu schnell UND zu langsam
+        if err:
             return {"status": "config_error",
-                    "error": "probe_speed %.2f verletzt Maximum %.1f (S1)"
-                             % (speed, SPEED_MAX), "warnings": warns}
+                    "error": "probe_speed: %s" % err, "warnings": warns}
 
         # XY-Positionierung (mit Freigabe, S3):
         try:
@@ -1920,193 +1981,167 @@ class K2PrtouchController:
             return {"status": "move_error", "error": "XY: %s" % exc,
                     "warnings": warns}
 
-        # Sampling starten (Stock-Parameter):
-        try:
-            self.pres.start_sampling()
-            self.step.start_sampling()
-        except Exception as exc:
-            return {"status": "start_error",
-                    "error": "start_prtouch_*: %s" % exc, "warnings": warns}
+        res, lift = self._armed_descent(c, step_mm, speed, t0, warns)
+        if lift:
+            try:
+                self.tool.lift(float(c["z_lift_mm"]), float(c["lift_speed"]))
+                self.tool.wait_moves()
+                self.waits += 1
+            except Exception as exc:
+                msg = "Anheben fehlgeschlagen: %s" % exc
+                if res.get("status") == "ok":
+                    res["status"] = "lift_error"
+                res["error"] = ("%s; %s" % (res["error"], msg)
+                                if res.get("error") else msg)
+        if res.get("status") != "ok":
+            return res
+        self.last_result = dict(res)
+        # can_brk False -> genau EINMAL versetzt wiederholen (BELEGT
+        # T58->T59: +0.25/-0.25mm, 1mm hoch). Erst NACH dem Entschärfen
+        # (finally in _armed_descent) – der zweite Versuch schaltet neu scharf.
+        if not res["can_brk"] and not _is_retry:
+            try:
+                self.tool.lift(float(c["retry_lift_mm"]),
+                               float(c["lift_speed"]))
+                self.tool.wait_moves()
+            except Exception:
+                pass
+            rx = float(x) + float(c["retry_dx"]) if x is not None else None
+            ry = float(y) + float(c["retry_dy"]) if y is not None else None
+            second = self.probe_point(rx, ry, dry_run=False, _is_retry=True)
+            second["first_try"] = {k: res[k] for k in
+                                   ("z", "zoft", "best_indx",
+                                    "step_bst_indx") if k in res}
+            second["retried"] = True
+            second["retry_dx"] = c["retry_dx"]
+            second["retry_dy"] = c["retry_dy"]
+            return second
+        return res
 
+    def _armed_descent(self, c, step_mm, speed, t0, warns):
+        """Scharf schalten, Schrittfahrt, IMMER entschärfen (try/finally).
+        -> (Ergebnis-Dict, anheben?). Angehoben wird erst nach dem
+        Entschärfen (probe_point)."""
+        core = self.core
+        res = None
+        lift = False
         total = 0.0
         steps = 0
+        moved = False
         try:
+            # Stillstand vor dem Scharfschalten (Bezug der Düse = gleitendes
+            # Mittel von vor 37-49 ms, MCU-Befund §3.2) – wie run_probe.
+            self.tool.wait_moves()
+            self.waits += 1
+            try:
+                arm_info = core.arm()
+            except Exception as exc:
+                res = {"status": self._arm_status(core.arm_phase),
+                       "error": str(exc), "warnings": warns}
+                return res, False
+            rest = arm_info.get("rest") or {}
+            baseline0 = rest.get("median")
+            if baseline0 is None:
+                # rest_check: False -> Nullpunkt der Notgrenze trotzdem aus
+                # dem (jetzt gefüllten) Register.
+                t_b, d_b = self.pres.read_pres()
+                _t, d0 = drop_empty(decode_ticks(t_b, c),
+                                    decode_pres_datas(d_b, c))
+                if len(d0) < REST_MIN_SAMPLES:
+                    res = {"status": "rest_error",
+                           "error": "Nullpunkt: nur %d gültige Rohwerte – "
+                                    "keine Bewegung" % len(d0),
+                           "warnings": warns}
+                    return res, False
+                baseline0 = median_int(d0)
             while True:
                 if total + step_mm > float(c["max_travel_mm"]) + 1e-9:
-                    self._abort_lift("max_travel %.2fmm überschritten "
-                                     "(%d Schritte)" % (c["max_travel_mm"],
-                                                        steps))
-                    try:
-                        self.pres.stop_sampling(ok=False)
-                    except Exception:
-                        pass
-                    try:
-                        self.step.stop_sampling(ok=False)
-                    except Exception:
-                        pass
-                    return {"status": "max_travel",
-                            "error": "kein Kontakt innerhalb max_travel_mm="
-                                     "%.2f (S2)" % c["max_travel_mm"],
-                            "steps": steps, "travel_mm": total,
-                            "warnings": warns}
+                    res = {"status": "max_travel",
+                           "error": "kein Kontakt innerhalb max_travel_mm="
+                                    "%.2f (S2)" % c["max_travel_mm"]}
+                    break
                 if time.monotonic() - t0 > float(c["probe_timeout_s"]):
-                    self._abort_lift("Timeout %.0fs" % c["probe_timeout_s"])
-                    for m in (self.pres, self.step):
-                        try:
-                            m.stop_sampling(ok=False)
-                        except Exception:
-                            pass
-                    return {"status": "timeout",
-                            "error": "Timeout %.0fs (S2)"
-                                     % c["probe_timeout_s"],
-                            "steps": steps, "travel_mm": total,
-                            "warnings": warns}
+                    res = {"status": "timeout",
+                           "error": "Timeout %.0fs (S2)"
+                                    % c["probe_timeout_s"]}
+                    break
                 # S1: kurzer Schritt + M400:
+                moved = True
                 self.tool.move_down(step_mm, speed)
                 self.tool.wait_moves()
                 self.waits += 1
                 total += step_mm
                 steps += 1
 
-                pt_b, pd_b = self.pres.read_pres()
-                st_b, sd_b = self.step.read_step()
-                pt = ticks_to_times(decode_ticks(pt_b, c),
-                                    c["clock_freq"])
-                pd = decode_pres_datas(pd_b, c)
-                st = ticks_to_times(decode_ticks(st_b, c), c["clock_freq"])
-                sd_counts = decode_step_counts(sd_b, c)
-                sd_mm = step_counts_to_mm(sd_counts, c, relative=True)
+                pt_raw, pd_raw = self.pres.read_pres()
+                st_raw, sd_raw = self.step.read_step()
+                tri = self._armed_triggered()
+                pt = ticks_to_times(decode_ticks(pt_raw, c), c["clock_freq"])
+                pd = decode_pres_datas(pd_raw, c)
+                st = ticks_to_times(decode_ticks(st_raw, c), c["clock_freq"])
+                sd_mm = step_counts_to_mm(decode_step_counts(sd_raw, c), c,
+                                          relative=True)
 
-                # S2: Notgrenze (Roh-Abweichung vom Nullpunkt):
+                # S2: Notgrenze (Roh-Abweichung vom Ruhe-Nullpunkt):
                 is_em, mag = check_emergency(pd, baseline0, c)
                 if is_em:
-                    self._abort_lift("Notgrenze %.0f überschritten "
-                                     "(|dev|=%.0f)" % (c["emergency_thresh"],
-                                                       mag))
-                    for m in (self.pres, self.step):
-                        try:
-                            m.stop_sampling(ok=False)
-                        except Exception:
-                            pass
-                    return {"status": "emergency",
-                            "error": "Kraft-Notgrenze: Abweichung %.0f > %.0f "
-                                     "(S2) – abgebrochen + angehoben."
-                                     % (mag, c["emergency_thresh"]),
-                            "steps": steps, "travel_mm": total,
-                            "warnings": warns}
+                    res = {"status": "emergency",
+                           "error": "Kraft-Notgrenze: Abweichung %.0f > %.0f "
+                                    "(S2) – abgebrochen + angehoben."
+                                    % (mag, c["emergency_thresh"])}
+                    break
 
                 det = detect_contact(pd, pt, sd_mm, st, c)
                 if det.get("contact"):
                     A = float(self.tool.get_z())
                     zoft = float(det["zoft"])
-                    final = float(A + zoft)
                     can, reason = check_can_brk(det["best_indx"],
-                                                det["step_bst_indx"],
-                                                zoft, c)
-                    # S1/S2: SOFORT stoppen + anheben:
-                    try:
-                        self.pres.stop_sampling(ok=True)
-                    except Exception:
-                        pass
-                    try:
-                        self.step.stop_sampling(ok=True)
-                    except Exception:
-                        pass
-                    try:
-                        self.tool.lift(float(c["z_lift_mm"]),
-                                       float(c["lift_speed"]))
-                        self.tool.wait_moves()
-                        self.waits += 1
-                    except Exception as exc:
-                        return {"status": "lift_error",
-                                "error": "Anheben nach Kontakt: %s" % exc,
-                                "z": final, "zoft": zoft,
-                                "warnings": warns}
-                    res = {"status": "ok", "z": final, "A": A,
+                                                det["step_bst_indx"], zoft, c)
+                    res = {"status": "ok", "z": float(A + zoft), "A": A,
                            "zoft": zoft, "best_indx": det["best_indx"],
                            "best_time": det["best_time"],
                            "step_bst_indx": det["step_bst_indx"],
                            "tri_pose": det["tri_pose"],
                            "bst_pose": det["bst_pose"],
                            "can_brk": bool(can), "can_reason": reason,
-                           "steps": steps, "travel_mm": total,
-                           "waits": self.waits, "warnings": warns,
-                           "swap": swap, "rest": rest_info_d}
-                    self.last_result = dict(res)
-                    # can_brk False → genau EINMAL versetzt wiederholen
-                    # (BELEGT T58→T59: +0.25/-0.25mm, 1mm hoch):
-                    if not can and not _is_retry:
-                        try:
-                            self.tool.lift(float(c["retry_lift_mm"]),
-                                           float(c["lift_speed"]))
-                            self.tool.wait_moves()
-                        except Exception:
-                            pass
-                        rx = (float(x) + float(c["retry_dx"])
-                              if x is not None else None)
-                        ry = (float(y) + float(c["retry_dy"])
-                              if y is not None else None)
-                        second = self.probe_point(rx, ry,
-                                                  dry_run=False,
-                                                  _is_retry=True)
-                        second["first_try"] = {k: res[k] for k in
-                                               ("z", "zoft", "best_indx",
-                                                "step_bst_indx")
-                                               if k in res}
-                        second["retried"] = True
-                        second["retry_dx"] = c["retry_dx"]
-                        second["retry_dy"] = c["retry_dy"]
-                        return second
-                    return res
-                # sonst: nächster kurzer Schritt (Überfahrweg wächst nur
-                # um step_mm; Test (g) prüft Abbruch ≤1 Schritt nach Kontakt,
-                # da Fake-Spike sofort im nächsten Fenster erscheint).
-        except PermissionError as exc:
-            try:
-                self._abort_lift("deny")
-            except Exception:
-                pass
-            return {"status": "denied", "error": str(exc),
-                    "warnings": warns}
-        except K2PrtouchError as exc:
-            try:
-                self._abort_lift("error")
-            except Exception:
-                pass
-            return {"status": "error", "error": str(exc),
-                    "warnings": warns}
+                           "mcu_triggered": bool(tri),
+                           "swap": arm_info.get("swap"), "rest": rest}
+                    break
+                if tri:
+                    # Düse hat nach ihrer eigenen Logik ausgelöst (B §3.3,
+                    # Puffer eingefroren), das Host-Kriterium aber nicht ->
+                    # kein Z-Wert, sicher abbrechen (Kriterium prüfen).
+                    res = {"status": "mcu_contact",
+                           "error": "Düse meldet Kontakt (tri_chxs), Host-"
+                                    "Kriterium contact_thresh %.0f/%d Samples "
+                                    "nicht erfüllt – kein Messwert (ANNAHME "
+                                    "Host-Kriterium prüfen, README B)."
+                                    % (c["contact_thresh"],
+                                       c.get("rest_min_consec", 2))}
+                    break
+                # sonst: nächster kurzer Schritt (Überfahrweg wächst nur um
+                # step_mm; Test (g) prüft Abbruch <= 1 Schritt nach Kontakt).
+            lift = True
         except Exception as exc:
-            try:
-                self._abort_lift("exception")
-            except Exception:
+            res = {"status": "error", "error": "unerwartet: %s" % exc}
+            lift = moved
+        finally:
+            # Immer entschärfen – auch bei jeder Ausnahme (wie run_probe).
+            errs = core.disarm()
+            if res is None:  # BaseException: weiterreichen, nur entschärft
                 pass
-            for m in (self.pres, self.step):
-                try:
-                    m.stop_sampling(ok=False)
-                except Exception:
-                    pass
-            return {"status": "error", "error": "unerwartet: %s" % exc,
-                    "warnings": warns}
-        # Kein Kontakt im Hub → bereits oben als max_travel behandelt;
-        # Falls Schleife je verlassen wird ohne return (sollte nicht):
-        try:
-            self._abort_lift("no_contact")
-        except Exception:
-            pass
-        return {"status": "no_contact", "error": "kein Kontakt im Hub",
-                "steps": steps, "travel_mm": total, "warnings": warns}
-
-    def _abort_lift(self, why):
-        """Bei jedem Fehler: Fahrt beenden + Z anheben (S2)."""
-        _ = why
-        try:
-            self.tool.lift(float(self.cfg["z_lift_mm"]),
-                           float(self.cfg["lift_speed"]))
-            self.tool.wait_moves()
-            self.waits += 1
-        except Exception as exc:
-            raise K2PrtouchError("Anheben nach Abbruch fehlgeschlagen: %s"
-                                 % exc)
+            elif errs:
+                msg = "Entschärfen fehlgeschlagen: %s" % "; ".join(errs)
+                if res.get("status") == "ok":
+                    res["status"] = "disarm_error"
+                res["error"] = ("%s; %s" % (res["error"], msg)
+                                if res.get("error") else msg)
+                res["disarm_errors"] = errs
+        res.setdefault("warnings", warns)
+        res["steps"] = steps
+        res["travel_mm"] = total
+        res["waits"] = self.waits
+        return res, lift
 
 
 # =====================================================================
@@ -2178,11 +2213,19 @@ class K2PrtouchProbeCore:
     """
 
     def __init__(self, cfg, get_params, descend, query_triggered,
-                 wait_moves, pause, error=K2PrtouchError, logger=None):
+                 wait_moves, pause, error=K2PrtouchError, logger=None,
+                 query_triggered_armed=None):
         self.cfg = dict(cfg)
         self.get_params = get_params
         self.descend = descend
+        # query_triggered: Signalweg-Test VOR dem Scharfschalten.
+        # query_triggered_armed: Prüfung „noch kein Kontakt“ NACH dem
+        # Scharfschalten (Default = query_triggered). mode steps braucht hier
+        # einen anderen Weg (Status tri_chxs), weil dort PC7 nur über
+        # stop_prtouch_step lesbar ist – das würde die step-Aufzeichnung
+        # beenden (K2PrtouchController._armed_triggered).
         self.query_triggered = query_triggered
+        self.query_triggered_armed = query_triggered_armed
         self.wait_moves = wait_moves
         self.pause = pause
         self.error = error
@@ -2192,6 +2235,9 @@ class K2PrtouchProbeCore:
         self.arm_count = 0
         self.disarm_count = 0
         self.last = None
+        # Zuletzt erreichte arm()-Stufe (swap/start/settle/rest/pc7/armed) –
+        # der Rückfallweg bildet daraus seinen Status (swap_error, …).
+        self.arm_phase = None
 
     def attach(self, pres, step):
         self.pres, self.step = pres, step
@@ -2254,6 +2300,7 @@ class K2PrtouchProbeCore:
                              "(klippy:connect abwarten) – keine Bewegung.")
         c = self.cfg
         info = {}
+        self.arm_phase = "swap"
         if c.get("swap_check", True):
             # Signalweg PA15 -> PC7 -> Endstop prüfen (wie Stock-TEST_SWAP,
             # aber direkt über den Stopp-Endstop): sta_swap=0 muss den
@@ -2277,6 +2324,7 @@ class K2PrtouchProbeCore:
                     "prüfen – keine Bewegung."
                     % (c.get("step_swap_pin"), t0, t1))
         # Stock-probe_prepare: cont_step -> start_pres -> start_step.
+        self.arm_phase = "start"
         info["cont"] = self._wrap("cont_prtouch_step", self.step.cont_step)
         ack = self._wrap("start_prtouch_pres", self.pres.start_sampling)
         info["ack_pres"] = ack
@@ -2297,6 +2345,7 @@ class K2PrtouchProbeCore:
         # Totzeit abwarten (MCU-Befund §3.2/5): Kontakt innerhalb von
         # lmt_dead Samples nach start erkennt die Düse NICHT. parse_options
         # erzwingt arm_settle_s >= min_arm_settle_s; hier doppelt (fail-safe).
+        self.arm_phase = "settle"
         settle = float(c.get("arm_settle_s", ARM_SETTLE_DEFAULT_S))
         need = min_arm_settle_s(c)
         if settle < need - 1e-9:
@@ -2304,6 +2353,7 @@ class K2PrtouchProbeCore:
                 "[k2_prtouch] arm_settle_s %.3f < Totzeit-Minimum %.3f s – "
                 "keine Bewegung." % (settle, need))
         self.pause(settle)
+        self.arm_phase = "rest"
         if c.get("rest_check", True):
             # Ruhetest erweitert (MCU-Befund §1/§7.4): Rohwerte (is_src=1)
             # mit Tickabstand/-1/24 Bit/nicht konstant + gefilterter Kanal
@@ -2324,11 +2374,14 @@ class K2PrtouchProbeCore:
                     "[k2_prtouch] Sensor-Ruhetest nach dem Scharfschalten "
                     "fehlgeschlagen: %s – keine Bewegung."
                     % "; ".join(ri["errors"]))
-        if bool(self._wrap("Endstop-Abfrage", self.query_triggered)):
+        self.arm_phase = "pc7"
+        q_armed = self.query_triggered_armed or self.query_triggered
+        if bool(self._wrap("Kontakt-Abfrage (scharf)", q_armed)):
             raise self.error(
                 "[k2_prtouch] Düse meldet bereits Kontakt (Endstop %s "
                 "ausgelöst) VOR der Fahrt – keine Bewegung. Düse frei? "
                 "Restkraft/Filament an der Düse?" % (c.get("step_swap_pin"),))
+        self.arm_phase = "armed"
         return info
 
     def disarm(self):
@@ -2969,9 +3022,12 @@ class PrinterK2Prtouch:
             except Exception as exc:
                 gcmd.respond_info("[k2_prtouch] READ: %s" % exc)
             return
+        # mode steps: dieselbe Vorabprüfung über den Controller (Signalweg
+        # über stop_prtouch_step, Kontakt-Abfrage über tri_chxs).
         try:
-            info, _ = ctl.check_sensor_rest()
-            gcmd.respond_info("[k2_prtouch] READ ok: %s" % (info,))
+            info = ctl.preflight()
+            gcmd.respond_info("[k2_prtouch] READ ok (Vorabprüfung ohne "
+                              "Bewegung): rest=%s" % (info.get("rest"),))
         except Exception as exc:
             gcmd.respond_info("[k2_prtouch] READ: %s" % exc)
 

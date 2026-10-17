@@ -154,8 +154,11 @@ Audit und Änderungsbegründungen: `<projekt>/AUDIT-UND-AENDERUNGEN.md`.
   in §6a.8. test_k2_box 34/34, resumecut 11 Läufe 151/151, a45 0 Fehler.
 - [ ] Am Gerät: Abbruch im Schacht (Box stromlos während T1), Faden von Hand aus dem Kopf → RESUME muss verweigern;
   T1 in der Pause → RESUME läuft; erst danach resume_redo_change testen.
-- [ ] Offen: PAUSE merkt nach Kettenabbruch hotend_temp = Wechsel-Temperatur (≥ 220 °C) → RESUME heizt darauf
-  (Vorschlag: _fail übergibt die ursprüngliche Zieltemperatur an PAUSE).
+- [x] PAUSE nach Kettenabbruch merkte hotend_temp = Wechsel-Temperatur (≥ 220 °C) – BEHOBEN 17.10.2026: _heat merkt
+  orig_target, _fail übergibt PAUSE `CFS_TEMP=<Ziel vor dem Wechsel>` (nur neue Pause, nur > 0 und ≠ aktuell); Abbruch in
+  bestehender Pause → `M104 S<orig_target>` (Pausentemperatur statt 220). Ziel 0/unlesbar = unbekannt → altes Verhalten.
+  NOTIZ-reinigung-resume §6a.10, test_k2_box 36/36, resumecut 151/151, a45 0 Fehler, lauf-modulfix EXIT-Bild = Referenz.
+- [ ] Am Gerät: Druck < 220 °C, Abbruch im Schacht → Meldung nennt CFS_TEMP, Pause 140 °C, nach RESUME Drucktemperatur.
 - [ ] Am Pi zu prüfen: Positionen Reinigung/Schacht wegen FORCE_MOVE-Versatz einzeln langsam abfahren; Vorextrusion
   460 mm/min/180 °C; Stall-Pin PB11 in Mode 3; RESUME direkt aus runout_gcode
   Zurückgestellt: Motor-Kalibrierfunktionen aus dessen motor_control.py (0x03 Encoder, 0x04 Elektrik-Offset,
@@ -575,7 +578,12 @@ box 179 · boxmini 17 · cfsseq 28 · motor 134 · motor_mini 43 · auto_addr 33
   Batch: config_endstop PC7 pull_up=1). test_k2_prtouch 248/248. KTWO_PRTOUCH_READ macht jetzt die Vorabprüfung (scharf → Ruhe → entschärft).
 - [ ] PrTouch am Gerät: KTWO_PRTOUCH_READ (Vorabprüfung) – tick_median_ms/filt_max_abs notieren; nach erster Antastung
   eingefrorenes Register is_src 0/1 lesen → Rampe Counts/Sample bei 5 mm/s → Mindestgeschwindigkeit/rest_filt_max_frac nachschärfen.
-- [ ] k2_prtouch `mode: steps` (Rückfallweg): Ruhetest liest vor start_prtouch_pres (Register leer) – unbenutzbar (Altfehler, README A.8).
+- [x] k2_prtouch `mode: steps` – BEHOBEN 17.10.2026: nutzt jetzt K2PrtouchProbeCore arm()/disarm()/preflight() wie der
+  Probe-Weg (scharf → Totzeit → Ruhetest → Schritte → finally disarm → Anheben), Kontakt im scharfen Zustand per
+  read_status (tri_chxs), neue Status start_error/contact_before_move/mcu_contact/disarm_error, Mindestgeschw. auch hier.
+  test_k2_prtouch 280/280, lauf-F EXIT 0. README B.1/B.2 (Host-Kriterium vs. MCU, ANNAHME „Treppen-Effekt“).
+- [ ] Am Gerät (nach Probe-Weg): KTWO_PRTOUCH_PROBE_STEPS DRY_RUN=1 mit allow_move False, dann leeres Bett mit kleinem
+  max_travel_mm; mcu_triggered/best_indx/zoft notieren, Log auf emergency/mcu_contact prüfen.
 - [x] Nachbau-Korrekturen aus den RE-Befunden – ERLEDIGT 17.10.2026: read_phase_currents(phase_order_invert=0) (idx 10 = +Ib
   bei 0; motor.py/motor_mini.py); Erase für Motorziele → ValueError (nur dev_type 1/10); Sendeschutz serial485.check_tx_frame
   + k2_transport (≤ 100 Datenbytes, fun 0xF0 ≤ 0x80, len ≤ 0xFC, RX 255; nie 0xFF/0xFD mit 0x01/0x0B außer FF 0B [01]);

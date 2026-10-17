@@ -513,12 +513,67 @@ nachholbar (bewusst): M8200-Kette (die Datei schickt nach RESUME selbst
 - **ANNAHME:** Kopf voll ≠ Ziel-Filament geladen (z. B. Schnitt gescheitert):
   RESUME druckt mit dem alten Filament weiter (Stock ebenso) – vorher von
   Hand `T<n>`.
-- **Beobachtung (nicht geändert):** `PAUSE` merkt `hotend_temp` =
+- ~~**Beobachtung (nicht geändert):** `PAUSE` merkt `hotend_temp` =
   Extruder-Ziel beim Abbruch; hatte die Kette schon geheizt, ist das
   max(Drucktemperatur, 220) – RESUME heizt dann darauf statt auf die
-  Drucktemperatur (END_OPT nach Fehler stellt das Ziel nicht zurück).
-  Vorschlag: `_fail` übergibt `orig_target` an PAUSE.
+  Drucktemperatur.~~ **Behoben 17.10.2026 spät, §6a.10** (`PAUSE CFS_TEMP`).
 - **Am Gerät (Hand am Not-Aus):** Abbruch im Schacht provozieren (Box
   stromlos während `T1`), dann Kopf leeren (Filament von Hand ziehen) →
   RESUME muss verweigern; `T1` in der Pause → RESUME läuft. Nachholen erst
   nach erfolgreichen Einzelschritten (NOTIZ-cfs.md §2) testen.
+
+### 6a.10 Temperatur nach abgebrochenem Wechsel: `PAUSE CFS_TEMP` (17.10.2026 spät)
+
+**Problem:** `PAUSE` merkt wie Stock das aktuelle Extruder-Ziel als
+`hotend_temp` (Stock `config/F008/gcode_macro.cfg:738`, Pi `macros.cfg`
+PAUSE), RESUME heizt darauf (Stock `gcode_macro.cfg:836-842`, Pi
+`_PI_RESUME_PREPARE` `M109 S{hotend_temp}`). Bricht ein Wechsel im Druck ab,
+nachdem `RETRUDE`/`EXTRUDE`/`FLUSH` schon auf die Wechsel-Temperatur geheizt
+hatten (`k2_box._heat` → `M109 S{max(Ziel, tn_extrude_temp 220)}`,
+`_change_temp`), ist das Ziel beim `PAUSE` die Wechsel- statt der
+Drucktemperatur; `END_OPT` stellt `orig_target` nur im Erfolgsfall zurück.
+Folge: RESUME heizt z. B. auf 220 statt 200 °C und druckt so weiter.
+
+**Lösung:**
+
+- `k2_box._heat` merkt `chain["orig_target"]` VOR dem ersten `M109` (auch
+  bei Abbruch während `M109` richtig – `M109` setzt das Ziel vor dem Warten);
+  Einzelschritt ohne Kette im Druck: `_run_step` merkt `_step_target`.
+- `_fail` (nur wenn DIESER Fehler die Pause auslöst) hängt
+  `CFS_TEMP=<Ziel vor dem Aufheizen>` an `PAUSE` (`_pause_temp`), sofern es
+  vom aktuellen Ziel abweicht. Kein `CFS_TEMP`: noch nicht geheizt (Abbruch
+  im Schnitt), Druckziel schon ≥ Wechsel-Temperatur (Ziel unverändert),
+  Ziel vor dem Wechsel 0/nicht lesbar (**unbekannt** → wie bisher aktuelles
+  Ziel, lieber Wechsel-Temperatur als kalt weiterdrucken; Meldung nennt
+  `SET_GCODE_VARIABLE MACRO=_PI_PARAM VARIABLE=hotend_temp VALUE=<°C>`).
+- `macros.cfg` PAUSE: `hotend_temp = CFS_TEMP` wenn > 0, sonst
+  `printer.extruder.target` (0/ungültig → aktuelles Ziel, nie 0 = kalt);
+  Meldung „RESUME heizt auf die Drucktemperatur vor dem Wechsel …“.
+  Pausentemperatur `M104 S140` unverändert.
+- Mehrere Abbrüche: eine Wiederholung IN der Pause (`T<n>` von Hand, Nachholen
+  per `resume_redo_change`, Runout-Kette) ruft kein `PAUSE` – `hotend_temp`
+  bleibt das Druckziel der ersten Pause. Neu: bricht sie nach dem Heizen ab,
+  setzt `_fail` die Düse auf das Ziel vor DIESEM Wechsel zurück
+  (= Pausentemperatur 140, wie `END_OPT` im Erfolgsfall) statt sie die ganze
+  Pause auf 220 stehen zu lassen.
+- Manueller `T<n>` in der Pause (Erfolg): `END_OPT` → `M104 S140`
+  (Pausentemperatur), RESUME heizt aus `hotend_temp` auf das Druckziel.
+- Ohne Pi-PAUSE-Makro (Upstream-PAUSE) wird `CFS_TEMP` ignoriert (wie
+  `CFS_RETURN_*`).
+
+**Stock:** ob `box_wrapper.so` vor dem `PAUSE` das Ziel zurücksetzt, ist
+**unbelegt (ANNAHME: nein** – `BoxError.handle_event` laut
+`BOOTLOADER-HOST-BEFUND-2026-10-17.md` §5.1 nur Z-Hop zurück, Safe-Pos,
+`PAUSE`; keine Temperatur genannt).
+
+**Nachweis (offline):** `test_k2_box.py` 36/36 (neu
+`test_pause_temp_nach_abbruch`, `test_makros_pause_temp`, Ergänzung im
+Nachhol-Fehlerfall; Negativprobe gegen den alten Stand: beide neuen Tests
+FAIL). Batch `upstream-test-resumecut/` unverändert 11 Läufe, 151/151.
+Zusatzlauf gegen Upstream (Scratch-Kopie von `lauf-schacht` mit
+`M104 S200` + Ausgabemakro): nach Abbruch `hotend_temp=200.0`,
+Ziel 140; nach RESUME Ziel 200.0; zweiter Abbruch in der Pause:
+`hotend_temp` bleibt 200.0, Ziel zurück auf 140 („Düse zurück auf 140 °C“), RESUME → 200.0. a45-Batch 0 Fehler, lauf-modulfix.sh EXIT-Bild wie Referenz.
+
+**Am Gerät:** Druck mit < 220 °C, Abbruch im Schacht provozieren → Meldung
+`CFS_TEMP`, nach RESUME `M105`/Moonraker: Ziel = Drucktemperatur.
